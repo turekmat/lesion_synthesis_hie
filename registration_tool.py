@@ -23,6 +23,8 @@ def register_image_to_atlas(moving_image_path, fixed_image_path, output_path):
     # Načtení obrazů pomocí ANTsPy
     fixed_ant = ants.image_read(str(fixed_image_path))
     moving_ant = ants.image_read(str(moving_image_path))
+    # Načtení původního obrazu (bez normalizace) pro získání cílového rozsahu
+    orig_moving_ant = ants.image_read(str(moving_image_path))
     
     # Normalizace intenzity vstupních obrazů pro lepší registraci
     fixed_ant = ants.iMath(fixed_ant, "Normalize")
@@ -65,11 +67,18 @@ def register_image_to_atlas(moving_image_path, fixed_image_path, output_path):
         print("Aplikuji masku na registrovaný obraz...")
         masked_registered_image = registered_image * brain_mask
         
-        # Zpětné škálování intenzit na požadovaný rozsah (-10 až +10)
+        # Získání původního dynamického rozsahu z původního obrazu
+        orig_moving_np = orig_moving_ant.numpy()
+        desired_min, desired_max = orig_moving_np.min(), orig_moving_np.max()
+        # Vypočítáme statistiky původního obrazu
+        orig_avg = orig_moving_np.mean()
+        orig_zero_pct = np.sum(orig_moving_np == 0) / orig_moving_np.size * 100
+        print(f"Originální image statistiky: min={desired_min}, max={desired_max}, avg={orig_avg}, %0={orig_zero_pct:.2f}%")
+        
+        # Zpětné škálování intenzit na cílový rozsah (z původního obrazu)
         print("Aplikuji zpětné škálování intenzit na registrovaný obraz...")
         masked_np = masked_registered_image.numpy()
-        desired_min, desired_max = -10.0, 10.0
-        mask = masked_np != 0  # pouze pixely uvnitř masky
+        mask = masked_np != 0  # škálujeme pouze pixely uvnitř masky
         if np.any(mask):
             current_min = masked_np[mask].min()
             current_max = masked_np[mask].max()
@@ -77,7 +86,6 @@ def register_image_to_atlas(moving_image_path, fixed_image_path, output_path):
             current_min, current_max = 0, 1  # záložní hodnoty, pokud je maska prázdná
         
         scaled_np = np.copy(masked_np)
-        # Lineární škálování pouze pro pixely uvnitř masky
         scaled_np[mask] = (masked_np[mask] - current_min) / (current_max - current_min) * (desired_max - desired_min) + desired_min
         
         # Vytvoření nového ANTs image ze škálovaného numpy pole a zachování geometrie původního obrazu
@@ -85,6 +93,13 @@ def register_image_to_atlas(moving_image_path, fixed_image_path, output_path):
         scaled_registered_image.set_origin(masked_registered_image.origin)
         scaled_registered_image.set_spacing(masked_registered_image.spacing)
         scaled_registered_image.set_direction(masked_registered_image.direction)
+        
+        # Vypočítáme statistiky registrovaného obrazu
+        scaled_avg = scaled_np.mean()
+        scaled_zero_pct = np.sum(scaled_np == 0) / scaled_np.size * 100
+        scaled_min = scaled_np.min()
+        scaled_max = scaled_np.max()
+        print(f"Registrovaný image statistiky: min={scaled_min}, max={scaled_max}, avg={scaled_avg}, %0={scaled_zero_pct:.2f}%")
         
         # Uložení registrovaného obrazu se škálováním
         print(f"Ukládám registrovaný obraz (se zpětným škálováním) do {output_path}")
@@ -132,7 +147,7 @@ def transform_label_map(label_map_path, transforms, fixed_image, output_path):
 def create_registration_visualization_pdf(atlas_image, orig_zadc, reg_zadc, orig_label, reg_label, output_pdf_path):
     """
     Vytvoří PDF vizualizaci registrace s 5 sloupci: atlas, původní ZADC, registrovaná ZADC,
-    původní label, registrovaná label
+    původní label, registrovaná label.
     
     Args:
         atlas_image: Normativní atlas (ANTs image)
@@ -152,7 +167,6 @@ def create_registration_visualization_pdf(atlas_image, orig_zadc, reg_zadc, orig
     reg_label_np = reg_label.numpy()
     
     # Vytvoření binární masky z atlasu (nenulové hodnoty)
-    # Použijeme práh 0.05 pro vytvoření masky, aby se zachytila mozková tkáň a odfiltroval šum
     brain_mask = (atlas_np > 0.05)
     
     # Aplikace masky na registrovanou ZADC mapu - nastavíme hodnoty mimo masku na 0
@@ -162,9 +176,9 @@ def create_registration_visualization_pdf(atlas_image, orig_zadc, reg_zadc, orig
             masked_reg_zadc_np[:, :, slice_idx] = masked_reg_zadc_np[:, :, slice_idx] * brain_mask[:, :, slice_idx]
     
     # Zjištění počtu řezů pro každý obraz
-    atlas_slices = atlas_np.shape[2]  # Předpokládáme, že poslední dimenze jsou řezy
+    atlas_slices = atlas_np.shape[2]
     orig_zadc_slices = orig_zadc_np.shape[2]
-    reg_zadc_slices = masked_reg_zadc_np.shape[2]  # Použijeme maskovanou verzi
+    reg_zadc_slices = masked_reg_zadc_np.shape[2]
     orig_label_slices = orig_label_np.shape[2]
     reg_label_slices = reg_label_np.shape[2]
     
@@ -173,16 +187,12 @@ def create_registration_visualization_pdf(atlas_image, orig_zadc, reg_zadc, orig
     
     # Vytvoříme PDF
     with PdfPages(output_pdf_path) as pdf:
-        # Určíme maximální počet řezů které budeme vizualizovat
         max_slices = max(atlas_slices, orig_zadc_slices, reg_zadc_slices, orig_label_slices, reg_label_slices)
         
-        # Pro každý řez vytvoříme stránku v PDF
         for slice_idx in range(max_slices):
             plt.figure(figsize=(20, 5))
-            
             gs = gridspec.GridSpec(1, 5, width_ratios=[1, 1, 1, 1, 1])
             
-            # Zobrazení atlasu
             ax1 = plt.subplot(gs[0])
             if slice_idx < atlas_slices:
                 atlas_slice = atlas_np[:, :, slice_idx] if atlas_np.ndim == 3 else atlas_np[:, :, slice_idx, 0]
@@ -190,7 +200,6 @@ def create_registration_visualization_pdf(atlas_image, orig_zadc, reg_zadc, orig
             ax1.set_title(f'Atlas (řez {slice_idx+1})')
             ax1.axis('off')
             
-            # Zobrazení původní ZADC mapy
             ax2 = plt.subplot(gs[1])
             if slice_idx < orig_zadc_slices:
                 orig_zadc_slice = orig_zadc_np[:, :, slice_idx] if orig_zadc_np.ndim == 3 else orig_zadc_np[:, :, slice_idx, 0]
@@ -198,7 +207,6 @@ def create_registration_visualization_pdf(atlas_image, orig_zadc, reg_zadc, orig
             ax2.set_title(f'Původní ZADC (řez {slice_idx+1})')
             ax2.axis('off')
             
-            # Zobrazení registrované ZADC mapy (s aplikovanou maskou)
             ax3 = plt.subplot(gs[2])
             if slice_idx < reg_zadc_slices:
                 reg_zadc_slice = masked_reg_zadc_np[:, :, slice_idx] if masked_reg_zadc_np.ndim == 3 else masked_reg_zadc_np[:, :, slice_idx, 0]
@@ -206,7 +214,6 @@ def create_registration_visualization_pdf(atlas_image, orig_zadc, reg_zadc, orig
             ax3.set_title(f'Registrovaná ZADC (řez {slice_idx+1})')
             ax3.axis('off')
             
-            # Zobrazení původní label mapy
             ax4 = plt.subplot(gs[3])
             if slice_idx < orig_label_slices:
                 orig_label_slice = orig_label_np[:, :, slice_idx] if orig_label_np.ndim == 3 else orig_label_np[:, :, slice_idx, 0]
@@ -214,7 +221,6 @@ def create_registration_visualization_pdf(atlas_image, orig_zadc, reg_zadc, orig
             ax4.set_title(f'Původní Label (řez {slice_idx+1})')
             ax4.axis('off')
             
-            # Zobrazení registrované label mapy
             ax5 = plt.subplot(gs[4])
             if slice_idx < reg_label_slices:
                 reg_label_slice = reg_label_np[:, :, slice_idx] if reg_label_np.ndim == 3 else reg_label_np[:, :, slice_idx, 0]
@@ -235,11 +241,9 @@ def process_dataset(args):
     Args:
         args: Argumenty příkazové řádky
     """
-    # Vytvoření výstupních adresářů
     zadc_output_dir = Path(args.output_dir) / "registered_zadc"
     label_output_dir = Path(args.output_dir) / "registered_label"
     
-    # Vytvoření adresáře pro PDF vizualizace, pokud je vyžadováno
     if args.pdf_viz_registration:
         pdf_dir = Path(args.output_dir) / "registration_visualizations"
         pdf_dir.mkdir(parents=True, exist_ok=True)
@@ -247,36 +251,28 @@ def process_dataset(args):
     zadc_output_dir.mkdir(parents=True, exist_ok=True)
     label_output_dir.mkdir(parents=True, exist_ok=True)
     
-    # Seznam souborů ZADC a odpovídajících LABEL
     zadc_files = sorted([f for f in Path(args.zadc_dir).glob("*") if f.suffix in ['.mha', '.nii.gz', '.nii']])
     label_files = sorted([f for f in Path(args.label_dir).glob("*") if f.suffix in ['.mha', '.nii.gz', '.nii']])
     
-    # Kontrola, zda máme stejný počet ZADC a LABEL souborů
     if len(zadc_files) != len(label_files):
         print(f"Varování: Rozdílný počet ZADC ({len(zadc_files)}) a LABEL ({len(label_files)}) souborů!")
     
-    # Zpracování každého páru ZADC a LABEL
     for i, (zadc_path, label_path) in enumerate(zip(zadc_files, label_files)):
         print(f"\n=== Zpracování {i+1}/{len(zadc_files)}: {zadc_path.name} ===")
-        
-        # Generování názvů výstupních souborů
         zadc_output_path = zadc_output_dir / f"reg_{zadc_path.name}"
         label_output_path = label_output_dir / f"reg_{label_path.name}"
         
-        # Změna přípony na .nii.gz, pokud je požadována
         if args.output_format == 'nii.gz':
             zadc_output_path = zadc_output_path.with_suffix('.nii.gz')
             label_output_path = label_output_path.with_suffix('.nii.gz')
         
         try:
-            # Registrace ZADC na atlas
             transforms, fixed_ref, orig_zadc, reg_zadc = register_image_to_atlas(
                 zadc_path,
                 args.normal_atlas_path,
                 zadc_output_path
             )
             
-            # Aplikace stejné transformace na LABEL mapu
             orig_label, reg_label = transform_label_map(
                 label_path,
                 transforms,
@@ -286,7 +282,6 @@ def process_dataset(args):
             
             print(f"Hotovo: {zadc_output_path} a {label_output_path}")
             
-            # Vytvoření PDF vizualizace, pokud je vyžadováno
             if args.pdf_viz_registration:
                 pdf_path = pdf_dir / f"registration_viz_{zadc_path.stem}.pdf"
                 create_registration_visualization_pdf(
@@ -321,7 +316,6 @@ def main():
     
     args = parser.parse_args()
     
-    # Kontrola, zda existují všechny potřebné cesty
     paths_to_check = [
         ("Normativní atlas", args.normal_atlas_path),
         ("Adresář ZADC", args.zadc_dir),
