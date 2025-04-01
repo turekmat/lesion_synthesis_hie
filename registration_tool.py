@@ -27,37 +27,60 @@ def register_image_to_atlas(moving_image_path, fixed_image_path, output_path):
     else:
         fixed_image = sitk.ReadImage(str(fixed_image_path))
     
-    # Inicializace parametrů registrace
-    parameter_map = sitk.GetDefaultParameterMap("bspline")
-    parameter_map["FinalGridSpacingInPhysicalUnits"] = ["10.0", "10.0", "10.0"]
-    parameter_map["NumberOfResolutions"] = ["4"]
-    parameter_map["MaximumNumberOfIterations"] = ["500"]
+    # Změna implementace pro použití základního SimpleITK bez Elastix
+    # Nejprve zarovnáme geometrické středy obrazů
+    initial_transform = sitk.CenteredTransformInitializer(
+        fixed_image, 
+        moving_image, 
+        sitk.AffineTransform(3),
+        sitk.CenteredTransformInitializerFilter.GEOMETRY
+    )
     
-    # Vytvoření elastix objektu pro registraci
-    elastix = sitk.ElastixImageFilter()
-    elastix.SetParameterMap(parameter_map)
-    elastix.SetFixedImage(fixed_image)
-    elastix.SetMovingImage(moving_image)
+    # Registrace pomocí metody Demons
+    registration_method = sitk.ImageRegistrationMethod()
+    
+    # Nastavení parametrů podobnosti
+    registration_method.SetMetricAsMattesMutualInformation(numberOfHistogramBins=50)
+    registration_method.SetMetricSamplingStrategy(registration_method.RANDOM)
+    registration_method.SetMetricSamplingPercentage(0.01)
+    
+    # Nastavení optimizačních parametrů
+    registration_method.SetOptimizerAsGradientDescent(
+        learningRate=1.0, 
+        numberOfIterations=100, 
+        convergenceMinimumValue=1e-6, 
+        convergenceWindowSize=10
+    )
+    registration_method.SetOptimizerScalesFromPhysicalShift()
+    
+    # Nastavení interpolace a počátečních podmínek
+    registration_method.SetInterpolator(sitk.sitkLinear)
+    registration_method.SetInitialTransform(initial_transform, inPlace=False)
     
     # Provedení registrace
-    elastix.Execute()
+    transform = registration_method.Execute(fixed_image, moving_image)
+    
+    # Aplikace transformace na pohyblivý obraz
+    resampler = sitk.ResampleImageFilter()
+    resampler.SetReferenceImage(fixed_image)
+    resampler.SetInterpolator(sitk.sitkLinear)
+    resampler.SetDefaultPixelValue(0)
+    resampler.SetTransform(transform)
+    
+    result_image = resampler.Execute(moving_image)
     
     # Uložení registrovaného obrazu
-    result_image = elastix.GetResultImage()
     sitk.WriteImage(result_image, str(output_path))
     
-    # Získání transformačního parametrického souboru pro další použití
-    transform_parameter_map = elastix.GetTransformParameterMap()
-    
-    return transform_parameter_map
+    return transform
 
-def transform_label_map(label_map_path, transform_parameter_map, output_path):
+def transform_label_map(label_map_path, transform, output_path):
     """
     Aplikuje transformaci na label mapu
     
     Args:
         label_map_path: Cesta k label mapě
-        transform_parameter_map: Parametry transformace získané z registrace
+        transform: Transformace získaná z registrace
         output_path: Cesta pro uložení transformované label mapy
     """
     print(f"Transforming label map {label_map_path}")
@@ -68,16 +91,17 @@ def transform_label_map(label_map_path, transform_parameter_map, output_path):
     else:
         label_map = sitk.ReadImage(str(label_map_path))
     
-    # Vytvoření transformix objektu pro aplikaci transformace
-    transformix = sitk.TransformixImageFilter()
-    transformix.SetTransformParameterMap(transform_parameter_map)
-    transformix.SetMovingImage(label_map)
+    # Načtení referenčního obrazu (jen informace o geometrii)
+    reference_image = sitk.ReadImage(str(output_path.parent.parent / "registered_zadc" / output_path.name))
     
-    # Aplikace transformace
-    transformix.Execute()
+    # Aplikace transformace na label mapu
+    resampler = sitk.ResampleImageFilter()
+    resampler.SetReferenceImage(reference_image)
+    resampler.SetInterpolator(sitk.sitkNearestNeighbor)  # Důležité pro label mapy
+    resampler.SetDefaultPixelValue(0)
+    resampler.SetTransform(transform)
     
-    # Uložení transformované label mapy
-    result_label = transformix.GetResultImage()
+    result_label = resampler.Execute(label_map)
     
     # Při transformaci label mapy je potřeba zachovat diskrétní hodnoty
     # (předejít interpolaci mezi hodnotami)
