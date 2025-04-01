@@ -70,39 +70,39 @@ class LabelGANDataset(Dataset):
     
     def __getitem__(self, idx):
     # Načtení LABEL mapy
-    if self.label_files[idx].endswith('.nii.gz') or self.label_files[idx].endswith('.nii'):
-        label = nib.load(self.label_files[idx]).get_fdata()
-    else:
-        label = sitk.GetArrayFromImage(sitk.ReadImage(self.label_files[idx]))
+        if self.label_files[idx].endswith('.nii.gz') or self.label_files[idx].endswith('.nii'):
+            label = nib.load(self.label_files[idx]).get_fdata()
+        else:
+            label = sitk.GetArrayFromImage(sitk.ReadImage(self.label_files[idx]))
+            
+        # Binarizace LABEL mapy (zajistíme, že jsou jen hodnoty 0 a 1)
+        label = (label > 0).astype(np.float32)
         
-    # Binarizace LABEL mapy (zajistíme, že jsou jen hodnoty 0 a 1)
-    label = (label > 0).astype(np.float32)
-    
-    # Převod na PyTorch tensory
-    normal_atlas = torch.FloatTensor(self.normal_atlas).unsqueeze(0)  # [1, D, H, W]
-    label = torch.FloatTensor(label).unsqueeze(0)  # [1, D, H, W]
-    
-    if self.transform:
-        normal_atlas = self.transform(normal_atlas)
-        label = self.transform(label)
-    
-    return_dict = {
-        'normal_atlas': normal_atlas,
-        'label': label
-    }
-    
-    # Přidání atlasu frekvence lézí, pokud je k dispozici
-    if self.lesion_atlas is not None:
-        lesion_atlas_tensor = torch.FloatTensor(self.lesion_atlas).unsqueeze(0)  # [1, D_les, H_les, W_les]
-        # Pokud tvary lesion_atlas a normal_atlas se neshodují, interpolujeme lesion_atlas na stejný rozměr jako normal_atlas
-        if lesion_atlas_tensor.shape != normal_atlas.shape:
-            # normal_atlas.shape má tvar [1, D, H, W]; použijeme tyto rozměry
-            lesion_atlas_tensor = F.interpolate(lesion_atlas_tensor.unsqueeze(0), size=normal_atlas.shape[1:], mode='trilinear', align_corners=False).squeeze(0)
+        # Převod na PyTorch tensory
+        normal_atlas = torch.FloatTensor(self.normal_atlas).unsqueeze(0)  # [1, D, H, W]
+        label = torch.FloatTensor(label).unsqueeze(0)  # [1, D, H, W]
+        
         if self.transform:
-            lesion_atlas_tensor = self.transform(lesion_atlas_tensor)
-        return_dict['lesion_atlas'] = lesion_atlas_tensor
+            normal_atlas = self.transform(normal_atlas)
+            label = self.transform(label)
         
-    return return_dict
+        return_dict = {
+            'normal_atlas': normal_atlas,
+            'label': label
+        }
+        
+        # Přidání atlasu frekvence lézí, pokud je k dispozici
+        if self.lesion_atlas is not None:
+            lesion_atlas_tensor = torch.FloatTensor(self.lesion_atlas).unsqueeze(0)  # [1, D_les, H_les, W_les]
+            # Pokud tvary lesion_atlas a normal_atlas se neshodují, interpolujeme lesion_atlas na stejný rozměr jako normal_atlas
+            if lesion_atlas_tensor.shape != normal_atlas.shape:
+                # normal_atlas.shape má tvar [1, D, H, W]; použijeme tyto rozměry
+                lesion_atlas_tensor = F.interpolate(lesion_atlas_tensor.unsqueeze(0), size=normal_atlas.shape[1:], mode='trilinear', align_corners=False).squeeze(0)
+            if self.transform:
+                lesion_atlas_tensor = self.transform(lesion_atlas_tensor)
+            return_dict['lesion_atlas'] = lesion_atlas_tensor
+            
+        return return_dict
 
 
 
