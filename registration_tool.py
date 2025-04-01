@@ -57,15 +57,23 @@ def register_image_to_atlas(moving_image_path, fixed_image_path, output_path):
             verbose=False
         )
         
+        # Vytvoření masky mozku z atlasu
+        print("Vytvářím masku mozku z atlasu...")
+        brain_mask = ants.threshold_image(fixed_ant, 0.05, 2.0)  # Vytvoření binární masky pro hodnoty > 0.05
+        
+        # Aplikace masky na registrovaný obraz
+        print("Aplikuji masku na registrovaný obraz...")
+        masked_registered_image = registered_image * brain_mask
+        
         # Uložení registrovaného obrazu
         print(f"Ukládám registrovaný obraz do {output_path}")
-        ants.image_write(registered_image, str(output_path))
+        ants.image_write(masked_registered_image, str(output_path))
         
         # Vrácení transformačních parametrů a referencí
         return {
             'fwdtransforms': reg['fwdtransforms'],
             'invtransforms': reg['invtransforms']
-        }, fixed_ant, moving_ant, registered_image
+        }, fixed_ant, moving_ant, masked_registered_image
         
     except Exception as e:
         print(f"Chyba při registraci: {e}")
@@ -122,10 +130,21 @@ def create_registration_visualization_pdf(atlas_image, orig_zadc, reg_zadc, orig
     orig_label_np = orig_label.numpy()
     reg_label_np = reg_label.numpy()
     
+    # Vytvoření binární masky z atlasu (nenulové hodnoty)
+    # Použijeme práh 0.05 pro vytvoření masky, aby se zachytila mozkovou tkáň a odfiltroval šum
+    brain_mask = (atlas_np > 0.05)
+    
+    # Aplikace masky na registrovanou ZADC mapu - nastavíme hodnoty mimo masku na 0
+    masked_reg_zadc_np = np.copy(reg_zadc_np)
+    for slice_idx in range(masked_reg_zadc_np.shape[2]):
+        if slice_idx < brain_mask.shape[2]:
+            # Aplikujeme masku na tento řez
+            masked_reg_zadc_np[:, :, slice_idx] = masked_reg_zadc_np[:, :, slice_idx] * brain_mask[:, :, slice_idx]
+    
     # Zjištění počtu řezů pro každý obraz
     atlas_slices = atlas_np.shape[2]  # Předpokládáme, že poslední dimenze jsou řezy
     orig_zadc_slices = orig_zadc_np.shape[2]
-    reg_zadc_slices = reg_zadc_np.shape[2]
+    reg_zadc_slices = masked_reg_zadc_np.shape[2]  # Použijeme maskovanou verzi
     orig_label_slices = orig_label_np.shape[2]
     reg_label_slices = reg_label_np.shape[2]
     
@@ -159,10 +178,10 @@ def create_registration_visualization_pdf(atlas_image, orig_zadc, reg_zadc, orig
             ax2.set_title(f'Původní ZADC (řez {slice_idx+1})')
             ax2.axis('off')
             
-            # Zobrazení registrované ZADC mapy
+            # Zobrazení registrované ZADC mapy (s aplikovanou maskou)
             ax3 = plt.subplot(gs[2])
             if slice_idx < reg_zadc_slices:
-                reg_zadc_slice = reg_zadc_np[:, :, slice_idx] if reg_zadc_np.ndim == 3 else reg_zadc_np[:, :, slice_idx, 0]
+                reg_zadc_slice = masked_reg_zadc_np[:, :, slice_idx] if masked_reg_zadc_np.ndim == 3 else masked_reg_zadc_np[:, :, slice_idx, 0]
                 ax3.imshow(reg_zadc_slice, cmap='gray')
             ax3.set_title(f'Registrovaná ZADC (řez {slice_idx+1})')
             ax3.axis('off')
