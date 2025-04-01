@@ -198,6 +198,9 @@ def run_pipeline(args):
             "--output_format", "nii.gz"
         ]
         
+        if args.pdf_viz_registration:
+            registration_cmd.append("--pdf_viz_registration")
+        
         if not run_command(registration_cmd):
             print("Registrace selhala. Ukončuji pipeline.")
             return
