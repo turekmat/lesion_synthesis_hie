@@ -343,8 +343,15 @@ def train_label_gan(args):
             noise = torch.randn_like(normal_atlas).to(device)
             
             # Ground truth labels pro adversarial loss
-            real_labels = torch.ones(batch_size, 1, 1, 1, 1).to(device)
-            fake_labels = torch.zeros(batch_size, 1, 1, 1, 1).to(device)
+            real_output = discriminator(normal_atlas, real_label)
+            real_labels = torch.ones_like(real_output)  # Cílový tensor se stejným tvarem jako real_output
+            d_real_loss = adversarial_loss(real_output, real_labels)
+
+            # Generované vzorky
+            fake_label = generator(normal_atlas, noise, lesion_atlas)
+            fake_output = discriminator(normal_atlas, fake_label.detach())
+            fake_labels = torch.zeros_like(fake_output)  # Cílový tensor se stejným tvarem jako fake_output
+            d_fake_loss = adversarial_loss(fake_output, fake_labels)
             
             # -------------------------
             # Trénink diskriminátoru
