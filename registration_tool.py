@@ -65,15 +65,36 @@ def register_image_to_atlas(moving_image_path, fixed_image_path, output_path):
         print("Aplikuji masku na registrovaný obraz...")
         masked_registered_image = registered_image * brain_mask
         
-        # Uložení registrovaného obrazu
-        print(f"Ukládám registrovaný obraz do {output_path}")
-        ants.image_write(masked_registered_image, str(output_path))
+        # Zpětné škálování intenzit na požadovaný rozsah (-10 až +10)
+        print("Aplikuji zpětné škálování intenzit na registrovaný obraz...")
+        masked_np = masked_registered_image.numpy()
+        desired_min, desired_max = -10.0, 10.0
+        mask = masked_np != 0  # pouze pixely uvnitř masky
+        if np.any(mask):
+            current_min = masked_np[mask].min()
+            current_max = masked_np[mask].max()
+        else:
+            current_min, current_max = 0, 1  # záložní hodnoty, pokud je maska prázdná
         
-        # Vrácení transformačních parametrů a referencí
+        scaled_np = np.copy(masked_np)
+        # Lineární škálování pouze pro pixely uvnitř masky
+        scaled_np[mask] = (masked_np[mask] - current_min) / (current_max - current_min) * (desired_max - desired_min) + desired_min
+        
+        # Vytvoření nového ANTs image ze škálovaného numpy pole a zachování geometrie původního obrazu
+        scaled_registered_image = ants.from_numpy(scaled_np)
+        scaled_registered_image.set_origin(masked_registered_image.origin)
+        scaled_registered_image.set_spacing(masked_registered_image.spacing)
+        scaled_registered_image.set_direction(masked_registered_image.direction)
+        
+        # Uložení registrovaného obrazu se škálováním
+        print(f"Ukládám registrovaný obraz (se zpětným škálováním) do {output_path}")
+        ants.image_write(scaled_registered_image, str(output_path))
+        
+        # Vrácení transformačních parametrů a referencí (vracíme škálovanou verzi)
         return {
             'fwdtransforms': reg['fwdtransforms'],
             'invtransforms': reg['invtransforms']
-        }, fixed_ant, moving_ant, masked_registered_image
+        }, fixed_ant, moving_ant, scaled_registered_image
         
     except Exception as e:
         print(f"Chyba při registraci: {e}")
@@ -131,14 +152,13 @@ def create_registration_visualization_pdf(atlas_image, orig_zadc, reg_zadc, orig
     reg_label_np = reg_label.numpy()
     
     # Vytvoření binární masky z atlasu (nenulové hodnoty)
-    # Použijeme práh 0.05 pro vytvoření masky, aby se zachytila mozkovou tkáň a odfiltroval šum
+    # Použijeme práh 0.05 pro vytvoření masky, aby se zachytila mozková tkáň a odfiltroval šum
     brain_mask = (atlas_np > 0.05)
     
     # Aplikace masky na registrovanou ZADC mapu - nastavíme hodnoty mimo masku na 0
     masked_reg_zadc_np = np.copy(reg_zadc_np)
     for slice_idx in range(masked_reg_zadc_np.shape[2]):
         if slice_idx < brain_mask.shape[2]:
-            # Aplikujeme masku na tento řez
             masked_reg_zadc_np[:, :, slice_idx] = masked_reg_zadc_np[:, :, slice_idx] * brain_mask[:, :, slice_idx]
     
     # Zjištění počtu řezů pro každý obraz
@@ -321,4 +341,4 @@ def main():
     process_dataset(args)
 
 if __name__ == "__main__":
-    main() 
+    main()
