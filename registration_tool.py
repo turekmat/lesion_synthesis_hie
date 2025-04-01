@@ -35,7 +35,7 @@ def register_image_to_atlas(moving_image_path, fixed_image_path, output_path):
             fixed=fixed_ant, 
             moving=moving_ant,
             type_of_transform='Affine', 
-            verbose=True
+            verbose=False
         )
         
         print("Provádím SyN registraci...")
@@ -45,7 +45,7 @@ def register_image_to_atlas(moving_image_path, fixed_image_path, output_path):
             type_of_transform='SyN',
             initial_transform=init_reg['fwdtransforms'][0],
             reg_iterations=[50, 30, 20],   # Počet iterací pro každou úroveň
-            verbose=True
+            verbose=False
         )
         
         # Aplikace transformace na pohyblivý obraz
@@ -53,7 +53,8 @@ def register_image_to_atlas(moving_image_path, fixed_image_path, output_path):
             fixed=fixed_ant,
             moving=moving_ant,
             transformlist=reg['fwdtransforms'],
-            interpolator='linear'
+            interpolator='linear',
+            verbose=False
         )
         
         # Uložení registrovaného obrazu
