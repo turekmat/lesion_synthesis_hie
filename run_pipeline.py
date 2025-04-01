@@ -436,6 +436,10 @@ def main():
     gen_group.add_argument('--lesion_intensity_range', type=str, default=None,
                         help='Rozsah intenzity léze ve formátu "min,max" (např. "0.3,0.8")')
     
+    # Nový parametr
+    parser.add_argument('--pdf_viz_registration', action='store_true',
+                        help='Vytvoří PDF vizualizaci registračních výsledků')
+    
     args = parser.parse_args()
     
     # Sestavení cest na základě kořenového adresáře a jmen souborů
