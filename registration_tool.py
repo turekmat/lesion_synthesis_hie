@@ -17,12 +17,12 @@ def register_image_to_atlas(moving_image_path, fixed_image_path, output_path):
     print(f"Registering {moving_image_path} to {fixed_image_path}")
     
     # Načtení obrazů
-    if moving_image_path.endswith('.nii.gz'):
+    if str(moving_image_path).endswith(('.nii.gz', '.nii')):
         moving_image = sitk.ReadImage(str(moving_image_path))
     else:
         moving_image = sitk.ReadImage(str(moving_image_path))
         
-    if fixed_image_path.endswith('.nii.gz'):
+    if str(fixed_image_path).endswith(('.nii.gz', '.nii')):
         fixed_image = sitk.ReadImage(str(fixed_image_path))
     else:
         fixed_image = sitk.ReadImage(str(fixed_image_path))
@@ -63,7 +63,7 @@ def transform_label_map(label_map_path, transform_parameter_map, output_path):
     print(f"Transforming label map {label_map_path}")
     
     # Načtení label mapy
-    if label_map_path.endswith('.nii.gz'):
+    if str(label_map_path).endswith(('.nii.gz', '.nii')):
         label_map = sitk.ReadImage(str(label_map_path))
     else:
         label_map = sitk.ReadImage(str(label_map_path))
@@ -103,8 +103,8 @@ def process_dataset(args):
     label_output_dir.mkdir(parents=True, exist_ok=True)
     
     # Seznam souborů ZADC a odpovídajících LABEL
-    zadc_files = sorted([f for f in Path(args.zadc_dir).glob("*") if f.suffix in ['.mha', '.nii.gz']])
-    label_files = sorted([f for f in Path(args.label_dir).glob("*") if f.suffix in ['.mha', '.nii.gz']])
+    zadc_files = sorted([f for f in Path(args.zadc_dir).glob("*") if f.suffix in ['.mha', '.nii.gz', '.nii']])
+    label_files = sorted([f for f in Path(args.label_dir).glob("*") if f.suffix in ['.mha', '.nii.gz', '.nii']])
     
     # Kontrola, zda máme stejný počet ZADC a LABEL souborů
     if len(zadc_files) != len(label_files):
