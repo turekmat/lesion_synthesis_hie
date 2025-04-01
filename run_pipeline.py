@@ -130,57 +130,6 @@ def visualize_gan_results(normal_atlas_path, synthetic_image_path, real_image_pa
     else:
         plt.show()
 
-def visualize_segmentation_results(image_path, segmentation_path, output_path=None, num_slices=3):
-    """Vizualizuje výsledky segmentace porovnáním vstupního obrazu a segmentace"""
-    image = load_image(image_path)
-    segmentation = load_image(segmentation_path).astype(bool)
-    
-    # Normalizace dat pro vizualizaci
-    image = (image - image.min()) / (image.max() - image.min())
-    
-    # Výběr řezů pro vizualizaci - preferujeme řezy s největším počtem segmentovaných pixelů
-    depth = image.shape[0]
-    if np.any(segmentation):
-        # Spočítáme počet segmentovaných pixelů v každém řezu
-        seg_pixels_per_slice = np.sum(segmentation, axis=(1, 2))
-        # Vybereme řezy s nejvíce segmentovanými pixely
-        slice_indices = np.argsort(seg_pixels_per_slice)[-num_slices:]
-    else:
-        # Pokud segmentace neobsahuje žádné pixely, použijeme rovnoměrně rozložené řezy
-        slice_indices = [int(depth * i / (num_slices + 1)) for i in range(1, num_slices + 1)]
-    
-    # Vykreslení porovnání
-    fig, axes = plt.subplots(num_slices, 3, figsize=(15, 5 * num_slices))
-    
-    for i, slice_idx in enumerate(slice_indices):
-        # Vstupní obraz
-        axes[i, 0].imshow(image[slice_idx], cmap='gray')
-        axes[i, 0].set_title(f'Vstupní obraz (řez {slice_idx})')
-        axes[i, 0].axis('off')
-        
-        # Segmentace
-        if slice_idx < segmentation.shape[0]:
-            axes[i, 1].imshow(segmentation[slice_idx], cmap='hot')
-            axes[i, 1].set_title(f'Segmentace (řez {slice_idx})')
-            axes[i, 1].axis('off')
-        
-        # Překryv
-        axes[i, 2].imshow(image[slice_idx], cmap='gray')
-        if slice_idx < segmentation.shape[0]:
-            mask = np.ma.masked_where(~segmentation[slice_idx], segmentation[slice_idx])
-            axes[i, 2].imshow(mask, cmap='autumn', alpha=0.7)
-        axes[i, 2].set_title(f'Překryv (řez {slice_idx})')
-        axes[i, 2].axis('off')
-    
-    plt.tight_layout()
-    
-    if output_path:
-        plt.savefig(output_path)
-        plt.close()
-        print(f"Vizualizace uložena do: {output_path}")
-    else:
-        plt.show()
-
 def run_command(cmd):
     """Spustí příkaz a vypíše výstup"""
     print(f"Spouštím: {' '.join(cmd)}")
@@ -198,23 +147,19 @@ def run_command(cmd):
     return True
 
 def run_pipeline(args):
-    """Spustí celou pipeline generování a segmentace lézí"""
+    """Spustí pipeline pro syntézu HIE lézí pomocí GAN modelu"""
     
     # Vytvoření adresářů
     registered_data_dir = Path(args.output_dir) / "registered_data"
     gan_output_dir = Path(args.output_dir) / "gan_output"
     synthetic_samples_dir = Path(args.output_dir) / "synthetic_samples"
-    synthetic_labels_dir = Path(args.output_dir) / "synthetic_labels"
-    segmentation_model_dir = Path(args.output_dir) / "segmentation_model"
-    segmentation_results_dir = Path(args.output_dir) / "segmentation_results"
     
     # Vytvoření adresáře pro vizualizace, pokud je požadováno
     if args.visualize:
         visualization_dir = Path(args.output_dir) / "visualizations"
         visualization_dir.mkdir(parents=True, exist_ok=True)
     
-    for dir_path in [registered_data_dir, gan_output_dir, synthetic_samples_dir, 
-                   synthetic_labels_dir, segmentation_model_dir, segmentation_results_dir]:
+    for dir_path in [registered_data_dir, gan_output_dir, synthetic_samples_dir]:
         dir_path.mkdir(parents=True, exist_ok=True)
     
     # 1. Registrace dat na normativní atlas
@@ -264,8 +209,23 @@ def run_pipeline(args):
             "--output_dir", str(gan_output_dir),
             "--epochs", str(args.gan_epochs),
             "--batch_size", str(args.gan_batch_size),
-            "--lr", str(args.gan_lr)
+            "--lr", str(args.gan_lr),
+            "--latent_dim", str(args.gan_latent_dim),
+            "--generator_filters", str(args.gan_generator_filters),
+            "--discriminator_filters", str(args.gan_discriminator_filters),
+            "--dropout_rate", str(args.gan_dropout_rate),
+            "--beta1", str(args.gan_beta1),
+            "--beta2", str(args.gan_beta2)
         ]
+        
+        if args.use_spectral_norm:
+            gan_train_cmd.append("--use_spectral_norm")
+        
+        if args.use_self_attention:
+            gan_train_cmd.append("--use_self_attention")
+            
+        if args.use_instance_noise:
+            gan_train_cmd.append("--use_instance_noise")
         
         if args.lesion_atlas_path:
             gan_train_cmd.extend(["--lesion_atlas_path", args.lesion_atlas_path])
@@ -314,11 +274,25 @@ def run_pipeline(args):
             "--normal_atlas_path", args.normal_atlas_path,
             "--output_dir", str(synthetic_samples_dir),
             "--checkpoint_path", checkpoint_path,
-            "--num_samples", str(args.num_synthetic_samples)
+            "--num_samples", str(args.num_synthetic_samples),
+            "--latent_dim", str(args.gan_latent_dim),
+            "--generator_filters", str(args.gan_generator_filters)
         ]
+        
+        if args.use_spectral_norm:
+            gan_generate_cmd.append("--use_spectral_norm")
+        
+        if args.use_self_attention:
+            gan_generate_cmd.append("--use_self_attention")
         
         if args.lesion_atlas_path:
             gan_generate_cmd.extend(["--lesion_atlas_path", args.lesion_atlas_path])
+        
+        if args.lesion_interpolation:
+            gan_generate_cmd.append("--lesion_interpolation")
+            
+        if args.lesion_intensity_range:
+            gan_generate_cmd.extend(["--lesion_intensity_range", args.lesion_intensity_range])
         
         if not run_command(gan_generate_cmd):
             print("Generování syntetických vzorků selhalo. Ukončuji pipeline.")
@@ -341,119 +315,6 @@ def run_pipeline(args):
                         args.normal_atlas_path, synthetic_path, output_path=vis_output_path, num_slices=args.vis_slices
                     )
     
-    # 4. Trénink segmentačního modelu
-    if args.run_segmentation_training:
-        print("\n=== KROK 4: Trénink segmentačního modelu ===\n")
-        
-        # Rozdělení dat na trénovací a validační
-        import random
-        import shutil
-        
-        real_image_files = list((registered_data_dir / "registered_zadc").glob("*.nii.gz"))
-        real_label_files = list((registered_data_dir / "registered_label").glob("*.nii.gz"))
-        
-        # Vytvoření adresářů pro rozdělená data
-        train_image_dir = registered_data_dir / "train_images"
-        train_label_dir = registered_data_dir / "train_labels"
-        val_image_dir = registered_data_dir / "val_images"
-        val_label_dir = registered_data_dir / "val_labels"
-        
-        for dir_path in [train_image_dir, train_label_dir, val_image_dir, val_label_dir]:
-            dir_path.mkdir(exist_ok=True)
-        
-        # Náhodné rozdělení na trénovací a validační sady (80/20)
-        indices = list(range(len(real_image_files)))
-        random.shuffle(indices)
-        
-        split_idx = int(len(indices) * 0.8)
-        train_indices = indices[:split_idx]
-        val_indices = indices[split_idx:]
-        
-        # Kopírování souborů do příslušných adresářů
-        for idx in train_indices:
-            shutil.copy(real_image_files[idx], train_image_dir / real_image_files[idx].name)
-            shutil.copy(real_label_files[idx], train_label_dir / real_label_files[idx].name)
-        
-        for idx in val_indices:
-            shutil.copy(real_image_files[idx], val_image_dir / real_image_files[idx].name)
-            shutil.copy(real_label_files[idx], val_label_dir / real_label_files[idx].name)
-        
-        # Spuštění tréninku segmentačního modelu
-        segment_train_cmd = [
-            "python", "segmentation_model.py", "train",
-            "--train_image_dir", str(train_image_dir),
-            "--train_label_dir", str(train_label_dir),
-            "--val_image_dir", str(val_image_dir),
-            "--val_label_dir", str(val_label_dir),
-            "--output_dir", str(segmentation_model_dir),
-            "--epochs", str(args.segmentation_epochs),
-            "--batch_size", str(args.segmentation_batch_size),
-            "--lr", str(args.segmentation_lr),
-            "--features", str(args.segmentation_features),
-            "--num_workers", str(args.num_workers)
-        ]
-        
-        # Přidání syntetických dat, pokud jsou k dispozici
-        if args.use_synthetic_data and args.run_gan_generation:
-            segment_train_cmd.extend([
-                "--synthetic_image_dir", str(synthetic_samples_dir),
-                "--synthetic_label_dir", str(synthetic_labels_dir)
-            ])
-        
-        if args.use_augmentation:
-            segment_train_cmd.append("--use_augmentation")
-        
-        if not run_command(segment_train_cmd):
-            print("Trénink segmentačního modelu selhal. Ukončuji pipeline.")
-            return
-    
-    # 5. Segmentace testovacích dat
-    if args.run_segmentation_prediction and args.test_image_dir:
-        print("\n=== KROK 5: Segmentace testovacích dat ===\n")
-        
-        # Nalezení nejlepšího modelu
-        if args.model_path:
-            model_path = args.model_path
-        else:
-            model_path = str(segmentation_model_dir / "best_model.pt")
-            if not Path(model_path).exists():
-                model_path = str(segmentation_model_dir / "final_model.pt")
-            if not Path(model_path).exists():
-                print("Nenalezen žádný natrénovaný model. Přeskakuji segmentaci.")
-                return
-        
-        segment_predict_cmd = [
-            "python", "segmentation_model.py", "predict",
-            "--input_dir", args.test_image_dir,
-            "--output_dir", str(segmentation_results_dir),
-            "--model_path", model_path,
-            "--threshold", str(args.threshold),
-            "--features", str(args.segmentation_features)
-        ]
-        
-        if not run_command(segment_predict_cmd):
-            print("Segmentace testovacích dat selhala.")
-            return
-        
-        # Vizualizace výsledků segmentace
-        if args.visualize:
-            print("\nVytvářím vizualizaci výsledků segmentace...")
-            test_files = sorted(list(Path(args.test_image_dir).glob("*.[mn][hi][aa]*")))
-            segmentation_files = sorted(list(segmentation_results_dir.glob("seg_*.[mn][hi][aa]*")))
-            
-            if test_files and segmentation_files and len(test_files) == len(segmentation_files):
-                # Vybereme několik vzorků pro vizualizaci
-                num_samples_to_visualize = min(3, len(test_files))
-                sample_indices = list(range(0, len(test_files), max(1, len(test_files) // num_samples_to_visualize)))[:num_samples_to_visualize]
-                
-                for i, idx in enumerate(sample_indices):
-                    image_path = test_files[idx]
-                    segmentation_path = segmentation_files[idx]
-                    vis_output_path = visualization_dir / f"segmentation_result_{i}.png"
-                    visualize_segmentation_results(
-                        image_path, segmentation_path, vis_output_path, num_slices=args.vis_slices
-                    )
-    
     print("\n=== Pipeline dokončena úspěšně! ===\n")
     print(f"Výsledky jsou k dispozici v adresáři: {args.output_dir}")
     
@@ -467,7 +328,7 @@ def construct_path(data_root, relative_path):
     return relative_path
 
 def main():
-    parser = argparse.ArgumentParser(description="HIE Lesion Synthesis and Segmentation Pipeline")
+    parser = argparse.ArgumentParser(description="HIE Lesion Synthesis Pipeline")
     
     # Parametry pro datové cesty
     data_path_group = parser.add_argument_group('Parametry datových cest')
@@ -493,8 +354,6 @@ def main():
                         help='Adresář s ZADC mapami (přepíše --bonbid_data_dir)')
     parser.add_argument('--label_dir', type=str, default=None,
                         help='Adresář s LABEL mapami (přepíše --bonbid_data_dir)')
-    parser.add_argument('--test_image_dir', type=str, default=None,
-                        help='Adresář s testovacími obrazy pro segmentaci')
     parser.add_argument('--output_dir', type=str, default="./pipeline_output",
                         help='Výstupní adresář pro všechny výsledky')
     
@@ -506,10 +365,6 @@ def main():
                         help='Spustit trénink GAN modelu')
     steps_group.add_argument('--run_gan_generation', action='store_true',
                         help='Spustit generování syntetických vzorků')
-    steps_group.add_argument('--run_segmentation_training', action='store_true',
-                        help='Spustit trénink segmentačního modelu')
-    steps_group.add_argument('--run_segmentation_prediction', action='store_true',
-                        help='Spustit segmentaci testovacích dat')
     steps_group.add_argument('--run_all', action='store_true',
                         help='Spustit všechny kroky pipeline')
     
@@ -528,31 +383,35 @@ def main():
                         help='Velikost dávky pro trénink GAN modelu')
     gan_group.add_argument('--gan_lr', type=float, default=0.0002,
                         help='Learning rate pro trénink GAN modelu')
-    gan_group.add_argument('--checkpoint_path', type=str, default=None,
-                        help='Cesta ke konkrétnímu checkpointu GAN modelu')
-    gan_group.add_argument('--num_synthetic_samples', type=int, default=20,
-                        help='Počet syntetických vzorků k vygenerování')
+    gan_group.add_argument('--gan_latent_dim', type=int, default=128,
+                        help='Velikost latentního prostoru generátoru')
+    gan_group.add_argument('--gan_generator_filters', type=int, default=64,
+                        help='Počáteční počet filtrů v generátoru')
+    gan_group.add_argument('--gan_discriminator_filters', type=int, default=64,
+                        help='Počáteční počet filtrů v diskriminátoru')
+    gan_group.add_argument('--gan_dropout_rate', type=float, default=0.3,
+                        help='Míra dropout v generátoru')
+    gan_group.add_argument('--gan_beta1', type=float, default=0.5,
+                        help='Beta1 parametr pro Adam optimizátor')
+    gan_group.add_argument('--gan_beta2', type=float, default=0.999,
+                        help='Beta2 parametr pro Adam optimizátor')
+    gan_group.add_argument('--use_spectral_norm', action='store_true',
+                        help='Použít spektrální normalizaci v diskriminátoru')
+    gan_group.add_argument('--use_self_attention', action='store_true',
+                        help='Použít self-attention vrstvy v generátoru a diskriminátoru')
+    gan_group.add_argument('--use_instance_noise', action='store_true',
+                        help='Použít instance noise pro stabilizaci tréninku GAN')
     
-    # Parametry segmentačního modelu
-    seg_group = parser.add_argument_group('Parametry segmentačního modelu')
-    seg_group.add_argument('--segmentation_epochs', type=int, default=100,
-                        help='Počet epoch pro trénink segmentačního modelu')
-    seg_group.add_argument('--segmentation_batch_size', type=int, default=2,
-                        help='Velikost dávky pro trénink segmentačního modelu')
-    seg_group.add_argument('--segmentation_lr', type=float, default=0.0001,
-                        help='Learning rate pro trénink segmentačního modelu')
-    seg_group.add_argument('--segmentation_features', type=int, default=32,
-                        help='Počet základních feature map v UNet modelu')
-    seg_group.add_argument('--use_synthetic_data', action='store_true',
-                        help='Použít syntetická data pro trénink segmentace')
-    seg_group.add_argument('--use_augmentation', action='store_true',
-                        help='Použít augmentaci dat pro trénink segmentace')
-    seg_group.add_argument('--model_path', type=str, default=None,
-                        help='Cesta ke konkrétnímu segmentačnímu modelu')
-    seg_group.add_argument('--threshold', type=float, default=0.5,
-                        help='Práh pro binarizaci segmentace')
-    seg_group.add_argument('--num_workers', type=int, default=4,
-                        help='Počet worker procesů pro DataLoader')
+    # Parametry pro generování vzorků
+    gen_group = parser.add_argument_group('Parametry generování vzorků')
+    gen_group.add_argument('--checkpoint_path', type=str, default=None,
+                        help='Cesta ke konkrétnímu checkpointu GAN modelu')
+    gen_group.add_argument('--num_synthetic_samples', type=int, default=20,
+                        help='Počet syntetických vzorků k vygenerování')
+    gen_group.add_argument('--lesion_interpolation', action='store_true',
+                        help='Generovat vzorky s interpolací mezi různými lézemi')
+    gen_group.add_argument('--lesion_intensity_range', type=str, default=None,
+                        help='Rozsah intenzity léze ve formátu "min,max" (např. "0.3,0.8")')
     
     args = parser.parse_args()
     
@@ -578,8 +437,6 @@ def main():
         args.run_registration = True
         args.run_gan_training = True
         args.run_gan_generation = True
-        args.run_segmentation_training = True
-        args.run_segmentation_prediction = True
     
     # Výpis sestavených cest
     print("\n=== Použité cesty ===")
@@ -588,8 +445,6 @@ def main():
     print(f"Adresář ZADC: {args.zadc_dir}")
     print(f"Adresář LABEL: {args.label_dir}")
     print(f"Výstupní adresář: {args.output_dir}")
-    if args.test_image_dir:
-        print(f"Testovací adresář: {args.test_image_dir}")
     
     # Kontrola existence cest
     paths_to_check = [
@@ -598,8 +453,6 @@ def main():
         ("Adresář ZADC", args.zadc_dir),
         ("Adresář LABEL", args.label_dir)
     ]
-    if args.test_image_dir:
-        paths_to_check.append(("Testovací adresář", args.test_image_dir))
     
     all_paths_exist = True
     for name, path in paths_to_check:
