@@ -69,27 +69,27 @@ class LabelGANDataset(Dataset):
         return len(self.label_files)
     
     def __getitem__(self, idx):
-        # Načtení LABEL mapy
-        if self.label_files[idx].endswith('.nii.gz') or self.label_files[idx].endswith('.nii'):
-            label = nib.load(self.label_files[idx]).get_fdata()
-        else:
-            label = sitk.GetArrayFromImage(sitk.ReadImage(self.label_files[idx]))
-            
-        # Binarizace LABEL mapy (zajistíme, že jsou jen hodnoty 0 a 1)
-        label = (label > 0).astype(np.float32)
+    # Načtení LABEL mapy
+    if self.label_files[idx].endswith('.nii.gz') or self.label_files[idx].endswith('.nii'):
+        label = nib.load(self.label_files[idx]).get_fdata()
+    else:
+        label = sitk.GetArrayFromImage(sitk.ReadImage(self.label_files[idx]))
         
-        # Převod na PyTorch tensory
-        normal_atlas = torch.FloatTensor(self.normal_atlas).unsqueeze(0)  # [1, D, H, W]
-        label = torch.FloatTensor(label).unsqueeze(0)  # [1, D, H, W]
-        
-        if self.transform:
-            normal_atlas = self.transform(normal_atlas)
-            label = self.transform(label)
-        
-        return_dict = {
-            'normal_atlas': normal_atlas,
-            'label': label
-        }
+    # Binarizace LABEL mapy (zajistíme, že jsou jen hodnoty 0 a 1)
+    label = (label > 0).astype(np.float32)
+    
+    # Převod na PyTorch tensory
+    normal_atlas = torch.FloatTensor(self.normal_atlas).unsqueeze(0)  # [1, D, H, W]
+    label = torch.FloatTensor(label).unsqueeze(0)  # [1, D, H, W]
+    
+    if self.transform:
+        normal_atlas = self.transform(normal_atlas)
+        label = self.transform(label)
+    
+    return_dict = {
+        'normal_atlas': normal_atlas,
+        'label': label
+    }
     
     # Přidání atlasu frekvence lézí, pokud je k dispozici
     if self.lesion_atlas is not None:
@@ -103,6 +103,7 @@ class LabelGANDataset(Dataset):
         return_dict['lesion_atlas'] = lesion_atlas_tensor
         
     return return_dict
+
 
 
 class LabelGenerator(nn.Module):
