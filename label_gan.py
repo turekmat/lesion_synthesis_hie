@@ -9,6 +9,23 @@ import SimpleITK as sitk
 import nibabel as nib
 from torch.nn import functional as F
 from pathlib import Path
+import random
+
+# Lehká augmentace: náhodný flip a rotace (v 3D, pouze kolem jedné osy)
+def random_flip_rotate(volume):
+    # volume: tensor tvaru [C, D, H, W]
+    if random.random() > 0.5:
+        volume = torch.flip(volume, dims=[2])  # flip horizontálně (H)
+    if random.random() > 0.5:
+        volume = torch.flip(volume, dims=[3])  # flip vertikálně (W)
+    # Mírná rotace: např. 90° rotace kolem osy D (pokud dimenze umožní)
+    if random.random() > 0.8:
+        volume = volume.transpose(2,3)
+    return volume
+
+# Definice transformace pro dataset
+def simple_transform(volume):
+    return random_flip_rotate(volume)
 
 class LabelGANDataset(Dataset):
     """Dataset pro LabelGAN, který generuje LABEL mapy HIE lézí"""
@@ -62,8 +79,8 @@ class LabelGANDataset(Dataset):
         label = (label > 0).astype(np.float32)
         
         # Převod na PyTorch tensory
-        normal_atlas = torch.FloatTensor(self.normal_atlas).unsqueeze(0)  # Přidání kanálové dimenze
-        label = torch.FloatTensor(label).unsqueeze(0)  # Přidání kanálové dimenze
+        normal_atlas = torch.FloatTensor(self.normal_atlas).unsqueeze(0)  # [1, D, H, W]
+        label = torch.FloatTensor(label).unsqueeze(0)  # [1, D, H, W]
         
         if self.transform:
             normal_atlas = self.transform(normal_atlas)
@@ -117,7 +134,7 @@ class LabelGenerator(nn.Module):
             nn.BatchNorm3d(features*8)
         )
         
-        # Self-attention vrstvy (volitelné)
+        # Self-attention (volitelné)
         if use_self_attention:
             self.self_attn = SelfAttention3D(features*8)
         
@@ -145,7 +162,7 @@ class LabelGenerator(nn.Module):
         self.label_output = nn.Sequential(
             nn.ReLU(),
             nn.ConvTranspose3d(features*2, 1, kernel_size=4, stride=2, padding=1),
-            nn.Sigmoid()  # Výstup v rozsahu [0, 1] pro LABEL
+            nn.Sigmoid()  # Výstup v rozsahu [0, 1]
         )
         
     def forward(self, x, noise, lesion_atlas=None):
@@ -157,9 +174,7 @@ class LabelGenerator(nn.Module):
         Returns:
             LABEL mapa
         """
-        # Spojení vstupu a šumu (a případně atlasu lézí)
         if lesion_atlas is not None:
-            # Pokud máme atlas lézí, vážíme šum podle něj
             weighted_noise = noise * lesion_atlas
             x = torch.cat([x, weighted_noise], dim=1)
         else:
@@ -171,7 +186,6 @@ class LabelGenerator(nn.Module):
         e3 = self.enc3(e2)
         e4 = self.enc4(e3)
         
-        # Self-attention (volitelné)
         if self.use_self_attention:
             e4 = self.self_attn(e4)
         
@@ -183,12 +197,9 @@ class LabelGenerator(nn.Module):
         d3 = self.dec3(d2)
         d3 = torch.cat([d3, e1], dim=1)
         
-        # Generování LABEL mapy
         label_map = self.label_output(d3)
-        
         return label_map
 
-# Self-Attention mechanismus pro lepší detaily
 class SelfAttention3D(nn.Module):
     """Self-attention mechanismus pro 3D data"""
     def __init__(self, in_dim):
@@ -200,19 +211,12 @@ class SelfAttention3D(nn.Module):
         
     def forward(self, x):
         batch_size, C, D, H, W = x.size()
-        
-        # Flatten prostorové dimenze
-        proj_query = self.query_conv(x).view(batch_size, -1, D * H * W).permute(0, 2, 1)
-        proj_key = self.key_conv(x).view(batch_size, -1, D * H * W)
-        
-        # Výpočet attention mapy
+        proj_query = self.query_conv(x).view(batch_size, -1, D*H*W).permute(0,2,1)
+        proj_key = self.key_conv(x).view(batch_size, -1, D*H*W)
         attention = F.softmax(torch.bmm(proj_query, proj_key), dim=2)
-        
-        proj_value = self.value_conv(x).view(batch_size, -1, D * H * W)
-        out = torch.bmm(proj_value, attention.permute(0, 2, 1))
+        proj_value = self.value_conv(x).view(batch_size, -1, D*H*W)
+        out = torch.bmm(proj_value, attention.permute(0,2,1))
         out = out.view(batch_size, C, D, H, W)
-        
-        # Gamma je naučitelný parametr, který určuje váhu self-attention
         out = self.gamma * out + x
         return out
 
@@ -220,51 +224,28 @@ class LabelDiscriminator(nn.Module):
     """Discriminator pro rozlišení reálných a syntetických LABEL map"""
     
     def __init__(self, in_channels=2, features=64, use_spectral_norm=False):
-        """
-        Args:
-            in_channels: Počet vstupních kanálů (normativní atlas + LABEL mapa)
-            features: Počet základních feature map
-            use_spectral_norm: Použít spektrální normalizaci pro stabilnější trénink
-        """
         super(LabelDiscriminator, self).__init__()
-        
-        # Použití spektrální normalizace pro stabilnější trénink
         if use_spectral_norm:
             norm_layer = lambda x: nn.utils.spectral_norm(x)
         else:
             norm_layer = lambda x: x
         
         self.model = nn.Sequential(
-            # První blok bez normalizace
             norm_layer(nn.Conv3d(in_channels, features, kernel_size=4, stride=2, padding=1)),
             nn.LeakyReLU(0.2),
-            
-            # Další bloky
             norm_layer(nn.Conv3d(features, features*2, kernel_size=4, stride=2, padding=1)),
             nn.BatchNorm3d(features*2),
             nn.LeakyReLU(0.2),
-            
             norm_layer(nn.Conv3d(features*2, features*4, kernel_size=4, stride=2, padding=1)),
             nn.BatchNorm3d(features*4),
             nn.LeakyReLU(0.2),
-            
             norm_layer(nn.Conv3d(features*4, features*8, kernel_size=4, stride=2, padding=1)),
             nn.BatchNorm3d(features*8),
             nn.LeakyReLU(0.2),
-            
-            # Výstupní vrstva
             norm_layer(nn.Conv3d(features*8, 1, kernel_size=4, stride=1, padding=0))
         )
     
     def forward(self, atlas, label):
-        """
-        Args:
-            atlas: Normativní atlas (B, 1, D, H, W)
-            label: Reálná nebo syntetická LABEL mapa (B, 1, D, H, W)
-        Returns:
-            Skóre pravděpodobnosti (B, 1, D', H', W')
-        """
-        # Spojení normativního atlasu a LABEL
         x = torch.cat([atlas, label], dim=1)
         return self.model(x)
 
@@ -277,141 +258,115 @@ class DiceLoss(nn.Module):
     def forward(self, pred, target):
         pred_flat = pred.view(-1)
         target_flat = target.view(-1)
-        
         intersection = (pred_flat * target_flat).sum()
         union = pred_flat.sum() + target_flat.sum()
-        
         dice = (2. * intersection + self.smooth) / (union + self.smooth)
         return 1 - dice
 
 def save_sample(data, path):
-    """Uložení vzorku jako .nii.gz soubor"""
     nii = nib.Nifti1Image(data, np.eye(4))
     nib.save(nii, path)
 
+def compute_gradient_penalty(D, real_samples, fake_samples, atlas, device):
+    """Výpočet gradient penalty podle WGAN-GP"""
+    alpha = torch.rand(real_samples.size(0), 1, 1, 1, 1).to(device)
+    interpolates = (alpha * real_samples + ((1 - alpha) * fake_samples)).requires_grad_(True)
+    d_interpolates = D(atlas, interpolates)
+    fake = torch.ones(d_interpolates.size()).to(device)
+    gradients = torch.autograd.grad(
+        outputs=d_interpolates,
+        inputs=interpolates,
+        grad_outputs=fake,
+        create_graph=True,
+        retain_graph=True,
+        only_inputs=True
+    )[0]
+    gradients = gradients.view(gradients.size(0), -1)
+    gradient_penalty = ((gradients.norm(2, dim=1) - 1) ** 2).mean()
+    return gradient_penalty
+
 def train_label_gan(args):
-    """Hlavní trénovací funkce pro LabelGAN model"""
-    
-    # Nastavení zařízení
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     
-    # Načtení datasetu
     dataset = LabelGANDataset(
         normal_atlas_path=args.normal_atlas_path,
         label_dir=args.label_dir,
-        lesion_atlas_path=args.lesion_atlas_path
+        lesion_atlas_path=args.lesion_atlas_path,
+        transform=simple_transform  # Lehká augmentace
     )
     dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
     
-    # Inicializace modelů
     generator = LabelGenerator(
-        in_channels=2,  # Atlas + šum
+        in_channels=2,
         features=args.generator_filters,
         dropout_rate=args.dropout_rate,
         use_self_attention=args.use_self_attention
     ).to(device)
     
     discriminator = LabelDiscriminator(
-        in_channels=2,  # Atlas + LABEL
+        in_channels=2,
         features=args.discriminator_filters,
         use_spectral_norm=args.use_spectral_norm
     ).to(device)
     
-    # Optimizátory
     g_optimizer = optim.Adam(generator.parameters(), lr=args.lr, betas=(args.beta1, args.beta2))
     d_optimizer = optim.Adam(discriminator.parameters(), lr=args.lr, betas=(args.beta1, args.beta2))
     
-    # Loss funkce
-    adversarial_loss = nn.BCEWithLogitsLoss()
-    dice_loss = DiceLoss()  # Pro lepší segmentaci lézí
+    # Scheduler pro decay learning rate
+    g_scheduler = optim.lr_scheduler.StepLR(g_optimizer, step_size=10, gamma=0.5)
+    d_scheduler = optim.lr_scheduler.StepLR(d_optimizer, step_size=10, gamma=0.5)
     
-    # Trénovací smyčka
+    adversarial_loss = nn.BCEWithLogitsLoss()
+    dice_loss = DiceLoss()
+    
+    lambda_gp = args.lambda_gp  # Váha gradient penalty
+    
     for epoch in range(args.epochs):
         for i, batch in enumerate(dataloader):
-            # Přesun dat na správné zařízení
             normal_atlas = batch['normal_atlas'].to(device)
             real_label = batch['label'].to(device)
-            
-            # Příprava lesion_atlas, pokud je k dispozici
             lesion_atlas = batch.get('lesion_atlas', None)
             if lesion_atlas is not None:
                 lesion_atlas = lesion_atlas.to(device)
-            
-            # Vytvoření náhodného šumu
             batch_size = normal_atlas.size(0)
             noise = torch.randn_like(normal_atlas).to(device)
             
-            # Ground truth labels pro adversarial loss
+            # Diskriminátor: Vytvoření cílových tenzorů podle výstupu
             real_output = discriminator(normal_atlas, real_label)
-            real_labels = torch.ones_like(real_output)  # Cílový tensor se stejným tvarem jako real_output
-            d_real_loss = adversarial_loss(real_output, real_labels)
-
-            # Generované vzorky
+            real_labels = torch.ones_like(real_output)
             fake_label = generator(normal_atlas, noise, lesion_atlas)
             fake_output = discriminator(normal_atlas, fake_label.detach())
-            fake_labels = torch.zeros_like(fake_output)  # Cílový tensor se stejným tvarem jako fake_output
-            d_fake_loss = adversarial_loss(fake_output, fake_labels)
+            fake_labels = torch.zeros_like(fake_output)
             
-            # -------------------------
-            # Trénink diskriminátoru
-            # -------------------------
             d_optimizer.zero_grad()
-            
-            # Reálné vzorky
-            real_output = discriminator(normal_atlas, real_label)
             d_real_loss = adversarial_loss(real_output, real_labels)
-            
-            # Generované vzorky
-            fake_label = generator(normal_atlas, noise, lesion_atlas)
-            fake_output = discriminator(normal_atlas, fake_label.detach())
             d_fake_loss = adversarial_loss(fake_output, fake_labels)
-            
-            # Celková ztráta diskriminátoru
-            d_loss = d_real_loss + d_fake_loss
+            gp = compute_gradient_penalty(discriminator, real_label, fake_label, normal_atlas, device)
+            d_loss = d_real_loss + d_fake_loss + lambda_gp * gp
             d_loss.backward()
             d_optimizer.step()
             
-            # -------------------------
-            # Trénink generátoru
-            # -------------------------
             g_optimizer.zero_grad()
-            
-            # Adversarial loss
             fake_output = discriminator(normal_atlas, fake_label)
             g_adv_loss = adversarial_loss(fake_output, real_labels)
-            
-            # Dice loss pro segmentaci lézí
             g_dice_loss = dice_loss(fake_label, real_label)
-            
-            # Přidáváme anatomicky konzistentní loss
-            # Penalizujeme léze v oblastech, kde mají být vzácné (např. mozeček, ventrální rohy)
-            # Toto je zjednodušená implementace - v reálné aplikaci by byla založena na atlasu struktury mozku
             anatomically_informed_loss = 0.0
             if lesion_atlas is not None:
-                # Penalizujeme léze, které nejsou v souladu s atlasem frekvence lézí
-                # Pro oblasti, kde jsou léze málo pravděpodobné (lesion_atlas < threshold), 
-                # penalizujeme generování lézí
-                threshold = 0.2  # Práh pro identifikaci oblastí s nízkou pravděpodobností lézí
+                threshold = 0.2
                 low_probability_mask = (lesion_atlas < threshold).float()
-                anatomically_informed_loss = (fake_label * low_probability_mask).mean() * 10.0  # Váha pro tuto ztrátu
-            
-            # Celková ztráta generátoru
-            g_loss = (
-                g_adv_loss +
-                args.lambda_dice * g_dice_loss +
-                anatomically_informed_loss
-            )
+                anatomically_informed_loss = (fake_label * low_probability_mask).mean() * 10.0
+            g_loss = g_adv_loss + args.lambda_dice * g_dice_loss + anatomically_informed_loss
             g_loss.backward()
             g_optimizer.step()
             
-            # Výpis stavu tréninku
             if i % 10 == 0:
                 print(f"Epoch [{epoch}/{args.epochs}], Batch {i}/{len(dataloader)}, "
                       f"D Loss: {d_loss.item():.4f}, G Loss: {g_loss.item():.4f}, "
                       f"ADV: {g_adv_loss.item():.4f}, DICE: {g_dice_loss.item():.4f}")
+        g_scheduler.step()
+        d_scheduler.step()
         
-        # Uložení checkpointu
         if (epoch + 1) % 10 == 0 or epoch == args.epochs - 1:
             os.makedirs(args.output_dir, exist_ok=True)
             torch.save({
@@ -422,18 +377,14 @@ def train_label_gan(args):
                 'epoch': epoch
             }, os.path.join(args.output_dir, f'labelgan_checkpoint_epoch{epoch}.pt'))
             
-            # Uložení vygenerovaného vzorku
             with torch.no_grad():
                 sample_atlas = normal_atlas[0:1]
                 sample_noise = torch.randn_like(sample_atlas).to(device)
-                
                 if lesion_atlas is not None:
                     sample_lesion_atlas = lesion_atlas[0:1]
                     sample_fake_label = generator(sample_atlas, sample_noise, sample_lesion_atlas)
                 else:
                     sample_fake_label = generator(sample_atlas, sample_noise)
-                
-                # Uložení vzorků jako .nii.gz soubory
                 sample_path = os.path.join(args.output_dir, f'labelgan_sample_epoch{epoch}')
                 save_sample(sample_fake_label[0, 0].cpu().numpy(), f"{sample_path}_fake_label.nii.gz")
                 save_sample(sample_atlas[0, 0].cpu().numpy(), f"{sample_path}_atlas.nii.gz")
@@ -442,35 +393,26 @@ def train_label_gan(args):
     print("LabelGAN Training completed!")
 
 def generate_label_samples(args):
-    """Generování vzorků LABEL map pomocí natrénovaného modelu"""
-    
-    # Nastavení zařízení
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     
-    # Načtení normativního atlasu
     if args.normal_atlas_path.endswith('.nii.gz') or args.normal_atlas_path.endswith('.nii'):
         normal_atlas = nib.load(args.normal_atlas_path).get_fdata()
     else:
         normal_atlas = sitk.GetArrayFromImage(sitk.ReadImage(args.normal_atlas_path))
     
-    # Normalizace
     normal_atlas = (normal_atlas - normal_atlas.min()) / (normal_atlas.max() - normal_atlas.min())
-    normal_atlas = torch.FloatTensor(normal_atlas).unsqueeze(0).unsqueeze(0).to(device)  # [1, 1, D, H, W]
+    normal_atlas = torch.FloatTensor(normal_atlas).unsqueeze(0).unsqueeze(0).to(device)
     
-    # Načtení atlasu frekvence lézí (pokud je dostupný)
     lesion_atlas = None
     if args.lesion_atlas_path:
         if args.lesion_atlas_path.endswith('.nii.gz') or args.lesion_atlas_path.endswith('.nii'):
             lesion_atlas = nib.load(args.lesion_atlas_path).get_fdata()
         else:
             lesion_atlas = sitk.GetArrayFromImage(sitk.ReadImage(args.lesion_atlas_path))
-        
-        # Normalizace
         lesion_atlas = (lesion_atlas - lesion_atlas.min()) / (lesion_atlas.max() - lesion_atlas.min())
-        lesion_atlas = torch.FloatTensor(lesion_atlas).unsqueeze(0).unsqueeze(0).to(device)  # [1, 1, D, H, W]
+        lesion_atlas = torch.FloatTensor(lesion_atlas).unsqueeze(0).unsqueeze(0).to(device)
     
-    # Inicializace a načtení generátoru
     generator = LabelGenerator(
         in_channels=2,
         features=args.generator_filters,
@@ -482,29 +424,18 @@ def generate_label_samples(args):
     generator.load_state_dict(checkpoint['generator'])
     generator.eval()
     
-    # Generování vzorků
     os.makedirs(args.output_dir, exist_ok=True)
-    
-    # Vytvoření adresáře pro LABEL mapy
     label_output_dir = os.path.join(args.output_dir, "label")
     os.makedirs(label_output_dir, exist_ok=True)
     
     for i in range(args.num_samples):
         with torch.no_grad():
-            # Vytvoření náhodného šumu
             noise = torch.randn_like(normal_atlas).to(device)
-            
-            # Kontrola, jestli máme lesion_atlas a pokud ano, použijeme ho
             if lesion_atlas is not None:
-                # Vážení šumu podle frekvence lézí
                 fake_label = generator(normal_atlas, noise, lesion_atlas)
             else:
                 fake_label = generator(normal_atlas, noise)
-            
-            # Prahování label mapy pro zajištění binarity
             fake_label_binary = (fake_label > 0.5).float()
-            
-            # Uložení vzorků s informativními názvy
             label_output_path = os.path.join(label_output_dir, f'sample_{i}_label.nii.gz')
             save_sample(fake_label_binary[0, 0].cpu().numpy(), label_output_path)
     
@@ -512,11 +443,9 @@ def generate_label_samples(args):
     print(f"LABEL maps saved to: {label_output_dir}")
 
 def main():
-    """Hlavní funkce skriptu"""
     parser = argparse.ArgumentParser(description="LabelGAN for HIE Lesion LABEL Map Synthesis")
     subparsers = parser.add_subparsers(dest='action', help='Action to perform')
     
-    # Společné argumenty
     parent_parser = argparse.ArgumentParser(add_help=False)
     parent_parser.add_argument('--normal_atlas_path', type=str, required=True,
                               help='Cesta k normativnímu atlasu')
@@ -537,16 +466,15 @@ def main():
     parent_parser.add_argument('--latent_dim', type=int, default=128,
                               help='Dimenze latentního prostoru (pro budoucí rozšíření)')
     
-    # Parser pro trénink
     train_parser = subparsers.add_parser('train', parents=[parent_parser],
                                         help='Trénink LabelGAN modelu')
     train_parser.add_argument('--label_dir', type=str, required=True,
                              help='Adresář s registrovanými LABEL mapami')
-    train_parser.add_argument('--batch_size', type=int, default=2,
+    train_parser.add_argument('--batch_size', type=int, default=1,
                              help='Velikost dávky pro trénink')
     train_parser.add_argument('--epochs', type=int, default=100,
                              help='Počet epoch tréninku')
-    train_parser.add_argument('--lr', type=float, default=0.0002,
+    train_parser.add_argument('--lr', type=float, default=0.0001,
                              help='Learning rate')
     train_parser.add_argument('--beta1', type=float, default=0.5,
                              help='Beta1 parametr pro Adam optimizér')
@@ -554,8 +482,9 @@ def main():
                              help='Beta2 parametr pro Adam optimizér')
     train_parser.add_argument('--lambda_dice', type=float, default=50.0,
                              help='Váha pro Dice loss (segmentace lézí)')
+    train_parser.add_argument('--lambda_gp', type=float, default=10.0,
+                             help='Váha pro gradient penalty')
     
-    # Parser pro generování
     generate_parser = subparsers.add_parser('generate', parents=[parent_parser],
                                            help='Generování vzorků LABEL map pomocí natrénovaného modelu')
     generate_parser.add_argument('--checkpoint_path', type=str, required=True,
@@ -573,4 +502,4 @@ def main():
         parser.print_help()
 
 if __name__ == "__main__":
-    main() 
+    main()
