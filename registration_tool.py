@@ -5,6 +5,9 @@ import nibabel as nib
 import numpy as np
 from pathlib import Path
 import ants
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_pdf import PdfPages
+import matplotlib.gridspec as gridspec
 
 def register_image_to_atlas(moving_image_path, fixed_image_path, output_path):
     """
@@ -61,7 +64,7 @@ def register_image_to_atlas(moving_image_path, fixed_image_path, output_path):
         return {
             'fwdtransforms': reg['fwdtransforms'],
             'invtransforms': reg['invtransforms']
-        }, fixed_ant
+        }, fixed_ant, moving_ant, registered_image
         
     except Exception as e:
         print(f"Chyba při registraci: {e}")
@@ -93,6 +96,97 @@ def transform_label_map(label_map_path, transforms, fixed_image, output_path):
     # Uložení transformované label mapy
     print(f"Ukládám transformovanou label mapu do {output_path}")
     ants.image_write(transformed_label, str(output_path))
+    
+    return label_map_ant, transformed_label
+
+def create_registration_visualization_pdf(atlas_image, orig_zadc, reg_zadc, orig_label, reg_label, output_pdf_path):
+    """
+    Vytvoří PDF vizualizaci registrace s 5 sloupci: atlas, původní ZADC, registrovaná ZADC,
+    původní label, registrovaná label
+    
+    Args:
+        atlas_image: Normativní atlas (ANTs image)
+        orig_zadc: Původní ZADC mapa (ANTs image)
+        reg_zadc: Registrovaná ZADC mapa (ANTs image)
+        orig_label: Původní label mapa (ANTs image)
+        reg_label: Registrovaná label mapa (ANTs image)
+        output_pdf_path: Cesta pro uložení PDF vizualizace
+    """
+    print(f"Vytvářím vizualizaci registrace do PDF: {output_pdf_path}")
+    
+    # Konverze ANTs obrazů na numpy pole
+    atlas_np = atlas_image.numpy()
+    orig_zadc_np = orig_zadc.numpy()
+    reg_zadc_np = reg_zadc.numpy()
+    orig_label_np = orig_label.numpy()
+    reg_label_np = reg_label.numpy()
+    
+    # Zjištění počtu řezů pro každý obraz
+    atlas_slices = atlas_np.shape[2]  # Předpokládáme, že poslední dimenze jsou řezy
+    orig_zadc_slices = orig_zadc_np.shape[2]
+    reg_zadc_slices = reg_zadc_np.shape[2]
+    orig_label_slices = orig_label_np.shape[2]
+    reg_label_slices = reg_label_np.shape[2]
+    
+    print(f"Počet řezů - Atlas: {atlas_slices}, Původní ZADC: {orig_zadc_slices}, Reg ZADC: {reg_zadc_slices}, " +
+          f"Původní Label: {orig_label_slices}, Reg Label: {reg_label_slices}")
+    
+    # Vytvoříme PDF
+    with PdfPages(output_pdf_path) as pdf:
+        # Určíme maximální počet řezů které budeme vizualizovat
+        max_slices = max(atlas_slices, orig_zadc_slices, reg_zadc_slices, orig_label_slices, reg_label_slices)
+        
+        # Pro každý řez vytvoříme stránku v PDF
+        for slice_idx in range(max_slices):
+            plt.figure(figsize=(20, 5))
+            
+            gs = gridspec.GridSpec(1, 5, width_ratios=[1, 1, 1, 1, 1])
+            
+            # Zobrazení atlasu
+            ax1 = plt.subplot(gs[0])
+            if slice_idx < atlas_slices:
+                atlas_slice = atlas_np[:, :, slice_idx] if atlas_np.ndim == 3 else atlas_np[:, :, slice_idx, 0]
+                ax1.imshow(atlas_slice, cmap='gray')
+            ax1.set_title(f'Atlas (řez {slice_idx+1})')
+            ax1.axis('off')
+            
+            # Zobrazení původní ZADC mapy
+            ax2 = plt.subplot(gs[1])
+            if slice_idx < orig_zadc_slices:
+                orig_zadc_slice = orig_zadc_np[:, :, slice_idx] if orig_zadc_np.ndim == 3 else orig_zadc_np[:, :, slice_idx, 0]
+                ax2.imshow(orig_zadc_slice, cmap='gray')
+            ax2.set_title(f'Původní ZADC (řez {slice_idx+1})')
+            ax2.axis('off')
+            
+            # Zobrazení registrované ZADC mapy
+            ax3 = plt.subplot(gs[2])
+            if slice_idx < reg_zadc_slices:
+                reg_zadc_slice = reg_zadc_np[:, :, slice_idx] if reg_zadc_np.ndim == 3 else reg_zadc_np[:, :, slice_idx, 0]
+                ax3.imshow(reg_zadc_slice, cmap='gray')
+            ax3.set_title(f'Registrovaná ZADC (řez {slice_idx+1})')
+            ax3.axis('off')
+            
+            # Zobrazení původní label mapy
+            ax4 = plt.subplot(gs[3])
+            if slice_idx < orig_label_slices:
+                orig_label_slice = orig_label_np[:, :, slice_idx] if orig_label_np.ndim == 3 else orig_label_np[:, :, slice_idx, 0]
+                ax4.imshow(orig_label_slice, cmap='hot')
+            ax4.set_title(f'Původní Label (řez {slice_idx+1})')
+            ax4.axis('off')
+            
+            # Zobrazení registrované label mapy
+            ax5 = plt.subplot(gs[4])
+            if slice_idx < reg_label_slices:
+                reg_label_slice = reg_label_np[:, :, slice_idx] if reg_label_np.ndim == 3 else reg_label_np[:, :, slice_idx, 0]
+                ax5.imshow(reg_label_slice, cmap='hot')
+            ax5.set_title(f'Registrovaná Label (řez {slice_idx+1})')
+            ax5.axis('off')
+            
+            plt.tight_layout()
+            pdf.savefig()
+            plt.close()
+    
+    print(f"PDF vizualizace uložena do: {output_pdf_path}")
 
 def process_dataset(args):
     """
@@ -104,6 +198,11 @@ def process_dataset(args):
     # Vytvoření výstupních adresářů
     zadc_output_dir = Path(args.output_dir) / "registered_zadc"
     label_output_dir = Path(args.output_dir) / "registered_label"
+    
+    # Vytvoření adresáře pro PDF vizualizace, pokud je vyžadováno
+    if args.pdf_viz_registration:
+        pdf_dir = Path(args.output_dir) / "registration_visualizations"
+        pdf_dir.mkdir(parents=True, exist_ok=True)
     
     zadc_output_dir.mkdir(parents=True, exist_ok=True)
     label_output_dir.mkdir(parents=True, exist_ok=True)
@@ -131,14 +230,14 @@ def process_dataset(args):
         
         try:
             # Registrace ZADC na atlas
-            transforms, fixed_ref = register_image_to_atlas(
+            transforms, fixed_ref, orig_zadc, reg_zadc = register_image_to_atlas(
                 zadc_path,
                 args.normal_atlas_path,
                 zadc_output_path
             )
             
             # Aplikace stejné transformace na LABEL mapu
-            transform_label_map(
+            orig_label, reg_label = transform_label_map(
                 label_path,
                 transforms,
                 fixed_ref,
@@ -146,6 +245,18 @@ def process_dataset(args):
             )
             
             print(f"Hotovo: {zadc_output_path} a {label_output_path}")
+            
+            # Vytvoření PDF vizualizace, pokud je vyžadováno
+            if args.pdf_viz_registration:
+                pdf_path = pdf_dir / f"registration_viz_{zadc_path.stem}.pdf"
+                create_registration_visualization_pdf(
+                    atlas_image=fixed_ref,
+                    orig_zadc=orig_zadc,
+                    reg_zadc=reg_zadc,
+                    orig_label=orig_label,
+                    reg_label=reg_label,
+                    output_pdf_path=str(pdf_path)
+                )
             
         except Exception as e:
             print(f"Zpracování selhalo pro pár {zadc_path.name} a {label_path.name}: {e}")
@@ -165,6 +276,8 @@ def main():
                         help='Výstupní adresář pro registrovaná data')
     parser.add_argument('--output_format', type=str, choices=['original', 'nii.gz'], default='nii.gz',
                         help='Formát výstupních souborů')
+    parser.add_argument('--pdf_viz_registration', action='store_true',
+                        help='Vytvoří PDF vizualizaci registračních výsledků')
     
     args = parser.parse_args()
     
