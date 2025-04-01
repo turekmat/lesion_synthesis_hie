@@ -72,15 +72,16 @@ def register_image_to_atlas(moving_image_path, fixed_image_path, output_path):
     # Uložení registrovaného obrazu
     sitk.WriteImage(result_image, str(output_path))
     
-    return transform
+    return transform, fixed_image
 
-def transform_label_map(label_map_path, transform, output_path):
+def transform_label_map(label_map_path, transform, reference_image, output_path):
     """
     Aplikuje transformaci na label mapu
     
     Args:
         label_map_path: Cesta k label mapě
         transform: Transformace získaná z registrace
+        reference_image: Referenční obraz pro geometrické informace
         output_path: Cesta pro uložení transformované label mapy
     """
     print(f"Transforming label map {label_map_path}")
@@ -90,9 +91,6 @@ def transform_label_map(label_map_path, transform, output_path):
         label_map = sitk.ReadImage(str(label_map_path))
     else:
         label_map = sitk.ReadImage(str(label_map_path))
-    
-    # Načtení referenčního obrazu (jen informace o geometrii)
-    reference_image = sitk.ReadImage(str(output_path.parent.parent / "registered_zadc" / output_path.name))
     
     # Aplikace transformace na label mapu
     resampler = sitk.ResampleImageFilter()
@@ -134,6 +132,12 @@ def process_dataset(args):
     if len(zadc_files) != len(label_files):
         print(f"Varování: Rozdílný počet ZADC ({len(zadc_files)}) a LABEL ({len(label_files)}) souborů!")
     
+    # Získání referenčního obrazu (normativní atlas) - použijeme stejný pro všechna data
+    if str(args.normal_atlas_path).endswith(('.nii.gz', '.nii')):
+        reference_image = sitk.ReadImage(str(args.normal_atlas_path))
+    else:
+        reference_image = sitk.ReadImage(str(args.normal_atlas_path))
+    
     # Zpracování každého páru ZADC a LABEL
     for i, (zadc_path, label_path) in enumerate(zip(zadc_files, label_files)):
         print(f"Zpracování {i+1}/{len(zadc_files)}: {zadc_path.name}")
@@ -148,7 +152,7 @@ def process_dataset(args):
             label_output_path = label_output_path.with_suffix('.nii.gz')
         
         # Registrace ZADC na atlas
-        transform_params = register_image_to_atlas(
+        transform, registered_reference = register_image_to_atlas(
             zadc_path,
             args.normal_atlas_path,
             zadc_output_path
@@ -157,7 +161,8 @@ def process_dataset(args):
         # Aplikace stejné transformace na LABEL mapu
         transform_label_map(
             label_path,
-            transform_params,
+            transform,
+            registered_reference,  # Použijeme referenční obraz
             label_output_path
         )
         
