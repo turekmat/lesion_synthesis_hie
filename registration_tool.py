@@ -7,72 +7,120 @@ from pathlib import Path
 
 def register_image_to_atlas(moving_image_path, fixed_image_path, output_path):
     """
-    Registruje vstupní obraz na atlas pomocí SimpleITK
+    Registruje vstupní obraz na atlas pomocí vícestupňové registrace:
+    1) Afinní registrace (Euler3DTransform)
+    2) Následná B-spline deformovatelná registrace
     
     Args:
         moving_image_path: Cesta k obrazu, který bude registrován
-        fixed_image_path: Cesta k obrazu atlasu
+        fixed_image_path: Cesta k obrazu atlasu (referenční obraz)
         output_path: Cesta pro uložení registrovaného obrazu
+        
+    Returns:
+        final_transform: Výsledná (kompozitní) transformace
+        fixed_image: Referenční (atlasový) obraz
     """
     print(f"Registering {moving_image_path} to {fixed_image_path}")
-    
+
     # Načtení obrazů
-    if str(moving_image_path).endswith(('.nii.gz', '.nii')):
-        moving_image = sitk.ReadImage(str(moving_image_path))
-    else:
-        moving_image = sitk.ReadImage(str(moving_image_path))
-        
-    if str(fixed_image_path).endswith(('.nii.gz', '.nii')):
-        fixed_image = sitk.ReadImage(str(fixed_image_path))
-    else:
-        fixed_image = sitk.ReadImage(str(fixed_image_path))
-    
-    # Změna implementace pro použití základního SimpleITK bez Elastix
-    # Nejprve zarovnáme geometrické středy obrazů
+    moving_image = sitk.ReadImage(str(moving_image_path))
+    fixed_image = sitk.ReadImage(str(fixed_image_path))
+
+    # ------------------------ #
+    # KROK 1: Afinní registrace
+    # ------------------------ #
+
+    # Počáteční transformace: Euler3DTransform (rotačně-translační, lze rozšířit na plně afinní)
     initial_transform = sitk.CenteredTransformInitializer(
-        fixed_image, 
-        moving_image, 
-        sitk.AffineTransform(3),
+        fixed_image,
+        moving_image,
+        sitk.Euler3DTransform(),
         sitk.CenteredTransformInitializerFilter.GEOMETRY
     )
-    
-    # Registrace pomocí metody Demons
+
+    # Nastavení metody registrace (afinní krok)
     registration_method = sitk.ImageRegistrationMethod()
     
-    # Nastavení parametrů podobnosti
-    registration_method.SetMetricAsMattesMutualInformation(numberOfHistogramBins=50)
+    # Metoda vyhodnocení podobnosti
+    registration_method.SetMetricAsMattesMutualInformation(numberOfHistogramBins=32)
     registration_method.SetMetricSamplingStrategy(registration_method.RANDOM)
     registration_method.SetMetricSamplingPercentage(0.01)
     
-    # Nastavení optimizačních parametrů
+    # Interpolace
+    registration_method.SetInterpolator(sitk.sitkLinear)
+    
+    # Multi-resolution (pyramid)
+    registration_method.SetShrinkFactorsPerLevel([4, 2, 1])
+    registration_method.SetSmoothingSigmasPerLevel([2, 1, 0])
+    registration_method.SmoothingSigmasAreInPhysicalUnitsOn()
+    
+    # Nastavení optimalizace
     registration_method.SetOptimizerAsGradientDescent(
-        learningRate=1.0, 
-        numberOfIterations=100, 
-        convergenceMinimumValue=1e-6, 
+        learningRate=1.0,
+        numberOfIterations=100,
+        convergenceMinimumValue=1e-6,
         convergenceWindowSize=10
     )
     registration_method.SetOptimizerScalesFromPhysicalShift()
     
-    # Nastavení interpolace a počátečních podmínek
-    registration_method.SetInterpolator(sitk.sitkLinear)
+    # Počáteční transformace
     registration_method.SetInitialTransform(initial_transform, inPlace=False)
     
-    # Provedení registrace
-    transform = registration_method.Execute(fixed_image, moving_image)
+    # Spuštění registrace
+    final_affine_transform = registration_method.Execute(fixed_image, moving_image)
+
+    # ------------------------------------- #
+    # KROK 2: B-spline (deformovatelná) fáze
+    # ------------------------------------- #
+
+    # Inicializace B-spline transformace
+    transform_domain_mesh_size = [8, 8, 8]  # lze upravit podle velikosti dat
+    bspline_transform = sitk.BSplineTransformInitializer(fixed_image, transform_domain_mesh_size)
     
-    # Aplikace transformace na pohyblivý obraz
+    # Vytvoření kompozitní transformace (afinní + B-spline)
+    composite_transform = sitk.Transform(final_affine_transform)
+    composite_transform.AddTransform(bspline_transform)
+
+    # Registrace B-spline
+    registration_method = sitk.ImageRegistrationMethod()
+    registration_method.SetMetricAsMattesMutualInformation(numberOfHistogramBins=32)
+    registration_method.SetMetricSamplingStrategy(registration_method.RANDOM)
+    registration_method.SetMetricSamplingPercentage(0.01)
+    registration_method.SetInterpolator(sitk.sitkLinear)
+    
+    # Multi-resolution i pro B-spline
+    registration_method.SetShrinkFactorsPerLevel([4, 2, 1])
+    registration_method.SetSmoothingSigmasPerLevel([2, 1, 0])
+    registration_method.SmoothingSigmasAreInPhysicalUnitsOn()
+    
+    # Pro B-spline lze použít např. LBFGSB nebo i jinou optimalizaci
+    registration_method.SetOptimizerAsLBFGSB(
+        gradientConvergenceTolerance=1e-5,
+        numberOfIterations=100,
+        maximumNumberOfCorrections=5,
+        maximumNumberOfFunctionEvaluations=1000,
+        costFunctionConvergenceFactor=1e+7
+    )
+    
+    registration_method.SetInitialTransform(composite_transform, inPlace=False)
+    
+    final_transform = registration_method.Execute(fixed_image, moving_image)
+
+    # ------------------------ #
+    # Aplikace výsledné transformace
+    # ------------------------ #
     resampler = sitk.ResampleImageFilter()
     resampler.SetReferenceImage(fixed_image)
     resampler.SetInterpolator(sitk.sitkLinear)
     resampler.SetDefaultPixelValue(0)
-    resampler.SetTransform(transform)
+    resampler.SetTransform(final_transform)
     
     result_image = resampler.Execute(moving_image)
     
     # Uložení registrovaného obrazu
     sitk.WriteImage(result_image, str(output_path))
     
-    return transform, fixed_image
+    return final_transform, fixed_image
 
 def transform_label_map(label_map_path, transform, reference_image, output_path):
     """
@@ -86,29 +134,22 @@ def transform_label_map(label_map_path, transform, reference_image, output_path)
     """
     print(f"Transforming label map {label_map_path}")
     
-    # Načtení label mapy
-    if str(label_map_path).endswith(('.nii.gz', '.nii')):
-        label_map = sitk.ReadImage(str(label_map_path))
-    else:
-        label_map = sitk.ReadImage(str(label_map_path))
+    label_map = sitk.ReadImage(str(label_map_path))
     
     # Aplikace transformace na label mapu
     resampler = sitk.ResampleImageFilter()
     resampler.SetReferenceImage(reference_image)
-    resampler.SetInterpolator(sitk.sitkNearestNeighbor)  # Důležité pro label mapy
+    # Pro label mapy je vhodné použít nearest neighbor (zachování diskrétních hodnot)
+    resampler.SetInterpolator(sitk.sitkNearestNeighbor)
     resampler.SetDefaultPixelValue(0)
     resampler.SetTransform(transform)
     
     result_label = resampler.Execute(label_map)
     
-    # Při transformaci label mapy je potřeba zachovat diskrétní hodnoty
-    # (předejít interpolaci mezi hodnotami)
-    result_label_array = sitk.GetArrayFromImage(result_label)
-    result_label_array = (result_label_array > 0.5).astype(np.uint8)
-    result_label_discrete = sitk.GetImageFromArray(result_label_array)
-    result_label_discrete.CopyInformation(result_label)
-    
-    sitk.WriteImage(result_label_discrete, str(output_path))
+    # Uložit přímo tak, aby nedošlo k interpolaci hodnot labelů
+    # (Pokud byste dělali threshold, lze zde ponechat, ale 
+    #  v nearest neighbor režimu by nemělo docházet k nežádoucímu prolínání.)
+    sitk.WriteImage(result_label, str(output_path))
 
 def process_dataset(args):
     """
@@ -132,11 +173,8 @@ def process_dataset(args):
     if len(zadc_files) != len(label_files):
         print(f"Varování: Rozdílný počet ZADC ({len(zadc_files)}) a LABEL ({len(label_files)}) souborů!")
     
-    # Získání referenčního obrazu (normativní atlas) - použijeme stejný pro všechna data
-    if str(args.normal_atlas_path).endswith(('.nii.gz', '.nii')):
-        reference_image = sitk.ReadImage(str(args.normal_atlas_path))
-    else:
-        reference_image = sitk.ReadImage(str(args.normal_atlas_path))
+    # Načteme normativní atlas (referenční obraz)
+    reference_image = sitk.ReadImage(str(args.normal_atlas_path))
     
     # Zpracování každého páru ZADC a LABEL
     for i, (zadc_path, label_path) in enumerate(zip(zadc_files, label_files)):
@@ -162,7 +200,7 @@ def process_dataset(args):
         transform_label_map(
             label_path,
             transform,
-            registered_reference,  # Použijeme referenční obraz
+            registered_reference,
             label_output_path
         )
         
@@ -187,4 +225,4 @@ def main():
     process_dataset(args)
 
 if __name__ == "__main__":
-    main() 
+    main()
