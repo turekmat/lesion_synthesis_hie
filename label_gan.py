@@ -90,15 +90,20 @@ class LabelGANDataset(Dataset):
             'normal_atlas': normal_atlas,
             'label': label
         }
+    
+    # Přidání atlasu frekvence lézí, pokud je k dispozici
+    if self.lesion_atlas is not None:
+        lesion_atlas_tensor = torch.FloatTensor(self.lesion_atlas).unsqueeze(0)  # [1, D_les, H_les, W_les]
+        # Pokud tvary lesion_atlas a normal_atlas se neshodují, interpolujeme lesion_atlas na stejný rozměr jako normal_atlas
+        if lesion_atlas_tensor.shape != normal_atlas.shape:
+            # normal_atlas.shape má tvar [1, D, H, W]; použijeme tyto rozměry
+            lesion_atlas_tensor = F.interpolate(lesion_atlas_tensor.unsqueeze(0), size=normal_atlas.shape[1:], mode='trilinear', align_corners=False).squeeze(0)
+        if self.transform:
+            lesion_atlas_tensor = self.transform(lesion_atlas_tensor)
+        return_dict['lesion_atlas'] = lesion_atlas_tensor
         
-        # Přidání atlasu frekvence lézí, pokud je k dispozici
-        if self.lesion_atlas is not None:
-            lesion_atlas = torch.FloatTensor(self.lesion_atlas).unsqueeze(0)
-            if self.transform:
-                lesion_atlas = self.transform(lesion_atlas)
-            return_dict['lesion_atlas'] = lesion_atlas
-            
-        return return_dict
+    return return_dict
+
 
 class LabelGenerator(nn.Module):
     """Generator pro syntézu LABEL map HIE lézí"""
