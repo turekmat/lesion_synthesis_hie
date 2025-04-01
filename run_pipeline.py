@@ -9,10 +9,29 @@ import nibabel as nib
 
 def load_image(image_path):
     """Načte obraz z cesty a vrátí numpy array"""
-    if str(image_path).endswith('.nii.gz'):
+    if str(image_path).endswith('.nii.gz') or str(image_path).endswith('.nii'):
         return nib.load(str(image_path)).get_fdata()
     else:
         return sitk.GetArrayFromImage(sitk.ReadImage(str(image_path)))
+
+def find_file_with_extensions(base_path, extensions=['.nii', '.nii.gz']):
+    """Zkusí najít soubor s danou cestou a jednou z uvedených přípon"""
+    base_path = Path(base_path)
+    
+    # Odstraníme případnou příponu z base_path
+    for ext in extensions:
+        if str(base_path).endswith(ext):
+            base_path = Path(str(base_path)[:-len(ext)])
+            break
+    
+    # Zkusíme jednotlivé přípony
+    for ext in extensions:
+        path_with_ext = Path(str(base_path) + ext)
+        if path_with_ext.exists():
+            return path_with_ext
+    
+    # Pokud nic nenajdeme, vrátíme původní cestu
+    return base_path
 
 def visualize_registration_results(original_path, registered_path, label_path=None, output_path=None, num_slices=3):
     """Vizualizuje výsledky registrace porovnáním původního a registrovaného obrazu"""
@@ -148,6 +167,10 @@ def run_command(cmd):
 
 def run_pipeline(args):
     """Spustí pipeline pro syntézu HIE lézí pomocí GAN modelu"""
+    
+    # Vyhledání souborů s podporou pro oba typy přípon
+    args.normal_atlas_path = str(find_file_with_extensions(args.normal_atlas_path))
+    args.lesion_atlas_path = str(find_file_with_extensions(args.lesion_atlas_path))
     
     # Vytvoření adresářů
     registered_data_dir = Path(args.output_dir) / "registered_data"
@@ -340,9 +363,9 @@ def main():
                         help='Adresář s normativními atlasy')
     data_path_group.add_argument('--lesion_atlases_dir', type=str, default="data/archive/lesion_atlases",
                         help='Adresář s lézemi atlasy')
-    data_path_group.add_argument('--normal_atlas_name', type=str, default="atlas_week0-1_masked.nii.gz",
+    data_path_group.add_argument('--normal_atlas_name', type=str, default="atlas_week0-1_masked.nii",
                         help='Název souboru normativního atlasu')
-    data_path_group.add_argument('--lesion_atlas_name', type=str, default="lesion_atlas.nii.gz",
+    data_path_group.add_argument('--lesion_atlas_name', type=str, default="lesion_atlas.nii",
                         help='Název souboru atlasu léze')
     
     # Hlavní parametry
@@ -456,7 +479,14 @@ def main():
     
     all_paths_exist = True
     for name, path in paths_to_check:
-        if not Path(path).exists():
+        # Kontrola se synonymickými příponami (.nii nebo .nii.gz)
+        if name in ["Normativní atlas", "Atlas lézí"]:
+            path_obj = find_file_with_extensions(path)
+            if not path_obj.exists():
+                print(f"CHYBA: {name} neexistuje: {path}")
+                print(f"       Zkusil jsem také hledat verzi s jinou příponou (.nii/.nii.gz).")
+                all_paths_exist = False
+        elif not Path(path).exists():
             print(f"CHYBA: {name} neexistuje: {path}")
             all_paths_exist = False
     
