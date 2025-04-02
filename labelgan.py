@@ -437,7 +437,7 @@ class Generator(nn.Module):
                         cleaned_binary[labeled_components == comp_id] = 1
                 
                 # Convert back to tensor
-                cleaned_binary_tensor = torch.from_numpy(cleaned_binary).float().to(self.device)
+                cleaned_binary_tensor = torch.from_numpy(cleaned_binary).float().to(out.device)
                 cleaned_binary_tensor = cleaned_binary_tensor.unsqueeze(0).unsqueeze(0)
                 
                 # STEP 5: Re-create a continuous-valued output by blending the original output 
@@ -1540,8 +1540,9 @@ class HIELesionGANTrainer:
                         if component_sizes[comp_id - 1] >= min_component_size:
                             cleaned_binary[labeled_components == comp_id] = 1
                     
-                    # MODIFIED: Convert back to tensor and ensure it's the same structure as original
-                    cleaned_binary_tensor = torch.from_numpy(cleaned_binary).float().to(self.device)
+                    # Convert back to tensor
+                    # Fix: Use the device of an input tensor instead of self.device
+                    cleaned_binary_tensor = torch.from_numpy(cleaned_binary).float().to(out.device)
                     cleaned_binary_tensor = cleaned_binary_tensor.unsqueeze(0).unsqueeze(0)
                     
                     # Final binary lesion combines the soft values with the cleaned binary mask
@@ -1898,7 +1899,7 @@ class HIELesionGANTrainer:
             batch_components.append(num_components)
         
         # Convert to tensor and calculate mean
-        mean_components = torch.tensor(batch_components, device=self.device).float().mean()
+        mean_components = torch.tensor(batch_components, device=binary_fake.device).float().mean()
         
         # Penalize having too many distinct components
         # The penalty increases as number of components increases beyond 5
