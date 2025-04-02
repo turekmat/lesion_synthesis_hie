@@ -1535,6 +1535,26 @@ class HIELesionGANTrainer:
                     with torch.no_grad():
                         fake_lesion = self.generator(z, atlas[:1], brain_mask[:1])
                     
+                    # NOVÉ: Zkontrolujeme, jestli výstup není prázdný, a pokud ano, vynutíme aktivace
+                    if torch.sum(fake_lesion > 0.3) < 100:  # Pokud je výstup téměř prázdný
+                        print(f"[SAMPLE {i}] Aplikuji nucenou aktivaci, protože výstup je téměř prázdný")
+                        
+                        # Vytvoření masky z vysoce pravděpodobných oblastí atlasu
+                        atlas_threshold = torch.quantile(atlas[:1].view(-1), 0.9)  # Horních 10% hodnot atlasu
+                        high_prob_regions = (atlas[:1] > atlas_threshold).float() * brain_mask[:1]
+                        
+                        # Generování náhodné aktivační masky
+                        act_mask = torch.zeros_like(fake_lesion)
+                        random_strength = torch.rand(1, device=self.device) * 0.3 + 0.7  # Aktivace 0.7-1.0
+                        
+                        # Přidání nucené aktivace do části vysoce pravděpodobných oblastí
+                        activation_regions = high_prob_regions * (torch.rand_like(high_prob_regions) > 0.5).float()
+                        act_mask = act_mask.scatter_(1, torch.zeros_like(fake_lesion, dtype=torch.long), 
+                                                  activation_regions * random_strength)
+                        
+                        # Smíchání s původním výstupem
+                        fake_lesion = fake_lesion * 0.2 + act_mask * 0.8  # 80% nucená aktivace
+                    
                     # MODIFIED: Use a smoother approach to map the outputs to a binary-like distribution
                     # Apply atlas mask to ensure lesions only appear in atlas-positive regions
                     fake_lesion = fake_lesion * atlas_binary[:1]
@@ -1843,12 +1863,12 @@ class HIELesionGANTrainer:
         # This is a critical step to kickstart the generator with some lesions
         total_lesion_volume = torch.sum(fake_lesions > 0.3)
         
-        # If we're in early training (first 1000 iterations) AND output is nearly empty
+        # If we're in early training (first 3000 iterations) AND output is nearly empty
         # Force some activation to help the model learn what lesions should look like
-        early_training = iteration < 1000
-        if early_training and total_lesion_volume < 10:
+        early_training = iteration < 3000  # Zvýšeno z 1000 na 3000 iterací
+        if early_training and total_lesion_volume < 500:  # Zvýšeno z 10 na 500 pro agresivnější nucení aktivací
             # Create a mask from high-probability atlas regions
-            atlas_threshold = torch.quantile(atlas.view(-1), 0.95)  # Top 5% of atlas values
+            atlas_threshold = torch.quantile(atlas.view(-1), 0.9)  # Top 10% místo 5% of atlas values
             high_prob_regions = (atlas > atlas_threshold).float() * brain_mask
             
             # Generate a random activation mask
@@ -1856,12 +1876,12 @@ class HIELesionGANTrainer:
             random_strength = torch.rand(1, device=self.device) * 0.3 + 0.7  # 0.7-1.0 activation
             
             # Add forced activation to a portion of high probability regions
-            activation_regions = high_prob_regions * (torch.rand_like(high_prob_regions) > 0.7).float()
+            activation_regions = high_prob_regions * (torch.rand_like(high_prob_regions) > 0.5).float()  # Změna z 0.7 na 0.5 pro větší aktivaci
             act_mask = act_mask.scatter_(1, torch.zeros_like(fake_lesions, dtype=torch.long), 
                                          activation_regions * random_strength)
             
             # Blend with the original output - stronger in early iterations, weaker later
-            blend_factor = max(0.0, 1.0 - (iteration / 500))  # Starts at 1.0, decreases to 0.0
+            blend_factor = max(0.2, 1.0 - (iteration / 2000))  # Starts at 1.0, decreases to 0.2, pomaleji klesá
             fake_lesions = fake_lesions * (1 - blend_factor) + act_mask * blend_factor
             
             # Track and report when forced activation is applied
@@ -2005,18 +2025,19 @@ class HIELesionGANTrainer:
         # COMPLETELY NEW: Direct minimum activation target loss
         # We directly specify a minimum percentage of pixels that should be activated
         # This forces the model to generate at least some lesions
-        min_activation_target = 0.005  # Target 0.5% minimum activation
+        min_activation_target = 0.02  # Zvýšeno z 0.005 (0.5%) na 0.02 (2%) minimum activation
         # Apply linear ramping of the target during early training
         if iteration < 1000:
             # Start with a very small target and gradually increase
             min_activation_target = min_activation_target * (iteration / 1000)
         
         # Strong penalty when below target, zero penalty when above
-        activation_target_loss = torch.relu(min_activation_target - valid_region_filled) * 1000.0
+        activation_target_loss = torch.relu(min_activation_target - valid_region_filled) * 5000.0  # Zvýšeno z 1000.0 na 5000.0
         
-        # If activation is extremely low, apply an additional extreme penalty
-        if valid_region_filled < 0.0001:  # Less than 0.01% activation
-            activation_target_loss = activation_target_loss * 10.0  # 10x penalty for essentially zero activation
+        # ADDITIONAL PENALTY: If the activation is essentially zero, apply a massive penalty
+        # This is critical to avoid the common GAN collapse to all zeros
+        if valid_region_filled < 0.0001:  # Essentially no activation at all
+            activation_target_loss = activation_target_loss * 50.0  # Zvýšeno z 10.0 na 50.0 - masivní penalizace za prázdný výstup
         
         # MUCH STRONGER empty penalty
         # We want at least 0.5% of valid regions to have lesions - anything less gets severely penalized
@@ -2074,7 +2095,7 @@ class HIELesionGANTrainer:
             connectivity_weight * connectivity_loss +  # Dynamic weight for connectivity loss
             3.0 * feature_matching_loss +  # Feature matching to stabilize training
             200.0 * empty_penalty +  # MUCH STRONGER penalty for empty outputs (4x previous increase)
-            500.0 * activation_target_loss  # Direct minimum activation target loss
+            2500.0 * activation_target_loss  # Zvýšeno z 500.0 na 2500.0 - Direct minimum activation target loss
         )
         
         # Backpropagation
@@ -2360,8 +2381,6 @@ class HIELesionGANTrainer:
                     'discriminator_state_dict': self.discriminator.state_dict(),
                     'g_optimizer_state_dict': self.generator_optimizer.state_dict(),
                     'd_optimizer_state_dict': self.discriminator_optimizer.state_dict(),
-                    'g_loss': epoch_g_loss,
-                    'd_loss': epoch_d_loss,
                 }, best_model_path)
                 print(f"Saved best model with G Loss: {epoch_g_loss:.4f}")
             
