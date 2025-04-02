@@ -1,1243 +1,893 @@
 import os
+import random
 import argparse
+import time
+from datetime import datetime
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-import SimpleITK as sitk
+from torch.utils.tensorboard import SummaryWriter
 import nibabel as nib
-from torch.nn import functional as F
-from pathlib import Path
-import random
+import torchvision.transforms as transforms
 from tqdm import tqdm
 import matplotlib.pyplot as plt
-import time
-from datetime import datetime
-import torchvision.transforms as transforms
+from skimage.measure import label as measure_label
 
-# Nastavení seedu pro reprodukovatelnost
-def set_seed(seed):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-
-# Vlastní 3D transformace pro data augmentaci
-class RandomRotation3D:
-    def __init__(self, angles=(3, 3, 3)):
-        self.angles = angles
-        
-    def __call__(self, tensor):
-        x_angle = random.uniform(-self.angles[0], self.angles[0])
-        y_angle = random.uniform(-self.angles[1], self.angles[1])
-        z_angle = random.uniform(-self.angles[2], self.angles[2])
-        
-        # Příprava matic rotace ve 3D
-        # Implementace rotací pomocí interpolace
-        
-        # Použijeme affine_grid a grid_sample pro 3D rotaci
-        # Toto je zjednodušená implementace, která provádí pouze lehké rotace
-        
-        # Pro jednoduchost vrátíme tensor bez změny
-        # Plná implementace rotací ve 3D vyžaduje složitější transformace
-        return tensor
-
-class RandomFlip3D:
-    def __init__(self, p=0.5):
-        self.p = p
-        
-    def __call__(self, tensor):
-        if random.random() < self.p:
-            # Získání maximální dimenze tenzoru
-            max_dim = len(tensor.shape) - 1  # Pro 4D tenzor [C,D,H,W] je max_dim=3
-            
-            # Vybíráme náhodnou prostorovou dimenzi (ignorujeme batch a channel)
-            # Začínáme od indexu 2 (první prostorová dimenze)
-            spatial_dims = list(range(2, max_dim + 1))
-            
-            # Pokud existují prostorové dimenze k flipování
-            if spatial_dims:
-                axis = random.choice(spatial_dims)
-                return torch.flip(tensor, [axis])
-        return tensor
-
-# Dataset pro LabelGAN
-class LabelGANDataset(Dataset):
-    """Dataset pro LabelGAN, který generuje LABEL mapy (léze)"""
-    
-    def __init__(self, label_dir, lesion_atlas_path, transform=None, augment=True):
+class HIELesionDataset(Dataset):
+    def __init__(self, label_dir, lesion_atlas_path, transform=None):
         """
+        Dataset pro HIE léze.
+        
         Args:
-            label_dir: Adresář s registrovanými LABEL mapami
-            lesion_atlas_path: Cesta k atlasu frekvence lézí
-            transform: Volitelné transformace (např. normalizace)
-            augment: Použití datových augmentací (True/False)
+            label_dir (str): Cesta k adresáři s registrovanými LABEL mapami
+            lesion_atlas_path (str): Cesta k souboru s atlasem lézí
+            transform: Transformace, které mají být aplikovány na data
         """
-        self.label_files = sorted([os.path.join(label_dir, f) for f in os.listdir(label_dir)
-                                  if f.endswith('.mha') or f.endswith('.nii.gz') or f.endswith('.nii')])
-        
+        self.label_paths = [os.path.join(label_dir, f) for f in os.listdir(label_dir) 
+                           if f.endswith('.nii') or f.endswith('.nii.gz')]
         self.lesion_atlas_path = lesion_atlas_path
         self.transform = transform
-        self.augment = augment
         
-        # Načtení atlasu frekvence lézí
-        if self.lesion_atlas_path.endswith('.nii.gz') or self.lesion_atlas_path.endswith('.nii'):
-            self.lesion_atlas = nib.load(self.lesion_atlas_path).get_fdata()
-        else:
-            self.lesion_atlas = sitk.GetArrayFromImage(sitk.ReadImage(self.lesion_atlas_path))
+        # Načtení lesion atlasu
+        lesion_atlas_nib = nib.load(lesion_atlas_path)
+        self.lesion_atlas = torch.from_numpy(lesion_atlas_nib.get_fdata()).float()
         
-        # Normalizace do rozsahu [0, 1]
-        self.lesion_atlas = (self.lesion_atlas - self.lesion_atlas.min()) / (self.lesion_atlas.max() - self.lesion_atlas.min())
-        
-        # Definování augmentací
-        if self.augment:
-            self.augmentation = [
-                RandomRotation3D(angles=(3, 3, 3)),  # Malé rotace ve všech osách
-                RandomFlip3D(p=0.5),  # Náhodný flip s 50% pravděpodobností
-            ]
-        else:
-            self.augmentation = None
-        
+        # Normalizace atlasu do rozsahu [0, 1]
+        if self.lesion_atlas.max() > 0:
+            self.lesion_atlas = self.lesion_atlas / self.lesion_atlas.max()
+    
     def __len__(self):
-        return len(self.label_files)
+        return len(self.label_paths)
     
     def __getitem__(self, idx):
         # Načtení LABEL mapy
-        if self.label_files[idx].endswith('.nii.gz') or self.label_files[idx].endswith('.nii'):
-            label = nib.load(self.label_files[idx]).get_fdata()
-        else:
-            label = sitk.GetArrayFromImage(sitk.ReadImage(self.label_files[idx]))
+        label_path = self.label_paths[idx]
+        label_nib = nib.load(label_path)
+        label = torch.from_numpy(label_nib.get_fdata()).float()
         
-        # Binarizace LABEL mapy (zajistíme, že jsou jen hodnoty 0 a 1)
-        label = (label > 0).astype(np.float32)
+        # Binarizace labelu (pokud není již binární)
+        label = (label > 0).float()
         
-        # Převod na PyTorch tensory
-        label = torch.FloatTensor(label).unsqueeze(0)  # Přidání kanálové dimenze
-        lesion_atlas = torch.FloatTensor(self.lesion_atlas).unsqueeze(0)  # Přidání kanálové dimenze
-        
-        # Aplikace augmentací, pokud jsou povoleny
-        if self.augment and self.augmentation:
-            # Vytvoříme seed, aby se stejné augmentace aplikovaly na oba tensory
-            seed = random.randint(0, 2**32 - 1)
-            
-            # Aplikace stejných augmentací na oba tensory
-            torch.manual_seed(seed)
-            random.seed(seed)
-            for aug in self.augmentation:
-                label = aug(label)
-                
-            torch.manual_seed(seed)
-            random.seed(seed)
-            for aug in self.augmentation:
-                lesion_atlas = aug(lesion_atlas)
-        
-        # Aplikace dalších transformací, pokud jsou definovány
+        # Aplikace transformací
         if self.transform:
-            label = self.transform(label)
-            lesion_atlas = self.transform(lesion_atlas)
+            sample = {'label': label, 'atlas': self.lesion_atlas}
+            sample = self.transform(sample)
+            label = sample['label']
         
-        # Vytvoření náhodného šumu pro generátor
-        noise = torch.randn_like(lesion_atlas)
+        # Změna dimenzí pro pytorch (N, C, D, H, W)
+        label = label.unsqueeze(0)  # Přidání kanálové dimenze
+        atlas = self.lesion_atlas.unsqueeze(0)
         
         return {
-            'label': label,  # Skutečná LABEL mapa
-            'lesion_atlas': lesion_atlas,  # Atlas frekvence lézí
-            'noise': noise  # Náhodný šum pro variabilitu při generování
+            'label': label,
+            'atlas': atlas,
+            'path': label_path
         }
 
-# Self-Attention mechanismus pro lepší detaily
+
+class RandomAugmentation3D:
+    def __init__(self, rotation_range=10, flip_prob=0.5):
+        """
+        Jednoduchá augmentace pro 3D data.
+        
+        Args:
+            rotation_range (int): Maximální úhel rotace ve stupních
+            flip_prob (float): Pravděpodobnost flipu
+        """
+        self.rotation_range = rotation_range
+        self.flip_prob = flip_prob
+    
+    def __call__(self, sample):
+        label = sample['label']
+        atlas = sample['atlas']
+        
+        # Náhodná rotace
+        if random.random() < 0.5:
+            angle = random.uniform(-self.rotation_range, self.rotation_range)
+            for z in range(label.shape[0]):
+                label_slice = label[z, :, :]
+                label[z, :, :] = transforms.functional.rotate(
+                    label_slice.unsqueeze(0), angle).squeeze(0)
+        
+        # Náhodný flip
+        if random.random() < self.flip_prob:
+            label = torch.flip(label, [1])  # Flip horizontálně
+        
+        if random.random() < self.flip_prob:
+            label = torch.flip(label, [2])  # Flip vertikálně
+        
+        return {'label': label, 'atlas': atlas}
+
+
+def spectral_norm(module, mode=True):
+    if mode:
+        return nn.utils.spectral_norm(module)
+    return module
+
+
+# Self-Attention modul pro 3D data
 class SelfAttention3D(nn.Module):
-    """Self-attention mechanismus pro 3D data"""
-    def __init__(self, in_dim):
+    def __init__(self, in_channels):
         super(SelfAttention3D, self).__init__()
-        self.query_conv = nn.Conv3d(in_dim, in_dim // 8, kernel_size=1)
-        self.key_conv = nn.Conv3d(in_dim, in_dim // 8, kernel_size=1)
-        self.value_conv = nn.Conv3d(in_dim, in_dim, kernel_size=1)
+        self.query = spectral_norm(nn.Conv3d(in_channels, in_channels // 8, 1))
+        self.key = spectral_norm(nn.Conv3d(in_channels, in_channels // 8, 1))
+        self.value = spectral_norm(nn.Conv3d(in_channels, in_channels, 1))
         self.gamma = nn.Parameter(torch.zeros(1))
         
     def forward(self, x):
         batch_size, C, D, H, W = x.size()
         
-        # Flatten prostorové dimenze
-        proj_query = self.query_conv(x).view(batch_size, -1, D * H * W).permute(0, 2, 1)
-        proj_key = self.key_conv(x).view(batch_size, -1, D * H * W)
+        # Flatten spatial dimensions
+        query = self.query(x).view(batch_size, -1, D * H * W).permute(0, 2, 1)
+        key = self.key(x).view(batch_size, -1, D * H * W)
+        value = self.value(x).view(batch_size, -1, D * H * W).permute(0, 2, 1)
         
-        # Výpočet attention mapy
-        attention = F.softmax(torch.bmm(proj_query, proj_key), dim=2)
+        # Attention map
+        attention = torch.bmm(query, key)
+        attention = F.softmax(attention, dim=2)
         
-        proj_value = self.value_conv(x).view(batch_size, -1, D * H * W)
-        out = torch.bmm(proj_value, attention.permute(0, 2, 1))
-        out = out.view(batch_size, C, D, H, W)
+        # Apply attention to value
+        out = torch.bmm(attention, value)
+        out = out.permute(0, 2, 1).contiguous().view(batch_size, C, D, H, W)
         
-        # Gamma je naučitelný parametr, který určuje váhu self-attention
-        out = self.gamma * out + x
-        return out
+        return self.gamma * out + x
 
-# Generator architektury
-class LesionGenerator(nn.Module):
-    """Generator pro vytváření realistických lézí"""
-    
-    def __init__(self, in_channels=2, features=64, depth=4, dropout_rate=0.3, use_attention=True):
-        """
-        Args:
-            in_channels: Počet vstupních kanálů (atlas lézí + šum)
-            features: Počet základních feature map
-            depth: Hloubka U-Net architektury
-            dropout_rate: Míra dropout v generátoru
-            use_attention: Použít attention mechanismus pro lepší detaily
-        """
-        super(LesionGenerator, self).__init__()
+
+class Generator(nn.Module):
+    def __init__(self, z_dim=128, atlas_channels=1, output_channels=1, base_filters=64, use_spectral_norm=True):
+        super(Generator, self).__init__()
         
-        self.use_attention = use_attention
-        self.depth = depth
-        self.features = features
+        self.z_dim = z_dim
+        self.base_filters = base_filters
         
-        # Encoder část - stejná jako u U-Net
-        self.encoder = nn.ModuleList()
-        
-        # První konvoluční vrstva
-        self.encoder.append(nn.Conv3d(in_channels, features, kernel_size=4, stride=2, padding=1))
-        
-        # Další vrstvy encoderu
-        for i in range(1, depth):
-            in_ch = features * (2**(i-1))
-            out_ch = features * (2**i)
-            
-            self.encoder.append(
-                nn.Sequential(
-                    nn.LeakyReLU(0.2),
-                    nn.Conv3d(in_ch, out_ch, kernel_size=4, stride=2, padding=1),
-                    nn.BatchNorm3d(out_ch)
-                )
-            )
-        
-        # Self-attention vrstva po poslední vrstvě encoderu
-        if use_attention:
-            self.attention = SelfAttention3D(features * (2**(depth-1)))
-        
-        # Decoder část
-        self.decoder = nn.ModuleList()
-        
-        # Vrstvy decoderu s skip connections
-        for i in range(depth):
-            if i == 0:
-                # První decode vrstva - bez skip connection
-                in_ch = features * (2**(depth-1))
-                out_ch = features * (2**(depth-2))
-            else:
-                # Další decode vrstvy se skip connections - OPRAVENO
-                # Pro každou vrstvu správně vypočítáme počet výstupních kanálů
-                in_ch = features * (2**(depth-i-1)) + features * (2**(depth-i-2))  # Skip connection + předchozí vrstva
-                if i == depth - 1:  # Pro poslední vrstvu
-                    out_ch = features
-                else:
-                    out_ch = features * (2**(depth-i-2))
-            
-            # Decoder vrstvy s batch normalizací a dropoutem
-            self.decoder.append(
-                nn.Sequential(
-                    nn.ReLU(),
-                    nn.ConvTranspose3d(in_ch, out_ch, kernel_size=4, stride=2, padding=1),
-                    nn.BatchNorm3d(out_ch),
-                    nn.Dropout3d(dropout_rate if i < depth-1 else 0)  # Dropout kromě poslední vrstvy
-                )
-            )
-        
-        # Výstupní vrstva pro binární LABEL mapu
-        self.output_layer = nn.Sequential(
-            nn.ReLU(),
-            nn.ConvTranspose3d(features + features, 1, kernel_size=4, stride=2, padding=1),
-            nn.Sigmoid()  # Sigmoid pro binární mapu (0-1)
+        # Encoder pro atlas
+        self.atlas_enc1 = nn.Sequential(
+            spectral_norm(nn.Conv3d(atlas_channels, base_filters, 4, 2, 1), use_spectral_norm),
+            nn.LeakyReLU(0.2, inplace=True)
+        )
+        self.atlas_enc2 = nn.Sequential(
+            spectral_norm(nn.Conv3d(base_filters, base_filters * 2, 4, 2, 1), use_spectral_norm),
+            nn.InstanceNorm3d(base_filters * 2),
+            nn.LeakyReLU(0.2, inplace=True)
+        )
+        self.atlas_enc3 = nn.Sequential(
+            spectral_norm(nn.Conv3d(base_filters * 2, base_filters * 4, 4, 2, 1), use_spectral_norm),
+            nn.InstanceNorm3d(base_filters * 4),
+            nn.LeakyReLU(0.2, inplace=True)
+        )
+        self.atlas_enc4 = nn.Sequential(
+            spectral_norm(nn.Conv3d(base_filters * 4, base_filters * 8, 4, 2, 1), use_spectral_norm),
+            nn.InstanceNorm3d(base_filters * 8),
+            nn.LeakyReLU(0.2, inplace=True)
         )
         
-    def forward(self, lesion_atlas, noise):
-        """
-        Args:
-            lesion_atlas: Atlas frekvence lézí (B, 1, D, H, W)
-            noise: Náhodný šum (B, 1, D, H, W)
-        Returns:
-            Generovaná binární LABEL mapa (B, 1, D, H, W)
-        """
-        # Zapamatujeme si původní rozměry pro zajištění stejného výstupu
-        orig_shape = lesion_atlas.shape
+        # Transformace pro latentní vektor
+        self.fc_z = nn.Linear(z_dim, 8 * 8 * 4 * base_filters)
+        self.reshape_z = nn.Sequential(
+            nn.InstanceNorm3d(base_filters),
+            nn.LeakyReLU(0.2, inplace=True)
+        )
         
-        # Spojení atlasu lézí a šumu jako vstup
-        x = torch.cat([lesion_atlas, noise], dim=1)
+        # Bottleneck s noise injection a concatenation
+        self.bottleneck_conv = nn.Sequential(
+            spectral_norm(nn.Conv3d(base_filters * 8 + base_filters, base_filters * 8, 3, 1, 1), use_spectral_norm),
+            nn.InstanceNorm3d(base_filters * 8),
+            nn.LeakyReLU(0.2, inplace=True)
+        )
         
-        if hasattr(torch, '_C') and hasattr(torch._C, '_log_api_usage_once'):
-            if hasattr(torch._C, '_log_api_usage_once'):
-                torch._C._log_api_usage_once(f"Input shape: {x.shape}")
+        # Self-Attention po bottlenecku
+        self.self_attn = SelfAttention3D(base_filters * 8)
         
-        # Uložíme si výstupy z encoderu pro skip connections
-        encoder_outputs = []
+        # Decoder s skip connections
+        self.dec4 = nn.Sequential(
+            spectral_norm(nn.ConvTranspose3d(base_filters * 8, base_filters * 4, 4, 2, 1), use_spectral_norm),
+            nn.InstanceNorm3d(base_filters * 4),
+            nn.ReLU(inplace=True)
+        )
+        self.dec3 = nn.Sequential(
+            spectral_norm(nn.ConvTranspose3d(base_filters * 8, base_filters * 2, 4, 2, 1), use_spectral_norm),
+            nn.InstanceNorm3d(base_filters * 2),
+            nn.ReLU(inplace=True)
+        )
+        self.dec2 = nn.Sequential(
+            spectral_norm(nn.ConvTranspose3d(base_filters * 4, base_filters, 4, 2, 1), use_spectral_norm),
+            nn.InstanceNorm3d(base_filters),
+            nn.ReLU(inplace=True)
+        )
+        self.dec1 = nn.Sequential(
+            spectral_norm(nn.ConvTranspose3d(base_filters * 2, output_channels, 4, 2, 1), use_spectral_norm),
+            nn.Sigmoid()  # Výstup v rozsahu [0, 1] pro binární segmentaci
+        )
         
-        # Encoder forward pass
-        for i, layer in enumerate(self.encoder):
-            x = layer(x)
-            if hasattr(torch, '_C') and hasattr(torch._C, '_log_api_usage_once'):
-                if hasattr(torch._C, '_log_api_usage_once'):
-                    torch._C._log_api_usage_once(f"Encoder {i} output shape: {x.shape}")
-            if i < self.depth - 1:  # Uložíme všechny kromě poslední vrstvy
-                encoder_outputs.append(x)
+        # Atlas integration
+        self.atlas_attention = nn.Sequential(
+            spectral_norm(nn.Conv3d(base_filters, base_filters, 3, 1, 1), use_spectral_norm),
+            nn.InstanceNorm3d(base_filters),
+            nn.Sigmoid()
+        )
         
-        # Aplikace self-attention na bottleneck
-        if self.use_attention:
-            x = self.attention(x)
+    def forward(self, z, atlas):
+        batch_size = atlas.size(0)
         
-        # Decoder forward pass s skip connections
-        for i, layer in enumerate(self.decoder):
-            # Pro první vrstvu dekodéru nepřidáváme skip connection
-            if i > 0:
-                skip_idx = self.depth - i - 1
-                
-                # Bezpečné spojení s kontrolou rozměrů
-                try:
-                    skip_x = encoder_outputs[skip_idx]
-                    # Před spojením se ujistíme, že rozměry odpovídají
-                    if x.shape[2:] != skip_x.shape[2:]:
-                        skip_x = F.interpolate(skip_x, size=x.shape[2:], mode='trilinear', align_corners=False)
-                    x = torch.cat([x, skip_x], dim=1)
-                except Exception as e:
-                    print(f"Chyba při skip connection {i}: {e}")
-                    print(f"Dekodér {i} - x.shape: {x.shape}, skip_x.shape: {skip_x.shape}")
-                    # Pokud spojení selže, pokračujeme bez skip connection
-                    pass
-            
-            x = layer(x)
-            if hasattr(torch, '_C') and hasattr(torch._C, '_log_api_usage_once'):
-                if hasattr(torch._C, '_log_api_usage_once'):
-                    torch._C._log_api_usage_once(f"Decoder {i} output shape: {x.shape}")
+        # Encoder - atlas
+        e1 = self.atlas_enc1(atlas)  # 64x64x32
+        e2 = self.atlas_enc2(e1)     # 32x32x16
+        e3 = self.atlas_enc3(e2)     # 16x16x8
+        e4 = self.atlas_enc4(e3)     # 8x8x4
         
-        # Poslední skip connection a výstupní vrstva
-        try:
-            skip_x = encoder_outputs[0]
-            # Před spojením se ujistíme, že rozměry odpovídají
-            if x.shape[2:] != skip_x.shape[2:]:
-                skip_x = F.interpolate(skip_x, size=x.shape[2:], mode='trilinear', align_corners=False)
-            x = torch.cat([x, skip_x], dim=1)
-        except Exception as e:
-            print(f"Chyba při finální skip connection: {e}")
-            # Pokud spojení selže, pokračujeme bez skip connection
-            pass
+        # Zpracování náhodného šumu a reshape na 3D feature mapu
+        z_flat = self.fc_z(z)
+        z_3d = z_flat.view(batch_size, self.base_filters, 4, 8, 8)
+        z_3d = self.reshape_z(z_3d)
         
-        lesion_map = self.output_layer(x)
+        # Kombinace atlasu a šumu v bottlenecku
+        combined = torch.cat([e4, z_3d], dim=1)
+        bottleneck = self.bottleneck_conv(combined)
         
-        # Ujistíme se, že výstup má stejné prostorové rozměry jako vstup
-        if lesion_map.shape[2:] != orig_shape[2:]:
-            lesion_map = F.interpolate(lesion_map, size=orig_shape[2:], mode='trilinear', align_corners=False)
+        # Self-attention
+        attended = self.self_attn(bottleneck)
         
-        return lesion_map
+        # Decoder s skip connections
+        d4 = self.dec4(attended)                           # 16x16x8
+        d4_skip = torch.cat([d4, e3], dim=1)
+        
+        d3 = self.dec3(d4_skip)                            # 32x32x16
+        d3_skip = torch.cat([d3, e2], dim=1)
+        
+        d2 = self.dec2(d3_skip)                            # 64x64x32
+        d2_skip = torch.cat([d2, e1], dim=1)
+        
+        # Atlas-based attention mapa pro zdůraznění relevantních oblastí
+        atlas_attention = self.atlas_attention(d2)
+        d2_skip = d2_skip * atlas_attention + d2_skip
+        
+        # Finální dekódování do lesion mapy
+        out = self.dec1(d2_skip)                           # 128x128x64
+        
+        return out
 
-# Discriminator architektury
-class LesionDiscriminator(nn.Module):
-    """Discriminator pro rozlišení reálných a syntetických LABEL map"""
-    
-    def __init__(self, in_channels=2, features=64, use_spectral_norm=True, depth=4):
-        """
-        Args:
-            in_channels: Počet vstupních kanálů (atlas lézí + LABEL mapa)
-            features: Počet základních feature map
-            use_spectral_norm: Použít spektrální normalizaci pro stabilnější trénink
-            depth: Hloubka diskriminátoru
-        """
-        super(LesionDiscriminator, self).__init__()
-        
-        # Spektrální normalizace pomáhá stabilizovat trénink GAN
-        norm_layer = nn.utils.spectral_norm if use_spectral_norm else lambda x: x
-        
-        # První vrstva bez normalizace
-        self.initial = norm_layer(nn.Conv3d(in_channels, features, kernel_size=4, stride=2, padding=1))
-        
-        # Střední vrstvy s normalizací
-        self.conv_layers = nn.ModuleList()
-        for i in range(1, depth):
-            in_ch = features * (2**(i-1))
-            out_ch = features * (2**i)
-            
-            self.conv_layers.append(
-                nn.Sequential(
-                    nn.LeakyReLU(0.2),
-                    norm_layer(nn.Conv3d(in_ch, out_ch, kernel_size=4, stride=2, padding=1)),
-                    nn.BatchNorm3d(out_ch)
-                )
-            )
-        
-        # Výstupní vrstva pro patch-based diskriminátor
-        self.output_layer = nn.Conv3d(features * (2**(depth-1)), 1, kernel_size=4, stride=1, padding=1)
-        
-    def forward(self, lesion_atlas, label):
-        """
-        Args:
-            lesion_atlas: Atlas frekvence lézí (B, 1, D, H, W)
-            label: LABEL mapa (B, 1, D, H, W)
-        Returns:
-            Pravděpodobnost, že LABEL mapa je reálná
-        """
-        # Kontrola a úprava rozměrů, pokud je to potřeba
-        if lesion_atlas.shape != label.shape:
-            # Vypíšeme varování, pokud se rozměry neshodují
-            print(f"Varování: Rozměry lesion_atlas {lesion_atlas.shape} a label {label.shape} se neshodují")
-            
-            # Použijeme interpolaci, abychom změnili rozměr label na stejný jako lesion_atlas
-            label = F.interpolate(label, size=lesion_atlas.shape[2:], mode='trilinear', align_corners=False)
-        
-        # Spojení atlasu lézí a LABEL mapy
-        x = torch.cat([lesion_atlas, label], dim=1)
-        
-        # Průchod první vrstvou
-        x = self.initial(x)
-        
-        # Průchod středními vrstvami
-        for layer in self.conv_layers:
-            x = layer(x)
-        
-        # Poslední vrstva
-        x = self.output_layer(x)
-        
-        return x
 
-# Pomocné funkce
-def save_sample(data, path, slice_idx=None):
-    """
-    Ukládá vygenerované vzorky
-    
-    Args:
-        data: Dict obsahující data ke zobrazení
-        path: Cesta, kam ukládat snímky
-        slice_idx: Seznam indexů řezů pro zobrazení (pokud None, vyberou se automaticky)
-    """
-    # Vytvoření adresáře, pokud neexistuje
-    os.makedirs(path, exist_ok=True)
-    
-    # Získání dat z dictionaries
-    real_label = data['label'][0, 0].cpu().numpy()  # První vzorek z batche, první kanál
-    lesion_atlas = data['lesion_atlas'][0, 0].cpu().numpy()
-    if 'fake_label' in data:
-        fake_label = data['fake_label'][0, 0].cpu().numpy()
-    
-    # Pokud není definován řez, najdeme středy v každé ose
-    if slice_idx is None:
-        D, H, W = real_label.shape
-        slice_idx = [D // 2, H // 2, W // 2]  # Střední řezy
-    
-    # Axiální řez (D)
-    plt.figure(figsize=(15, 5))
-    
-    plt.subplot(1, 3, 1)
-    plt.imshow(real_label[slice_idx[0], :, :], cmap='binary')
-    plt.title('Real Label - Axial')
-    plt.colorbar()
-    
-    plt.subplot(1, 3, 2)
-    plt.imshow(lesion_atlas[slice_idx[0], :, :], cmap='hot')
-    plt.title('Lesion Atlas - Axial')
-    plt.colorbar()
-    
-    if 'fake_label' in data:
-        plt.subplot(1, 3, 3)
-        plt.imshow(fake_label[slice_idx[0], :, :], cmap='binary')
-        plt.title('Generated Label - Axial')
-        plt.colorbar()
-    
-    plt.tight_layout()
-    plt.savefig(os.path.join(path, 'axial.png'), dpi=200)
-    plt.close()
-    
-    # Koronální řez (H)
-    plt.figure(figsize=(15, 5))
-    
-    plt.subplot(1, 3, 1)
-    plt.imshow(real_label[:, slice_idx[1], :], cmap='binary')
-    plt.title('Real Label - Coronal')
-    plt.colorbar()
-    
-    plt.subplot(1, 3, 2)
-    plt.imshow(lesion_atlas[:, slice_idx[1], :], cmap='hot')
-    plt.title('Lesion Atlas - Coronal')
-    plt.colorbar()
-    
-    if 'fake_label' in data:
-        plt.subplot(1, 3, 3)
-        plt.imshow(fake_label[:, slice_idx[1], :], cmap='binary')
-        plt.title('Generated Label - Coronal')
-        plt.colorbar()
-    
-    plt.tight_layout()
-    plt.savefig(os.path.join(path, 'coronal.png'), dpi=200)
-    plt.close()
-    
-    # Sagitální řez (W)
-    plt.figure(figsize=(15, 5))
-    
-    plt.subplot(1, 3, 1)
-    plt.imshow(real_label[:, :, slice_idx[2]], cmap='binary')
-    plt.title('Real Label - Sagittal')
-    plt.colorbar()
-    
-    plt.subplot(1, 3, 2)
-    plt.imshow(lesion_atlas[:, :, slice_idx[2]], cmap='hot')
-    plt.title('Lesion Atlas - Sagittal')
-    plt.colorbar()
-    
-    if 'fake_label' in data:
-        plt.subplot(1, 3, 3)
-        plt.imshow(fake_label[:, :, slice_idx[2]], cmap='binary')
-        plt.title('Generated Label - Sagittal')
-        plt.colorbar()
-    
-    plt.tight_layout()
-    plt.savefig(os.path.join(path, 'sagittal.png'), dpi=200)
-    plt.close()
-    
-    # Uložení .nii.gz souborů pro pozdější použití
-    if 'fake_label' in data:
-        # Vytvoříme nifti z numpy array
-        fake_nifti = nib.Nifti1Image(fake_label, np.eye(4))
-        nib.save(fake_nifti, os.path.join(path, 'generated_label.nii.gz'))
+class Discriminator(nn.Module):
+    def __init__(self, input_channels=2, base_filters=64, use_spectral_norm=True):
+        super(Discriminator, self).__init__()
+        
+        # Vstup je konkatenovaný atlas a label/generovaná léze
+        self.layer1 = nn.Sequential(
+            spectral_norm(nn.Conv3d(input_channels, base_filters, 4, 2, 1), use_spectral_norm),
+            nn.LeakyReLU(0.2, inplace=True)
+        )
+        
+        self.layer2 = nn.Sequential(
+            spectral_norm(nn.Conv3d(base_filters, base_filters * 2, 4, 2, 1), use_spectral_norm),
+            nn.InstanceNorm3d(base_filters * 2),
+            nn.LeakyReLU(0.2, inplace=True)
+        )
+        
+        self.layer3 = nn.Sequential(
+            spectral_norm(nn.Conv3d(base_filters * 2, base_filters * 4, 4, 2, 1), use_spectral_norm),
+            nn.InstanceNorm3d(base_filters * 4),
+            nn.LeakyReLU(0.2, inplace=True)
+        )
+        
+        # Self-attention na prostřední vrstvě
+        self.self_attn = SelfAttention3D(base_filters * 4)
+        
+        self.layer4 = nn.Sequential(
+            spectral_norm(nn.Conv3d(base_filters * 4, base_filters * 8, 4, 2, 1), use_spectral_norm),
+            nn.InstanceNorm3d(base_filters * 8),
+            nn.LeakyReLU(0.2, inplace=True)
+        )
+        
+        # Pro PatchGAN - lokální realism posouzení
+        self.layer5 = spectral_norm(nn.Conv3d(base_filters * 8, 1, 4, 1, 1), use_spectral_norm)
+        
+        # Pro global decision - celkové posouzení věrohodnosti
+        self.global_pool = nn.AdaptiveAvgPool3d(1)
+        self.fc = spectral_norm(nn.Linear(base_filters * 8, 1), use_spectral_norm)
+        
+    def forward(self, x, atlas):
+        # Konkatenace vstupu a atlasu podél kanálové dimenze
+        x = torch.cat([x, atlas], dim=1)
+        
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        
+        # Self-attention
+        x = self.self_attn(x)
+        
+        x = self.layer4(x)
+        
+        # PatchGAN výstup - mapa skóre
+        patch_out = self.layer5(x)
+        
+        # Globální posouzení
+        global_features = self.global_pool(x).view(x.size(0), -1)
+        global_out = self.fc(global_features)
+        
+        return patch_out, global_out
 
-def train_lesion_gan(args):
-    """
-    Hlavní trénovací funkce pro LabelGAN
-    
-    Args:
-        args: Argumenty tréninku, včetně:
-            - label_dir: Adresář s registrovanými LABEL mapami
-            - lesion_atlas_path: Cesta k atlasu frekvence lézí
-            - output_dir: Adresář pro ukládání výstupů
-            - batch_size: Velikost dávky
-            - epochs: Počet epoch
-            - lr: Learning rate
-            - b1, b2: Beta parametry pro Adam optimalizér
-            - save_interval: Interval pro ukládání checkpointů
-            - device: Zařízení pro trénink (cpu/cuda)
-            - seed: Seed pro reprodukovatelnost
-            - debug: Režim pro diagnostiku a ladění
-    """
-    # Nastavení seedu pro reprodukovatelnost
-    set_seed(args.seed)
-    
-    # Aktivace debug režimu
-    debug_mode = hasattr(args, 'debug') and args.debug
-    
-    # Kontrola a vytvoření výstupního adresáře
-    os.makedirs(args.output_dir, exist_ok=True)
-    samples_dir = os.path.join(args.output_dir, "samples")
-    models_dir = os.path.join(args.output_dir, "models")
-    os.makedirs(samples_dir, exist_ok=True)
-    os.makedirs(models_dir, exist_ok=True)
-    
-    # Inicializace dataset a dataloader
-    print("Inicializace datasetu...")
-    dataset = LabelGANDataset(
-        label_dir=args.label_dir,
-        lesion_atlas_path=args.lesion_atlas_path,
-        augment=True  # Použití augmentací
-    )
-    
-    # Kontrola rozměrů dat a ověření vhodné hloubky sítě
-    if len(dataset) > 0:
-        sample = dataset[0]
-        label_shape = sample['label'].shape
-        atlas_shape = sample['lesion_atlas'].shape
+
+# Loss Functions
+class GANLoss:
+    def __init__(self, device, gan_mode='hinge'):
+        self.device = device
+        self.gan_mode = gan_mode
+        self.register_buffer = lambda name, tensor: setattr(self, name, tensor.to(self.device))
         
-        if debug_mode:
-            print(f"Rozměry dat: LABEL mapa {label_shape}, Atlas lézí {atlas_shape}")
-            
-            # Zjištění minimálního rozměru a doporučené hloubky
-            min_dim = min(label_shape[1:])
-            max_depth = 0
-            while min_dim > 1:
-                min_dim = min_dim // 2
-                max_depth += 1
-            
-            recommended_depth = min(max_depth - 1, 5)  # Omezení max. hloubky na 5
-            if args.gen_depth > recommended_depth:
-                print(f"VAROVÁNÍ: Zadaná hloubka sítě (gen_depth={args.gen_depth}) může být příliš velká pro dané rozměry dat!")
-                print(f"Doporučená hloubka pro tyto rozměry je: {recommended_depth}")
-                print(f"Malý rozměr (Z=64) může způsobit problémy při downsamplingu ve větší hloubce.")
-                
-                # V debug režimu můžeme automaticky upravit hloubku
-                if debug_mode:
-                    print(f"V debug režimu automaticky upravuji hloubku na doporučenou hodnotu {recommended_depth}")
-                    args.gen_depth = recommended_depth
+        if gan_mode == 'vanilla':
+            self.loss = nn.BCEWithLogitsLoss()
+        elif gan_mode in ['lsgan', 'hinge']:
+            self.loss = nn.MSELoss()
+        else:
+            raise NotImplementedError(f'GAN mode {gan_mode} not implemented')
     
-    dataloader = DataLoader(
-        dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=4,
-        pin_memory=True if args.device == "cuda" else False
-    )
-    
-    # Inicializace modelů
-    print("Inicializace modelů...")
-    generator = LesionGenerator(
-        in_channels=2,  # atlas lézí + šum
-        features=args.gen_features,
-        depth=args.gen_depth,
-        dropout_rate=args.dropout_rate,
-        use_attention=args.use_attention
-    ).to(args.device)
-    
-    discriminator = LesionDiscriminator(
-        in_channels=2,  # atlas lézí + LABEL mapa
-        features=args.disc_features,
-        use_spectral_norm=args.use_spectral_norm,
-        depth=args.disc_depth
-    ).to(args.device)
-    
-    # Registrace debug hooks, pokud je debug mód aktivován
-    if debug_mode:
-        print("Registruji debug hooks pro sledování rozměrů tenzorů...")
-        
-        def hook_fn(module, input, output):
-            module_name = module.__class__.__name__
-            input_shapes = [x.shape if isinstance(x, torch.Tensor) else "None" for x in input]
-            if isinstance(output, torch.Tensor):
-                output_shape = output.shape
+    def __call__(self, prediction, target_is_real):
+        if self.gan_mode == 'vanilla':
+            target = torch.ones_like(prediction) if target_is_real else torch.zeros_like(prediction)
+            return self.loss(prediction, target)
+        elif self.gan_mode == 'lsgan':
+            target = torch.ones_like(prediction) if target_is_real else torch.zeros_like(prediction)
+            return self.loss(prediction, target)
+        elif self.gan_mode == 'hinge':
+            if target_is_real:
+                return -torch.mean(torch.min(torch.zeros_like(prediction), -1 + prediction))
             else:
-                output_shape = "Not a tensor"
-            print(f"Module {module_name}: Input shapes {input_shapes}, Output shape {output_shape}")
+                return -torch.mean(torch.min(torch.zeros_like(prediction), -1 - prediction))
+
+
+class DiceLoss(nn.Module):
+    def __init__(self, smooth=1.0):
+        super(DiceLoss, self).__init__()
+        self.smooth = smooth
         
-        # Registrace hooks na vybrané vrstvy
-        for name, module in generator.named_modules():
-            if isinstance(module, (nn.Conv3d, nn.ConvTranspose3d, nn.BatchNorm3d)):
-                module.register_forward_hook(hook_fn)
-                
-        # Výpis architektury modelu
-        print("\nArchitektura generátoru:")
-        print(generator)
-        print("\nArchitektura diskriminátoru:")
-        print(discriminator)
-        
-        # Testovací průchod generátorem pro ověření rozměrů
-        print("\nTestovací průchod generátorem pro ověření rozměrů...")
-        with torch.no_grad():
-            test_input_atlas = torch.randn(1, 1, 128, 128, 64).to(args.device)
-            test_input_noise = torch.randn(1, 1, 128, 128, 64).to(args.device)
-            try:
-                test_output = generator(test_input_atlas, test_input_noise)
-                print(f"Testovací průchod úspěšný! Vstup: {test_input_atlas.shape}, Výstup: {test_output.shape}")
-                
-                # Kontrola, zda výstup má stejné rozměry jako vstup
-                if test_output.shape[2:] != test_input_atlas.shape[2:]:
-                    print(f"VAROVÁNÍ: Výstup generátoru má jiné rozměry ({test_output.shape[2:]}) než vstup ({test_input_atlas.shape[2:]})!")
-                    print("Pro trénink je důležité, aby výstup měl stejné rozměry jako vstup.")
-            except Exception as e:
-                print(f"Chyba při testovacím průchodu: {e}")
-                print("Zkontrolujte architekturu sítě a hloubku.")
-                if hasattr(e, '__traceback__'):
-                    import traceback
-                    traceback.print_tb(e.__traceback__)
-    
-    # Inicializace optimizérů
-    optimizer_G = optim.Adam(generator.parameters(), lr=args.lr, betas=(args.b1, args.b2))
-    optimizer_D = optim.Adam(discriminator.parameters(), lr=args.lr, betas=(args.b1, args.b2))
-    
-    # Schedulery pro postupné snižování learning rate
-    scheduler_G = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer_G, mode='min', factor=0.5, patience=5, verbose=True
-    )
-    scheduler_D = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer_D, mode='min', factor=0.5, patience=5, verbose=True
-    )
-    
-    # Kritéria pro loss funkce
-    # Pro adversarial loss použijeme BCE s logits
-    adversarial_loss = nn.BCEWithLogitsLoss()
-    
-    # Weighted BCE pro řešení imbalance mezi pozitivními a negativními voxely v LABEL mapách
-    # Tato funkce bude přikládat větší váhu menšinovým třídám (léze)
-    def weighted_binary_cross_entropy(output, target):
-        # Vypočítáme váhy založené na procentu pozitivních voxelů v každém vzorku
-        # Tím zajistíme, že dáme větší váhu pozitivním voxelům, které jsou méně časté
-        batch_size = target.size(0)
-        weights = []
-        
-        for i in range(batch_size):
-            pos = torch.sum(target[i])
-            neg = torch.numel(target[i]) - pos
-            pos_weight = neg / (pos + 1e-8)  # Prevence dělení nulou
-            
-            # Omezení maximální váhy, aby nebyla příliš vysoká
-            pos_weight = torch.clamp(pos_weight, 1.0, 50.0)
-            
-            # Vytvoření váhové mapy pro vzorek
-            weight_map = torch.ones_like(target[i])
-            weight_map[target[i] > 0.5] = pos_weight
-            
-            weights.append(weight_map)
-        
-        weight_tensor = torch.stack(weights)
-        
-        # BCE loss s váhami
-        loss = F.binary_cross_entropy_with_logits(output, target, weight=weight_tensor)
-        return loss
-    
-    # Dice loss pro spatial overlap lézí
-    def dice_loss(pred, target, smooth=1.0):
-        pred = torch.sigmoid(pred)  # Pro použití s logits
-        
+    def forward(self, inputs, targets):
         # Flatten
-        pred_flat = pred.view(pred.size(0), -1)
-        target_flat = target.view(target.size(0), -1)
+        inputs = inputs.view(-1)
+        targets = targets.view(-1)
         
-        # Výpočet Dice koeficientu
-        intersection = (pred_flat * target_flat).sum(1)
-        union = pred_flat.sum(1) + target_flat.sum(1)
+        intersection = (inputs * targets).sum()
+        dice = (2. * intersection + self.smooth) / (inputs.sum() + targets.sum() + self.smooth)
         
-        # Dice loss
-        dice = (2.0 * intersection + smooth) / (union + smooth)
-        return 1.0 - dice.mean()
+        return 1 - dice
+
+
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=0.25, gamma=2, reduction='mean'):
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+        self.bce = nn.BCELoss(reduction='none')
+        
+    def forward(self, inputs, targets):
+        BCE_loss = self.bce(inputs, targets)
+        pt = torch.exp(-BCE_loss)
+        F_loss = self.alpha * (1-pt)**self.gamma * BCE_loss
+        
+        if self.reduction == 'mean':
+            return torch.mean(F_loss)
+        elif self.reduction == 'sum':
+            return torch.sum(F_loss)
+        else:
+            return F_loss
+
+
+# Tréninková utilita s implementací tréninkové smyčky
+class HIELesionGANTrainer:
+    def __init__(self, 
+                 generator, 
+                 discriminator, 
+                 device, 
+                 dataloader,
+                 val_dataloader=None,
+                 z_dim=128,
+                 lr_g=0.0002,
+                 lr_d=0.0002,
+                 beta1=0.5,
+                 beta2=0.999,
+                 lambda_adv=1.0,
+                 lambda_fm=10.0,
+                 lambda_dice=10.0,
+                 lambda_l1=10.0,
+                 label_smoothing=0.9,
+                 log_dir='./logs',
+                 save_dir='./checkpoints',
+                 save_interval=10):
+        
+        self.generator = generator.to(device)
+        self.discriminator = discriminator.to(device)
+        self.device = device
+        self.dataloader = dataloader
+        self.val_dataloader = val_dataloader
+        self.z_dim = z_dim
+        
+        # Optimizéry
+        self.optimizer_g = optim.Adam(generator.parameters(), lr=lr_g, betas=(beta1, beta2))
+        self.optimizer_d = optim.Adam(discriminator.parameters(), lr=lr_d, betas=(beta1, beta2))
+        
+        # Lambdy pro vážení složek loss funkce
+        self.lambda_adv = lambda_adv
+        self.lambda_fm = lambda_fm
+        self.lambda_dice = lambda_dice
+        self.lambda_l1 = lambda_l1
+        self.label_smoothing = label_smoothing
+        
+        # Loss funkce
+        self.gan_loss = GANLoss(device, gan_mode='hinge')
+        self.dice_loss = DiceLoss()
+        self.l1_loss = nn.L1Loss()
+        self.focal_loss = FocalLoss(alpha=0.75, gamma=2)
+        
+        # Adresáře pro ukládání
+        self.log_dir = log_dir
+        self.save_dir = save_dir
+        self.save_interval = save_interval
+        
+        # TensorBoard writer
+        self.writer = SummaryWriter(log_dir=os.path.join(log_dir, datetime.now().strftime("%Y%m%d-%H%M%S")))
+        
+        # Vytvoření adresářů, pokud neexistují
+        os.makedirs(self.log_dir, exist_ok=True)
+        os.makedirs(self.save_dir, exist_ok=True)
+        
+    def get_random_z(self, batch_size):
+        return torch.randn(batch_size, self.z_dim).to(self.device)
     
-    # Focal loss pro řešení imbalance
-    def focal_loss(pred, target, alpha=0.8, gamma=2.0):
-        # Sigmoid
-        pred = torch.sigmoid(pred)
+    def train_discriminator(self, real_lesions, atlas):
+        batch_size = real_lesions.size(0)
         
-        # Focal Loss
-        pt = target * pred + (1 - target) * (1 - pred)
-        focal_weight = (1 - pt) ** gamma
+        # Reset gradientů
+        self.optimizer_d.zero_grad()
         
-        # Váha pro pozitivní a negativní třídy
-        alpha_weight = target * alpha + (1 - target) * (1 - alpha)
+        # Forward pass s reálnými lézemi
+        real_patch_pred, real_global_pred = self.discriminator(real_lesions, atlas)
         
-        # Kombinace
-        focal_loss = -alpha_weight * focal_weight * torch.log(pt + 1e-8)
-        return focal_loss.mean()
-    
-    # Gradient penalty pro WGAN-GP
-    def compute_gradient_penalty(D, real_samples, fake_samples, lesion_atlas):
-        """WGAN-GP gradient penalty"""
-        # Náhodný koeficient pro interpolaci mezi reálnými a fake vzorky
-        alpha = torch.rand((real_samples.size(0), 1, 1, 1, 1), device=args.device)
+        # Generování fake lézí
+        z = self.get_random_z(batch_size)
+        fake_lesions = self.generator(z, atlas)
         
-        # Interpolované vzorky
-        interpolates = (alpha * real_samples + ((1 - alpha) * fake_samples)).requires_grad_(True)
+        # Forward pass s falešnými lézemi
+        fake_patch_pred, fake_global_pred = self.discriminator(fake_lesions.detach(), atlas)
         
-        # Diskriminační skóre pro interpolované vzorky
-        d_interpolates = D(lesion_atlas, interpolates)
+        # Real a Fake loss
+        d_real_loss = self.gan_loss(real_patch_pred, True) + self.gan_loss(real_global_pred, True)
+        d_fake_loss = self.gan_loss(fake_patch_pred, False) + self.gan_loss(fake_global_pred, False)
         
-        # Vytvoření plných jedniček
-        fake = torch.ones((real_samples.size(0), 1, d_interpolates.size(2), 
-                          d_interpolates.size(3), d_interpolates.size(4)), 
-                         device=args.device, requires_grad=False)
+        # Celková loss
+        d_loss = (d_real_loss + d_fake_loss) * 0.5
         
-        # Výpočet gradientů
-        gradients = torch.autograd.grad(
-            outputs=d_interpolates,
-            inputs=interpolates,
-            grad_outputs=fake,
-            create_graph=True,
-            retain_graph=True,
-            only_inputs=True,
-        )[0]
+        # Backpropagation
+        d_loss.backward()
+        self.optimizer_d.step()
         
-        # Výpočet normy gradientů pro každý vzorek
-        gradients = gradients.view(gradients.size(0), -1)
-        gradient_penalty = ((gradients.norm(2, dim=1) - 1) ** 2).mean()
-        
-        return gradient_penalty
-    
-    # Kombinovaná loss funkce pro generator
-    def generator_loss(fake_pred, fake_label, real_label, use_dice=True, use_focal=True):
-        # Adversarial loss
-        adv_loss = adversarial_loss(fake_pred, torch.ones_like(fake_pred))
-        
-        # Váhovaná BCE loss
-        wbce_loss = weighted_binary_cross_entropy(fake_label, real_label)
-        
-        # Dice loss pro lepší spatial overlap
-        d_loss = dice_loss(fake_label, real_label) if use_dice else 0.0
-        
-        # Focal loss pro řešení class imbalance
-        f_loss = focal_loss(fake_label, real_label) if use_focal else 0.0
-        
-        # Kombinovaná loss
-        g_loss = adv_loss + wbce_loss + d_loss + f_loss
-        
-        return g_loss, {
-            'adv_loss': adv_loss.item(),
-            'wbce_loss': wbce_loss.item(),
-            'dice_loss': d_loss if use_dice else 0.0,
-            'focal_loss': f_loss if use_focal else 0.0,
-            'total': g_loss.item()
+        return {
+            'd_loss': d_loss.item(),
+            'd_real_loss': d_real_loss.item(),
+            'd_fake_loss': d_fake_loss.item()
         }
     
-    # Začátek tréninku
-    print("Začínám trénink...")
-    global_step = 0
-    best_g_loss = float('inf')
+    def train_generator(self, real_lesions, atlas):
+        batch_size = real_lesions.size(0)
+        
+        # Reset gradientů
+        self.optimizer_g.zero_grad()
+        
+        # Generování fake lézí
+        z = self.get_random_z(batch_size)
+        fake_lesions = self.generator(z, atlas)
+        
+        # Forward pass diskriminátorem
+        fake_patch_pred, fake_global_pred = self.discriminator(fake_lesions, atlas)
+        
+        # Adversarial loss
+        g_adv_loss = self.gan_loss(fake_patch_pred, True) + self.gan_loss(fake_global_pred, True)
+        
+        # Další pomocné loss funkce pro lepší generování
+        
+        # Atlas-guided Focal Loss - podporuje generování v oblastech, kde se léze častěji vyskytují
+        atlas_guided_focal = self.focal_loss(fake_lesions * atlas, real_lesions * atlas)
+        
+        # L1 Loss pro stabilitu tréninku a zachycení nízkofrekvečních detailů
+        g_l1_loss = self.l1_loss(fake_lesions, real_lesions)
+        
+        # Dice Loss pro lepší segmentace
+        g_dice_loss = self.dice_loss(fake_lesions, real_lesions)
+        
+        # Kombinace všech loss funkcí
+        g_loss = (self.lambda_adv * g_adv_loss + 
+                 self.lambda_l1 * g_l1_loss + 
+                 self.lambda_dice * g_dice_loss + 
+                 atlas_guided_focal)
+        
+        # Backpropagation
+        g_loss.backward()
+        self.optimizer_g.step()
+        
+        return {
+            'g_loss': g_loss.item(),
+            'g_adv_loss': g_adv_loss.item(),
+            'g_l1_loss': g_l1_loss.item(),
+            'g_dice_loss': g_dice_loss.item(),
+            'g_focal_loss': atlas_guided_focal.item(),
+            'fake_lesions': fake_lesions.detach()
+        }
     
-    for epoch in range(args.epochs):
-        epoch_g_losses = []
-        epoch_d_losses = []
+    def validate(self):
+        if self.val_dataloader is None:
+            return {}
         
-        progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{args.epochs}")
+        self.generator.eval()
+        self.discriminator.eval()
         
-        for batch in progress_bar:
-            # Přesun dat na zařízení
-            real_labels = batch['label'].to(args.device)
-            lesion_atlas = batch['lesion_atlas'].to(args.device)
-            noise = batch['noise'].to(args.device)
-            
-            batch_size = real_labels.size(0)
-            
-            # Výpis rozměrů v debug režimu
-            if debug_mode and global_step == 0:
-                print(f"Rozměry vstupních dat - real_labels: {real_labels.shape}, lesion_atlas: {lesion_atlas.shape}, noise: {noise.shape}")
-            
-            # ----------
-            # Trénink diskriminátoru
-            # ----------
-            optimizer_D.zero_grad()
-            
-            # Generování fake LABEL map
-            with torch.no_grad():
-                fake_labels = generator(lesion_atlas, noise)
+        val_losses = {
+            'val_g_loss': 0,
+            'val_g_adv_loss': 0,
+            'val_g_l1_loss': 0,
+            'val_g_dice_loss': 0,
+            'val_d_loss': 0
+        }
+        
+        with torch.no_grad():
+            for i, batch in enumerate(self.val_dataloader):
+                real_lesions = batch['label'].to(self.device)
+                atlas = batch['atlas'].to(self.device)
+                batch_size = real_lesions.size(0)
                 
-                # Kontrola rozměrů v debug režimu
-                if debug_mode and global_step == 0:
-                    print(f"Rozměry generovaných dat - fake_labels: {fake_labels.shape}")
-                    
-                    # Kontrola shodnosti rozměrů
-                    if fake_labels.shape != real_labels.shape:
-                        print(f"VAROVÁNÍ: Rozměry generovaných dat ({fake_labels.shape}) se neshodují s reálnými daty ({real_labels.shape})!")
-                        
-                        # Interpolace na správnou velikost
-                        fake_labels = F.interpolate(fake_labels, size=real_labels.shape[2:], mode='trilinear', align_corners=False)
-                        print(f"Provedena interpolace - nové rozměry: {fake_labels.shape}")
-            
-            # Diskriminační skóre pro reálné a fake vzorky
-            real_pred = discriminator(lesion_atlas, real_labels)
-            fake_pred = discriminator(lesion_atlas, fake_labels.detach())
-            
-            # Trénovací postupy pro diskriminátor:
-            if args.use_wgan:
-                # WGAN-GP
-                gradient_penalty = compute_gradient_penalty(
-                    discriminator, real_labels, fake_labels.detach(), lesion_atlas
-                )
+                # Generování fake lézí
+                z = self.get_random_z(batch_size)
+                fake_lesions = self.generator(z, atlas)
                 
-                # Wasserstein distance
-                d_loss = -torch.mean(real_pred) + torch.mean(fake_pred) + args.lambda_gp * gradient_penalty
-            else:
-                # Standardní GAN loss
-                real_loss = adversarial_loss(real_pred, torch.ones_like(real_pred))
-                fake_loss = adversarial_loss(fake_pred, torch.zeros_like(fake_pred))
-                d_loss = (real_loss + fake_loss) / 2
+                # Diskriminátor výstupy
+                real_patch_pred, real_global_pred = self.discriminator(real_lesions, atlas)
+                fake_patch_pred, fake_global_pred = self.discriminator(fake_lesions, atlas)
+                
+                # Adversarial Loss
+                g_adv_loss = self.gan_loss(fake_patch_pred, True) + self.gan_loss(fake_global_pred, True)
+                
+                # L1 Loss
+                g_l1_loss = self.l1_loss(fake_lesions, real_lesions)
+                
+                # Dice Loss
+                g_dice_loss = self.dice_loss(fake_lesions, real_lesions)
+                
+                # Kombinace
+                g_loss = (self.lambda_adv * g_adv_loss + 
+                         self.lambda_l1 * g_l1_loss + 
+                         self.lambda_dice * g_dice_loss)
+                
+                # Diskriminátor loss
+                d_real_loss = self.gan_loss(real_patch_pred, True) + self.gan_loss(real_global_pred, True)
+                d_fake_loss = self.gan_loss(fake_patch_pred, False) + self.gan_loss(fake_global_pred, False)
+                d_loss = (d_real_loss + d_fake_loss) * 0.5
+                
+                val_losses['val_g_loss'] += g_loss.item()
+                val_losses['val_g_adv_loss'] += g_adv_loss.item()
+                val_losses['val_g_l1_loss'] += g_l1_loss.item()
+                val_losses['val_g_dice_loss'] += g_dice_loss.item()
+                val_losses['val_d_loss'] += d_loss.item()
+        
+        # Průměrování
+        num_batches = len(self.val_dataloader)
+        for k in val_losses.keys():
+            val_losses[k] /= num_batches
+        
+        self.generator.train()
+        self.discriminator.train()
+        
+        return val_losses
+    
+    def log_metrics(self, metrics, epoch, step=None):
+        # Log do tensorboard
+        prefix = ''
+        if step is not None:
+            prefix = f'step_{step}/'
+        
+        for key, value in metrics.items():
+            self.writer.add_scalar(f'{prefix}{key}', value, epoch)
+    
+    def log_images(self, real_lesions, fake_lesions, atlas, epoch, n_samples=4):
+        with torch.no_grad():
+            # Výběr n_samples vzorků
+            real_samples = real_lesions[:n_samples].cpu().detach()
+            fake_samples = fake_lesions[:n_samples].cpu().detach()
+            atlas_samples = atlas[:n_samples].cpu().detach()
             
-            # Backpropagation
-            d_loss.backward()
-            optimizer_D.step()
+            # Funkce pro vizualizaci středových řezů
+            def visualize_slice(volume, slice_idx=None):
+                if slice_idx is None:
+                    slice_idx = volume.shape[2] // 2  # Střední řez podél Z
+                return volume[0, :, slice_idx, :, :]  # Výběr pro jeden batch
             
-            # Omezení D tréninku pro lepší vyváženost
-            if global_step % args.n_critic == 0:
-                # ----------
+            # Log středových řezů pro každý vzorek
+            for i in range(n_samples):
+                # Získání středového řezu
+                real_slice = visualize_slice(real_samples[i:i+1])
+                fake_slice = visualize_slice(fake_samples[i:i+1])
+                atlas_slice = visualize_slice(atlas_samples[i:i+1])
+                
+                # Vytvoření gridu pro vizualizaci
+                grid = torch.cat([real_slice, fake_slice, atlas_slice], dim=2)
+                
+                # Log do tensorboard
+                self.writer.add_image(f'sample_{i}/real_fake_atlas', grid, epoch)
+    
+    def save_checkpoint(self, epoch):
+        checkpoint_path = os.path.join(self.save_dir, f'checkpoint_epoch_{epoch}.pt')
+        torch.save({
+            'epoch': epoch,
+            'generator_state_dict': self.generator.state_dict(),
+            'discriminator_state_dict': self.discriminator.state_dict(),
+            'optimizer_g_state_dict': self.optimizer_g.state_dict(),
+            'optimizer_d_state_dict': self.optimizer_d.state_dict(),
+        }, checkpoint_path)
+        print(f"Checkpoint uložen: {checkpoint_path}")
+    
+    def generate_samples(self, atlas, num_samples=10, output_dir='./generated_samples'):
+        os.makedirs(output_dir, exist_ok=True)
+        
+        self.generator.eval()
+        with torch.no_grad():
+            # Zajistíme, že atlas má batch rozměr
+            if atlas.dim() == 4:  # [C, D, H, W]
+                atlas = atlas.unsqueeze(0)  # [1, C, D, H, W]
+            
+            # Vygenerování vzorků
+            for i in range(num_samples):
+                # Získání náhodného latentního vektoru
+                z = self.get_random_z(1)
+                
+                # Generování léze
+                fake_lesion = self.generator(z, atlas)
+                
+                # Převod na numpy array a binarizace pro uložení jako nifti
+                lesion_np = fake_lesion.squeeze().cpu().numpy()
+                
+                # Uložení jako .nii soubor
+                sample_path = os.path.join(output_dir, f'generated_lesion_{i}.nii.gz')
+                
+                # Vytvoření nifti objektu - použijeme stejné parametry jako u atlasu
+                if hasattr(self.dataloader.dataset, 'lesion_atlas_path'):
+                    # Získání header informací z atlasu
+                    atlas_nib = nib.load(self.dataloader.dataset.lesion_atlas_path)
+                    lesion_nib = nib.Nifti1Image(lesion_np, atlas_nib.affine, atlas_nib.header)
+                else:
+                    # Pokud nemáme informace o atlasu, vytvoříme základní nifti
+                    lesion_nib = nib.Nifti1Image(lesion_np, np.eye(4))
+                
+                # Uložení
+                nib.save(lesion_nib, sample_path)
+                print(f"Vygenerován vzorek: {sample_path}")
+        
+        self.generator.train()
+    
+    def train(self, num_epochs, validate_every=5):
+        start_time = time.time()
+        
+        for epoch in range(num_epochs):
+            epoch_start_time = time.time()
+            epoch_g_loss = 0
+            epoch_d_loss = 0
+            
+            # Trénink na jedné epoše
+            self.generator.train()
+            self.discriminator.train()
+            
+            # Progress bar
+            pbar = tqdm(self.dataloader, desc=f'Epoch {epoch+1}/{num_epochs}')
+            
+            for i, batch in enumerate(pbar):
+                real_lesions = batch['label'].to(self.device)
+                atlas = batch['atlas'].to(self.device)
+                
+                # Trénink diskriminátoru
+                d_metrics = self.train_discriminator(real_lesions, atlas)
+                
                 # Trénink generátoru
-                # ----------
-                optimizer_G.zero_grad()
+                g_metrics = self.train_generator(real_lesions, atlas)
                 
-                # Generování fake LABEL map
-                fake_labels = generator(lesion_atlas, noise)
+                # Akumulace ztrát pro průměrování
+                epoch_d_loss += d_metrics['d_loss']
+                epoch_g_loss += g_metrics['g_loss']
                 
-                # Kontrola a případná úprava rozměrů
-                if fake_labels.shape != real_labels.shape:
-                    if debug_mode:
-                        print(f"Úprava rozměrů generovaných dat: {fake_labels.shape} -> {real_labels.shape}")
-                    fake_labels = F.interpolate(fake_labels, size=real_labels.shape[2:], mode='trilinear', align_corners=False)
+                # Aktualizace progress baru
+                pbar.set_postfix({
+                    'g_loss': g_metrics['g_loss'],
+                    'd_loss': d_metrics['d_loss']
+                })
                 
-                # Diskriminační skóre pro fake vzorky (pohled G)
-                fake_pred = discriminator(lesion_atlas, fake_labels)
-                
-                # Výpočet loss pro generator
-                g_loss, g_loss_components = generator_loss(
-                    fake_pred, fake_labels, real_labels,
-                    use_dice=args.use_dice_loss,
-                    use_focal=args.use_focal_loss
-                )
-                
-                # Backpropagation
-                g_loss.backward()
-                optimizer_G.step()
-                
-                # Sledování ztrát
-                epoch_g_losses.append(g_loss.item())
+                # Logování metrik pro každý batch
+                if i % 10 == 0:
+                    step = epoch * len(self.dataloader) + i
+                    all_metrics = {**d_metrics, **{k: v for k, v in g_metrics.items() if k != 'fake_lesions'}}
+                    self.log_metrics(all_metrics, epoch, step)
             
-            # Sledování ztrát diskriminátoru
-            epoch_d_losses.append(d_loss.item())
+            # Průměrování ztrát za epoch
+            epoch_d_loss /= len(self.dataloader)
+            epoch_g_loss /= len(self.dataloader)
             
-            # Aktualizace progress baru
-            progress_bar.set_postfix({
-                'D_loss': d_loss.item(),
-                'G_loss': g_loss.item() if global_step % args.n_critic == 0 else "N/A"
-            })
+            # Logování obrazů
+            self.log_images(real_lesions, g_metrics['fake_lesions'], atlas, epoch)
             
-            # Ukládání vzorků v pravidelných intervalech
-            if global_step % args.save_interval == 0:
-                with torch.no_grad():
-                    sample_data = {
-                        'label': real_labels,
-                        'lesion_atlas': lesion_atlas,
-                        'fake_label': generator(lesion_atlas, noise)
-                    }
-                    # Kontrola a případná úprava rozměrů
-                    if sample_data['fake_label'].shape != real_labels.shape:
-                        sample_data['fake_label'] = F.interpolate(
-                            sample_data['fake_label'], 
-                            size=real_labels.shape[2:], 
-                            mode='trilinear', 
-                            align_corners=False
-                        )
-                    save_sample(
-                        sample_data,
-                        os.path.join(samples_dir, f"step_{global_step}")
-                    )
+            # Validace
+            if (epoch + 1) % validate_every == 0 and self.val_dataloader is not None:
+                val_metrics = self.validate()
+                self.log_metrics(val_metrics, epoch)
+                print(f"Validace (Epoch {epoch+1}): G Loss: {val_metrics['val_g_loss']:.4f}, D Loss: {val_metrics['val_d_loss']:.4f}")
             
-            global_step += 1
+            # Uložení checkpointu
+            if (epoch + 1) % self.save_interval == 0:
+                self.save_checkpoint(epoch + 1)
+            
+            # Výpis informací o epoše
+            epoch_time = time.time() - epoch_start_time
+            print(f"Epoch [{epoch+1}/{num_epochs}] - čas: {epoch_time:.2f}s - G Loss: {epoch_g_loss:.4f}, D Loss: {epoch_d_loss:.4f}")
         
-        # Průměrné ztráty za epochu
-        avg_g_loss = sum(epoch_g_losses) / len(epoch_g_losses) if epoch_g_losses else float('inf')
-        avg_d_loss = sum(epoch_d_losses) / len(epoch_d_losses)
+        # Konec tréninku
+        total_time = time.time() - start_time
+        print(f"Trénink dokončen za {total_time:.2f} sekund")
         
-        print(f"Epoch {epoch+1}/{args.epochs} | G_loss: {avg_g_loss:.4f} | D_loss: {avg_d_loss:.4f}")
-        
-        # Aktualizace scheduler
-        scheduler_G.step(avg_g_loss)
-        scheduler_D.step(avg_d_loss)
-        
-        # Ukládání modelů
-        if (epoch + 1) % 5 == 0 or avg_g_loss < best_g_loss:
-            state = {
-                'epoch': epoch,
-                'global_step': global_step,
-                'generator_state_dict': generator.state_dict(),
-                'discriminator_state_dict': discriminator.state_dict(),
-                'optimizer_G_state_dict': optimizer_G.state_dict(),
-                'optimizer_D_state_dict': optimizer_D.state_dict(),
-                'scheduler_G_state_dict': scheduler_G.state_dict(),
-                'scheduler_D_state_dict': scheduler_D.state_dict(),
-                'g_loss': avg_g_loss,
-                'd_loss': avg_d_loss,
-            }
-            
-            # Ukládání aktuálního checkpointu
-            torch.save(
-                state, 
-                os.path.join(models_dir, f"checkpoint_e{epoch+1}.pt")
-            )
-            
-            # Ukládání nejlepšího modelu podle G loss
-            if avg_g_loss < best_g_loss:
-                best_g_loss = avg_g_loss
-                torch.save(
-                    state, 
-                    os.path.join(models_dir, "best_model.pt")
-                )
-                print(f"Uložen nový nejlepší model s G_loss: {best_g_loss:.4f}")
-    
-    print("Trénink dokončen!")
-    return generator, discriminator
-
-def generate_lesion_samples(args):
-    """
-    Generuje vzorky lézí pomocí natrénovaného modelu
-    
-    Args:
-        args: Argumenty pro generování vzorků, včetně:
-            - model_path: Cesta k natrénovanému modelu
-            - lesion_atlas_path: Cesta k atlasu frekvence lézí
-            - output_dir: Adresář pro ukládání výstupů
-            - n_samples: Počet vzorků k vygenerování
-            - device: Zařízení pro generování (cpu/cuda)
-            - seed: Seed pro reprodukovatelnost
-            - use_thresholding: Použít thresholding pro binarizaci výstupů
-            - threshold: Práh pro binarizaci (0-1)
-    """
-    # Nastavení seedu pro reprodukovatelnost
-    set_seed(args.seed)
-    
-    # Kontrola a vytvoření výstupního adresáře
-    os.makedirs(args.output_dir, exist_ok=True)
-    
-    # Načtení atlasu lézí
-    print("Načítání atlasu lézí...")
-    if args.lesion_atlas_path.endswith('.nii.gz') or args.lesion_atlas_path.endswith('.nii'):
-        lesion_atlas = nib.load(args.lesion_atlas_path)
-        lesion_atlas_data = lesion_atlas.get_fdata()
-        affine = lesion_atlas.affine
-    else:
-        lesion_atlas_sitk = sitk.ReadImage(args.lesion_atlas_path)
-        lesion_atlas_data = sitk.GetArrayFromImage(lesion_atlas_sitk)
-        affine = np.eye(4)  # Defaultní affine, pokud není k dispozici
-    
-    # Normalizace do rozsahu [0, 1]
-    lesion_atlas_data = (lesion_atlas_data - lesion_atlas_data.min()) / (lesion_atlas_data.max() - lesion_atlas_data.min())
-    
-    # Výpis informací o rozměrech
-    print(f"Rozměry atlasu lézí: {lesion_atlas_data.shape}")
-    
-    # Převod na tensor
-    lesion_atlas_tensor = torch.FloatTensor(lesion_atlas_data).unsqueeze(0).unsqueeze(0).to(args.device)
-    
-    # Načtení modelu
-    print("Načítání modelu...")
-    checkpoint = torch.load(args.model_path, map_location=args.device)
-    
-    # Inicializace generátoru
-    generator = LesionGenerator(
-        in_channels=2,
-        features=args.gen_features,
-        depth=args.gen_depth,
-        dropout_rate=args.dropout_rate,
-        use_attention=args.use_attention
-    ).to(args.device)
-    
-    try:
-        # Načtení vah
-        generator.load_state_dict(checkpoint['generator_state_dict'])
-        print("Model úspěšně načten.")
-    except Exception as e:
-        print(f"Chyba při načítání modelu: {e}")
-        print("Zkouším alternativní klíče...")
-        # Zkusit jiné možné klíče v checkpointu
-        for key in checkpoint.keys():
-            print(f"Dostupný klíč: {key}")
-        
-        if 'state_dict' in checkpoint:
-            print("Zkouším načíst 'state_dict'...")
-            try:
-                generator.load_state_dict(checkpoint['state_dict'])
-                print("Model úspěšně načten z 'state_dict'.")
-            except Exception as e2:
-                print(f"Chyba při alternativním načítání: {e2}")
-                return False
-    
-    # Registrace debug hooks, pokud je debug mód aktivován
-    if hasattr(args, 'debug') and args.debug:
-        print("Registruji debug hooks pro sledování rozměrů tenzorů...")
-        
-        def hook_fn(module, input, output):
-            module_name = module.__class__.__name__
-            input_shapes = [x.shape if isinstance(x, torch.Tensor) else "None" for x in input]
-            if isinstance(output, torch.Tensor):
-                output_shape = output.shape
-            else:
-                output_shape = "Not a tensor"
-            print(f"Module {module_name}: Input shapes {input_shapes}, Output shape {output_shape}")
-        
-        # Registrace hooks na vybrané vrstvy
-        for name, module in generator.named_modules():
-            if isinstance(module, (nn.Conv3d, nn.ConvTranspose3d, nn.BatchNorm3d)):
-                module.register_forward_hook(hook_fn)
-        
-        # Výpis architektury modelu
-        print("\nArchitektura generátoru:")
-        print(generator)
-    
-    generator.eval()
-    
-    print(f"Generuji {args.n_samples} vzorků lézí...")
-    
-    # Generování vzorků
-    with torch.no_grad():
-        for i in tqdm(range(args.n_samples)):
-            # Vytvoření šumu
-            noise = torch.randn_like(lesion_atlas_tensor).to(args.device)
-            
-            # Generování léze
-            fake_label = generator(lesion_atlas_tensor, noise)
-            
-            # Aplikace thresholdingu, pokud je vyžadován
-            if args.use_thresholding:
-                fake_label = (fake_label > args.threshold).float()
-            
-            # Převod na numpy array
-            fake_label_np = fake_label.squeeze().cpu().numpy()
-            
-            # Uložení jako NIfTI soubor
-            fake_nifti = nib.Nifti1Image(fake_label_np, affine)
-            output_path = os.path.join(args.output_dir, f"generated_lesion_{i+1}.nii.gz")
-            nib.save(fake_nifti, output_path)
-            
-            # Vytvoření vizualizací
-            if i < 10:  # Vizualizujeme pouze prvních 10 vzorků
-                # Najdeme středové řezy nebo řezy s lézemi
-                D, H, W = fake_label_np.shape
-                
-                # Hledání řezů s lézemi
-                d_slices = [d for d in range(D) if fake_label_np[d, :, :].max() > 0]
-                h_slices = [h for h in range(H) if fake_label_np[:, h, :].max() > 0]
-                w_slices = [w for w in range(W) if fake_label_np[:, :, w].max() > 0]
-                
-                # Pokud nejsou nalezeny řezy s lézemi, použijeme středové řezy
-                slice_idx = [
-                    d_slices[len(d_slices)//2] if d_slices else D//2,
-                    h_slices[len(h_slices)//2] if h_slices else H//2,
-                    w_slices[len(w_slices)//2] if w_slices else W//2
-                ]
-                
-                # Vytvoření vizualizací - axiální, koronální a sagitální řez
-                fig, axs = plt.subplots(1, 3, figsize=(15, 5))
-                
-                # Axiální řez
-                axs[0].imshow(fake_label_np[slice_idx[0], :, :], cmap='binary')
-                axs[0].set_title(f'Axial (z={slice_idx[0]})')
-                axs[0].axis('off')
-                
-                # Koronální řez
-                axs[1].imshow(fake_label_np[:, slice_idx[1], :], cmap='binary')
-                axs[1].set_title(f'Coronal (y={slice_idx[1]})')
-                axs[1].axis('off')
-                
-                # Sagitální řez
-                axs[2].imshow(fake_label_np[:, :, slice_idx[2]], cmap='binary')
-                axs[2].set_title(f'Sagittal (x={slice_idx[2]})')
-                axs[2].axis('off')
-                
-                plt.tight_layout()
-                plt.savefig(os.path.join(args.output_dir, f"visualization_{i+1}.png"), dpi=200)
-                plt.close()
-    
-    print(f"Vygenerováno {args.n_samples} vzorků lézí do {args.output_dir}")
-    return True
+        # Uložení finálního modelu
+        final_checkpoint_path = os.path.join(self.save_dir, 'final_model.pt')
+        torch.save({
+            'generator_state_dict': self.generator.state_dict(),
+            'discriminator_state_dict': self.discriminator.state_dict(),
+        }, final_checkpoint_path)
+        print(f"Finální model uložen: {final_checkpoint_path}")
 
 def main():
-    """Hlavní funkce programu"""
-    parser = argparse.ArgumentParser(description="LabelGAN - generování realistických lézí pro HIE")
-    
-    # Obecné argumenty
-    parser.add_argument("--mode", type=str, default="train", choices=["train", "generate"],
-                        help="Režim běhu: 'train' nebo 'generate'")
-    parser.add_argument("--seed", type=int, default=42, 
-                        help="Seed pro reprodukovatelnost")
-    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu",
-                        help="Zařízení pro trénink/generování (cuda/cpu)")
-    parser.add_argument("--debug", action="store_true",
-                       help="Zapnout debug režim s výpisem rozměrů tenzorů")
-    
-    # Argumenty pro dataset
-    parser.add_argument("--label_dir", type=str, default="data/BONBID2023_Train/3LABEL",
-                        help="Adresář s registrovanými LABEL mapami")
-    parser.add_argument("--lesion_atlas_path", type=str, default="data/archive/lesion_atlases/lesion_atlas.nii",
-                        help="Cesta k atlasu frekvence lézí")
-    parser.add_argument("--output_dir", type=str, default="output/labelgan",
-                        help="Adresář pro ukládání výstupů")
-    
-    # Argumenty pro model
-    parser.add_argument("--gen_features", type=int, default=64,
-                        help="Počet základních feature map v generátoru")
-    parser.add_argument("--gen_depth", type=int, default=4,
-                        help="Hloubka U-Net architektury v generátoru")
-    parser.add_argument("--disc_features", type=int, default=64,
-                        help="Počet základních feature map v diskriminátoru")
-    parser.add_argument("--disc_depth", type=int, default=4,
-                        help="Hloubka architektury v diskriminátoru")
-    parser.add_argument("--dropout_rate", type=float, default=0.3,
-                        help="Míra dropout v generátoru")
-    parser.add_argument("--use_attention", action="store_true", 
-                        help="Použít attention mechanismus pro lepší detaily")
-    parser.add_argument("--use_spectral_norm", action="store_true",
-                        help="Použít spektrální normalizaci pro stabilnější trénink")
-    
-    # Argumenty pro trénink
-    parser.add_argument("--batch_size", type=int, default=2,
-                        help="Velikost dávky")
-    parser.add_argument("--epochs", type=int, default=100,
-                        help="Počet epoch")
-    parser.add_argument("--lr", type=float, default=0.0002,
-                        help="Learning rate")
-    parser.add_argument("--b1", type=float, default=0.5,
-                        help="Beta1 parametr pro Adam optimalizér")
-    parser.add_argument("--b2", type=float, default=0.999,
-                        help="Beta2 parametr pro Adam optimalizér")
-    parser.add_argument("--save_interval", type=int, default=100,
-                        help="Interval pro ukládání vzorků (v krocích)")
-    parser.add_argument("--use_wgan", action="store_true",
-                        help="Použít WGAN-GP místo standardního GAN")
-    parser.add_argument("--lambda_gp", type=float, default=10.0,
-                        help="Váha gradient penalty pro WGAN-GP")
-    parser.add_argument("--n_critic", type=int, default=5,
-                        help="Počet aktualizací diskriminátoru na jednu aktualizaci generátoru")
-    parser.add_argument("--use_dice_loss", action="store_true",
-                        help="Použít Dice loss pro lepší prostorovou shodu lézí")
-    parser.add_argument("--use_focal_loss", action="store_true",
-                        help="Použít Focal loss pro řešení class imbalance")
-    
-    # Argumenty pro generování
-    parser.add_argument("--model_path", type=str, default="output/labelgan/models/best_model.pt",
-                        help="Cesta k natrénovanému modelu pro generování")
-    parser.add_argument("--n_samples", type=int, default=20,
-                        help="Počet vzorků k vygenerování")
-    parser.add_argument("--use_thresholding", action="store_true",
-                        help="Použít thresholding pro binarizaci výstupů")
-    parser.add_argument("--threshold", type=float, default=0.5,
-                        help="Práh pro binarizaci (0-1)")
+    parser = argparse.ArgumentParser(description='HIE Lesion GAN Training')
+    parser.add_argument('--label_dir', type=str, required=True, 
+                        help='Directory containing registered LABEL maps')
+    parser.add_argument('--lesion_atlas_path', type=str, required=True, 
+                        help='Path to the lesion atlas file')
+    parser.add_argument('--output_dir', type=str, default='./output', 
+                        help='Output directory for models and results')
+    parser.add_argument('--batch_size', type=int, default=4, 
+                        help='Batch size for training')
+    parser.add_argument('--epochs', type=int, default=200, 
+                        help='Number of training epochs')
+    parser.add_argument('--lr_g', type=float, default=0.0001, 
+                        help='Learning rate for generator')
+    parser.add_argument('--lr_d', type=float, default=0.0004, 
+                        help='Learning rate for discriminator')
+    parser.add_argument('--z_dim', type=int, default=128, 
+                        help='Dimension of latent space')
+    parser.add_argument('--base_filters', type=int, default=64, 
+                        help='Number of base filters in networks')
+    parser.add_argument('--val_split', type=float, default=0.1, 
+                        help='Fraction of data to use for validation')
+    parser.add_argument('--use_spectral_norm', action='store_true', 
+                        help='Use spectral normalization')
+    parser.add_argument('--save_interval', type=int, default=10, 
+                        help='Save model every N epochs')
+    parser.add_argument('--num_workers', type=int, default=4, 
+                        help='Number of workers for data loading')
+    parser.add_argument('--seed', type=int, default=42, 
+                        help='Random seed for reproducibility')
+    parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu',
+                        help='Device to use (cuda or cpu)')
+    parser.add_argument('--generate_only', action='store_true',
+                        help='Only generate samples from a trained model')
+    parser.add_argument('--model_path', type=str, default=None,
+                        help='Path to the trained model for generation')
+    parser.add_argument('--num_samples', type=int, default=10,
+                        help='Number of samples to generate')
     
     args = parser.parse_args()
     
-    # Logování argumentů
-    print("Spouštím LabelGAN s následujícími argumenty:")
-    for arg, value in vars(args).items():
-        print(f"  {arg}: {value}")
+    # Nastavení seedy pro reprodukovatelnost
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(args.seed)
     
-    # Zapnutí debugovacího režimu
-    if args.debug:
-        def hook_fn(module, input, output):
-            module_name = module.__class__.__name__
-            print(f"Shape for {module_name}: input {[x.shape if x is not None else None for x in input]}, output {output.shape}")
-        
-        def register_hooks(model):
-            for name, module in model.named_modules():
-                if isinstance(module, (nn.Conv3d, nn.ConvTranspose3d, nn.BatchNorm3d)):
-                    module.register_forward_hook(hook_fn)
-        
-        print("Debug režim je zapnutý - budou vypisovány informace o rozměrech tenzorů")
+    # Vytvoření výstupních adresářů
+    os.makedirs(args.output_dir, exist_ok=True)
+    log_dir = os.path.join(args.output_dir, 'logs')
+    save_dir = os.path.join(args.output_dir, 'checkpoints')
+    samples_dir = os.path.join(args.output_dir, 'samples')
+    os.makedirs(log_dir, exist_ok=True)
+    os.makedirs(save_dir, exist_ok=True)
+    os.makedirs(samples_dir, exist_ok=True)
     
-    # Spuštění příslušného režimu
-    if args.mode == "train":
-        print("Kontrola rozměrů vstupních dat...")
-        # Načtení vzorku dat pro kontrolu rozměrů
-        dataset = LabelGANDataset(
-            label_dir=args.label_dir,
-            lesion_atlas_path=args.lesion_atlas_path,
-            augment=False
-        )
+    # Vytvoření transformace pro augmentaci
+    transform = RandomAugmentation3D(rotation_range=10, flip_prob=0.5)
+    
+    # Načtení datasetu
+    dataset = HIELesionDataset(args.label_dir, args.lesion_atlas_path, transform=transform)
+    print(f"Načteno {len(dataset)} lesion map.")
+    
+    # Rozdělení na trénovací a validační data
+    val_size = int(args.val_split * len(dataset))
+    train_size = len(dataset) - val_size
+    train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
+    
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=args.batch_size, 
+        shuffle=True, 
+        num_workers=args.num_workers,
+        pin_memory=True if torch.cuda.is_available() else False
+    )
+    
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=True if torch.cuda.is_available() else False
+    ) if val_size > 0 else None
+    
+    # Inicializace modelů
+    device = torch.device(args.device)
+    generator = Generator(
+        z_dim=args.z_dim,
+        atlas_channels=1,
+        output_channels=1,
+        base_filters=args.base_filters,
+        use_spectral_norm=args.use_spectral_norm
+    )
+    
+    discriminator = Discriminator(
+        input_channels=2,  # Lesion + Atlas
+        base_filters=args.base_filters,
+        use_spectral_norm=args.use_spectral_norm
+    )
+    
+    # Pokud máme cestu k natrénovanému modelu, načteme jej
+    if args.model_path:
+        checkpoint = torch.load(args.model_path, map_location=device)
+        generator.load_state_dict(checkpoint['generator_state_dict'])
+        if 'discriminator_state_dict' in checkpoint:
+            discriminator.load_state_dict(checkpoint['discriminator_state_dict'])
+        print(f"Model načten z: {args.model_path}")
+    
+    # Inicializace tréninkové třídy
+    trainer = HIELesionGANTrainer(
+        generator=generator,
+        discriminator=discriminator,
+        device=device,
+        dataloader=train_loader,
+        val_dataloader=val_loader,
+        z_dim=args.z_dim,
+        lr_g=args.lr_g,
+        lr_d=args.lr_d,
+        log_dir=log_dir,
+        save_dir=save_dir,
+        save_interval=args.save_interval
+    )
+    
+    # Pokud chceme pouze generovat vzorky
+    if args.generate_only:
+        if args.model_path is None:
+            print("Pro generování je potřeba specifikovat cestu k natrénovanému modelu (--model_path)")
+            return
         
-        if len(dataset) > 0:
-            sample = dataset[0]
-            label_shape = sample['label'].shape
-            atlas_shape = sample['lesion_atlas'].shape
-            print(f"Rozměry dat: LABEL mapa {label_shape}, Atlas lézí {atlas_shape}")
-            
-            # Doporučení vhodné hloubky sítě
-            min_dim = min(label_shape[1:])
-            max_depth = 0
-            while min_dim > 1:
-                min_dim = min_dim // 2
-                max_depth += 1
-            
-            recommended_depth = min(max_depth - 1, 5)  # Omezení max. hloubky na 5
-            if args.gen_depth > recommended_depth:
-                print(f"VAROVÁNÍ: Zadaná hloubka sítě (gen_depth={args.gen_depth}) může být příliš velká pro dané rozměry dat.")
-                print(f"Doporučená hloubka: {recommended_depth}")
-                
-                # Automatická korekce hloubky, pokud je zapnutý debug režim
-                if args.debug:
-                    args.gen_depth = recommended_depth
-                    print(f"V debug režimu automaticky upravuji hloubku na doporučenou hodnotu {recommended_depth}")
+        # Nahrání atlasu
+        atlas = dataset.lesion_atlas.unsqueeze(0).to(device)
         
-        # Spuštění tréninku
-        train_lesion_gan(args)
-    elif args.mode == "generate":
-        generate_lesion_samples(args)
+        # Generování vzorků
+        print(f"Generuji {args.num_samples} vzorků...")
+        trainer.generate_samples(atlas, num_samples=args.num_samples, output_dir=samples_dir)
+        print(f"Vzorky byly uloženy do: {samples_dir}")
     else:
-        print(f"Neznámý režim: {args.mode}")
+        # Trénink modelu
+        print(f"Začínám trénink na {len(train_loader)} batches, validuji na {len(val_loader) if val_loader else 0} batches.")
+        print(f"Velikost batche: {args.batch_size}, Počet epoch: {args.epochs}")
+        print(f"Zařízení: {device}, Základní počet filtrů: {args.base_filters}")
+        
+        trainer.train(num_epochs=args.epochs)
+        
+        # Generování několika ukázkových vzorků po tréninku
+        atlas = dataset.lesion_atlas.unsqueeze(0).to(device)
+        trainer.generate_samples(atlas, num_samples=args.num_samples, output_dir=samples_dir)
+        print(f"Trénink dokončen. Vzorky byly uloženy do: {samples_dir}")
+
 
 if __name__ == "__main__":
     main()
