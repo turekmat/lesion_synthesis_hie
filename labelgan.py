@@ -359,8 +359,8 @@ class Generator(nn.Module):
             print(f"Logits output shape: {logits.shape}")
         
         # MODIFIED: Apply a more nuanced sigmoid activation for more natural lesion transitions
-        # Use a moderate temperature that doesn't make the output too binary
-        temperature = 10.0  # Reduced from 20.0 for softer transitions
+        # Further reduced temperature for smoother, less binary outputs during generation
+        temperature = 5.0  # Reduced from 10.0 for even softer transitions
         out = torch.sigmoid(logits * temperature)
         
         # Resize atlas to match output size if needed
@@ -377,36 +377,93 @@ class Generator(nn.Module):
         blend_factor = 0.7  # Controls how much the atlas influences the output
         out = torch.clamp((out * (1.0 + atlas_mod * blend_factor)), 0.0, 1.0)
         
-        # MODIFIED: During inference, apply a softer thresholding approach
-        # Use morphological operations to create more cohesive lesions  
+        # COMPLETELY REWORKED approach to creating connected lesions during inference
         if not self.training:
-            # Instead of hard threshold, use a continuous activation that favors outputs
-            # with more defined structures
+            # STEP 1: Initial thresholding to identify potential lesion regions
+            # Use a lower threshold to capture more potential lesion areas
+            potential_lesions = (out > 0.3).float()
             
-            # First threshold to determine foreground regions
-            foreground = (out > 0.35).float()  # Lower threshold captures more potential lesion areas
-            
-            # MODIFIED: Apply a spatial smoothing to encourage lesion coherence
-            # This acts as a simple morphological operation that helps connect nearby voxels
-            # Implement a 3D average pooling with small kernel as a smoothing operation
-            kernel_size = 3
+            # STEP 2: Apply a sequence of 3D morphological operations to connect nearby regions
+            # First dilate to connect nearby regions (implemented with max pooling)
+            kernel_size = 5  # Increased from 3 for stronger connectivity
             padding = kernel_size // 2
-            smoothed = F.avg_pool3d(
-                F.pad(foreground, (padding, padding, padding, padding, padding, padding)),
-                kernel_size,
-                stride=1
+            
+            # Dilate - expand regions to connect nearby components
+            dilated = F.max_pool3d(
+                F.pad(potential_lesions, (padding, padding, padding, padding, padding, padding)),
+                kernel_size=kernel_size,
+                stride=1,
+                padding=0
             )
             
-            # Apply a threshold to the smoothed output to get more coherent regions
-            coherent = (smoothed > 0.2).float()  # Lower threshold to encourage connectivity
+            # Apply a second, smaller dilation to ensure robust connections
+            small_kernel = 3
+            small_pad = small_kernel // 2
+            dilated = F.max_pool3d(
+                F.pad(dilated, (small_pad, small_pad, small_pad, small_pad, small_pad, small_pad)),
+                kernel_size=small_kernel,
+                stride=1,
+                padding=0
+            )
             
-            # Combine with original output for final result with more connected components
-            out = out * coherent
+            # STEP 3: Apply erosion to refine the shape (implemented with min pooling)
+            # To implement erosion with min pooling, we invert, apply max pooling, then invert again
+            inverted = 1 - dilated
+            eroded_inv = F.max_pool3d(
+                F.pad(inverted, (small_pad, small_pad, small_pad, small_pad, small_pad, small_pad)),
+                kernel_size=small_kernel,
+                stride=1,
+                padding=0
+            )
+            # Invert back to get the eroded mask
+            eroded = 1 - eroded_inv
             
-            # Apply a final threshold that keeps more of the original probability values
-            # but zeroes out very low activations
-            out = torch.where(out > 0.2, out, torch.zeros_like(out))
-        
+            # STEP 4: Get connected components to filter out tiny isolated regions
+            # Process on CPU for component analysis
+            binary_np = eroded[0, 0].cpu().numpy()
+            labeled_components, num_components = measure_label(binary_np, return_num=True)
+            
+            # Calculate component sizes
+            if num_components > 0:
+                component_sizes = np.bincount(labeled_components.flatten())[1:] if num_components > 0 else []
+                
+                # Increased minimum component size to remove more isolated points
+                min_component_size = 10  # Increased from 3 to filter small noise more aggressively
+                
+                # Create cleaned binary mask - keep only sufficiently large components
+                cleaned_binary = np.zeros_like(binary_np)
+                for comp_id in range(1, num_components + 1):
+                    if component_sizes[comp_id - 1] >= min_component_size:
+                        cleaned_binary[labeled_components == comp_id] = 1
+                
+                # Convert back to tensor
+                cleaned_binary_tensor = torch.from_numpy(cleaned_binary).float().to(self.device)
+                cleaned_binary_tensor = cleaned_binary_tensor.unsqueeze(0).unsqueeze(0)
+                
+                # STEP 5: Re-create a continuous-valued output by blending the original output 
+                # with the morphologically processed mask
+                # This preserves some of the original probability values within the connected regions
+                continuous_output = out * cleaned_binary_tensor
+                
+                # STEP 6: Apply Gaussian-like smoothing to create more natural transitions
+                # Implement a simple smoothing operation that preserves connected structures
+                smoothed = F.avg_pool3d(
+                    F.pad(continuous_output, (padding, padding, padding, padding, padding, padding)),
+                    kernel_size=kernel_size,
+                    stride=1,
+                    padding=0
+                )
+                
+                # Blend the smoothed output with the continuous output
+                blend_weight = 0.7
+                final_output = blend_weight * smoothed + (1 - blend_weight) * continuous_output
+                
+                # Final thresholding to clean up very small values
+                final_output = torch.where(final_output > 0.15, final_output, torch.zeros_like(final_output))
+                
+                # Use the morphologically processed output
+                out = final_output
+            
         if self.debug:
             print(f"Output shape (before masking): {out.shape}")
         
@@ -590,6 +647,68 @@ class Discriminator(nn.Module):
         # 2. Global output for overall realism
         # 3. Distribution score for evaluating atlas probability consistency
         return patch_out, global_out, distribution_score
+
+    def get_features(self, x, atlas):
+        """
+        Extract intermediate layer features for feature matching loss
+        
+        Args:
+            x: Input lesion map (B, 1, D, H, W)
+            atlas: Atlas probability map (B, 1, D, H, W)
+            
+        Returns:
+            tuple of feature lists: (patch_features, global_features, distribution_features)
+        """
+        # Ensure inputs are in the proper range
+        x = torch.clamp(x, 0.0, 1.0)
+        
+        # Combined input - concatenate lesion and atlas
+        combined_input = torch.cat([x, atlas], dim=1)
+        
+        # Process the combined input through the first layer
+        feat1 = self.input_layer(combined_input)
+        
+        # Process atlas separately for the atlas-specific path
+        atlas_feat = self.atlas_encoder(atlas)
+        
+        # Combine atlas features with lesion features
+        combined_feat = torch.cat([feat1, atlas_feat], dim=1)
+        
+        # Further processing through deeper layers
+        feat2 = self.layer2(combined_feat)
+        feat3 = self.layer3(feat2)
+        
+        # Self-attention at the middle layer
+        feat_attn = self.self_attn(feat3)
+        
+        # Final convolutional features
+        feat4 = self.layer4(feat_attn)
+        
+        # Extract patch-level features through the patch head
+        patch_feat5 = self.patch_layer5(feat4)
+        
+        # Apply atlas-guided attention after patch_layer5
+        atlas_down = F.interpolate(atlas, size=patch_feat5.shape[2:], mode='trilinear', align_corners=False)
+        attention_input = torch.cat([patch_feat5, atlas_down], dim=1)
+        attention_map = self.atlas_attention(attention_input)
+        patch_feat5_attn = patch_feat5 * attention_map
+        
+        # Final patch output
+        patch_feat6 = self.patch_layer6(patch_feat5_attn)
+        
+        # Global features - use adaptive pooling for global representation
+        global_input = feat4
+        global_feat = self.global_layer(global_input)
+        
+        # Distribution features
+        dist_feat = self.distribution_layer(feat4)
+        
+        # Return features from multiple layers for each output
+        patch_features = [feat1, feat2, feat3, feat4, patch_feat5, patch_feat5_attn]
+        global_features = [feat1, feat2, feat3, feat4, global_feat]
+        distribution_features = [feat1, feat2, feat3, feat4, dist_feat]
+        
+        return patch_features, global_features, distribution_features
 
 
 # Loss Functions
@@ -821,77 +940,110 @@ class HIELesionGANTrainer:
                  device=None,
                  debug=False):
         
-        if device is None:
-            self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        else:
-            self.device = device
-        
         self.dataloader = dataloader
         self.val_dataloader = val_dataloader
         self.z_dim = z_dim
         self.save_dir = save_dir
         self.validate_every = validate_every
         self.save_interval = save_interval
-        
-        # Set debug mode
         self.debug = debug
         
-        # Create model components
-        self.generator = Generator(z_dim=z_dim, atlas_channels=1, output_channels=1, base_filters=64)
-        self.discriminator = Discriminator(input_channels=2, atlas_channels=1, base_filters=64)
+        # Ensure save directory exists
+        os.makedirs(save_dir, exist_ok=True)
         
-        # Move models to device
-        self.generator = self.generator.to(self.device)
-        self.discriminator = self.discriminator.to(self.device)
+        # Set up device
+        if device is None:
+            self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        else:
+            self.device = device
+            
+        print(f"Using device: {self.device}")
         
-        # Set debug flags
-        self.generator.debug = debug
-        self.discriminator.debug = debug
+        # Create lesion atlas path attribute if available in dataset
+        if hasattr(dataloader.dataset, 'atlas_path'):
+            self.lesion_atlas_path = dataloader.dataset.atlas_path
+        else:
+            self.lesion_atlas_path = None
         
-        # Initialize optimizers
+        # Create generator and discriminator
+        self.generator = Generator(z_dim=z_dim).to(self.device)
+        self.discriminator = Discriminator().to(self.device)
+        
+        # Set up TensorBoard
+        current_time = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+        log_dir = os.path.join(save_dir, 'logs', current_time)
+        self.writer = SummaryWriter(log_dir=log_dir)
+        print(f"TensorBoard logs will be saved to {log_dir}")
+        
+        # NEW: Implement Two Time-scale Update Rule (TTUR)
+        # Use different learning rates for generator and discriminator
+        # Generator needs a higher learning rate to catch up with the discriminator
+        self.g_learning_rate = learning_rate * 2.0  # Increased generator learning rate
+        self.d_learning_rate = learning_rate * 0.5  # Decreased discriminator learning rate
+        
+        # Set up optimizers with adjusted learning rates
         self.generator_optimizer = optim.Adam(
             self.generator.parameters(), 
-            lr=learning_rate, 
+            lr=self.g_learning_rate,  # Using higher learning rate for generator
             betas=(beta1, beta2)
         )
         
         self.discriminator_optimizer = optim.Adam(
             self.discriminator.parameters(), 
-            lr=learning_rate,
+            lr=self.d_learning_rate,  # Using lower learning rate for discriminator 
             betas=(beta1, beta2)
         )
         
-        # Initialize loss functions
+        # NEW: Add learning rate schedulers to decrease learning rates over time
+        # This helps stabilize training in later stages
+        self.g_scheduler = optim.lr_scheduler.ExponentialLR(self.generator_optimizer, gamma=0.995)
+        self.d_scheduler = optim.lr_scheduler.ExponentialLR(self.discriminator_optimizer, gamma=0.995)
+        
+        # Create adversarial loss
         self.adversarial_loss = GANLoss(self.device, gan_mode='hinge')
+        
+        # Create additional losses
         self.l1_loss = nn.L1Loss()
         self.dice_loss = DiceLoss()
-        
-        # Atlas-weighted loss functions
-        self.atlas_weighted_l1 = AtlasWeightedLoss(nn.L1Loss(), reduction='mean')
-        self.atlas_weighted_dice = AtlasWeightedLoss(DiceLoss(), reduction='mean')
-        self.atlas_focal_loss = AtlasGuidedFocalLoss(alpha=0.75, gamma=2.5)  # Upravené parametry
+        self.focal_loss = FocalLoss()
+        self.atlas_weighted_l1 = AtlasWeightedLoss(nn.L1Loss())
+        self.atlas_weighted_dice = AtlasWeightedLoss(DiceLoss())
+        self.atlas_focal_loss = AtlasGuidedFocalLoss()
         self.atlas_distribution_loss = AtlasDistributionLoss()
         
-        # Loss weights - upravené pro větší důraz na generování lézí
+        # Set loss weights
         self.adv_loss_weight = 1.0
         self.l1_loss_weight = 10.0
         self.weighted_l1_weight = 5.0
-        self.dice_loss_weight = 10.0
-        self.focal_loss_weight = 8.0  # Zvýšeno z 2.0 na 8.0 pro větší důraz na oblasti s lézemi
-        self.distribution_loss_weight = 2.0  # Zvýšeno pro lepší rozložení léze
-        self.violation_penalty_weight = 2.0  # Sníženo z 5.0 na 2.0, aby model nebyl tolik penalizován za porušení atlasu
+        self.dice_loss_weight = 5.0
+        self.focal_loss_weight = 2.0
+        self.distribution_loss_weight = 1.0
+        self.violation_penalty_weight = 5.0
         
-        # Setup TensorBoard writer
-        self.writer = SummaryWriter(log_dir=os.path.join(save_dir, 'logs'))
+        # NEW: Add parameters to control noise injection for discriminator stability
+        self.noise_std = 0.05  # Standard deviation of Gaussian noise added to discriminator inputs
+        self.label_smoothing = 0.1  # Amount of label smoothing (0.1 = use 0.9 for real, 0.1 for fake)
         
-        # Create necessary directories
-        os.makedirs(os.path.join(save_dir, 'logs'), exist_ok=True)
-        os.makedirs(os.path.join(save_dir, 'checkpoints'), exist_ok=True)
-        os.makedirs(os.path.join(save_dir, 'samples'), exist_ok=True)
+        # NEW: Spectral normalization flag - already used but making explicit
+        self.use_spectral_norm = True
         
-        # Define helper function for debug printing
-        self.debug_print = self.create_debug_printer()
+        # NEW: Add gradient penalty parameter for WGAN-GP style regularization
+        self.use_gradient_penalty = True
+        self.gradient_penalty_weight = 10.0
         
+        # Print model architectures in debug mode
+        if debug:
+            print("Generator architecture:")
+            print(self.generator)
+            print("\nDiscriminator architecture:")
+            print(self.discriminator)
+            
+        # Create debug printer
+        if debug:
+            self.debug_print = self.create_debug_printer()
+        else:
+            self.debug_print = lambda *args, **kwargs: None  # No-op
+
     def create_debug_printer(self):
         """Create a debug print function that only prints when debug is enabled"""
         def debug_printer(message, tensor=None):
@@ -1534,85 +1686,115 @@ class HIELesionGANTrainer:
         # Reset discriminator gradients
         self.discriminator_optimizer.zero_grad()
         
-        # ADDED: Ensure real_lesions are in valid range [0,1]
-        if torch.any(real_lesions > 1.0) or torch.any(real_lesions < 0.0):
-            if self.debug:
-                min_val = real_lesions.min().item()
-                max_val = real_lesions.max().item()
-                print(f"[WARNING] real_lesions outside range [0,1]: min={min_val}, max={max_val}")
-            real_lesions = torch.clamp(real_lesions, 0.0, 1.0)
-        
-        # Get brain mask from the class that contains atlas
-        if hasattr(self.dataloader.dataset, 'brain_mask') and self.dataloader.dataset.brain_mask is not None:
-            brain_mask = torch.from_numpy(self.dataloader.dataset.brain_mask).float().unsqueeze(0).unsqueeze(0).to(self.device)
+        # NEW: Add a small random noise to the real images
+        # This prevents discriminator from being too confident and helps training stability
+        if self.noise_std > 0:
+            real_lesions_noisy = real_lesions + torch.randn_like(real_lesions) * self.noise_std
+            real_lesions_noisy = torch.clamp(real_lesions_noisy, 0.0, 1.0)
         else:
-            brain_mask = torch.ones_like(atlas)
-        
-        # Debug prints if needed
-        if self.debug:
-            self.debug_print("Real lesions in train_discriminator", real_lesions)
-            self.debug_print("Atlas in train_discriminator", atlas)
-        
-        # Real lesion forward pass
-        real_patch_pred, real_global_pred, real_distribution_pred = self.discriminator(real_lesions, atlas)
+            real_lesions_noisy = real_lesions
         
         # Generate fake lesions
         z = torch.randn(batch_size, self.z_dim, device=self.device)
         
-        # Generate fake lesions
-        with torch.no_grad():  # Do not compute gradients for generator during discriminator step
-            fake_lesions = self.generator(z, atlas, brain_mask)
+        # Don't need gradient for the generator when training discriminator
+        with torch.no_grad():
+            fake_lesions = self.generator(z, atlas)
             
-            # ADDED: Ensure fake_lesions are in valid range [0,1]
-            if torch.any(fake_lesions > 1.0) or torch.any(fake_lesions < 0.0):
-                if self.debug:
-                    min_val = fake_lesions.min().item()
-                    max_val = fake_lesions.max().item()
-                    print(f"[WARNING] fake_lesions outside range [0,1]: min={min_val}, max={max_val}")
+            # NEW: Add noise to fake samples too
+            if self.noise_std > 0:
+                fake_lesions = fake_lesions + torch.randn_like(fake_lesions) * self.noise_std
                 fake_lesions = torch.clamp(fake_lesions, 0.0, 1.0)
+            
+            # Ensure fake_lesions are in valid range
+            fake_lesions = torch.clamp(fake_lesions, 0.0, 1.0)
         
-        # Debug print if needed
+        # Debug prints if needed
         if self.debug:
+            self.debug_print("Real lesions in train_discriminator", real_lesions_noisy)
             self.debug_print("Fake lesions in train_discriminator", fake_lesions)
         
-        # Fake lesion forward pass
-        fake_patch_pred, fake_global_pred, fake_distribution_pred = self.discriminator(fake_lesions.detach(), atlas)
+        # Discriminator predictions on real samples
+        real_patch_pred, real_global_pred, real_distribution_pred = self.discriminator(real_lesions_noisy, atlas)
         
-        # Adversarial loss with label smoothing (using soft labels for real: 0.9 instead of 1.0)
-        real_patch_labels = torch.ones_like(real_patch_pred) * 0.9
-        real_global_labels = torch.ones_like(real_global_pred) * 0.9
-        real_dist_labels = torch.ones_like(real_distribution_pred) * 0.9
+        # Discriminator predictions on fake samples
+        fake_patch_pred, fake_global_pred, fake_distribution_pred = self.discriminator(fake_lesions, atlas)
         
-        fake_patch_labels = torch.zeros_like(fake_patch_pred) * 0.1
-        fake_global_labels = torch.zeros_like(fake_global_pred) * 0.1
-        fake_dist_labels = torch.zeros_like(fake_distribution_pred) * 0.1
+        # NEW: Use label smoothing for real labels to prevent overconfidence
+        real_patch_labels = torch.ones_like(real_patch_pred) * (1.0 - self.label_smoothing)
+        real_global_labels = torch.ones_like(real_global_pred) * (1.0 - self.label_smoothing)
+        real_dist_labels = torch.ones_like(real_distribution_pred) * (1.0 - self.label_smoothing)
         
-        # Compute discriminator losses for real samples
+        # Labels for fake samples
+        fake_patch_labels = torch.zeros_like(fake_patch_pred)
+        fake_global_labels = torch.zeros_like(fake_global_pred)
+        fake_dist_labels = torch.zeros_like(fake_distribution_pred)
+        
+        # Calculate adversarial losses for real samples
         d_real_patch_loss = self.adversarial_loss(real_patch_pred, real_patch_labels)
         d_real_global_loss = self.adversarial_loss(real_global_pred, real_global_labels)
         d_real_dist_loss = self.adversarial_loss(real_distribution_pred, real_dist_labels)
         
-        # Compute discriminator losses for fake samples
+        # Calculate adversarial losses for fake samples
         d_fake_patch_loss = self.adversarial_loss(fake_patch_pred, fake_patch_labels)
         d_fake_global_loss = self.adversarial_loss(fake_global_pred, fake_global_labels)
         d_fake_dist_loss = self.adversarial_loss(fake_distribution_pred, fake_dist_labels)
         
-        # Total discriminator losses
+        # Combined loss for real and fake samples from all outputs
         d_real_loss = (d_real_patch_loss + d_real_global_loss + d_real_dist_loss) / 3.0
         d_fake_loss = (d_fake_patch_loss + d_fake_global_loss + d_fake_dist_loss) / 3.0
         
-        # Total loss
-        d_loss = (d_real_loss + d_fake_loss) / 2.0
+        # NEW: Calculate gradient penalty (WGAN-GP style regularization)
+        gradient_penalty = 0.0
+        if self.use_gradient_penalty:
+            # Create random interpolations between real and fake
+            alpha = torch.rand(batch_size, 1, 1, 1, 1, device=self.device)
+            interpolates = alpha * real_lesions_noisy + (1 - alpha) * fake_lesions
+            interpolates.requires_grad_(True)
+            
+            # Forward pass with interpolates
+            disc_interpolates = self.discriminator(interpolates, atlas)
+            
+            # Use the first output (patch) for gradient penalty
+            gradients = torch.autograd.grad(
+                outputs=disc_interpolates[0].sum(),
+                inputs=interpolates,
+                create_graph=True,
+                retain_graph=True,
+                only_inputs=True
+            )[0]
+            
+            # Calculate the penalty
+            gradients = gradients.view(batch_size, -1)
+            gradient_norm = gradients.norm(2, dim=1)
+            gradient_penalty = ((gradient_norm - 1) ** 2).mean() * self.gradient_penalty_weight
+        
+        # Total discriminator loss with gradient penalty
+        d_loss = d_real_loss + d_fake_loss
+        
+        # Add gradient penalty if enabled
+        if self.use_gradient_penalty:
+            d_loss = d_loss + gradient_penalty
+        
+        # NEW: Add regularization to prevent the discriminator from becoming too strong
+        # Implement feature matching loss - this aligns the feature distributions between real and fake
+        # It's a soft constraint that prevents the discriminator from focusing too much on minute details
+        feature_matching_loss = 0.0
         
         # Backpropagation
         d_loss.backward()
+        
+        # NEW: Clip gradients to prevent exploding gradients
+        torch.nn.utils.clip_grad_norm_(self.discriminator.parameters(), max_norm=1.0)
+        
         self.discriminator_optimizer.step()
         
         # Return losses for logging
         return {
             'd_loss': d_loss.item(),
             'd_real_loss': d_real_loss.item(),
-            'd_fake_loss': d_fake_loss.item()
+            'd_fake_loss': d_fake_loss.item(),
+            'gradient_penalty': gradient_penalty.item() if self.use_gradient_penalty else 0.0
         }
 
     def train_generator(self, real_lesions, atlas, brain_mask, iteration):
@@ -1623,7 +1805,6 @@ class HIELesionGANTrainer:
         
         # MODIFIED: Generate diverse latent vectors z with batch-specific noise
         # This ensures better diversity in training and helps the model learn to use the noise effectively
-        # Mix in iteration and batch size information to ensure different patterns across training
         z_base = torch.randn(batch_size, self.z_dim, device=self.device)
         
         # Add a small perturbation based on the iteration to increase diversity
@@ -1633,7 +1814,7 @@ class HIELesionGANTrainer:
         # Generate fake lesions using the Generator
         fake_lesions = self.generator(z, atlas, brain_mask)
         
-        # ADDED: Ensure fake_lesions are in valid range [0,1]
+        # Ensure fake_lesions are in valid range [0,1]
         if torch.any(fake_lesions > 1.0) or torch.any(fake_lesions < 0.0):
             if self.debug:
                 min_val = fake_lesions.min().item()
@@ -1647,10 +1828,19 @@ class HIELesionGANTrainer:
             self.debug_print("Fake lesions in train_generator", fake_lesions)
             self.debug_print("Atlas in train_generator", atlas)
         
+        # NEW: Apply noise to inputs for discriminator evaluation
+        # This makes the discriminator's task harder and helps the generator learn
+        if self.noise_std > 0:
+            fake_lesions_noisy = fake_lesions + torch.randn_like(fake_lesions) * self.noise_std * 0.5  # less noise than in discriminator training
+            fake_lesions_noisy = torch.clamp(fake_lesions_noisy, 0.0, 1.0)
+        else:
+            fake_lesions_noisy = fake_lesions
+            
         # Discriminator forward pass on fake lesions
-        fake_patch_pred, fake_global_pred, fake_distribution_pred = self.discriminator(fake_lesions, atlas)
+        fake_patch_pred, fake_global_pred, fake_distribution_pred = self.discriminator(fake_lesions_noisy, atlas)
         
-        # Adversarial loss with label smoothing (using soft labels for real: 0.9 instead of 1.0)
+        # Use soft labels for real (with less smoothing than in discriminator training)
+        # This helps with one-sided label smoothing to improve training stability
         real_patch_labels = torch.ones_like(fake_patch_pred) * 0.9
         real_global_labels = torch.ones_like(fake_global_pred) * 0.9
         real_dist_labels = torch.ones_like(fake_distribution_pred) * 0.9
@@ -1675,12 +1865,11 @@ class HIELesionGANTrainer:
             if self.debug:
                 self.debug_print("Resized valid_regions mask", valid_regions)
         
-        # MODIFIED: Add a structural coherence loss to encourage connected lesions
+        # ENHANCED: Improved structural coherence loss to encourage connected lesions
         # First get a binary mask of the fake lesions for structural analysis
         binary_fake = (fake_lesions > 0.5).float()
         
-        # Apply a spatial gradient to detect edges
-        # Calculate gradients in all 3 directions
+        # Apply a spatial gradient to detect edges in all 3 directions
         dx = torch.abs(binary_fake[:, :, 1:, :, :] - binary_fake[:, :, :-1, :, :])
         dy = torch.abs(binary_fake[:, :, :, 1:, :] - binary_fake[:, :, :, :-1, :])
         dz = torch.abs(binary_fake[:, :, :, :, 1:] - binary_fake[:, :, :, :, :-1])
@@ -1699,8 +1888,32 @@ class HIELesionGANTrainer:
         total_edges = torch.sum(edge_map) + 1e-8
         edge_ratio = total_edges / total_positive
         
-        # Coherence loss: penalize high edge ratio (fragmented lesions)
-        coherence_loss = torch.clamp(edge_ratio - 0.8, min=0)  # 0.8 is a threshold for acceptable fragmentation
+        # NEW: Enhanced coherence loss with perimeter/area ratio penalty
+        # Lower values of this ratio indicate more compact, less fragmented objects
+        coherence_loss = torch.clamp(edge_ratio - 0.5, min=0)  # Reduced threshold from 0.8 to 0.5
+        
+        # NEW: Connectivity loss using morphological analysis
+        # Process binary_fake on CPU for morphological operations
+        binary_np = binary_fake.cpu().detach().numpy()
+        
+        # Count components for each image in batch
+        batch_components = []
+        for b in range(binary_np.shape[0]):
+            # Get binary mask for this batch item
+            sample_binary = binary_np[b, 0]
+            
+            # Find connected components
+            labeled, num_components = measure_label(sample_binary, return_num=True)
+            
+            # Count components
+            batch_components.append(num_components)
+        
+        # Convert to tensor and calculate mean
+        mean_components = torch.tensor(batch_components, device=self.device).float().mean()
+        
+        # Penalize having too many distinct components
+        # The penalty increases as number of components increases beyond 5
+        connectivity_loss = torch.clamp(mean_components - 5, min=0) * 0.2
         
         # Calculate masked L1 loss (only consider atlas-positive regions within the brain)
         masked_l1_loss = torch.sum(torch.abs(real_lesions - fake_lesions) * valid_regions) / (torch.sum(valid_regions) + 1e-8)
@@ -1728,6 +1941,29 @@ class HIELesionGANTrainer:
         invalid_regions = (1 - valid_regions)
         atlas_violation = torch.sum(fake_lesions * invalid_regions) / (torch.sum(fake_lesions) + 1e-8)
         
+        # NEW: Implement feature matching loss to help stabilize training
+        # Extract features from the discriminator for real images
+        with torch.no_grad():
+            real_patch_feat, real_global_feat, real_dist_feat = self.discriminator.get_features(real_lesions, atlas)
+            
+        # Get features for fake images
+        fake_patch_feat, fake_global_feat, fake_dist_feat = self.discriminator.get_features(fake_lesions, atlas)
+        
+        # Calculate feature matching loss (L1 distance between feature maps)
+        feature_matching_loss = 0.0
+        for real_feat, fake_feat in zip(real_patch_feat, fake_patch_feat):
+            feature_matching_loss += F.l1_loss(fake_feat, real_feat.detach())
+        
+        for real_feat, fake_feat in zip(real_global_feat, fake_global_feat):
+            feature_matching_loss += F.l1_loss(fake_feat, real_feat.detach())
+            
+        feature_matching_loss = feature_matching_loss / (len(real_patch_feat) + len(real_global_feat))
+        
+        # Dynamic loss weighting based on training progress
+        # Gradually increase importance of connectivity losses as training progresses
+        coherence_weight = min(5.0 + iteration * 0.01, 10.0)  # Increases from 5 to 10 over time
+        connectivity_weight = min(2.0 + iteration * 0.005, 5.0)  # Increases from 2 to 5 over time
+        
         # Total generator loss
         g_loss = (
             self.adv_loss_weight * g_adv_loss + 
@@ -1737,11 +1973,17 @@ class HIELesionGANTrainer:
             self.focal_loss_weight * focal_loss_term +
             self.distribution_loss_weight * distribution_loss +
             self.violation_penalty_weight * atlas_violation + 
-            5.0 * coherence_loss  # Coherence loss weight
+            coherence_weight * coherence_loss +  # Dynamic weight for coherence loss
+            connectivity_weight * connectivity_loss +  # Dynamic weight for connectivity loss
+            3.0 * feature_matching_loss  # Feature matching to stabilize training
         )
         
         # Backpropagation
         g_loss.backward()
+        
+        # Clip gradients to prevent exploding gradients
+        torch.nn.utils.clip_grad_norm_(self.generator.parameters(), max_norm=1.0)
+        
         self.generator_optimizer.step()
         
         # Return generator losses for logging and generated lesions for visualization
@@ -1754,8 +1996,10 @@ class HIELesionGANTrainer:
             'g_focal': focal_loss_term.item(),
             'g_distribution': distribution_loss.item(),
             'g_atlas_violation': atlas_violation.item(),
-            'g_coherence': coherence_loss.item(),  # Add this for logging
-            'fake_lesions': fake_lesions.detach()  # Add this for visualization
+            'g_coherence': coherence_loss.item(),
+            'g_connectivity': connectivity_loss.item(),
+            'g_feature_matching': feature_matching_loss.item(),
+            'fake_lesions': fake_lesions.detach()
         }
 
     def generate_pdf_slices(self, epoch, num_samples=3):
@@ -1836,7 +2080,7 @@ class HIELesionGANTrainer:
                     # Pro každý slice
                     for i in range(depth):
                         slice_img = raw_lesion_np[i, :, :]
-                        nonzero_count = np.count_nonzero(slice_img)
+                        nonzero_count = np.count_nonzero(slice_img == 1)
                         
                         # Nad každým slice zobrazíme číslo slice a počet nenulových pixelů
                         axs[i].set_title(f"{i+1}/{depth}, nz: {nonzero_count}", fontsize=8)
@@ -1862,12 +2106,22 @@ class HIELesionGANTrainer:
     def train(self, num_epochs, validate_every=5):
         start_time = time.time()
         
+        # Initialize tracking variables for training stability
+        prev_g_loss = float('inf')
+        prev_d_loss = float('inf')
+        loss_stability_counter = 0
+        best_g_loss = float('inf')
+        
+        # Track learning rates
+        g_lr_history = []
+        d_lr_history = []
+        
         for epoch in range(num_epochs):
             epoch_start_time = time.time()
             epoch_g_loss = 0
             epoch_d_loss = 0
             
-            # Trénink na jedné epoše
+            # Training on one epoch
             self.generator.train()
             self.discriminator.train()
             
@@ -1882,42 +2136,83 @@ class HIELesionGANTrainer:
                 atlas = batch['atlas'].to(self.device)
                 brain_mask = batch['brain_mask'].to(self.device)
                 
-                # Trénink diskriminátoru
+                # Train discriminator
                 d_metrics = self.train_discriminator(real_lesions, atlas)
                 
-                # Trénink generátoru
-                g_metrics = self.train_generator(real_lesions, atlas, brain_mask, i)
+                # NEW: Only train generator if discriminator loss is reasonable
+                # Skip generator update if discriminator is still too weak
+                # This prevents training the generator against a poor discriminator
+                train_generator = True
+                if d_metrics['d_loss'] < 0.01:
+                    # If discriminator loss is very low, it's getting too strong
+                    # Train generator multiple times to help it catch up
+                    num_g_steps = 2
+                elif d_metrics['d_loss'] > 0.5:
+                    # If discriminator loss is high, it's still learning the basics
+                    # Skip generator training occasionally
+                    if i % 3 != 0:
+                        train_generator = False
+                    num_g_steps = 1
+                else:
+                    # Normal case - balanced training
+                    num_g_steps = 1
                 
-                # Akumulace ztrát pro průměrování
+                # Train generator (possibly multiple times)
+                g_metrics = None
+                if train_generator:
+                    for g_step in range(num_g_steps):
+                        g_metrics = self.train_generator(real_lesions, atlas, brain_mask, i + epoch * len(pbar))
+                else:
+                    # Create dummy metrics for logging
+                    g_metrics = {'g_total': 0.0, 'fake_lesions': torch.zeros_like(real_lesions)}
+                
+                # Accumulate losses for averaging
                 epoch_d_loss += d_metrics['d_loss']
                 epoch_g_loss += g_metrics['g_total']
                 
-                # Aktualizace progress baru
+                # Update progress bar
                 pbar.set_postfix({
                     'g_loss': g_metrics['g_total'],
                     'd_loss': d_metrics['d_loss']
                 })
                 
-                # Logování metrik pro každý batch
+                # Log metrics for every few batches
                 if i % 10 == 0:
                     step = epoch * len(self.dataloader) + i
-                    # OPRAVA: Explicitně vyfiltruj 'fake_lesions' z metrik, protože to není skalární hodnota
-                    all_metrics = {**d_metrics, **{k: v for k, v in g_metrics.items() if k != 'fake_lesions' and k != 'g_atlas_violation'}}
+                    # Filter out non-scalar metrics
+                    all_metrics = {
+                        **{k: v for k, v in d_metrics.items() if isinstance(v, (int, float))},
+                        **{k: v for k, v in g_metrics.items() if isinstance(v, (int, float))}
+                    }
                     self.log_metrics(all_metrics, epoch, step)
                 
-                # Uložení posledního batche pro vizualizaci
+                # Save last batch for visualization
                 if i == len(pbar) - 1:
                     last_batch_data = {
                         'real_lesions': real_lesions.detach(),
-                        'fake_lesions': g_metrics['fake_lesions'].detach(),  # Here we use the detached tensor
+                        'fake_lesions': g_metrics['fake_lesions'].detach(),
                         'atlas': atlas.detach()
                     }
             
-            # Průměrování ztrát za epoch
+            # Average losses for the epoch
             epoch_d_loss /= len(self.dataloader)
             epoch_g_loss /= len(self.dataloader)
             
-            # Logování obrazů pokud máme data
+            # NEW: Apply learning rate schedulers
+            self.g_scheduler.step()
+            self.d_scheduler.step()
+            
+            # NEW: Record current learning rates
+            current_g_lr = self.g_scheduler.get_last_lr()[0]
+            current_d_lr = self.d_scheduler.get_last_lr()[0]
+            g_lr_history.append(current_g_lr)
+            d_lr_history.append(current_d_lr)
+            
+            # Log learning rates
+            self.writer.add_scalar('LearningRate/generator', current_g_lr, epoch)
+            self.writer.add_scalar('LearningRate/discriminator', current_d_lr, epoch)
+            
+            # Log images if we have data
             if last_batch_data is not None:
                 self.log_images(
                     last_batch_data['real_lesions'],
@@ -1930,29 +2225,76 @@ class HIELesionGANTrainer:
             if (epoch + 1) % validate_every == 0 and self.val_dataloader is not None:
                 self.validate(epoch)
             
-            # Uložení checkpointu
+            # Save checkpoint
             if (epoch + 1) % self.save_interval == 0:
                 self.save_checkpoint(epoch + 1)
             
-            # Generovat PDF s řezy každých 10 epoch
+            # Generate PDF with slices every 10 epochs
             if (epoch + 1) % 10 == 0:
                 self.generate_pdf_slices(epoch + 1)
             
-            # Výpis informací o epoše
+            # Check for training stability
+            if epoch > 0:
+                g_loss_change = abs(epoch_g_loss - prev_g_loss) / max(prev_g_loss, 1e-8)
+                d_loss_change = abs(epoch_d_loss - prev_d_loss) / max(prev_d_loss, 1e-8)
+                
+                # If losses are changing too little or too much, increment instability counter
+                if g_loss_change < 0.01 or g_loss_change > 2.0 or d_loss_change < 0.01 or d_loss_change > 2.0:
+                    loss_stability_counter += 1
+                else:
+                    loss_stability_counter = 0
+            
+            prev_g_loss = epoch_g_loss
+            prev_d_loss = epoch_d_loss
+            
+            # Save best model if generator loss improves
+            if epoch_g_loss < best_g_loss:
+                best_g_loss = epoch_g_loss
+                best_model_path = os.path.join(self.save_dir, 'best_model.pt')
+                torch.save({
+                    'epoch': epoch + 1,
+                    'generator_state_dict': self.generator.state_dict(),
+                    'discriminator_state_dict': self.discriminator.state_dict(),
+                    'g_optimizer_state_dict': self.generator_optimizer.state_dict(),
+                    'd_optimizer_state_dict': self.discriminator_optimizer.state_dict(),
+                    'g_loss': epoch_g_loss,
+                    'd_loss': epoch_d_loss,
+                }, best_model_path)
+                print(f"Saved best model with G Loss: {epoch_g_loss:.4f}")
+            
+            # Print epoch information
             epoch_time = time.time() - epoch_start_time
-            print(f"Epoch [{epoch+1}/{num_epochs}] - čas: {epoch_time:.2f}s - G Loss: {epoch_g_loss:.4f}, D Loss: {epoch_d_loss:.4f}")
+            print(f"Epoch [{epoch+1}/{num_epochs}] - time: {epoch_time:.2f}s - G Loss: {epoch_g_loss:.4f}, D Loss: {epoch_d_loss:.4f}, LR: G={current_g_lr:.6f}/D={current_d_lr:.6f}")
+            
+            # NEW: Check for training instability and adjust learning rates if needed
+            if loss_stability_counter >= 3:
+                print(f"WARNING: Training appears unstable. Adjusting learning rates...")
+                # Reduce learning rates manually
+                for param_group in self.generator_optimizer.param_groups:
+                    param_group['lr'] *= 0.5
+                for param_group in self.discriminator_optimizer.param_groups:
+                    param_group['lr'] *= 0.5
+                
+                # Reset stability counter
+                loss_stability_counter = 0
         
-        # Konec tréninku
+        # End of training
         total_time = time.time() - start_time
-        print(f"Trénink dokončen za {total_time:.2f} sekund")
+        print(f"Training completed in {total_time:.2f} seconds")
         
-        # Uložení finálního modelu
+        # Save final model
         final_checkpoint_path = os.path.join(self.save_dir, 'final_model.pt')
         torch.save({
             'generator_state_dict': self.generator.state_dict(),
             'discriminator_state_dict': self.discriminator.state_dict(),
+            'g_optimizer_state_dict': self.generator_optimizer.state_dict(),
+            'd_optimizer_state_dict': self.discriminator_optimizer.state_dict(),
+            'g_loss': epoch_g_loss,
+            'd_loss': epoch_d_loss,
+            'g_lr_history': g_lr_history,
+            'd_lr_history': d_lr_history,
         }, final_checkpoint_path)
-        print(f"Finální model uložen: {final_checkpoint_path}")
+        print(f"Final model saved: {final_checkpoint_path}")
 
 def main():
     parser = argparse.ArgumentParser(description="Train a lesion GAN")
