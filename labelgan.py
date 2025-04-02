@@ -373,7 +373,8 @@ class Generator(nn.Module):
         
         # Blend the generated output with the atlas probability
         # This makes lesions more likely in high-probability regions
-        out = out * (1.0 + atlas_mod)
+        # MODIFIED: Ensure output is clamped to [0,1] range
+        out = torch.clamp(out * (1.0 + atlas_mod), 0.0, 1.0)
         
         # Binarize the output to ensure truly binary masks during inference
         # During training we use the continuous version for gradient flow
@@ -708,6 +709,10 @@ class AtlasGuidedFocalLoss(nn.Module):
         if inputs.shape[2:] != atlas.shape[2:]:
             atlas = F.interpolate(atlas, size=inputs.shape[2:], mode='trilinear', align_corners=False)
         
+        # ADDED: Ensure inputs and targets are in range [0, 1]
+        inputs = torch.clamp(inputs, 0.0, 1.0)
+        targets = torch.clamp(targets, 0.0, 1.0)
+        
         # Regular focal loss term
         BCE_loss = self.bce(inputs, targets)
         pt = torch.exp(-BCE_loss)
@@ -749,6 +754,9 @@ class AtlasDistributionLoss(nn.Module):
         # Ensure dimensions match
         if lesions.shape[2:] != atlas.shape[2:]:
             atlas = F.interpolate(atlas, size=lesions.shape[2:], mode='trilinear', align_corners=False)
+        
+        # ADDED: Ensure lesions are non-negative for a valid distribution
+        lesions = torch.clamp(lesions, 0.0, 1.0)
         
         # Normalize atlas to sum to 1 (probability distribution)
         atlas_sum = torch.sum(atlas, dim=(2, 3, 4), keepdim=True) + 1e-8
@@ -911,12 +919,28 @@ class HIELesionGANTrainer:
                 atlas = batch['atlas'].to(self.device)
                 brain_mask = batch['brain_mask'].to(self.device)
                 
+                # ADDED: Ensure real_lesions are in valid range [0,1]
+                if torch.any(real_lesions > 1.0) or torch.any(real_lesions < 0.0):
+                    if self.debug:
+                        min_val = real_lesions.min().item()
+                        max_val = real_lesions.max().item()
+                        print(f"[WARNING] real_lesions outside range [0,1] during validation: min={min_val}, max={max_val}")
+                    real_lesions = torch.clamp(real_lesions, 0.0, 1.0)
+                
                 batch_size = real_lesions.size(0)
                 num_batches += 1
                 
                 # Generate fake lesions
                 z = torch.randn(batch_size, self.z_dim, device=self.device)
                 fake_lesions = self.generator(z, atlas, brain_mask)
+                
+                # ADDED: Ensure fake_lesions are in valid range [0,1]
+                if torch.any(fake_lesions > 1.0) or torch.any(fake_lesions < 0.0):
+                    if self.debug:
+                        min_val = fake_lesions.min().item()
+                        max_val = fake_lesions.max().item()
+                        print(f"[WARNING] fake_lesions outside range [0,1] during validation: min={min_val}, max={max_val}")
+                    fake_lesions = torch.clamp(fake_lesions, 0.0, 1.0)
                 
                 # Debug prints of tensor shapes if needed
                 if self.debug_print:
@@ -1422,6 +1446,14 @@ class HIELesionGANTrainer:
         # Reset discriminator gradients
         self.discriminator_optimizer.zero_grad()
         
+        # ADDED: Ensure real_lesions are in valid range [0,1]
+        if torch.any(real_lesions > 1.0) or torch.any(real_lesions < 0.0):
+            if self.debug:
+                min_val = real_lesions.min().item()
+                max_val = real_lesions.max().item()
+                print(f"[WARNING] real_lesions outside range [0,1]: min={min_val}, max={max_val}")
+            real_lesions = torch.clamp(real_lesions, 0.0, 1.0)
+        
         # Get brain mask from the class that contains atlas
         if hasattr(self.dataloader.dataset, 'brain_mask') and self.dataloader.dataset.brain_mask is not None:
             brain_mask = torch.from_numpy(self.dataloader.dataset.brain_mask).float().unsqueeze(0).unsqueeze(0).to(self.device)
@@ -1442,6 +1474,14 @@ class HIELesionGANTrainer:
         # Generate fake lesions
         with torch.no_grad():  # Do not compute gradients for generator during discriminator step
             fake_lesions = self.generator(z, atlas, brain_mask)
+            
+            # ADDED: Ensure fake_lesions are in valid range [0,1]
+            if torch.any(fake_lesions > 1.0) or torch.any(fake_lesions < 0.0):
+                if self.debug:
+                    min_val = fake_lesions.min().item()
+                    max_val = fake_lesions.max().item()
+                    print(f"[WARNING] fake_lesions outside range [0,1]: min={min_val}, max={max_val}")
+                fake_lesions = torch.clamp(fake_lesions, 0.0, 1.0)
         
         # Debug print if needed
         if self.debug:
@@ -1498,6 +1538,14 @@ class HIELesionGANTrainer:
         
         # Generate fake lesions using the Generator
         fake_lesions = self.generator(z, atlas, brain_mask)
+        
+        # ADDED: Ensure fake_lesions are in valid range [0,1]
+        if torch.any(fake_lesions > 1.0) or torch.any(fake_lesions < 0.0):
+            if self.debug:
+                min_val = fake_lesions.min().item()
+                max_val = fake_lesions.max().item()
+                print(f"[WARNING] fake_lesions outside range [0,1]: min={min_val}, max={max_val}")
+            fake_lesions = torch.clamp(fake_lesions, 0.0, 1.0)
         
         # Debug prints if needed
         if self.debug:
