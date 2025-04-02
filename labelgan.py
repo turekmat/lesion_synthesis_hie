@@ -684,29 +684,18 @@ class Discriminator(nn.Module):
         # Final convolutional features
         feat4 = self.layer4(feat_attn)
         
-        # Extract patch-level features through the patch head
-        patch_feat5 = self.patch_layer5(feat4)
+        # Get patch, global, and distribution features based on how forward() uses these features
+        # Determine which internal layers are used for each output path
         
-        # Apply atlas-guided attention after patch_layer5
-        atlas_down = F.interpolate(atlas, size=patch_feat5.shape[2:], mode='trilinear', align_corners=False)
-        attention_input = torch.cat([patch_feat5, atlas_down], dim=1)
-        attention_map = self.atlas_attention(attention_input)
-        patch_feat5_attn = patch_feat5 * attention_map
+        # For patch output: Use all features up to patch-specific outputs
+        # Simplified - just use the core feature hierarchy
+        patch_features = [feat1, feat2, feat3, feat4]
         
-        # Final patch output
-        patch_feat6 = self.patch_layer6(patch_feat5_attn)
+        # For global output: Similar approach, just use the core feature hierarchy
+        global_features = [feat1, feat2, feat3, feat4]
         
-        # Global features - use adaptive pooling for global representation
-        global_input = feat4
-        global_feat = self.global_layer(global_input)
-        
-        # Distribution features
-        dist_feat = self.distribution_layer(feat4)
-        
-        # Return features from multiple layers for each output
-        patch_features = [feat1, feat2, feat3, feat4, patch_feat5, patch_feat5_attn]
-        global_features = [feat1, feat2, feat3, feat4, global_feat]
-        distribution_features = [feat1, feat2, feat3, feat4, dist_feat]
+        # For distribution features: Same approach
+        distribution_features = [feat1, feat2, feat3, feat4]
         
         return patch_features, global_features, distribution_features
 
@@ -1951,13 +1940,21 @@ class HIELesionGANTrainer:
         
         # Calculate feature matching loss (L1 distance between feature maps)
         feature_matching_loss = 0.0
-        for real_feat, fake_feat in zip(real_patch_feat, fake_patch_feat):
-            feature_matching_loss += F.l1_loss(fake_feat, real_feat.detach())
         
-        for real_feat, fake_feat in zip(real_global_feat, fake_global_feat):
-            feature_matching_loss += F.l1_loss(fake_feat, real_feat.detach())
+        # Ensure we have matching feature pairs
+        min_patch_features = min(len(real_patch_feat), len(fake_patch_feat))
+        min_global_features = min(len(real_global_feat), len(fake_global_feat))
+        
+        # Compare feature maps for patch features
+        for i in range(min_patch_features):
+            feature_matching_loss += F.l1_loss(fake_patch_feat[i], real_patch_feat[i].detach())
+        
+        # Compare feature maps for global features
+        for i in range(min_global_features):
+            feature_matching_loss += F.l1_loss(fake_global_feat[i], real_global_feat[i].detach())
             
-        feature_matching_loss = feature_matching_loss / (len(real_patch_feat) + len(real_global_feat))
+        # Normalize by the number of feature maps compared
+        feature_matching_loss = feature_matching_loss / (min_patch_features + min_global_features)
         
         # Dynamic loss weighting based on training progress
         # Gradually increase importance of connectivity losses as training progresses
