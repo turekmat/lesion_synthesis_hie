@@ -48,12 +48,12 @@ class HIELesionDataset(Dataset):
         self.intensity_noise = intensity_noise
         
         # Načtení všech souborů s labely
-        self.label_files = sorted([os.path.join(label_dir, f) for f in os.listdir(label_dir)
-                                 if f.endswith('.nii.gz') or f.endswith('.nii')])
+        self.label_files = sorted([os.path.join(label_dir, f) for f in os.listdir(label_dir) 
+                               if f.endswith('.nii.gz') or f.endswith('.nii')])
         
         if not self.label_files:
             raise ValueError(f"No label files found in {label_dir}")
-            
+        
         print(f"Found {len(self.label_files)} lesion label files in {label_dir}")
         
         # NOVÁ FUNKCE: Filtrování celočerných obrázků
@@ -196,7 +196,7 @@ class RandomAugmentation3D:
                 label_slice = label[z, :, :]
                 label[z, :, :] = transforms.functional.rotate(
                     label_slice.unsqueeze(0), angle).squeeze(0)
-            
+        
             # Rotace brain_mask - stejný úhel jako label
             for z in range(brain_mask.shape[0]):
                 mask_slice = brain_mask[z, :, :]
@@ -526,7 +526,7 @@ class Generator(nn.Module):
                 
             # Apply brain mask
             out = out * brain_mask_resized
-            
+        
         return out
 
 
@@ -1000,8 +1000,8 @@ class HIELesionGANTrainer:
         
         # MODIFIED: Use Two Time-Scale Update Rule (TTUR)
         # Generator gets higher learning rate to overcome local minima
-        self.g_learning_rate = learning_rate * 2.0  # Increased generator learning rate
-        self.d_learning_rate = learning_rate * 0.5  # Decreased discriminator learning rate
+        self.g_learning_rate = learning_rate * 4.0  # Zvýšeno z 2.0 na 4.0 pro ještě silnější generátor
+        self.d_learning_rate = learning_rate * 0.25  # Sníženo z 0.5 na 0.25 pro slabší diskriminátor
         
         # Set up optimizers with adjusted learning rates
         self.generator_optimizer = optim.Adam(
@@ -1018,8 +1018,8 @@ class HIELesionGANTrainer:
         
         # NEW: Add learning rate schedulers to decrease learning rates over time
         # This helps stabilize training in later stages
-        self.g_scheduler = optim.lr_scheduler.ExponentialLR(self.generator_optimizer, gamma=0.995)
-        self.d_scheduler = optim.lr_scheduler.ExponentialLR(self.discriminator_optimizer, gamma=0.995)
+        self.g_scheduler = optim.lr_scheduler.ExponentialLR(self.generator_optimizer, gamma=0.996)  # Mírnější snižování pro generátor
+        self.d_scheduler = optim.lr_scheduler.ExponentialLR(self.discriminator_optimizer, gamma=0.992)  # Rychlejší snižování pro diskriminátor
         
         # Create adversarial loss
         self.adversarial_loss = GANLoss(self.device, gan_mode='hinge')
@@ -1034,7 +1034,7 @@ class HIELesionGANTrainer:
         self.atlas_distribution_loss = AtlasDistributionLoss()
         
         # Set loss weights
-        self.adv_loss_weight = 1.0
+        self.adv_loss_weight = 0.5  # Sníženo z 1.0 na 0.5 - menší důraz na adversarial loss
         self.l1_loss_weight = 10.0
         self.weighted_l1_weight = 5.0
         self.dice_loss_weight = 5.0
@@ -1043,22 +1043,22 @@ class HIELesionGANTrainer:
         self.violation_penalty_weight = 5.0
         
         # NEW: Add parameters to control noise injection for discriminator stability
-        self.noise_std = 0.05  # Standard deviation of Gaussian noise added to discriminator inputs
-        self.label_smoothing = 0.1  # Amount of label smoothing to apply (0.1 = use 0.9 for real instead of 1.0)
+        self.noise_std = 0.2  # Zvýšeno z 0.05 na 0.2 - výrazně větší šum pro destabilizaci diskriminátoru
+        self.label_smoothing = 0.3  # Zvýšeno z 0.1 na 0.3 - větší label smoothing (0.3 = use 0.7 for real instead of 1.0)
         
         # NEW: Add parameters for gradient penalty in WGAN-GP style training
-        self.use_gradient_penalty = True  # Whether to use gradient penalty
-        self.gp_weight = 10.0  # Weight for gradient penalty
+        self.use_gradient_penalty = False  # Vypnuto, nechceme příliš silný diskriminátor
+        self.gp_weight = 5.0  # Sníženo z 10.0 na 5.0
         
         # NEW: Add parameters to control activation requirements
-        self.min_activation_percent = 0.005  # Minimum percent of valid regions that should have lesions (0.5%)
-        self.empty_penalty_weight = 200.0   # Weight for empty output penalty
-        self.activation_target_weight = 500.0  # Weight for direct activation target loss
+        self.min_activation_percent = 0.02  # Zvýšeno z 0.005 na 0.02 (2% minimální aktivace)
+        self.empty_penalty_weight = 500.0   # Zvýšeno z 200.0 na 500.0
+        self.activation_target_weight = 2500.0  # Zvýšeno z 500.0 na 2500.0
         
         # NEW: Add early training assistance parameters
-        self.early_training_iters = 1000  # Number of iterations to consider "early training"
-        self.forced_activation_threshold = 10  # Below this number of activated voxels, force activation
-
+        self.early_training_iters = 3000  # Zvýšeno z 1000 na 3000 - delší období nucené aktivace
+        self.forced_activation_threshold = 500  # Zvýšeno z 10 na 500 - agresivnější aktivace
+        
     def create_debug_printer(self):
         """Create a debug print function that only prints when debug is enabled"""
         def debug_printer(message, tensor=None):
@@ -1529,7 +1529,7 @@ class HIELesionGANTrainer:
                     else:
                         # Set a different seed for each sample to ensure diversity
                         torch.manual_seed(42 + i) if use_fixed_z else None
-                        z = torch.randn(1, self.z_dim, device=self.device)
+                    z = torch.randn(1, self.z_dim, device=self.device)
                     
                     # Generate lesions
                     with torch.no_grad():
@@ -1725,7 +1725,7 @@ class HIELesionGANTrainer:
         # NEW: Add a small random noise to the real images
         # This prevents discriminator from being too confident and helps training stability
         if self.noise_std > 0:
-            real_lesions_noisy = real_lesions + torch.randn_like(real_lesions) * self.noise_std
+            real_lesions_noisy = real_lesions + torch.randn_like(real_lesions) * self.noise_std * 2.0  # Zvýšení šumu 2x
             real_lesions_noisy = torch.clamp(real_lesions_noisy, 0.0, 1.0)
         else:
             real_lesions_noisy = real_lesions
@@ -1740,98 +1740,74 @@ class HIELesionGANTrainer:
             
             # NEW: Add noise to fake samples too
             if self.noise_std > 0:
-                fake_lesions = fake_lesions + torch.randn_like(fake_lesions) * self.noise_std
+                fake_lesions = fake_lesions + torch.randn_like(fake_lesions) * self.noise_std * 2.0  # Zvýšení šumu 2x
                 fake_lesions = torch.clamp(fake_lesions, 0.0, 1.0)
-            
-            # Ensure fake_lesions are in valid range
-            fake_lesions = torch.clamp(fake_lesions, 0.0, 1.0)
         
-        # Debug prints if needed
-        if self.debug:
-            self.debug_print("Real lesions in train_discriminator", real_lesions_noisy)
-            self.debug_print("Fake lesions in train_discriminator", fake_lesions)
+        # Pass real lesions through discriminator
+        real_patch_pred, real_global_pred, real_distrib_pred = self.discriminator(real_lesions_noisy, atlas)
         
-        # Discriminator predictions on real samples
-        real_patch_pred, real_global_pred, real_distribution_pred = self.discriminator(real_lesions_noisy, atlas)
+        # Pass fake lesions through discriminator
+        fake_patch_pred, fake_global_pred, fake_distrib_pred = self.discriminator(fake_lesions.detach(), atlas)
         
-        # Discriminator predictions on fake samples
-        fake_patch_pred, fake_global_pred, fake_distribution_pred = self.discriminator(fake_lesions, atlas)
+        # Use soft labels for real and fake (one-sided label smoothing)
+        # This prevents the discriminator from being too confident
+        real_patch_labels = torch.ones_like(real_patch_pred) * 0.9  # Sníženo z 1.0 na 0.9
+        real_global_labels = torch.ones_like(real_global_pred) * 0.9  # Sníženo z 1.0 na 0.9
+        real_distrib_labels = torch.ones_like(real_distrib_pred) * 0.9  # Sníženo z 1.0 na 0.9
         
-        # NEW: Use label smoothing for real labels to prevent overconfidence
-        real_patch_labels = torch.ones_like(real_patch_pred) * (1.0 - self.label_smoothing)
-        real_global_labels = torch.ones_like(real_global_pred) * (1.0 - self.label_smoothing)
-        real_dist_labels = torch.ones_like(real_distribution_pred) * (1.0 - self.label_smoothing)
-        
-        # Labels for fake samples
         fake_patch_labels = torch.zeros_like(fake_patch_pred)
         fake_global_labels = torch.zeros_like(fake_global_pred)
-        fake_dist_labels = torch.zeros_like(fake_distribution_pred)
+        fake_distrib_labels = torch.zeros_like(fake_distrib_pred)
         
-        # Calculate adversarial losses for real samples
-        d_real_patch_loss = self.adversarial_loss(real_patch_pred, real_patch_labels)
-        d_real_global_loss = self.adversarial_loss(real_global_pred, real_global_labels)
-        d_real_dist_loss = self.adversarial_loss(real_distribution_pred, real_dist_labels)
-        
-        # Calculate adversarial losses for fake samples
-        d_fake_patch_loss = self.adversarial_loss(fake_patch_pred, fake_patch_labels)
-        d_fake_global_loss = self.adversarial_loss(fake_global_pred, fake_global_labels)
-        d_fake_dist_loss = self.adversarial_loss(fake_distribution_pred, fake_dist_labels)
-        
-        # Combined loss for real and fake samples from all outputs
-        d_real_loss = (d_real_patch_loss + d_real_global_loss + d_real_dist_loss) / 3.0
-        d_fake_loss = (d_fake_patch_loss + d_fake_global_loss + d_fake_dist_loss) / 3.0
-        
-        # NEW: Calculate gradient penalty (WGAN-GP style regularization)
-        gradient_penalty = 0.0
-        if self.use_gradient_penalty:
-            # Create random interpolations between real and fake
-            alpha = torch.rand(batch_size, 1, 1, 1, 1, device=self.device)
-            interpolates = alpha * real_lesions_noisy + (1 - alpha) * fake_lesions
-            interpolates.requires_grad_(True)
+        # NEW: Náhodné převrácení labelu pro některé vzorky (label flipping)
+        # Toto dále oslabuje diskriminátor
+        if batch_size > 1 and torch.rand(1).item() < 0.1:  # 10% šance na flip labelu
+            flip_idx = torch.randint(0, batch_size, (1,)).item()
+            fake_patch_labels[flip_idx] = 1.0
+            fake_global_labels[flip_idx] = 1.0
+            fake_distrib_labels[flip_idx] = 1.0
             
-            # Forward pass with interpolates
-            disc_interpolates = self.discriminator(interpolates, atlas)
+            real_patch_labels[flip_idx] = 0.0
+            real_global_labels[flip_idx] = 0.0
+            real_distrib_labels[flip_idx] = 0.0
+        
+        # Calculate discriminator losses for real and fake lesions
+        d_loss_real_patch = self.adversarial_loss(real_patch_pred, real_patch_labels)
+        d_loss_fake_patch = self.adversarial_loss(fake_patch_pred, fake_patch_labels)
+        d_patch_loss = (d_loss_real_patch + d_loss_fake_patch) / 2
+        
+        d_loss_real_global = self.adversarial_loss(real_global_pred, real_global_labels)
+        d_loss_fake_global = self.adversarial_loss(fake_global_pred, fake_global_labels)
+        d_global_loss = (d_loss_real_global + d_loss_fake_global) / 2
+        
+        d_loss_real_distrib = self.adversarial_loss(real_distrib_pred, real_distrib_labels)
+        d_loss_fake_distrib = self.adversarial_loss(fake_distrib_pred, fake_distrib_labels)
+        d_distrib_loss = (d_loss_real_distrib + d_loss_fake_distrib) / 2
+        
+        # Total discriminator loss
+        d_loss = d_patch_loss + d_global_loss + d_distrib_loss
+        
+        # NEW: Náhodně přeskočit aktualizaci diskriminátoru s 20% pravděpodobností
+        # Toto dále zvýhodňuje generátor
+        should_update_d = torch.rand(1).item() > 0.2
+        
+        if should_update_d:
+            # Backpropagation
+            d_loss.backward()
             
-            # Use the first output (patch) for gradient penalty
-            gradients = torch.autograd.grad(
-                outputs=disc_interpolates[0].sum(),
-                inputs=interpolates,
-                create_graph=True,
-                retain_graph=True,
-                only_inputs=True
-            )[0]
+            # Gradient clipping to prevent exploding gradients
+            torch.nn.utils.clip_grad_norm_(self.discriminator.parameters(), max_norm=1.0)
             
-            # Calculate the penalty
-            gradients = gradients.view(batch_size, -1)
-            gradient_norm = gradients.norm(2, dim=1)
-            gradient_penalty = ((gradient_norm - 1) ** 2).mean() * self.gp_weight
+            # Update discriminator weights
+            self.discriminator_optimizer.step()
         
-        # Total discriminator loss with gradient penalty
-        d_loss = d_real_loss + d_fake_loss
-        
-        # Add gradient penalty if enabled
-        if self.use_gradient_penalty:
-            d_loss = d_loss + gradient_penalty
-        
-        # NEW: Add regularization to prevent the discriminator from becoming too strong
-        # Implement feature matching loss - this aligns the feature distributions between real and fake
-        # It's a soft constraint that prevents the discriminator from focusing too much on minute details
-        feature_matching_loss = 0.0
-        
-        # Backpropagation
-        d_loss.backward()
-        
-        # NEW: Clip gradients to prevent exploding gradients
-        torch.nn.utils.clip_grad_norm_(self.discriminator.parameters(), max_norm=1.0)
-        
-        self.discriminator_optimizer.step()
-        
-        # Return losses for logging
         return {
             'd_loss': d_loss.item(),
-            'd_real_loss': d_real_loss.item(),
-            'd_fake_loss': d_fake_loss.item(),
-            'gradient_penalty': gradient_penalty.item() if self.use_gradient_penalty else 0.0
+            'd_patch': d_patch_loss.item(),
+            'd_global': d_global_loss.item(),
+            'd_distrib': d_distrib_loss.item(),
+            'd_real': (d_loss_real_patch + d_loss_real_global + d_loss_real_distrib).item() / 3,
+            'd_fake': (d_loss_fake_patch + d_loss_fake_global + d_loss_fake_distrib).item() / 3,
         }
 
     def train_generator(self, real_lesions, atlas, brain_mask, iteration):
@@ -1901,7 +1877,7 @@ class HIELesionGANTrainer:
             fake_lesions_noisy = torch.clamp(fake_lesions_noisy, 0.0, 1.0)
         else:
             fake_lesions_noisy = fake_lesions
-            
+        
         # Discriminator forward pass on fake lesions
         fake_patch_pred, fake_global_pred, fake_distribution_pred = self.discriminator(fake_lesions_noisy, atlas)
         
@@ -1956,7 +1932,9 @@ class HIELesionGANTrainer:
         
         # NEW: Enhanced coherence loss with perimeter/area ratio penalty
         # Lower values of this ratio indicate more compact, less fragmented objects
-        coherence_loss = torch.clamp(edge_ratio - 0.5, min=0)  # Reduced threshold from 0.8 to 0.5
+        # V raných fázích tréninku snížíme threshold, abychom dovolili více fragmentované léze
+        threshold = 0.3  # Sníženo z 0.5 na 0.3
+        coherence_loss = torch.clamp(edge_ratio - threshold, min=0)
         
         # NEW: Connectivity loss using morphological analysis
         # Process binary_fake on CPU for morphological operations
@@ -1978,8 +1956,9 @@ class HIELesionGANTrainer:
         mean_components = torch.tensor(batch_components, device=binary_fake.device).float().mean()
         
         # Penalize having too many distinct components
-        # The penalty increases as number of components increases beyond 5
-        connectivity_loss = torch.clamp(mean_components - 5, min=0) * 0.2
+        # Původně se penalty zvyšovala nad 5 komponent, nyní ji zvýšíme až nad 10 komponent
+        # Tím dovolíme větší fragmentaci v raných fázích
+        connectivity_loss = torch.clamp(mean_components - 10, min=0) * 0.1  # Sníženo z 0.2 na 0.1 a z thresholdu 5 na 10
         
         # Calculate masked L1 loss (only consider atlas-positive regions within the brain)
         masked_l1_loss = torch.sum(torch.abs(real_lesions - fake_lesions) * valid_regions) / (torch.sum(valid_regions) + 1e-8)
@@ -2077,10 +2056,11 @@ class HIELesionGANTrainer:
         # Normalize by the number of feature maps compared
         feature_matching_loss = feature_matching_loss / (min_patch_features + min_global_features)
         
-        # Dynamic loss weighting based on training progress
-        # Gradually increase importance of connectivity losses as training progresses
-        coherence_weight = min(5.0 + iteration * 0.01, 10.0)  # Increases from 5 to 10 over time
-        connectivity_weight = min(2.0 + iteration * 0.005, 5.0)  # Increases from 2 to 5 over time
+        # Dynamic weights for coherence and connectivity losses based on training stage
+        # In early training, we focus more on avoiding empty outputs than enforcing coherence
+        iteration_progress = min(1.0, iteration / 5000)  # 0.0 at start, 1.0 after 5000 iterations
+        coherence_weight = 5.0 * iteration_progress  # Starts at 0, gradually increases to 5.0
+        connectivity_weight = 2.0 * iteration_progress  # Starts at 0, gradually increases to 2.0
         
         # REBALANCED: Total generator loss with dramatically increased empty penalty weight
         g_loss = (
@@ -2094,8 +2074,8 @@ class HIELesionGANTrainer:
             coherence_weight * coherence_loss +  # Dynamic weight for coherence loss
             connectivity_weight * connectivity_loss +  # Dynamic weight for connectivity loss
             3.0 * feature_matching_loss +  # Feature matching to stabilize training
-            200.0 * empty_penalty +  # MUCH STRONGER penalty for empty outputs (4x previous increase)
-            2500.0 * activation_target_loss  # Zvýšeno z 500.0 na 2500.0 - Direct minimum activation target loss
+            self.empty_penalty_weight * empty_penalty +  # Zvýšená penalty za prázdné výstupy
+            self.activation_target_weight * activation_target_loss  # Zvýšená penalty za nedostatek aktivace
         )
         
         # Backpropagation
@@ -2260,35 +2240,32 @@ class HIELesionGANTrainer:
                 atlas = batch['atlas'].to(self.device)
                 brain_mask = batch['brain_mask'].to(self.device)
                 
-                # Train discriminator
-                d_metrics = self.train_discriminator(real_lesions, atlas, brain_mask)
+                # NEW: Trénovat diskriminátor pouze občas
+                # To dá generátoru výhodu
+                train_discriminator = True
+                if i % 3 != 0:  # Trénuj diskriminátor pouze každou třetí iteraci
+                    train_discriminator = False
                 
-                # NEW: Only train generator if discriminator loss is reasonable
-                # Skip generator update if discriminator is still too weak
-                # This prevents training the generator against a poor discriminator
-                train_generator = True
-                if d_metrics['d_loss'] < 0.01:
-                    # If discriminator loss is very low, it's getting too strong
-                    # Train generator multiple times to help it catch up
-                    num_g_steps = 2
-                elif d_metrics['d_loss'] > 0.5:
-                    # If discriminator loss is high, it's still learning the basics
-                    # Skip generator training occasionally
-                    if i % 3 != 0:
-                        train_generator = False
-                    num_g_steps = 1
+                # Train discriminator pouze pokud je to potřeba
+                if train_discriminator:
+                    d_metrics = self.train_discriminator(real_lesions, atlas, brain_mask)
                 else:
-                    # Normal case - balanced training
-                    num_g_steps = 1
+                    # Dummy metriky, pokud jsme diskriminátor netrénovali
+                    d_metrics = {'d_loss': 0.0, 'd_patch': 0.0, 'd_global': 0.0, 'd_distrib': 0.0, 'd_real': 0.0, 'd_fake': 0.0}
                 
-                # Train generator (possibly multiple times)
+                # NEW: Vždy trénuj generátor, nezávisle na diskriminátoru
+                # Nepoužívat komplexní logiku, která může někdy skipnout trénink generátoru
+                
+                # Určení počtu kroků trénování generátoru
+                if train_discriminator:
+                    num_g_steps = 1  # Standardní počet kroků
+                else:
+                    num_g_steps = 3  # Když netrénujeme diskriminátor, dej generátoru více kroků
+                
+                # Train generator (multiple times)
                 g_metrics = None
-                if train_generator:
-                    for g_step in range(num_g_steps):
-                        g_metrics = self.train_generator(real_lesions, atlas, brain_mask, i + epoch * len(pbar))
-                else:
-                    # Create dummy metrics for logging
-                    g_metrics = {'g_total': 0.0, 'fake_lesions': torch.zeros_like(real_lesions)}
+                for g_step in range(num_g_steps):
+                    g_metrics = self.train_generator(real_lesions, atlas, brain_mask, i + epoch * len(pbar))
                 
                 # Accumulate losses for averaging
                 epoch_d_loss += d_metrics['d_loss']
