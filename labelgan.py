@@ -177,7 +177,7 @@ class DeconvBlock(nn.Module):
 
 # Generator s attention mechanismem
 class Generator(nn.Module):
-    def __init__(self, in_channels=3, out_channels=1, feature_maps=64, use_attention=True):
+    def __init__(self, in_channels=3, out_channels=1, feature_maps=64, use_attention=True, attention_type='downsample'):
         """
         3D U-Net generátor pro LabelGAN
         
@@ -186,10 +186,12 @@ class Generator(nn.Module):
             out_channels: Počet výstupních kanálů (1 pro binární masku lézí)
             feature_maps: Počet základních feature map
             use_attention: Použít self-attention mechanismus
+            attention_type: Typ attention mechanismu ('downsample', 'block', 'axial')
         """
         super(Generator, self).__init__()
         
         self.use_attention = use_attention
+        self.attention_type = attention_type
         
         # Encoder (downsample)
         self.conv1 = ConvBlock(in_channels, feature_maps)
@@ -202,7 +204,12 @@ class Generator(nn.Module):
         
         # Self-attention na bottlenecku
         if use_attention:
-            self.attention = SelfAttention3D(feature_maps*8)
+            if attention_type == 'downsample':
+                self.attention = SelfAttention3D(feature_maps*8, reduction_factor=2)
+            elif attention_type == 'block':
+                self.attention = BlockAttention3D(feature_maps*8, block_size=8)
+            elif attention_type == 'axial':
+                self.attention = AxialAttention3D(feature_maps*8)
         
         # Decoder (upsample)
         self.deconv4 = DeconvBlock(feature_maps*8, feature_maps*4)
@@ -262,38 +269,275 @@ class Generator(nn.Module):
 
 # Self-attention mechanismus pro 3D data
 class SelfAttention3D(nn.Module):
-    def __init__(self, in_channels):
+    def __init__(self, in_channels, reduction_factor=4):
+        """
+        Efektivní self-attention mechanismus pro 3D data s prostorovým downsamplováním
+        
+        Args:
+            in_channels: Počet vstupních kanálů
+            reduction_factor: Faktor, kterým se zmenší prostorové rozlišení pro attention mapu
+        """
         super(SelfAttention3D, self).__init__()
         
+        self.in_channels = in_channels
+        self.reduction_factor = reduction_factor
+        
+        # Definice konvolučních vrstev pro query, key a value projekce
         self.query = nn.Conv3d(in_channels, in_channels//8, kernel_size=1)
         self.key = nn.Conv3d(in_channels, in_channels//8, kernel_size=1)
         self.value = nn.Conv3d(in_channels, in_channels, kernel_size=1)
+        
+        # Škálovací parametr pro attention
         self.gamma = nn.Parameter(torch.zeros(1))
         
     def forward(self, x):
         batch_size, channels, depth, height, width = x.size()
         
-        # Flatten prostorové dimenze
-        query = self.query(x).view(batch_size, -1, depth * height * width).permute(0, 2, 1)
-        key = self.key(x).view(batch_size, -1, depth * height * width)
-        value = self.value(x).view(batch_size, -1, depth * height * width)
+        # Down-sampling prostorové dimenze pro redukci velikosti attention mapy
+        # Použijeme average pooling pro downsampling
+        x_pooled = F.avg_pool3d(x, kernel_size=self.reduction_factor, 
+                                stride=self.reduction_factor)
         
-        # Attention mapa
-        attention = torch.bmm(query, key)
-        attention = F.softmax(attention, dim=1)
+        # Výpočet query, key a value projekcí
+        query = self.query(x_pooled)  # [B, C/8, d', h', w']
+        key = self.key(x_pooled)      # [B, C/8, d', h', w']
+        value = self.value(x_pooled)  # [B, C, d', h', w']
         
-        # Výstup
-        out = torch.bmm(value, attention.permute(0, 2, 1))
-        out = out.view(batch_size, channels, depth, height, width)
+        # Získání nových prostorových dimenzí po downsamplingu
+        _, ch_q, d, h, w = query.size()
         
-        # Residual connection
+        # Reshape pro batch matrix multiplication
+        query = query.view(batch_size, ch_q, -1).permute(0, 2, 1)  # [B, d'*h'*w', C/8]
+        key = key.view(batch_size, ch_q, -1)                       # [B, C/8, d'*h'*w']
+        value = value.view(batch_size, channels, -1)               # [B, C, d'*h'*w']
+        
+        # Výpočet attention mapy - nyní mnohem menší díky downsamplingu
+        attention = torch.bmm(query, key)  # [B, d'*h'*w', d'*h'*w']
+        
+        # Použití softmax pro normalizaci vah
+        attention = F.softmax(attention, dim=2)
+        
+        # Aplikace attention vah na hodnoty
+        out = torch.bmm(value, attention.permute(0, 2, 1))  # [B, C, d'*h'*w']
+        
+        # Reshape zpět na prostorové dimenze
+        out = out.view(batch_size, channels, d, h, w)  # [B, C, d', h', w']
+        
+        # Upsampling zpět na původní velikost
+        out = F.interpolate(out, size=(depth, height, width), 
+                           mode='trilinear', align_corners=False)
+        
+        # Residual connection s váhovým parametrem gamma
+        out = self.gamma * out + x
+        
+        return out
+
+# Implementace blokové lokální attention pro 3D data
+class BlockAttention3D(nn.Module):
+    def __init__(self, in_channels, block_size=16):
+        """
+        Bloková lokální attention pro 3D data - rozdělí vstup na menší bloky
+        a aplikuje attention separátně na každý blok
+        
+        Args:
+            in_channels: Počet vstupních kanálů
+            block_size: Velikost bloku pro attention (block_size^3 voxelů)
+        """
+        super(BlockAttention3D, self).__init__()
+        
+        self.in_channels = in_channels
+        self.block_size = block_size
+        
+        # Definice konvolučních vrstev pro query, key a value projekce
+        self.query = nn.Conv3d(in_channels, in_channels//8, kernel_size=1)
+        self.key = nn.Conv3d(in_channels, in_channels//8, kernel_size=1)
+        self.value = nn.Conv3d(in_channels, in_channels, kernel_size=1)
+        
+        # Škálovací parametr pro attention
+        self.gamma = nn.Parameter(torch.zeros(1))
+        
+    def forward(self, x):
+        batch_size, channels, depth, height, width = x.size()
+        
+        # Výpočet query, key a value projekcí
+        queries = self.query(x)  # [B, C/8, D, H, W]
+        keys = self.key(x)       # [B, C/8, D, H, W]
+        values = self.value(x)   # [B, C, D, H, W]
+        
+        # Rozdělení prostoru na bloky a aplikace attention na každý blok
+        # Výpočet počtu bloků v každé dimenzi
+        d_blocks = max(1, depth // self.block_size)
+        h_blocks = max(1, height // self.block_size)
+        w_blocks = max(1, width // self.block_size)
+        
+        # Určení velikosti bloku v každé dimenzi
+        d_block_size = depth // d_blocks
+        h_block_size = height // h_blocks
+        w_block_size = width // w_blocks
+        
+        # Inicializace výstupního tensoru
+        out = torch.zeros_like(x)
+        
+        # Zpracování každého bloku
+        for d_idx in range(d_blocks):
+            for h_idx in range(h_blocks):
+                for w_idx in range(w_blocks):
+                    # Určení hranic bloku
+                    d_start = d_idx * d_block_size
+                    d_end = min((d_idx + 1) * d_block_size, depth)
+                    h_start = h_idx * h_block_size
+                    h_end = min((h_idx + 1) * h_block_size, height)
+                    w_start = w_idx * w_block_size
+                    w_end = min((w_idx + 1) * w_block_size, width)
+                    
+                    # Extrakce bloku pro každou projekci
+                    q_block = queries[:, :, d_start:d_end, h_start:h_end, w_start:w_end]
+                    k_block = keys[:, :, d_start:d_end, h_start:h_end, w_start:w_end]
+                    v_block = values[:, :, d_start:d_end, h_start:h_end, w_start:w_end]
+                    
+                    # Reshape pro batch matrix multiplication
+                    q_flat = q_block.view(batch_size, channels//8, -1).permute(0, 2, 1)  # [B, N, C/8]
+                    k_flat = k_block.view(batch_size, channels//8, -1)                   # [B, C/8, N]
+                    v_flat = v_block.view(batch_size, channels, -1)                      # [B, C, N]
+                    
+                    # Výpočet attention mapy pro blok
+                    attention = torch.bmm(q_flat, k_flat)  # [B, N, N]
+                    attention = F.softmax(attention, dim=2)
+                    
+                    # Aplikace attention vah na hodnoty
+                    block_out = torch.bmm(v_flat, attention.permute(0, 2, 1))  # [B, C, N]
+                    
+                    # Reshape zpět na prostorové dimenze bloku
+                    block_out = block_out.view(batch_size, channels, 
+                                              d_end-d_start, h_end-h_start, w_end-w_start)
+                    
+                    # Přiřazení výstupu bloku do výstupního tensoru
+                    out[:, :, d_start:d_end, h_start:h_end, w_start:w_end] = block_out
+        
+        # Residual connection s váhovým parametrem gamma
+        out = self.gamma * out + x
+        
+        return out
+
+# Implementace axiální attention pro 3D data
+class AxialAttention3D(nn.Module):
+    def __init__(self, in_channels, heads=4, dim_head=None):
+        """
+        Axiální attention pro 3D data - provádí attention separátně po jednotlivých osách
+        
+        Args:
+            in_channels: Počet vstupních kanálů
+            heads: Počet attention hlav
+            dim_head: Dimenze každé hlavy (pokud None, vypočítá se)
+        """
+        super(AxialAttention3D, self).__init__()
+        
+        self.in_channels = in_channels
+        self.heads = heads
+        
+        # Pokud není specifikována dimenze hlavy, vypočítáme ji
+        self.dim_head = dim_head if dim_head is not None else in_channels // heads
+        
+        # Dimenze interních projekcí
+        dim_inner = self.dim_head * heads
+        
+        # Škálovací faktor pro dot-product attention
+        self.scale = self.dim_head ** -0.5
+        
+        # Parametr pro residual connection
+        self.gamma = nn.Parameter(torch.zeros(1))
+        
+        # Projekce pro jednotlivé osy
+        # Pro depth (D)
+        self.to_qkv_d = nn.Conv3d(in_channels, dim_inner * 3, kernel_size=1)
+        self.to_out_d = nn.Conv3d(dim_inner, in_channels, kernel_size=1)
+        
+        # Pro height (H)
+        self.to_qkv_h = nn.Conv3d(in_channels, dim_inner * 3, kernel_size=1)
+        self.to_out_h = nn.Conv3d(dim_inner, in_channels, kernel_size=1)
+        
+        # Pro width (W)
+        self.to_qkv_w = nn.Conv3d(in_channels, dim_inner * 3, kernel_size=1)
+        self.to_out_w = nn.Conv3d(dim_inner, in_channels, kernel_size=1)
+        
+    def _compute_axis_attention(self, x, axis, to_qkv, to_out):
+        batch_size, channels, depth, height, width = x.size()
+        
+        # Výměna os tak, aby osa attention byla poslední
+        if axis == 0:  # depth
+            x = x.permute(0, 2, 3, 4, 1)  # [B, D, H, W, C]
+            axis_dim = depth
+        elif axis == 1:  # height
+            x = x.permute(0, 3, 2, 4, 1)  # [B, H, D, W, C]
+            axis_dim = height
+        else:  # width
+            x = x.permute(0, 4, 2, 3, 1)  # [B, W, D, H, C]
+            axis_dim = width
+        
+        # Reshape pro attention
+        if axis == 0:
+            shape = (batch_size, depth, height * width, channels)
+        elif axis == 1:
+            shape = (batch_size, height, depth * width, channels)
+        else:
+            shape = (batch_size, width, depth * height, channels)
+            
+        x_reshaped = x.reshape(shape)  # [B, axis_dim, *, C]
+        
+        # Aplikace projekcí a rozdělení na query, key, value
+        qkv = to_qkv(x.permute(0, 4, 1, 2, 3))  # [B, dim_inner*3, axis_dim, *, *]
+        q, k, v = torch.chunk(qkv, 3, dim=1)  # Každý má tvar [B, dim_inner, axis_dim, *, *]
+        
+        # Reshape pro multi-head attention
+        q = q.view(batch_size, self.heads, self.dim_head, -1)  # [B, heads, dim_head, axis_dim * * *]
+        k = k.view(batch_size, self.heads, self.dim_head, -1)  # [B, heads, dim_head, axis_dim * * *]
+        v = v.view(batch_size, self.heads, self.dim_head, -1)  # [B, heads, dim_head, axis_dim * * *]
+        
+        # Transpozice pro batch matrix multiplication
+        q = q.permute(0, 1, 3, 2)  # [B, heads, axis_dim * * *, dim_head]
+        
+        # Výpočet attention skóre
+        attn = torch.matmul(q, k)  # [B, heads, axis_dim * * *, axis_dim * * *]
+        attn = attn * self.scale
+        attn = F.softmax(attn, dim=-1)
+        
+        # Aplikace attention vah
+        out = torch.matmul(attn, v.permute(0, 1, 3, 2))  # [B, heads, axis_dim * * *, dim_head]
+        
+        # Reshape zpět na původní formát
+        out = out.permute(0, 1, 3, 2).contiguous()  # [B, heads, dim_head, axis_dim * * *]
+        out = out.view(batch_size, self.heads * self.dim_head, *x.shape[1:4])  # [B, dim_inner, axis_dim, *, *]
+        
+        # Finální projekce
+        out = to_out(out)  # [B, C, axis_dim, *, *]
+        
+        # Permutace zpět na formát [B, C, D, H, W]
+        if axis == 0:  # depth
+            out = out.permute(0, 1, 2, 3, 4)  # [B, C, D, H, W]
+        elif axis == 1:  # height
+            out = out.permute(0, 1, 3, 2, 4)  # [B, C, D, H, W]
+        else:  # width
+            out = out.permute(0, 1, 3, 4, 2)  # [B, C, D, H, W]
+            
+        return out
+    
+    def forward(self, x):
+        # Postupně aplikujeme attention po jednotlivých osách
+        out_d = self._compute_axis_attention(x, axis=0, to_qkv=self.to_qkv_d, to_out=self.to_out_d)
+        out_h = self._compute_axis_attention(x, axis=1, to_qkv=self.to_qkv_h, to_out=self.to_out_h)
+        out_w = self._compute_axis_attention(x, axis=2, to_qkv=self.to_qkv_w, to_out=self.to_out_w)
+        
+        # Kombinace výstupů z jednotlivých os
+        out = out_d + out_h + out_w
+        
+        # Residual connection s váhovým parametrem gamma
         out = self.gamma * out + x
         
         return out
 
 # Discriminator model
 class Discriminator(nn.Module):
-    def __init__(self, in_channels=3, feature_maps=64, use_attention=True):
+    def __init__(self, in_channels=3, feature_maps=64, use_attention=True, attention_type='downsample'):
         """
         PatchGAN diskriminátor pro 3D data
         
@@ -301,10 +545,12 @@ class Discriminator(nn.Module):
             in_channels: Počet vstupních kanálů (normativní atlas + léze + volitelně atlas lézí)
             feature_maps: Počet základních feature map
             use_attention: Použít self-attention mechanismus
+            attention_type: Typ attention mechanismu ('downsample', 'block', 'axial')
         """
         super(Discriminator, self).__init__()
         
         self.use_attention = use_attention
+        self.attention_type = attention_type
         
         # Sequence of convolutional layers
         self.conv1 = ConvBlock(in_channels, feature_maps, use_norm=False)
@@ -314,7 +560,12 @@ class Discriminator(nn.Module):
         
         # Self-attention layer
         if use_attention:
-            self.attention = SelfAttention3D(feature_maps*4)
+            if attention_type == 'downsample':
+                self.attention = SelfAttention3D(feature_maps*4, reduction_factor=2)
+            elif attention_type == 'block':
+                self.attention = BlockAttention3D(feature_maps*4, block_size=8)
+            elif attention_type == 'axial':
+                self.attention = AxialAttention3D(feature_maps*4)
         
         # Output layer
         self.output = nn.Conv3d(feature_maps*8, 1, kernel_size=3, padding=1)
@@ -401,7 +652,7 @@ class FocalLoss(nn.Module):
         return focal_loss.mean()
 
 # Funkce pro uložení 3D obrazu ve formátu .nii nebo .nii.gz
-def save_nifti(data, output_path, reference_nifti=None):
+def save_nifti(data, output_path, reference_nifti=None, reference_path=None):
     """
     Uloží data jako NIFTI soubor
     
@@ -409,7 +660,12 @@ def save_nifti(data, output_path, reference_nifti=None):
         data: 3D numpy array
         output_path: Výstupní cesta
         reference_nifti: Volitelně referenční NIFTI objekt pro zachování metadat
+        reference_path: Volitelně cesta k referenčnímu NIFTI souboru pro zachování metadat
     """
+    if reference_path is not None:
+        # Načtení referenčního NIFTI pro zachování metadat
+        reference_nifti = nib.load(reference_path)
+    
     if reference_nifti is not None:
         # Zachování metadat z referenčního NIFTI
         nifti_img = nib.Nifti1Image(data, reference_nifti.affine, reference_nifti.header)
@@ -588,8 +844,8 @@ def train_labelgan(args):
         disc_in_channels = 2  # atlas + label
     
     # Inicializace modelů
-    generator = Generator(in_channels=disc_in_channels, out_channels=1, feature_maps=args.feature_maps).to(device)
-    discriminator = Discriminator(in_channels=disc_in_channels, feature_maps=args.feature_maps).to(device)
+    generator = Generator(in_channels=disc_in_channels, out_channels=1, feature_maps=args.feature_maps, use_attention=args.use_attention, attention_type=args.attention_type).to(device)
+    discriminator = Discriminator(in_channels=disc_in_channels, feature_maps=args.feature_maps, use_attention=args.use_attention, attention_type=args.attention_type).to(device)
     
     # Inicializace optimizerů
     g_optimizer = optim.Adam(generator.parameters(), lr=args.lr, betas=(args.beta1, 0.999))
@@ -812,10 +1068,10 @@ def train_labelgan(args):
                 fake_binary = (fake_np > 0.5).astype(np.float32)
                 
                 # Uložení jako NIFTI
-                save_nifti(fake_np, f"{sample_path}_raw.nii.gz")
-                save_nifti(fake_binary, f"{sample_path}_binary.nii.gz")
-                save_nifti(real_np, f"{sample_path}_real.nii.gz")
-                save_nifti(atlas_np, f"{sample_path}_atlas.nii.gz")
+                save_nifti(fake_np, f"{sample_path}_raw.nii.gz", reference_path=args.normal_atlas_path)
+                save_nifti(fake_binary, f"{sample_path}_binary.nii.gz", reference_path=args.normal_atlas_path)
+                save_nifti(real_np, f"{sample_path}_real.nii.gz", reference_path=args.normal_atlas_path)
+                save_nifti(atlas_np, f"{sample_path}_atlas.nii.gz", reference_path=args.normal_atlas_path)
         
         # Uložení modelů
         if val_metrics['dice'] > best_val_dice:
@@ -836,115 +1092,121 @@ def train_labelgan(args):
     print("Trénink LabelGAN dokončen!")
 
 # Funkce pro generování syntetických lézí pomocí natrénovaného modelu
-def generate_lesions(args):
+def generate(args):
     """
-    Generuje syntetické léze pomocí natrénovaného generátoru
+    Generování syntetických lézí
     
     Args:
-        args: Argumenty příkazové řádky
+        args: Argumenty z příkazové řádky
     """
-    # Nastavení reprodukovatelnosti
-    set_seed(args.seed)
+    print(f"Generování {args.output_count} syntetických lézí...")
     
-    # Určení zařízení
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Použité zařízení: {device}")
+    # Kontrola dostupnosti GPU
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Používám zařízení: {device}")
     
-    # Vytvoření výstupního adresáře
-    os.makedirs(args.output_dir, exist_ok=True)
+    # Načtení atlas
+    print(f"Načítám normální atlas z: {args.normal_atlas_path}")
+    normal_atlas = load_nifti(args.normal_atlas_path)  # [D, H, W]
     
-    # Načtení normativního atlasu
-    if args.normal_atlas_path.endswith('.nii.gz') or args.normal_atlas_path.endswith('.nii'):
-        normal_atlas_data = nib.load(args.normal_atlas_path)
-        normal_atlas = normal_atlas_data.get_fdata()
-    else:
-        normal_atlas_sitk = sitk.ReadImage(args.normal_atlas_path)
-        normal_atlas = sitk.GetArrayFromImage(normal_atlas_sitk)
-        normal_atlas_data = None  # Nemáme nibabel objekt pro metadata
-    
-    # Normalizace atlasu na rozsah [0, 1]
-    normal_atlas = (normal_atlas - normal_atlas.min()) / (normal_atlas.max() - normal_atlas.min())
-    
-    # Načtení atlasu frekvence lézí, pokud je dostupný
-    lesion_atlas = None
-    lesion_atlas_data = None
-    
+    # Určení kanálů podle dostupnosti atlasu lézí
+    in_channels = 2  # Normální atlas + šum
     if args.lesion_atlas_path:
-        if args.lesion_atlas_path.endswith('.nii.gz') or args.lesion_atlas_path.endswith('.nii'):
-            lesion_atlas_data = nib.load(args.lesion_atlas_path)
-            lesion_atlas = lesion_atlas_data.get_fdata()
-        else:
-            lesion_atlas_sitk = sitk.ReadImage(args.lesion_atlas_path)
-            lesion_atlas = sitk.GetArrayFromImage(lesion_atlas_sitk)
-        
-        # Normalizace atlasu lézí na rozsah [0, 1]
-        lesion_atlas = (lesion_atlas - lesion_atlas.min()) / (lesion_atlas.max() - lesion_atlas.min())
-    
-    # Načtení modelu generátoru
-    # Konfigurace vstupních kanálů
-    if args.lesion_atlas_path:
-        in_channels = 3  # atlas + šum + lesion atlas
+        print(f"Načítám atlas lézí z: {args.lesion_atlas_path}")
+        lesion_atlas = load_nifti(args.lesion_atlas_path)  # [D, H, W]
+        in_channels += 1  # Přidáme extra kanál pro atlas lézí
     else:
-        in_channels = 2  # atlas + šum
+        lesion_atlas = None
     
     # Inicializace modelu
-    generator = Generator(in_channels=in_channels, out_channels=1, feature_maps=args.feature_maps).to(device)
+    generator = Generator(in_channels=in_channels, out_channels=1, feature_maps=args.feature_maps, 
+                          use_attention=args.use_attention, attention_type=args.attention_type).to(device)
     
     # Načtení vah
+    print(f"Načítám natrénovaný model z: {args.model_path}")
     generator.load_state_dict(torch.load(args.model_path, map_location=device))
     generator.eval()
     
-    # Nastavení modelu do eval módu
-    generator.eval()
+    # Vytvoření výstupního adresáře
+    if not os.path.exists(args.output_dir):
+        os.makedirs(args.output_dir)
     
-    # Konverze atlasů na tensory
-    normal_atlas_tensor = torch.FloatTensor(normal_atlas).unsqueeze(0).unsqueeze(0).to(device)  # [1, 1, D, H, W]
-    
-    if lesion_atlas is not None:
-        lesion_atlas_tensor = torch.FloatTensor(lesion_atlas).unsqueeze(0).unsqueeze(0).to(device)  # [1, 1, D, H, W]
-    
-    # Generování zadaného počtu syntetických lézí
-    with torch.no_grad():
-        for i in tqdm(range(args.num_samples), desc="Generuji léze"):
-            # Vygenerování náhodného šumu
-            noise = torch.randn(1, 1, *normal_atlas.shape).to(device)
-            
-            # Generování léze
+    # Generování syntetických lézí
+    for i in range(args.output_count):
+        # Příprava vstupu pro generátor
+        noise = torch.randn(1, 1, *normal_atlas.shape, device=device)  # [1, 1, D, H, W]
+        normal_atlas_tensor = torch.from_numpy(normal_atlas).float().unsqueeze(0).unsqueeze(0).to(device)  # [1, 1, D, H, W]
+        
+        inputs = [normal_atlas_tensor, noise]
+        
+        # Pokud máme atlas lézí, přidáme jej
+        if lesion_atlas is not None:
+            lesion_atlas_tensor = torch.from_numpy(lesion_atlas).float().unsqueeze(0).unsqueeze(0).to(device)  # [1, 1, D, H, W]
+            inputs.append(lesion_atlas_tensor)
+        
+        # Spojení všech vstupů
+        x = torch.cat(inputs, dim=1)
+        
+        # Generování syntetické léze
+        with torch.no_grad():
             if lesion_atlas is not None:
-                # Spojení atlasu, šumu a atlasu lézí
-                gen_input = torch.cat([normal_atlas_tensor, noise, lesion_atlas_tensor], dim=1)
-                fake_label = generator(gen_input, lesion_atlas_tensor)
+                synthetic_lesion = generator(x, lesion_atlas_tensor)
             else:
-                # Spojení atlasu a šumu
-                gen_input = torch.cat([normal_atlas_tensor, noise], dim=1)
-                fake_label = generator(gen_input)
-            
-            # Převod na numpy
-            fake_np = fake_label[0, 0].cpu().numpy()
-            
-            # Binarizace výstupu (použití prahu)
-            if args.threshold:
-                fake_binary = (fake_np > args.threshold).astype(np.float32)
-            else:
-                # Použití adaptivního prahu, který zachová přibližně stejné procento lézí jako v trénovacích datech
-                # Typický rozsah je 1-5% voxelů
-                sorted_values = np.sort(fake_np.flatten())
-                threshold_index = int(0.95 * len(sorted_values))  # Assuming approximately 5% of voxels are lesions
-                adaptive_threshold = sorted_values[threshold_index]
-                fake_binary = (fake_np > adaptive_threshold).astype(np.float32)
-            
-            # Uložení jako NIFTI
-            output_path = os.path.join(args.output_dir, f"synthetic_lesion_{i+1:04d}.nii.gz")
-            
-            if normal_atlas_data is not None:
-                save_nifti(fake_binary, output_path, normal_atlas_data)
-            else:
-                save_nifti(fake_binary, output_path)
+                synthetic_lesion = generator(x)
+        
+        # Převod na numpy a binarizace
+        synthetic_lesion = synthetic_lesion.cpu().numpy().squeeze()  # [D, H, W]
+        binary_lesion = (synthetic_lesion > args.mask_threshold).astype(np.float32)
+        
+        # Uložení výsledku
+        out_path = os.path.join(args.output_dir, f"synthetic_lesion_{i+1}.nii.gz")
+        save_nifti(binary_lesion, out_path, reference_path=args.normal_atlas_path)
+        print(f"Uložena syntetická léze: {out_path}")
     
-    print(f"Vygenerováno {args.num_samples} syntetických lézí do adresáře: {args.output_dir}")
+    print("Generování dokončeno.")
 
-# Hlavní funkce
+# Pomocná funkce pro načítání NIFTI souborů
+def load_nifti(path):
+    """
+    Načte NIFTI soubor a vrátí data jako numpy pole
+    
+    Args:
+        path: Cesta k NIFTI souboru (.nii nebo .nii.gz)
+        
+    Returns:
+        Numpy array s daty z NIFTI souboru
+    """
+    if path.endswith('.nii.gz') or path.endswith('.nii'):
+        img = nib.load(path)
+        data = img.get_fdata()
+    else:
+        img = sitk.ReadImage(path)
+        data = sitk.GetArrayFromImage(img)
+    
+    # Normalizace na rozsah [0, 1]
+    data = (data - data.min()) / (data.max() - data.min() + 1e-8)
+    
+    return data.astype(np.float32)
+
+# Main funkce
 def main():
+    """
+    Hlavní funkce skriptu
+
+    Podporuje dva režimy:
+    1. Trénování GAN modelu (train)
+    2. Generování nových syntetických lézí (generate)
+    
+    Pro efektivní využití paměti při použití attention mechanismu jsou k dispozici tři možnosti:
+    - 'downsample': Aplikuje attention na downsamplovaná data (snížení rozlišení)
+    - 'block': Rozdělí data na menší bloky a aplikuje attention po blocích
+    - 'axial': Aplikuje attention separátně podél jednotlivých os (nejúspornější)
+    
+    V případě problémů s pamětí zkuste:
+    1. Změnit attention_type na 'axial' (nejúspornější)
+    2. Zmenšit block_size u 'block' attention nebo zvýšit reduction_factor u 'downsample'
+    3. Případně zcela vypnout attention mechanismus (--use_attention False)
+    """
     parser = argparse.ArgumentParser(description='LabelGAN pro generování syntetických lézí u HIE')
     
     # Sdílené argumenty
@@ -960,7 +1222,7 @@ def main():
                         help='Počet základních feature map v modelu')
     
     # Podparsery pro různé módy
-    subparsers = parser.add_subparsers(dest='mode', help='Mód operace')
+    subparsers = parser.add_subparsers(dest='command', help='Mód operace')
     
     # Parser pro trénink
     train_parser = subparsers.add_parser('train', help='Trénování LabelGAN')
@@ -988,24 +1250,39 @@ def main():
                              help='Váha pro Dice Loss')
     train_parser.add_argument('--focal_weight', type=float, default=5.0,
                              help='Váha pro Focal Loss')
+    train_parser.add_argument('--use_attention', type=bool, default=True,
+                             help='Použít attention mechanismus')
+    train_parser.add_argument('--attention_type', type=str, default='downsample',
+                             help='Typ attention mechanismu')
     
     # Parser pro generování
     generate_parser = subparsers.add_parser('generate', help='Generování syntetických lézí')
-    generate_parser.add_argument('--model_path', type=str, required=True,
-                                help='Cesta k natrénovanému generátoru')
-    generate_parser.add_argument('--num_samples', type=int, default=10,
-                                help='Počet syntetických lézí k vygenerování')
-    generate_parser.add_argument('--threshold', type=float, default=None,
-                                help='Práh pro binarizaci výstupu (0.0-1.0, None pro adaptivní práh)')
+    generate_parser.add_argument('--model_path', type=str, required=True, 
+                               help='Cesta k natrénovanému modelu')
+    generate_parser.add_argument('--output_count', type=int, default=10,
+                               help='Počet vygenerovaných výstupů')
+    generate_parser.add_argument('--feature_maps', type=int, default=64,
+                               help='Počet základních feature map v sítích')
+    generate_parser.add_argument('--mask_threshold', type=float, default=0.5,
+                               help='Práh pro binarizaci masky')
+    generate_parser.add_argument('--use_attention', type=bool, default=True,
+                               help='Použít attention mechanismus')
+    generate_parser.add_argument('--attention_type', type=str, default='downsample',
+                               help='Typ attention mechanismu (downsample, block, axial)')
     
     # Parsování argumentů
     args = parser.parse_args()
     
-    # Spuštění podle módu
-    if args.mode == 'train':
-        train_labelgan(args)
-    elif args.mode == 'generate':
-        generate_lesions(args)
+    # Kontrola, zda je definován příkaz
+    if not hasattr(args, 'command'):
+        parser.print_help()
+        return
+    
+    # Volání hlavních funkcí podle režimu
+    if args.command == 'train':
+        train(args)  # Volání funkce train()
+    elif args.command == 'generate':
+        generate(args)
     else:
         parser.print_help()
 
