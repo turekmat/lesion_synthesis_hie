@@ -621,35 +621,25 @@ def train_label_gan(args):
     print("LabelGAN Training completed!")
 
 def generate_label_samples(args):
-    """Generování vzorků LABEL map pomocí natrénovaného modelu"""
-    
-    # Nastavení zařízení
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     
-    # Načtení normativního atlasu
     if args.normal_atlas_path.endswith('.nii.gz') or args.normal_atlas_path.endswith('.nii'):
         normal_atlas = nib.load(args.normal_atlas_path).get_fdata()
     else:
         normal_atlas = sitk.GetArrayFromImage(sitk.ReadImage(args.normal_atlas_path))
-    
-    # Normalizace
     normal_atlas = (normal_atlas - normal_atlas.min()) / (normal_atlas.max() - normal_atlas.min())
-    normal_atlas = torch.FloatTensor(normal_atlas).unsqueeze(0).unsqueeze(0).to(device)  # [1, 1, D, H, W]
+    normal_atlas = torch.FloatTensor(normal_atlas).unsqueeze(0).unsqueeze(0).to(device)
     
-    # Načtení atlasu frekvence lézí (pokud je dostupný)
     lesion_atlas = None
     if args.lesion_atlas_path:
         if args.lesion_atlas_path.endswith('.nii.gz') or args.lesion_atlas_path.endswith('.nii'):
             lesion_atlas = nib.load(args.lesion_atlas_path).get_fdata()
         else:
             lesion_atlas = sitk.GetArrayFromImage(sitk.ReadImage(args.lesion_atlas_path))
-        
-        # Normalizace
         lesion_atlas = (lesion_atlas - lesion_atlas.min()) / (lesion_atlas.max() - lesion_atlas.min())
-        lesion_atlas = torch.FloatTensor(lesion_atlas).unsqueeze(0).unsqueeze(0).to(device)  # [1, 1, D, H, W]
+        lesion_atlas = torch.FloatTensor(lesion_atlas).unsqueeze(0).unsqueeze(0).to(device)
     
-    # Inicializace a načtení generátoru
     generator = LabelGenerator(
         in_channels=2,
         features=args.generator_filters,
@@ -661,34 +651,60 @@ def generate_label_samples(args):
     generator.load_state_dict(checkpoint['generator'])
     generator.eval()
     
-    # Generování vzorků
     os.makedirs(args.output_dir, exist_ok=True)
-    
-    # Vytvoření adresáře pro LABEL mapy
     label_output_dir = os.path.join(args.output_dir, "label")
     os.makedirs(label_output_dir, exist_ok=True)
     
+    generated_labels = []
     for i in range(args.num_samples):
         with torch.no_grad():
-            # Vytvoření náhodného šumu
             noise = torch.randn_like(normal_atlas).to(device)
-            
-            # Kontrola, jestli máme lesion_atlas a pokud ano, použijeme ho
             if lesion_atlas is not None:
-                # Vážení šumu podle frekvence lézí
                 fake_label = generator(normal_atlas, noise, lesion_atlas)
             else:
                 fake_label = generator(normal_atlas, noise)
-            
-            # Prahování label mapy pro zajištění binarity
             fake_label_binary = (fake_label > 0.5).float()
-            
-            # Uložení vzorků s informativními názvy
+            label_np = fake_label_binary[0, 0].cpu().numpy()  # [D, H, W]
+            generated_labels.append(label_np)
             label_output_path = os.path.join(label_output_dir, f'sample_{i}_label.nii.gz')
-            save_sample(fake_label_binary[0, 0].cpu().numpy(), label_output_path)
+            save_sample(label_np, label_output_path)
+    
+    if args.vizualize_generated:
+        pdf_output_path = os.path.join(args.output_dir, "generated_labels.pdf")
+        visualize_all_generated_labels(generated_labels, pdf_output_path)
     
     print(f"Generated {args.num_samples} LABEL maps")
     print(f"LABEL maps saved to: {label_output_dir}")
+    
+    
+def visualize_all_generated_labels(generated_labels, output_pdf_path, slices_per_row=5):
+    """
+    Vytvoří jeden PDF dokument s vizualizací všech generovaných LABEL map.
+    Každá LABEL mapa je zobrazena na samostatných stránkách, přičemž každá stránka obsahuje
+    mřížku řezu (slices_per_row řezu na řádek).
+    
+    Args:
+        generated_labels: List numpy polí s vygenerovanými LABEL mapami, každé s tvarem [D, H, W]
+        output_pdf_path: Cesta k uložení výsledného PDF
+        slices_per_row: Počet řezu na řádek
+    """
+    with PdfPages(output_pdf_path) as pdf:
+        for idx, label_np in enumerate(generated_labels):
+            D, H, W = label_np.shape
+            n_rows = int(np.ceil(D / slices_per_row))
+            fig = plt.figure(figsize=(slices_per_row*3, n_rows*3))
+            gs = gridspec.GridSpec(n_rows, slices_per_row)
+            for slice_idx in range(D):
+                row = slice_idx // slices_per_row
+                col = slice_idx % slices_per_row
+                ax = fig.add_subplot(gs[row, col])
+                ax.imshow(label_np[slice_idx, :, :], cmap='gray')
+                ax.set_title(f"Sample {idx+1}, Slice {slice_idx+1}")
+                ax.axis('off')
+            plt.tight_layout()
+            pdf.savefig(fig)
+            plt.close(fig)
+    print(f"Všechny generované LABEL mapy byly uloženy do PDF: {output_pdf_path}")
 
 def main():
     """Hlavní funkce skriptu"""
@@ -750,6 +766,8 @@ def main():
                                 help='Cesta k checkpointu modelu')
     generate_parser.add_argument('--num_samples', type=int, default=10,
                                 help='Počet vzorků k vygenerování')
+    generate_parser.add_argument('--vizualize_generated', action='store_true',
+                                help='Vytvoří PDF s vizualizací vygenerovaných LABEL map')
     
     args = parser.parse_args()
     
