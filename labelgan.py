@@ -1665,12 +1665,13 @@ class HIELesionGANTrainer:
 
     def generate_pdf_slices(self, epoch, num_samples=3):
         """
-        Generuje ukázkové léze a ukládá jejich řezy do PDF.
-        Pouze axiální pohled se všemi řezy.
-        
+        Generuje PDF se všemi axiálními řezy 3D imagu.
+        V každém slice nad obrázkem je číslo řezu (z celkového počtu) a počet nenulových pixelů.
+        Řezy jsou uspořádány po 4 na řádek.
+
         Args:
             epoch: Aktuální epocha
-            num_samples: Počet lézí k vygenerování
+            num_samples: Počet generovaných vzorků
         """
         print(f"Generuji PDF vizualizaci pro epochu {epoch}...")
         # Vytvoření adresáře pro PDF
@@ -1680,205 +1681,87 @@ class HIELesionGANTrainer:
         # Název výsledného PDF
         pdf_path = os.path.join(pdf_dir, f'lesion_slices_epoch_{epoch}.pdf')
         
-        # Get a batch of data to extract atlas and brain mask
+        # Získáme data z loaderu (pouze první batch)
         for batch in self.dataloader:
             atlas = batch['atlas'].to(self.device)
             brain_mask = batch['brain_mask'].to(self.device)
             
-            # Ensure they have batch dimension
+            # Zajistíme batch rozměr
             if atlas.dim() == 3:
                 atlas = atlas.unsqueeze(0)
             if brain_mask.dim() == 3:
                 brain_mask = brain_mask.unsqueeze(0)
             
-            # Create binary mask versions
+            # Binární masky
             atlas_binary = (atlas > 0).float()
             brain_mask_binary = (brain_mask > 0).float()
             
-            # Switch model to eval mode
+            # Přepneme model do eval režimu
             self.generator.eval()
             
-            # Import matplotlib modules here to avoid potential import errors
             from matplotlib.backends.backend_pdf import PdfPages
             import matplotlib.pyplot as plt
-            from matplotlib.colors import LinearSegmentedColormap
             
-            # Vytvoření vlastní colormapy pro zvýraznění lézí - i velmi malých hodnot
-            # Dvě barvy: černá (0) a červená (i pro malé hodnoty > 0)
-            highlight_cmap = LinearSegmentedColormap.from_list('highlight', [(0, 0, 0), (1, 0, 0)], N=256)
-            
-            # Otevřeme PDF soubor jednou pro všechny stránky
+            # Otevření PDF souboru (všechny vzorky na samostatných stránkách)
             with PdfPages(pdf_path) as pdf:
-                # Přidáme stránku s informacemi o významu barev
-                fig_info = plt.figure(figsize=(8, 8))
-                plt.axis('off')
-                plt.text(0.5, 0.95, "INFORMACE O ZOBRAZENÍ LÉZÍ", ha='center', fontsize=16, weight='bold')
-                plt.text(0.5, 0.9, "V tomto PDF jsou léze zobrazeny dvěma způsoby:", ha='center', fontsize=14)
-                
-                # Vysvětlení dvou typů zobrazení
-                plt.text(0.5, 0.85, "1. Standardní zobrazení (cmap='binary'):", ha='center', fontsize=14, weight='bold')
-                plt.text(0.5, 0.82, "   - Bílá = léze (hodnota 1)", ha='center', fontsize=13)
-                plt.text(0.5, 0.79, "   - Černá = pozadí (hodnota 0)", ha='center', fontsize=13)
-                
-                plt.text(0.5, 0.73, "2. Zvýrazněné zobrazení (vlastní colormap):", ha='center', fontsize=14, weight='bold')
-                plt.text(0.5, 0.7, "   - Červená = jakákoliv nenulová hodnota (léze)", ha='center', fontsize=13)
-                plt.text(0.5, 0.67, "   - Černá = pozadí (hodnota 0)", ha='center', fontsize=13)
-                plt.text(0.5, 0.63, "   Toto zobrazení zvýrazní i velmi malé léze!", ha='center', fontsize=13)
-                
-                # Ukázka barev
-                ax_sample1 = plt.axes([0.2, 0.45, 0.25, 0.12])
-                ax_sample2 = plt.axes([0.6, 0.45, 0.25, 0.12])
-                
-                sample_data = np.zeros((10, 20))
-                sample_data[2:8, 5:15] = 1.0  # Ukázková velká léze
-                sample_data[1, 1:3] = 0.1     # Ukázková malá léze
-                
-                # Standardní zobrazení
-                ax_sample1.imshow(sample_data, cmap='binary', vmin=0, vmax=1)
-                ax_sample1.set_title("Standardní zobrazení")
-                ax_sample1.axis('off')
-                
-                # Zvýrazněné zobrazení
-                ax_sample2.imshow(sample_data, cmap=highlight_cmap, vmin=0, vmax=1)
-                ax_sample2.set_title("Zvýrazněné zobrazení")
-                ax_sample2.axis('off')
-                
-                # Další informace
-                plt.text(0.5, 0.3, "DŮLEŽITÉ POZNÁMKY:", ha='center', fontsize=14, weight='bold')
-                plt.text(0.5, 0.25, "• Model je nyní optimalizován pro generování i velmi malých lézí", ha='center', fontsize=13)
-                plt.text(0.5, 0.22, "• Červená místa ve zvýrazněném zobrazení ukazují kde model zkouší generovat léze", ha='center', fontsize=13)
-                plt.text(0.5, 0.19, "• I malé hodnoty (< 0.5) jsou důležité, jelikož indikují tendenci modelu", ha='center', fontsize=13)
-                plt.text(0.5, 0.16, "• Během tréninku by se tyto oblasti měly postupně zvětšovat", ha='center', fontsize=13)
-                
-                plt.text(0.5, 0.09, f"PDF generováno v epoše {epoch}", ha='center', fontsize=14)
-                plt.text(0.5, 0.05, f"Datum: {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}", ha='center', fontsize=12)
-                
-                plt.tight_layout()
-                pdf.savefig(fig_info)
-                plt.close(fig_info)
-                
-                # Generujeme více vzorků (3 jako výchozí)
                 for sample_idx in range(num_samples):
                     print(f"  Generuji vzorek {sample_idx+1}/{num_samples}...")
                     
-                    # Vygenerujeme jeden vzorek pro získání 3D dat
+                    # Vygenerování vzorku (3D image)
                     with torch.no_grad():
                         z = torch.randn(1, self.z_dim, device=self.device)
                         fake_lesion = self.generator(z, atlas[:1], brain_mask[:1])
                         
-                        # Aplikace atlas masky a brain mask
+                        # Aplikace atlas a brain mask
                         fake_lesion = fake_lesion * atlas_binary[:1] * brain_mask_binary[:1]
                         
-                        # Uložíme původní hodnoty před binarizací pro zvýraznění slabých signálů
+                        # Ponecháme původní hodnoty (raw) před binarizací
                         raw_lesion_np = fake_lesion[0, 0].cpu().numpy()
                         
-                        # Binární threshold pro standardní zobrazení
+                        # Binarizace pro kontrolu, zda nejsou hodnoty invertované
                         binary_lesion = (fake_lesion > 0.5).float()
                         binary_np = binary_lesion[0, 0].cpu().numpy()
                     
-                    # Kontrola hodnot - pokud jsou hodnoty převážně 1, je to opačně než očekáváme
-                    # a pravděpodobně léze mají hodnotu 0 a pozadí hodnotu 1
-                    zeros_percentage = np.mean(binary_np == 0) * 100
                     ones_percentage = np.mean(binary_np == 1) * 100
-                    
-                    # Invertujeme pokud většina hodnot je 1 (což by znamenalo, že léze jsou 0)
                     if ones_percentage > 90:
                         print(f"  UPOZORNĚNÍ: Hodnoty vypadají invertované - {ones_percentage:.2f}% jsou jedničky!")
-                        binary_np = 1 - binary_np  # Invertujeme binární hodnoty
-                        raw_lesion_np = 1 - raw_lesion_np  # Invertujeme i raw hodnoty
+                        binary_np = 1 - binary_np
+                        raw_lesion_np = 1 - raw_lesion_np
                     
-                    # Získáme velikosti 3D objemu
-                    depth, height, width = binary_np.shape
+                    # Použijeme všechny řezy
+                    depth = raw_lesion_np.shape[0]
                     
-                    # Určíme počet řezů a jejich uspořádání na stránce - 2 řezy na řádek (standardní a zvýrazněný)
-                    slices_per_row = 2
-                    rows_needed = depth  # Každý řez bude na vlastním řádku se dvěma zobrazeními
+                    # Uspořádání: 4 řezy na řádek
+                    cols = 4
+                    rows = int(np.ceil(depth / cols))
+                    fig, axs = plt.subplots(rows, cols, figsize=(cols * 3, rows * 3))
+                    # Pokud je pouze jeden řádek, zajistíme konzistentní iteraci
+                    axs = np.array(axs).reshape(-1)
                     
-                    # Najdeme nenulové řezy, abychom věděli, které léze máme vizualizovat
-                    nonzero_slices = []
+                    # Pro každý slice
                     for i in range(depth):
-                        if np.any(raw_lesion_np[i, :, :] > 0):
-                            nonzero_slices.append(i)
-                    
-                    # Kontrola jestli vůbec jsou nějaké nenulové řezy
-                    if not nonzero_slices:
-                        print("  VAROVÁNÍ: Žádné nenulové řezy nenalezeny. Použijeme všechny řezy.")
-                        nonzero_slices = list(range(depth))
-                    
-                    # Vytvoříme obrázek pro všechny axiální řezy
-                    fig = plt.figure(figsize=(12, min(40, len(nonzero_slices) * 3)))  # Omezíme maximální výšku
-                    plt.suptitle(f"Generovaná HIE léze #{sample_idx+1} - Epocha {epoch} - Axiální pohled", fontsize=16)
-                    
-                    # Přidáme informace o objemu a dalších vlastnostech
-                    total_volume = np.sum(binary_np)
-                    total_voxels = binary_np.size
-                    zero_percentage = (binary_np == 0).sum() / total_voxels * 100
-                    
-                    # Analýza raw hodnot - kolik voxelů má alespoň malou nenulovou hodnotu
-                    raw_nonzero = (raw_lesion_np > 0).sum()
-                    raw_nonzero_percentage = raw_nonzero / total_voxels * 100
-                    
-                    components, num_components = measure_label(binary_np, return_num=True)
-                    
-                    info_text = (
-                        f"Objem léze: {total_volume} voxelů ({(100-zero_percentage):.3f}% objemu), "
-                        f"Nenulových voxelů před thresholdingem: {raw_nonzero} ({raw_nonzero_percentage:.3f}%), "
-                        f"Počet komponent: {num_components}, "
-                        f"Pozadí: {zero_percentage:.2f}% voxelů"
-                    )
-                    fig.text(0.5, 0.97, info_text, ha='center', fontsize=12)
-                    
-                    # Vizualizace pouze nenulových řezů
-                    for idx, slice_idx in enumerate(nonzero_slices):
-                        # Získáme řez v axiální rovině
-                        slice_data_binary = binary_np[slice_idx, :, :]
-                        slice_data_raw = raw_lesion_np[slice_idx, :, :]
+                        slice_img = raw_lesion_np[i, :, :]
+                        nonzero_count = np.count_nonzero(slice_img)
                         
-                        # Spočítáme procento nul v tomto řezu
-                        slice_zero_percentage = (slice_data_binary == 0).sum() / slice_data_binary.size * 100
-                        # Maximální hodnota v tomto řezu (před thresholdingem)
-                        slice_max_value = slice_data_raw.max()
-                        
-                        # Přidáme subplot pro standardní zobrazení (binary colormap)
-                        ax1 = plt.subplot(len(nonzero_slices), 2, idx*2 + 1)
-                        im1 = ax1.imshow(slice_data_binary, cmap='binary', interpolation='none', vmin=0, vmax=1)
-                        ax1.set_title(f"Řez {slice_idx} - Standardní (max={slice_max_value:.3f})")
-                        ax1.axis('off')
-                        
-                        # Přidáme subplot pro zvýrazněné zobrazení (highlight colormap)
-                        ax2 = plt.subplot(len(nonzero_slices), 2, idx*2 + 2)
-                        im2 = ax2.imshow(slice_data_raw, cmap=highlight_cmap, interpolation='none', vmin=0, vmax=1)
-                        ax2.set_title(f"Řez {slice_idx} - Zvýrazněno (>0)")
-                        ax2.axis('off')
+                        # Nad každým slice zobrazíme číslo slice a počet nenulových pixelů
+                        axs[i].set_title(f"{i+1}/{depth}, nz: {nonzero_count}", fontsize=8)
+                        axs[i].imshow(slice_img, cmap='gray', vmin=0, vmax=1)
+                        axs[i].axis('off')
                     
-                    # Přidáme popisek vysvětlující barvy
-                    fig.text(0.25, 0.985, "Standardní (černá/bílá)", ha='center', fontsize=10, weight='bold')
-                    fig.text(0.75, 0.985, "Zvýrazněné (černá/červená)", ha='center', fontsize=10, weight='bold')
+                    # Skryjeme prázdné subplots (pokud nějaké zbydou)
+                    for j in range(depth, len(axs)):
+                        axs[j].axis('off')
                     
-                    # Přizpůsobíme rozložení a uložíme do PDF
-                    plt.tight_layout(rect=[0, 0, 1, 0.95])  # Necháme místo pro nadpis
+                    plt.tight_layout()
                     pdf.savefig(fig)
                     plt.close(fig)
                 
-                # Přidáme souhrnnou stránku s informacemi
-                fig = plt.figure(figsize=(8, 6))
-                plt.axis('off')
-                plt.text(0.5, 0.8, f"HIE léze generované v epoše {epoch}", ha='center', fontsize=16)
-                plt.text(0.5, 0.7, f"Počet ukázek: {num_samples}", ha='center', fontsize=14)
-                plt.text(0.5, 0.6, f"Datum a čas generování: {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}", ha='center', fontsize=14)
-                plt.text(0.5, 0.5, "Generováno pomocí HIE Lesion GAN", ha='center', fontsize=14)
-                plt.text(0.5, 0.4, f"Zobrazení: Axiální (všechny nenulové řezy)", ha='center', fontsize=14)
-                plt.text(0.5, 0.35, f"Standardní (černá/bílá) a Zvýrazněné (červené léze)", ha='center', fontsize=14)
-                plt.text(0.5, 0.3, f"PDF uloženo do: {pdf_path}", ha='center', fontsize=12)
-                plt.tight_layout()
-                pdf.savefig(fig)
-                plt.close(fig)
-            
-            # Vrátit generátor do režimu tréninku
+            # Vrátíme model do tréninkového režimu
             self.generator.train()
-            break
+            break  # Použijeme pouze první batch
         
         print(f"PDF vizualizace uložena do: {pdf_path}")
+
 
 
     def train(self, num_epochs, validate_every=5):
