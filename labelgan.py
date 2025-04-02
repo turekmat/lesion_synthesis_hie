@@ -217,17 +217,13 @@ class LesionGenerator(nn.Module):
         # Vrstvy decoderu s skip connections
         for i in range(depth):
             if i == 0:
-                # První decode vrstva
+                # První decode vrstva - bez skip connection
                 in_ch = features * (2**(depth-1))
                 out_ch = features * (2**(depth-2))
             else:
                 # Další decode vrstvy se skip connections
-                in_ch = features * (2**(depth-i)) * 2  # x2 kvůli skip connections
-                out_ch = features * (2**(depth-i-1))
-            
-            if i == depth - 1:
-                # Poslední vrstva
-                out_ch = features
+                in_ch = features * (2**(depth-i-1)) * 2  # x2 kvůli skip connections
+                out_ch = features * (2**(depth-i-2)) if i < depth-1 else features
             
             # Decoder vrstvy s batch normalizací a dropoutem
             self.decoder.append(
@@ -257,12 +253,16 @@ class LesionGenerator(nn.Module):
         # Spojení atlasu lézí a šumu jako vstup
         x = torch.cat([lesion_atlas, noise], dim=1)
         
+        # Debug informace o rozměrech
+        # print(f"Input shape: {x.shape}")
+        
         # Uložíme si výstupy z encoderu pro skip connections
         encoder_outputs = []
         
         # Encoder forward pass
         for i, layer in enumerate(self.encoder):
             x = layer(x)
+            # print(f"Encoder {i} output shape: {x.shape}")
             if i < self.depth - 1:  # Uložíme všechny kromě poslední vrstvy
                 encoder_outputs.append(x)
         
@@ -272,14 +272,43 @@ class LesionGenerator(nn.Module):
         
         # Decoder forward pass s skip connections
         for i, layer in enumerate(self.decoder):
-            if i > 0:  # Pro všechny kromě první decode vrstvy přidáme skip connection
+            # Pro první vrstvu dekodéru nepřidáváme skip connection
+            if i > 0:
                 skip_idx = self.depth - i - 1
-                x = torch.cat([x, encoder_outputs[skip_idx]], dim=1)
+                # print(f"Decoder {i} input shape before skip: {x.shape}")
+                # print(f"Skip connection from encoder {skip_idx} shape: {encoder_outputs[skip_idx].shape}")
+                
+                # Bezpečné spojení s kontrolou rozměrů
+                try:
+                    x = torch.cat([x, encoder_outputs[skip_idx]], dim=1)
+                except RuntimeError as e:
+                    # Pokud se rozměry neshodují, použijeme resize pomocí interpolace
+                    skip_x = encoder_outputs[skip_idx]
+                    if x.shape[2:] != skip_x.shape[2:]:
+                        skip_x = F.interpolate(skip_x, size=x.shape[2:], mode='trilinear', align_corners=False)
+                    x = torch.cat([x, skip_x], dim=1)
+            
+            # print(f"Decoder {i} input shape after skip: {x.shape}")
             x = layer(x)
+            # print(f"Decoder {i} output shape: {x.shape}")
         
         # Poslední skip connection a výstupní vrstva
-        x = torch.cat([x, encoder_outputs[0]], dim=1)
+        # print(f"Shape before final skip: {x.shape}")
+        # print(f"Final skip connection shape: {encoder_outputs[0].shape}")
+        
+        # Bezpečné spojení s kontrolou rozměrů pro poslední skip connection
+        try:
+            x = torch.cat([x, encoder_outputs[0]], dim=1)
+        except RuntimeError as e:
+            # Pokud se rozměry neshodují, použijeme resize pomocí interpolace
+            skip_x = encoder_outputs[0]
+            if x.shape[2:] != skip_x.shape[2:]:
+                skip_x = F.interpolate(skip_x, size=x.shape[2:], mode='trilinear', align_corners=False)
+            x = torch.cat([x, skip_x], dim=1)
+        
+        # print(f"Shape after final skip: {x.shape}")
         lesion_map = self.output_layer(x)
+        # print(f"Final output shape: {lesion_map.shape}")
         
         return lesion_map
 
@@ -501,6 +530,30 @@ def train_lesion_gan(args):
         use_spectral_norm=args.use_spectral_norm,
         depth=args.disc_depth
     ).to(args.device)
+    
+    # Registrace debug hooks, pokud je debug mód aktivován
+    if hasattr(args, 'debug') and args.debug:
+        print("Registruji debug hooks pro sledování rozměrů tenzorů...")
+        
+        def hook_fn(module, input, output):
+            module_name = module.__class__.__name__
+            input_shapes = [x.shape if isinstance(x, torch.Tensor) else "None" for x in input]
+            if isinstance(output, torch.Tensor):
+                output_shape = output.shape
+            else:
+                output_shape = "Not a tensor"
+            print(f"Module {module_name}: Input shapes {input_shapes}, Output shape {output_shape}")
+        
+        # Registrace hooks na vybrané vrstvy
+        for name, module in generator.named_modules():
+            if isinstance(module, (nn.Conv3d, nn.ConvTranspose3d, nn.BatchNorm3d)):
+                module.register_forward_hook(hook_fn)
+                
+        # Výpis architektury modelu
+        print("\nArchitektura generátoru:")
+        print(generator)
+        print("\nArchitektura diskriminátoru:")
+        print(discriminator)
     
     # Inicializace optimizérů
     optimizer_G = optim.Adam(generator.parameters(), lr=args.lr, betas=(args.b1, args.b2))
@@ -816,6 +869,9 @@ def generate_lesion_samples(args):
     # Normalizace do rozsahu [0, 1]
     lesion_atlas_data = (lesion_atlas_data - lesion_atlas_data.min()) / (lesion_atlas_data.max() - lesion_atlas_data.min())
     
+    # Výpis informací o rozměrech
+    print(f"Rozměry atlasu lézí: {lesion_atlas_data.shape}")
+    
     # Převod na tensor
     lesion_atlas_tensor = torch.FloatTensor(lesion_atlas_data).unsqueeze(0).unsqueeze(0).to(args.device)
     
@@ -832,8 +888,48 @@ def generate_lesion_samples(args):
         use_attention=args.use_attention
     ).to(args.device)
     
-    # Načtení vah
-    generator.load_state_dict(checkpoint['generator_state_dict'])
+    try:
+        # Načtení vah
+        generator.load_state_dict(checkpoint['generator_state_dict'])
+        print("Model úspěšně načten.")
+    except Exception as e:
+        print(f"Chyba při načítání modelu: {e}")
+        print("Zkouším alternativní klíče...")
+        # Zkusit jiné možné klíče v checkpointu
+        for key in checkpoint.keys():
+            print(f"Dostupný klíč: {key}")
+        
+        if 'state_dict' in checkpoint:
+            print("Zkouším načíst 'state_dict'...")
+            try:
+                generator.load_state_dict(checkpoint['state_dict'])
+                print("Model úspěšně načten z 'state_dict'.")
+            except Exception as e2:
+                print(f"Chyba při alternativním načítání: {e2}")
+                return False
+    
+    # Registrace debug hooks, pokud je debug mód aktivován
+    if hasattr(args, 'debug') and args.debug:
+        print("Registruji debug hooks pro sledování rozměrů tenzorů...")
+        
+        def hook_fn(module, input, output):
+            module_name = module.__class__.__name__
+            input_shapes = [x.shape if isinstance(x, torch.Tensor) else "None" for x in input]
+            if isinstance(output, torch.Tensor):
+                output_shape = output.shape
+            else:
+                output_shape = "Not a tensor"
+            print(f"Module {module_name}: Input shapes {input_shapes}, Output shape {output_shape}")
+        
+        # Registrace hooks na vybrané vrstvy
+        for name, module in generator.named_modules():
+            if isinstance(module, (nn.Conv3d, nn.ConvTranspose3d, nn.BatchNorm3d)):
+                module.register_forward_hook(hook_fn)
+        
+        # Výpis architektury modelu
+        print("\nArchitektura generátoru:")
+        print(generator)
+    
     generator.eval()
     
     print(f"Generuji {args.n_samples} vzorků lézí...")
@@ -912,6 +1008,8 @@ def main():
                         help="Seed pro reprodukovatelnost")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu",
                         help="Zařízení pro trénink/generování (cuda/cpu)")
+    parser.add_argument("--debug", action="store_true",
+                       help="Zapnout debug režim s výpisem rozměrů tenzorů")
     
     # Argumenty pro dataset
     parser.add_argument("--label_dir", type=str, default="data/BONBID2023_Train/3LABEL",
@@ -978,8 +1076,53 @@ def main():
     for arg, value in vars(args).items():
         print(f"  {arg}: {value}")
     
+    # Zapnutí debugovacího režimu
+    if args.debug:
+        def hook_fn(module, input, output):
+            module_name = module.__class__.__name__
+            print(f"Shape for {module_name}: input {[x.shape if x is not None else None for x in input]}, output {output.shape}")
+        
+        def register_hooks(model):
+            for name, module in model.named_modules():
+                if isinstance(module, (nn.Conv3d, nn.ConvTranspose3d, nn.BatchNorm3d)):
+                    module.register_forward_hook(hook_fn)
+        
+        print("Debug režim je zapnutý - budou vypisovány informace o rozměrech tenzorů")
+    
     # Spuštění příslušného režimu
     if args.mode == "train":
+        print("Kontrola rozměrů vstupních dat...")
+        # Načtení vzorku dat pro kontrolu rozměrů
+        dataset = LabelGANDataset(
+            label_dir=args.label_dir,
+            lesion_atlas_path=args.lesion_atlas_path,
+            augment=False
+        )
+        
+        if len(dataset) > 0:
+            sample = dataset[0]
+            label_shape = sample['label'].shape
+            atlas_shape = sample['lesion_atlas'].shape
+            print(f"Rozměry dat: LABEL mapa {label_shape}, Atlas lézí {atlas_shape}")
+            
+            # Doporučení vhodné hloubky sítě
+            min_dim = min(label_shape[1:])
+            max_depth = 0
+            while min_dim > 1:
+                min_dim = min_dim // 2
+                max_depth += 1
+            
+            recommended_depth = min(max_depth - 1, 5)  # Omezení max. hloubky na 5
+            if args.gen_depth > recommended_depth:
+                print(f"VAROVÁNÍ: Zadaná hloubka sítě (gen_depth={args.gen_depth}) může být příliš velká pro dané rozměry dat.")
+                print(f"Doporučená hloubka: {recommended_depth}")
+                
+                # Automatická korekce hloubky, pokud je zapnutý debug režim
+                if args.debug:
+                    args.gen_depth = recommended_depth
+                    print(f"V debug režimu automaticky upravuji hloubku na doporučenou hodnotu {recommended_depth}")
+        
+        # Spuštění tréninku
         train_lesion_gan(args)
     elif args.mode == "generate":
         generate_lesion_samples(args)
