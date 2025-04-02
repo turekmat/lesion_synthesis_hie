@@ -26,84 +26,141 @@ class HIELesionDataset(Dataset):
                  transform=None, 
                  use_random_affine=False, 
                  use_elastic_transform=False,
-                 intensity_noise=0.1):
+                 intensity_noise=0.1,
+                 filter_empty=True):  # Nový parametr pro filtrování prázdných obrázků
+        """
+        Dataset pro načítání labelů, atlasu a případně brain masky
+        
+        Args:
+            label_dir: Adresář s label mapami
+            atlas_path: Cesta k atlasu lézí
+            brain_mask_path: Cesta k masce mozku
+            transform: Transformace aplikované na data
+            use_random_affine: Použít náhodnou afinní transformaci
+            use_elastic_transform: Použít elastickou transformaci pro augmentaci
+            intensity_noise: Síla šumu pro intenzitu
+            filter_empty: Filtrovat celočerné obrázky bez lézí
+        """
         self.label_dir = label_dir
         self.transform = transform
         self.use_random_affine = use_random_affine
         self.use_elastic_transform = use_elastic_transform
         self.intensity_noise = intensity_noise
         
-        # Load all label file paths
-        self.label_files = sorted([os.path.join(label_dir, f) for f in os.listdir(label_dir) 
-                               if f.endswith('.nii.gz') or f.endswith('.nii')])
+        # Načtení všech souborů s labely
+        self.label_files = sorted([os.path.join(label_dir, f) for f in os.listdir(label_dir)
+                                 if f.endswith('.nii.gz') or f.endswith('.nii')])
         
+        if not self.label_files:
+            raise ValueError(f"No label files found in {label_dir}")
+            
         print(f"Found {len(self.label_files)} lesion label files in {label_dir}")
         
-        # Load lesion probability atlas if provided
-        self.atlas = None
-        if atlas_path and os.path.exists(atlas_path):
-            print(f"Loading lesion atlas from {atlas_path}")
-            atlas_nii = nib.load(atlas_path)
-            self.atlas = atlas_nii.get_fdata()
-            # Normalize atlas to [0, 1] if needed
-            if self.atlas.max() > 1.0:
-                self.atlas = self.atlas / self.atlas.max()
+        # NOVÁ FUNKCE: Filtrování celočerných obrázků
+        if filter_empty:
+            non_empty_files = []
+            print("Filtering out completely black images...")
             
-            # Binary atlas representation (any non-zero value is a potential lesion location)
-            self.atlas_binary = (self.atlas > 0).astype(np.float32)
+            for file_path in tqdm(self.label_files, desc="Checking lesion files"):
+                # Načtení label souboru
+                if file_path.endswith('.nii.gz') or file_path.endswith('.nii'):
+                    label_data = nib.load(file_path).get_fdata()
+                else:
+                    continue  # Přeskočit nepodporované formáty
+                
+                # Kontrola, zda obrázek obsahuje nenulové hodnoty (tj. léze)
+                if np.any(label_data > 0):
+                    non_empty_files.append(file_path)
             
-            print(f"Atlas shape: {self.atlas.shape}, min: {self.atlas.min()}, max: {self.atlas.max()}")
-        else:
-            print("No lesion atlas provided or file not found")
+            filtered_count = len(self.label_files) - len(non_empty_files)
+            if filtered_count > 0:
+                print(f"Filtered out {filtered_count} completely black images")
+                print(f"Remaining images with lesions: {len(non_empty_files)}")
+                self.label_files = non_empty_files
+            else:
+                print("No completely black images found - all images contain lesions")
         
-        # Load normative brain mask if provided
-        self.brain_mask = None
-        if brain_mask_path and os.path.exists(brain_mask_path):
-            print(f"Loading brain mask from {brain_mask_path}")
-            brain_mask_nii = nib.load(brain_mask_path)
-            self.brain_mask = brain_mask_nii.get_fdata()
+        # Načtení atlasu lézí, pokud je dostupný
+        self.atlas_path = atlas_path
+        if atlas_path:
+            print(f"Loading lesion atlas from {atlas_path}")
+            self.atlas = nib.load(atlas_path).get_fdata()
             
-            # Ensure brain mask is binary
-            self.brain_mask = (self.brain_mask > 0).astype(np.float32)
+            # Normalizace atlasu na rozsah [0, 1]
+            self.atlas = (self.atlas - np.min(self.atlas)) / (np.max(self.atlas) - np.min(self.atlas))
+            print(f"Atlas shape: {self.atlas.shape}, min: {np.min(self.atlas)}, max: {np.max(self.atlas)}")
             
-            print(f"Brain mask shape: {self.brain_mask.shape}, sum: {np.sum(self.brain_mask)}")
+            # Převod na tensor
+            self.atlas = torch.FloatTensor(self.atlas).unsqueeze(0)  # Přidání kanálové dimenze
         else:
-            print("No brain mask provided or file not found")
+            self.atlas = None
+            
+        # Načtení masky mozku, pokud je dostupná
+        self.brain_mask_path = brain_mask_path
+        if brain_mask_path:
+            print(f"Loading brain mask from {brain_mask_path}")
+            self.brain_mask = nib.load(brain_mask_path).get_fdata()
+            
+            # Binarizace masky
+            self.brain_mask = (self.brain_mask > 0).astype(np.float32)
+            print(f"Brain mask shape: {self.brain_mask.shape}, sum: {np.sum(self.brain_mask)}")
+            
+            # Převod na tensor
+            self.brain_mask = torch.FloatTensor(self.brain_mask).unsqueeze(0)  # Přidání kanálové dimenze
+        else:
+            self.brain_mask = None
+            
+        # Inicializace 3D augmentací, pokud jsou požadovány
+        if use_random_affine:
+            self.augmentation = RandomAugmentation3D()
         
     def __len__(self):
         return len(self.label_files)
     
     def __getitem__(self, idx):
-        # Load label
+        # Načtení label mapy
         label_path = self.label_files[idx]
         label_nii = nib.load(label_path)
         label = label_nii.get_fdata()
         
-        # Ensure label is binary
+        # Binarizace label (léze jsou nenulové hodnoty)
         label = (label > 0).astype(np.float32)
         
-        # Convert to tensor and add channel dimension
+        # Převod na tensor
         label_tensor = torch.from_numpy(label).float().unsqueeze(0)
         
-        # Prepare atlas if available
+        # Načtení atlasu, pokud je k dispozici
         if self.atlas is not None:
-            atlas_tensor = torch.from_numpy(self.atlas).float().unsqueeze(0)
+            # Již načteno a převedeno na tensor v __init__
+            atlas_tensor = self.atlas.clone()
         else:
-            # If no atlas, create a dummy tensor of ones with the same shape as the label
-            atlas_tensor = torch.ones_like(label_tensor)
+            # Pokud atlas chybí, vytvoříme prázdný tensor stejné velikosti jako label
+            atlas_tensor = torch.zeros_like(label_tensor)
         
-        # Prepare brain mask if available
+        # Načtení masky mozku, pokud je k dispozici
         if self.brain_mask is not None:
-            brain_mask_tensor = torch.from_numpy(self.brain_mask).float().unsqueeze(0)
+            # Již načteno a převedeno na tensor v __init__
+            brain_mask_tensor = self.brain_mask.clone()
         else:
-            # If no brain mask, create a dummy tensor of ones with the same shape as the label
+            # Pokud maska chybí, použijeme jednotkovou masku stejné velikosti jako label
             brain_mask_tensor = torch.ones_like(label_tensor)
         
-        # Apply transformations if needed
-        if self.transform:
-            label_tensor = self.transform(label_tensor)
-            atlas_tensor = self.transform(atlas_tensor)
-            brain_mask_tensor = self.transform(brain_mask_tensor)
+        # Aplikace transformací a augmentací, pokud jsou požadovány
+        if self.use_random_affine:
+            # Vytvoříme slovník pro augmentaci
+            sample = {'label': label_tensor, 'atlas': atlas_tensor, 'brain_mask': brain_mask_tensor}
+            augmented = self.augmentation(sample)
+            label_tensor = augmented['label']
+            atlas_tensor = augmented['atlas']
+            brain_mask_tensor = augmented['brain_mask']
+        
+        # Přidání malého Gaussovského šumu pro větší rozmanitost
+        if self.intensity_noise > 0:
+            noise = torch.randn_like(label_tensor) * self.intensity_noise
+            # Aplikujeme šum pouze na nenulové hodnoty pro zachování binárního charakteru
+            label_tensor = torch.where(label_tensor > 0, 
+                                    torch.clamp(label_tensor + noise, 0.0, 1.0), 
+                                    label_tensor)
         
         return {
             'label': label_tensor, 
@@ -128,23 +185,41 @@ class RandomAugmentation3D:
     def __call__(self, sample):
         label = sample['label']
         atlas = sample['atlas']
+        brain_mask = sample['brain_mask']
         
-        # Náhodná rotace
+        # Náhodná rotace - aplikovaná na všechny komponenty stejně pro konzistenci
         if random.random() < 0.5:
             angle = random.uniform(-self.rotation_range, self.rotation_range)
+            
+            # Rotace label
             for z in range(label.shape[0]):
                 label_slice = label[z, :, :]
                 label[z, :, :] = transforms.functional.rotate(
                     label_slice.unsqueeze(0), angle).squeeze(0)
+            
+            # Rotace brain_mask - stejný úhel jako label
+            for z in range(brain_mask.shape[0]):
+                mask_slice = brain_mask[z, :, :]
+                brain_mask[z, :, :] = transforms.functional.rotate(
+                    mask_slice.unsqueeze(0), angle).squeeze(0)
         
-        # Náhodný flip
+        # Náhodný horizontální flip - aplikovaný na všechny komponenty
         if random.random() < self.flip_prob:
-            label = torch.flip(label, [1])  # Flip horizontálně
+            label = torch.flip(label, [1])       # Flip horizontálně
+            brain_mask = torch.flip(brain_mask, [1])  # Stejný flip pro masku
         
+        # Náhodný vertikální flip - aplikovaný na všechny komponenty
         if random.random() < self.flip_prob:
-            label = torch.flip(label, [2])  # Flip vertikálně
+            label = torch.flip(label, [2])       # Flip vertikálně
+            brain_mask = torch.flip(brain_mask, [2])  # Stejný flip pro masku
         
-        return {'label': label, 'atlas': atlas}
+        # Atlas neaugmentujeme, protože představuje anatomickou pravděpodobnost
+        
+        return {
+            'label': label, 
+            'atlas': atlas, 
+            'brain_mask': brain_mask
+        }
 
 
 def spectral_norm(module, mode=True):
@@ -272,96 +347,73 @@ class Generator(nn.Module):
         self.debug = False
         
     def forward(self, z, atlas, brain_mask=None):
-        batch_size = atlas.size(0)
-        
-        if self.debug:
-            print(f"Input atlas shape: {atlas.shape}, z shape: {z.shape}")
-            if brain_mask is not None:
-                print(f"Brain mask shape: {brain_mask.shape}")
-        
-        # Encoder - atlas
-        e1 = self.atlas_enc1(atlas)  # 64x64x32
-        e2 = self.atlas_enc2(e1)     # 32x32x16
-        e3 = self.atlas_enc3(e2)     # 16x16x8
-        e4 = self.atlas_enc4(e3)     # 8x8x4
-        
-        if self.debug:
-            print(f"Encoder outputs - e1: {e1.shape}, e2: {e2.shape}, e3: {e3.shape}, e4: {e4.shape}")
-        
-        # Zpracování náhodného šumu a reshape na 3D feature mapu
-        z_flat = self.fc_z(z)
-        
-        # Shape fix: Get the actual shape from e4 to ensure compatibility
-        _, _, D, H, W = e4.shape
-        z_3d = z_flat.view(batch_size, self.base_filters, D, H, W)
-        z_3d = self.reshape_z(z_3d)
-        
-        if self.debug:
-            print(f"Latent z_3d shape: {z_3d.shape}")
-        
-        # Kombinace atlasu a šumu v bottlenecku
-        combined = torch.cat([e4, z_3d], dim=1)
-        if self.debug:
-            print(f"Combined bottleneck shape: {combined.shape}")
+        # Ensure z has the right shape
+        if z.dim() == 2:
+            z = z.unsqueeze(2).unsqueeze(3).unsqueeze(4)
             
+        # Transform latent vector
+        batch_size = z.size(0)
+        z_flat = self.fc_z(z.view(batch_size, -1))
+        z_reshaped = z_flat.view(batch_size, self.base_filters, 8, 8, 4)
+        z_processed = self.reshape_z(z_reshaped)
+        
+        # Encoder for atlas - extract spatial features at multiple levels
+        a1 = self.atlas_enc1(atlas)  # Output: base_filters
+        a2 = self.atlas_enc2(a1)     # Output: base_filters*2
+        a3 = self.atlas_enc3(a2)     # Output: base_filters*4
+        a4 = self.atlas_enc4(a3)     # Output: base_filters*8
+        
+        # Concatenate processed latent vector with atlas features
+        combined = torch.cat([a4, z_processed], dim=1)
+        
+        # Pass through bottleneck convolution to fuse features
         bottleneck = self.bottleneck_conv(combined)
         
-        # Self-attention
-        attended = self.self_attn(bottleneck)
-        if self.debug:
-            print(f"After self-attention: {attended.shape}")
+        # Apply self-attention at bottleneck for long-range dependencies
+        bottleneck_attn = self.self_attn(bottleneck)
         
-        # Decoder s skip connections
-        d4 = self.dec4(attended)                           # 16x16x8
-        if self.debug:
-            print(f"d4 shape: {d4.shape}, e3 shape: {e3.shape}")
-            
-        d4_skip = torch.cat([d4, e3], dim=1)
-        if self.debug:
-            print(f"d4_skip shape: {d4_skip.shape}")
+        # Decoder with skip connections from encoder
+        d4 = self.dec4(bottleneck_attn)
         
-        d3 = self.dec3(d4_skip)                            # 32x32x16
-        if self.debug:
-            print(f"d3 shape: {d3.shape}, e2 shape: {e2.shape}")
-            
-        d3_skip = torch.cat([d3, e2], dim=1)
-        if self.debug:
-            print(f"d3_skip shape: {d3_skip.shape}")
+        # Concatenate with encoder features and decode
+        d4_cat = torch.cat([d4, a3], dim=1)
+        d3 = self.dec3(d4_cat)
         
-        d2 = self.dec2(d3_skip)                            # 64x64x32
-        if self.debug:
-            print(f"d2 shape: {d2.shape}, e1 shape: {e1.shape}")
-            
-        d2_skip = torch.cat([d2, e1], dim=1)               # Concatenate to get [batch, base_filters*2, D, H, W]
-        if self.debug:
-            print(f"d2_skip shape (before attention): {d2_skip.shape}")
+        d3_cat = torch.cat([d3, a2], dim=1)
+        d2 = self.dec2(d3_cat)
         
-        # Resize atlas for attention if needed
-        if d2_skip.shape[2:] != atlas.shape[2:]:
-            atlas_resized = F.interpolate(atlas, size=d2_skip.shape[2:], mode='trilinear', align_corners=False)
-        else:
-            atlas_resized = atlas
-            
-        # Probabilistic atlas-based attention - using continuous atlas values, not just binary
-        # Concatenate feature maps with atlas to guide the attention mechanism
-        attention_input = torch.cat([d2_skip, atlas_resized], dim=1)
-        atlas_attention = self.atlas_attention(attention_input)
+        # Use attention mechanism to focus on atlas-positive regions
+        # Prepare attention input by concatenating d2 features with atlas
+        d2_with_atlas = torch.cat([d2, F.interpolate(atlas, size=d2.shape[2:], mode='trilinear', align_corners=False)], dim=1)
+        attention_map = self.atlas_attention(d2_with_atlas)
         
-        if self.debug:
-            print(f"atlas_attention shape: {atlas_attention.shape}")
-            
-        # Apply attention with residual connection
-        d2_skip = d2_skip * atlas_attention + d2_skip
+        # Apply attention to d2 features
+        d2_attended = d2 * attention_map
         
-        # Finální dekódování do lesion mapy
-        logits = self.dec1(d2_skip)                       # 128x128x64
-        if self.debug:
-            print(f"Logits output shape: {logits.shape}")
+        # Concatenate with attended features
+        d2_cat = torch.cat([d2_attended, a1], dim=1)
+        
+        # Final layer with sigmoid to create probability map
+        logits = self.dec1(d2_cat)
         
         # MODIFIED: Apply a more nuanced sigmoid activation for more natural lesion transitions
         # Further reduced temperature for smoother, less binary outputs during generation
-        temperature = 3.0  # Reduced from 5.0 for even softer transitions (was 10.0 originally)
-        out = torch.sigmoid(logits * temperature)
+        temperature = 2.5  # Further reduced from 3.0 for even softer transitions
+        
+        # MODIFIED: Add a stronger positive bias to encourage more non-zero activations
+        # This shifts the sigmoid curve to the left, making it much more likely to produce higher values
+        bias = 0.3  # Increased from 0.2 for more aggressive activation encouragement
+        out = torch.sigmoid(temperature * (logits + bias - 0.5))
+        
+        # NEW: Add conditional instance normalization that shifts the distribution toward more activation
+        # This subtly increases all values, especially in regions with high atlas probability
+        if not self.training:
+            # Only apply during inference to ensure training is still learning properly
+            # Scale the shift based on atlas values to maintain anatomical plausibility
+            atlas_factor = F.interpolate(atlas, size=out.shape[2:], mode='trilinear', align_corners=False)
+            # Apply a small positive shift more strongly in high-atlas regions
+            normalization_shift = atlas_factor * 0.1  # Small positive shift
+            out = out + normalization_shift * (1.0 - out)  # Apply shift more to low values
         
         # Resize atlas to match output size if needed
         if out.shape[2:] != atlas.shape[2:]:
@@ -374,14 +426,14 @@ class Generator(nn.Module):
         
         # MODIFIED: Blend the generated output with the atlas probability using a more aggressive approach
         # This creates more visible, anatomically plausible lesions
-        blend_factor = 1.2  # Increased from 0.7 to enhance the influence of atlas on the output
+        blend_factor = 1.5  # Further increased from 1.2 to more strongly enhance atlas influence
         out = torch.clamp((out * (1.0 + atlas_mod * blend_factor)), 0.0, 1.0)
         
         # COMPLETELY REWORKED approach to creating connected lesions during inference
         if not self.training:
             # STEP 1: Initial thresholding to identify potential lesion regions
-            # Use a lower threshold to capture more potential lesion areas
-            potential_lesions = (out > 0.2).float()  # Reduced from 0.3 to capture more weak activations
+            # Use a MUCH lower threshold to capture more potential lesion areas
+            potential_lesions = (out > 0.15).float()  # Reduced from 0.2 to ensure we capture even weak activations
             
             # STEP 2: Apply a sequence of 3D morphological operations to connect nearby regions
             # First dilate to connect nearby regions (implemented with max pooling)
@@ -428,7 +480,7 @@ class Generator(nn.Module):
                 component_sizes = np.bincount(labeled_components.flatten())[1:] if num_components > 0 else []
                 
                 # Reduced minimum component size to keep more potential lesions
-                min_component_size = 5  # Reduced from 10 to retain more potential lesions
+                min_component_size = 3  # Further reduced from 5 to retain even smaller lesions
                 
                 # Create cleaned binary mask - keep only sufficiently large components
                 cleaned_binary = np.zeros_like(binary_np)
@@ -459,41 +511,22 @@ class Generator(nn.Module):
                 final_output = blend_weight * smoothed + (1 - blend_weight) * continuous_output
                 
                 # Final thresholding to clean up very small values - lower threshold to keep more subtle lesions
-                final_output = torch.where(final_output > 0.1, final_output, torch.zeros_like(final_output))  # Reduced from 0.15
+                final_output = torch.where(final_output > 0.08, final_output, torch.zeros_like(final_output))  # Further reduced from 0.1
                 
                 # Use the morphologically processed output
                 out = final_output
-            
-        if self.debug:
-            print(f"Output shape (before masking): {out.shape}")
         
-        # Ensure lesions only appear where atlas is non-zero (binary constraint)
-        atlas_mask = (atlas > 0).float()
-        
-        # Ensure atlas_mask has the same spatial dimensions as the output
-        if out.shape[2:] != atlas.shape[2:]:
-            atlas_mask = F.interpolate(atlas_mask, size=out.shape[2:], mode='nearest')
-            if self.debug:
-                print(f"Resized atlas_mask to match output: {atlas_mask.shape}")
-        
-        out = out * atlas_mask
-        
-        # Apply brain mask constraint if provided
+        # If brain mask is provided, ensure output is zero outside the brain
         if brain_mask is not None:
-            # Resize brain mask if necessary
+            # Resize brain mask if needed
             if out.shape[2:] != brain_mask.shape[2:]:
                 brain_mask_resized = F.interpolate(brain_mask, size=out.shape[2:], mode='nearest')
-                if self.debug:
-                    print(f"Resized brain_mask to match output: {brain_mask_resized.shape}")
             else:
                 brain_mask_resized = brain_mask
                 
-            # Apply brain mask to ensure lesions are only inside the brain
+            # Apply brain mask
             out = out * brain_mask_resized
             
-        if self.debug:
-            print(f"Final output shape: {out.shape}")
-        
         return out
 
 
@@ -937,7 +970,7 @@ class HIELesionGANTrainer:
         self.save_interval = save_interval
         self.debug = debug
         
-        # Ensure save directory exists
+        # Create model save directory
         os.makedirs(save_dir, exist_ok=True)
         
         # Set up device
@@ -945,28 +978,28 @@ class HIELesionGANTrainer:
             self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         else:
             self.device = device
-            
+        
         print(f"Using device: {self.device}")
         
-        # Create lesion atlas path attribute if available in dataset
-        if hasattr(dataloader.dataset, 'atlas_path'):
-            self.lesion_atlas_path = dataloader.dataset.atlas_path
-        else:
-            self.lesion_atlas_path = None
-        
-        # Create generator and discriminator
+        # Initialize models
         self.generator = Generator(z_dim=z_dim).to(self.device)
         self.discriminator = Discriminator().to(self.device)
         
+        # NEW: Initialize fixed random vectors for consistent training visualization
+        self.fixed_z = torch.randn(4, z_dim, device=self.device)
+        
         # Set up TensorBoard
-        current_time = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
-        log_dir = os.path.join(save_dir, 'logs', current_time)
+        current_time = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        log_dir = os.path.join("logs", current_time)
+        os.makedirs(log_dir, exist_ok=True)
         self.writer = SummaryWriter(log_dir=log_dir)
         print(f"TensorBoard logs will be saved to {log_dir}")
         
-        # NEW: Implement Two Time-scale Update Rule (TTUR)
-        # Use different learning rates for generator and discriminator
-        # Generator needs a higher learning rate to catch up with the discriminator
+        # NEW: Setup debug printer
+        self.debug_print = self.create_debug_printer() if debug else lambda *args, **kwargs: None
+        
+        # MODIFIED: Use Two Time-Scale Update Rule (TTUR)
+        # Generator gets higher learning rate to overcome local minima
         self.g_learning_rate = learning_rate * 2.0  # Increased generator learning rate
         self.d_learning_rate = learning_rate * 0.5  # Decreased discriminator learning rate
         
@@ -1011,27 +1044,20 @@ class HIELesionGANTrainer:
         
         # NEW: Add parameters to control noise injection for discriminator stability
         self.noise_std = 0.05  # Standard deviation of Gaussian noise added to discriminator inputs
-        self.label_smoothing = 0.1  # Amount of label smoothing (0.1 = use 0.9 for real, 0.1 for fake)
+        self.label_smoothing = 0.1  # Amount of label smoothing to apply (0.1 = use 0.9 for real instead of 1.0)
         
-        # NEW: Spectral normalization flag - already used but making explicit
-        self.use_spectral_norm = True
+        # NEW: Add parameters for gradient penalty in WGAN-GP style training
+        self.use_gradient_penalty = True  # Whether to use gradient penalty
+        self.gp_weight = 10.0  # Weight for gradient penalty
         
-        # NEW: Add gradient penalty parameter for WGAN-GP style regularization
-        self.use_gradient_penalty = True
-        self.gradient_penalty_weight = 10.0
+        # NEW: Add parameters to control activation requirements
+        self.min_activation_percent = 0.005  # Minimum percent of valid regions that should have lesions (0.5%)
+        self.empty_penalty_weight = 200.0   # Weight for empty output penalty
+        self.activation_target_weight = 500.0  # Weight for direct activation target loss
         
-        # Print model architectures in debug mode
-        if debug:
-            print("Generator architecture:")
-            print(self.generator)
-            print("\nDiscriminator architecture:")
-            print(self.discriminator)
-            
-        # Create debug printer
-        if debug:
-            self.debug_print = self.create_debug_printer()
-        else:
-            self.debug_print = lambda *args, **kwargs: None  # No-op
+        # NEW: Add early training assistance parameters
+        self.early_training_iters = 1000  # Number of iterations to consider "early training"
+        self.forced_activation_threshold = 10  # Below this number of activated voxels, force activation
 
     def create_debug_printer(self):
         """Create a debug print function that only prints when debug is enabled"""
@@ -1757,7 +1783,7 @@ class HIELesionGANTrainer:
             # Calculate the penalty
             gradients = gradients.view(batch_size, -1)
             gradient_norm = gradients.norm(2, dim=1)
-            gradient_penalty = ((gradient_norm - 1) ** 2).mean() * self.gradient_penalty_weight
+            gradient_penalty = ((gradient_norm - 1) ** 2).mean() * self.gp_weight
         
         # Total discriminator loss with gradient penalty
         d_loss = d_real_loss + d_fake_loss
@@ -1811,6 +1837,35 @@ class HIELesionGANTrainer:
                 max_val = fake_lesions.max().item()
                 print(f"[WARNING] fake_lesions outside range [0,1]: min={min_val}, max={max_val}")
             fake_lesions = torch.clamp(fake_lesions, 0.0, 1.0)
+        
+        # NEW: Check for all-zero outputs and force activation in early training
+        # This is a critical step to kickstart the generator with some lesions
+        total_lesion_volume = torch.sum(fake_lesions > 0.3)
+        
+        # If we're in early training (first 1000 iterations) AND output is nearly empty
+        # Force some activation to help the model learn what lesions should look like
+        early_training = iteration < 1000
+        if early_training and total_lesion_volume < 10:
+            # Create a mask from high-probability atlas regions
+            atlas_threshold = torch.quantile(atlas.view(-1), 0.95)  # Top 5% of atlas values
+            high_prob_regions = (atlas > atlas_threshold).float() * brain_mask
+            
+            # Generate a random activation mask
+            act_mask = torch.zeros_like(fake_lesions)
+            random_strength = torch.rand(1, device=self.device) * 0.3 + 0.7  # 0.7-1.0 activation
+            
+            # Add forced activation to a portion of high probability regions
+            activation_regions = high_prob_regions * (torch.rand_like(high_prob_regions) > 0.7).float()
+            act_mask = act_mask.scatter_(1, torch.zeros_like(fake_lesions, dtype=torch.long), 
+                                         activation_regions * random_strength)
+            
+            # Blend with the original output - stronger in early iterations, weaker later
+            blend_factor = max(0.0, 1.0 - (iteration / 500))  # Starts at 1.0, decreases to 0.0
+            fake_lesions = fake_lesions * (1 - blend_factor) + act_mask * blend_factor
+            
+            # Track and report when forced activation is applied
+            if iteration % 10 == 0:
+                print(f"[EARLY TRAINING] Forced activation applied at iter {iteration}, blend={blend_factor:.2f}")
         
         # Debug prints if needed
         if self.debug:
@@ -1931,12 +1986,48 @@ class HIELesionGANTrainer:
         invalid_regions = (1 - valid_regions)
         atlas_violation = torch.sum(fake_lesions * invalid_regions) / (torch.sum(fake_lesions) + 1e-8)
         
-        # NEW: Add "empty output" penalty to discourage generator from producing all zeros
+        # NEW: "Empty output" penalty to discourage generator from producing all zeros
         # Calculate what portion of atlas-valid regions contain lesions
         valid_region_filled = torch.sum(binary_fake * valid_regions) / (torch.sum(valid_regions) + 1e-8)
         
-        # Strong penalty if less than 0.5% of valid regions contain lesions
-        empty_penalty = torch.exp(-20.0 * valid_region_filled) * 10.0
+        # NEW: Calculate the real data activation percentage for comparison
+        real_binary = (real_lesions > 0.5).float()
+        real_valid_region_filled = torch.sum(real_binary * valid_regions) / (torch.sum(valid_regions) + 1e-8)
+        
+        # Print stats occasionally to understand what's happening
+        if iteration % 10 == 0:
+            total_pixels = torch.sum(valid_regions).item()
+            real_activated = torch.sum(real_binary * valid_regions).item()
+            fake_activated = torch.sum(binary_fake * valid_regions).item()
+            print(f"[STATS] Iter {iteration} - Valid pixels: {total_pixels:.1f}, Real activated: {real_activated:.1f} ({real_valid_region_filled.item()*100:.4f}%), Fake activated: {fake_activated:.1f} ({valid_region_filled.item()*100:.4f}%)")
+        
+        # COMPLETELY NEW: Direct minimum activation target loss
+        # We directly specify a minimum percentage of pixels that should be activated
+        # This forces the model to generate at least some lesions
+        min_activation_target = 0.005  # Target 0.5% minimum activation
+        # Apply linear ramping of the target during early training
+        if iteration < 1000:
+            # Start with a very small target and gradually increase
+            min_activation_target = min_activation_target * (iteration / 1000)
+        
+        # Strong penalty when below target, zero penalty when above
+        activation_target_loss = torch.relu(min_activation_target - valid_region_filled) * 1000.0
+        
+        # If activation is extremely low, apply an additional extreme penalty
+        if valid_region_filled < 0.0001:  # Less than 0.01% activation
+            activation_target_loss = activation_target_loss * 10.0  # 10x penalty for essentially zero activation
+        
+        # MUCH STRONGER empty penalty
+        # We want at least 0.5% of valid regions to have lesions - anything less gets severely penalized
+        # Using a piecewise approach to create a hard constraint-like effect
+        min_fill_percentage = 0.005  # 0.5% minimum coverage required
+        
+        if valid_region_filled < min_fill_percentage:
+            # Apply extremely heavy penalty for being below minimum
+            empty_penalty = 1000.0 * torch.exp(-100.0 * valid_region_filled / min_fill_percentage)
+        else:
+            # Small or no penalty when we have enough activation
+            empty_penalty = torch.exp(-20.0 * valid_region_filled) * 10.0
         
         # NEW: Implement feature matching loss to help stabilize training
         # Extract features from the discriminator for real images
@@ -1969,7 +2060,7 @@ class HIELesionGANTrainer:
         coherence_weight = min(5.0 + iteration * 0.01, 10.0)  # Increases from 5 to 10 over time
         connectivity_weight = min(2.0 + iteration * 0.005, 5.0)  # Increases from 2 to 5 over time
         
-        # Total generator loss
+        # REBALANCED: Total generator loss with dramatically increased empty penalty weight
         g_loss = (
             self.adv_loss_weight * g_adv_loss + 
             self.l1_loss_weight * masked_l1_loss + 
@@ -1981,7 +2072,8 @@ class HIELesionGANTrainer:
             coherence_weight * coherence_loss +  # Dynamic weight for coherence loss
             connectivity_weight * connectivity_loss +  # Dynamic weight for connectivity loss
             3.0 * feature_matching_loss +  # Feature matching to stabilize training
-            10.0 * empty_penalty  # Strong penalty for empty outputs
+            200.0 * empty_penalty +  # MUCH STRONGER penalty for empty outputs (4x previous increase)
+            500.0 * activation_target_loss  # Direct minimum activation target loss
         )
         
         # Backpropagation
@@ -2006,6 +2098,9 @@ class HIELesionGANTrainer:
             'g_connectivity': connectivity_loss.item(),
             'g_feature_matching': feature_matching_loss.item(),
             'g_empty_penalty': empty_penalty.item(),
+            'g_activation_target': activation_target_loss.item(),
+            'g_valid_fill': valid_region_filled.item() * 100.0,  # Report as percentage
+            'g_real_fill': real_valid_region_filled.item() * 100.0,  # Real data fill percentage
             'fake_lesions': fake_lesions.detach()
         }
 
@@ -2314,6 +2409,7 @@ def main():
     parser.add_argument("--z_dim", type=int, default=128, help="Dimension of latent space")
     parser.add_argument("--save_dir", type=str, default="./results", help="Directory to save results")
     parser.add_argument("--debug", action="store_true", help="Enable debug output")
+    parser.add_argument("--filter_empty", action="store_true", help="Filter out empty (all-black) images from the dataset")
     
     args = parser.parse_args()
     
@@ -2321,7 +2417,8 @@ def main():
     dataset = HIELesionDataset(
         label_dir=args.label_dir,
         atlas_path=args.atlas_path,
-        brain_mask_path=args.brain_mask_path
+        brain_mask_path=args.brain_mask_path,
+        filter_empty=args.filter_empty
     )
     
     # Create dataloader
