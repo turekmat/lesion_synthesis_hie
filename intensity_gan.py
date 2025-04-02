@@ -9,6 +9,7 @@ import SimpleITK as sitk
 import nibabel as nib
 from torch.nn import functional as F
 from pathlib import Path
+import random
 
 class IntensityGANDataset(Dataset):
     """Dataset pro IntensityGAN, který upravuje intenzity voxelů dle LABEL map"""
@@ -543,6 +544,25 @@ def generate_intensity_samples(args):
     
     print(f"Generated ZADC maps for {min(len(label_files), args.num_samples)} LABEL maps")
     print(f"ZADC maps saved to: {zadc_output_dir}")
+
+class RandomFlip3D:
+    def __init__(self, p=0.5):
+        self.p = p
+        
+    def __call__(self, tensor):
+        if random.random() < self.p:
+            # Získání maximální dimenze tenzoru
+            max_dim = len(tensor.shape) - 1  # Pro 4D tenzor [C,D,H,W] je max_dim=3
+            
+            # Vybíráme náhodnou prostorovou dimenzi (ignorujeme batch a channel)
+            # Začínáme od indexu 2 (první prostorová dimenze)
+            spatial_dims = list(range(2, max_dim + 1))
+            
+            # Pokud existují prostorové dimenze k flipování
+            if spatial_dims:
+                axis = random.choice(spatial_dims)
+                return torch.flip(tensor, [axis])
+        return tensor
 
 def main():
     """Hlavní funkce skriptu"""
