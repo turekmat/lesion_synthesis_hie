@@ -98,6 +98,25 @@ def register_image_to_atlas(moving_image_path, fixed_image_path, output_path):
             
             # Škálování zpět do původního rozsahu
             scaled_np[mask] = (masked_np[mask] - current_min) / (current_max - current_min) * (orig_max - orig_min) + orig_min
+            
+            # Pro lepší zachování distribuce: použití percentilů pro mapování hodnot
+            # Určíme hlavní percentily v původních datech
+            p10, p50, p90 = np.percentile(orig_moving_np[orig_moving_np != 0], [10, 50, 90]) if np.any(orig_moving_np != 0) else (0, 0, 0)
+            
+            # Aplikujeme histogram matching pro lepší zachování distribuce
+            # Toto je jednoduchá implementace - přizpůsobíme střed a rozpětí histogramu
+            # Pro úplný histogram matching by byla potřeba složitější implementace
+            mean_orig = p50
+            std_orig = (p90 - p10) / 2.563  # přibližný přepočet na směrodatnou odchylku
+            
+            mean_current = np.mean(scaled_np[mask])
+            std_current = np.std(scaled_np[mask]) if np.std(scaled_np[mask]) > 0 else 1.0
+            
+            # Přizpůsobení střední hodnoty a rozpětí k původní distribuci
+            scaled_np[mask] = ((scaled_np[mask] - mean_current) / std_current * std_orig + mean_orig)
+            
+            # Zajistíme, že hodnoty zůstanou v původním rozsahu
+            scaled_np[mask] = np.clip(scaled_np[mask], orig_min, orig_max)
         
         # Vytvoření nového ANTs image ze škálovaného numpy pole a zachování geometrie původního obrazu
         scaled_registered_image = ants.from_numpy(scaled_np)
@@ -196,10 +215,11 @@ def create_registration_visualization_pdf(atlas_image, orig_adc, reg_adc, orig_l
     print(f"Počet řezů - Atlas: {atlas_slices}, Původní ADC: {orig_adc_slices}, Reg ADC: {reg_adc_slices}, " +
           f"Původní Label: {orig_label_slices}, Reg Label: {reg_label_slices}")
     
-    # Nastavení barevných map pro ADC - použijeme 'viridis' pro ADC mapy
-    adc_cmap = 'viridis'
+    # Nastavení barevných map pro ADC - použijeme 'gray' pro ADC mapy (stejné jako atlas)
+    adc_cmap = 'gray'
     
     # Výpočet vhodných limitů pro barevné mapy ADC
+    # Použijeme stejné limity pro původní i registrovanou ADC pro konzistentní vizualizaci
     adc_vmin, adc_vmax = np.percentile(orig_adc_np[orig_adc_np != 0], [1, 99]) if np.any(orig_adc_np != 0) else (0, 1)
     
     # Vytvoříme PDF
