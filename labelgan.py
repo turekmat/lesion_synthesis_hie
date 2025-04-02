@@ -360,7 +360,7 @@ class Generator(nn.Module):
         
         # MODIFIED: Apply a more nuanced sigmoid activation for more natural lesion transitions
         # Further reduced temperature for smoother, less binary outputs during generation
-        temperature = 5.0  # Reduced from 10.0 for even softer transitions
+        temperature = 3.0  # Reduced from 5.0 for even softer transitions (was 10.0 originally)
         out = torch.sigmoid(logits * temperature)
         
         # Resize atlas to match output size if needed
@@ -372,16 +372,16 @@ class Generator(nn.Module):
         # Apply atlas modulation - enhance probability in regions with higher atlas values
         atlas_mod = self.atlas_modulation(atlas_final)
         
-        # MODIFIED: Blend the generated output with the atlas probability using a smoother approach
-        # This creates more continuous, anatomically plausible lesions
-        blend_factor = 0.7  # Controls how much the atlas influences the output
+        # MODIFIED: Blend the generated output with the atlas probability using a more aggressive approach
+        # This creates more visible, anatomically plausible lesions
+        blend_factor = 1.2  # Increased from 0.7 to enhance the influence of atlas on the output
         out = torch.clamp((out * (1.0 + atlas_mod * blend_factor)), 0.0, 1.0)
         
         # COMPLETELY REWORKED approach to creating connected lesions during inference
         if not self.training:
             # STEP 1: Initial thresholding to identify potential lesion regions
             # Use a lower threshold to capture more potential lesion areas
-            potential_lesions = (out > 0.3).float()
+            potential_lesions = (out > 0.2).float()  # Reduced from 0.3 to capture more weak activations
             
             # STEP 2: Apply a sequence of 3D morphological operations to connect nearby regions
             # First dilate to connect nearby regions (implemented with max pooling)
@@ -427,8 +427,8 @@ class Generator(nn.Module):
             if num_components > 0:
                 component_sizes = np.bincount(labeled_components.flatten())[1:] if num_components > 0 else []
                 
-                # Increased minimum component size to remove more isolated points
-                min_component_size = 10  # Increased from 3 to filter small noise more aggressively
+                # Reduced minimum component size to keep more potential lesions
+                min_component_size = 5  # Reduced from 10 to retain more potential lesions
                 
                 # Create cleaned binary mask - keep only sufficiently large components
                 cleaned_binary = np.zeros_like(binary_np)
@@ -458,8 +458,8 @@ class Generator(nn.Module):
                 blend_weight = 0.7
                 final_output = blend_weight * smoothed + (1 - blend_weight) * continuous_output
                 
-                # Final thresholding to clean up very small values
-                final_output = torch.where(final_output > 0.15, final_output, torch.zeros_like(final_output))
+                # Final thresholding to clean up very small values - lower threshold to keep more subtle lesions
+                final_output = torch.where(final_output > 0.1, final_output, torch.zeros_like(final_output))  # Reduced from 0.15
                 
                 # Use the morphologically processed output
                 out = final_output
@@ -1542,7 +1542,7 @@ class HIELesionGANTrainer:
                     
                     # Convert back to tensor
                     # Fix: Use the device of an input tensor instead of self.device
-                    cleaned_binary_tensor = torch.from_numpy(cleaned_binary).float().to(out.device)
+                    cleaned_binary_tensor = torch.from_numpy(cleaned_binary).float().to(fake_lesion.device)
                     cleaned_binary_tensor = cleaned_binary_tensor.unsqueeze(0).unsqueeze(0)
                     
                     # Final binary lesion combines the soft values with the cleaned binary mask
@@ -1931,6 +1931,13 @@ class HIELesionGANTrainer:
         invalid_regions = (1 - valid_regions)
         atlas_violation = torch.sum(fake_lesions * invalid_regions) / (torch.sum(fake_lesions) + 1e-8)
         
+        # NEW: Add "empty output" penalty to discourage generator from producing all zeros
+        # Calculate what portion of atlas-valid regions contain lesions
+        valid_region_filled = torch.sum(binary_fake * valid_regions) / (torch.sum(valid_regions) + 1e-8)
+        
+        # Strong penalty if less than 0.5% of valid regions contain lesions
+        empty_penalty = torch.exp(-20.0 * valid_region_filled) * 10.0
+        
         # NEW: Implement feature matching loss to help stabilize training
         # Extract features from the discriminator for real images
         with torch.no_grad():
@@ -1973,7 +1980,8 @@ class HIELesionGANTrainer:
             self.violation_penalty_weight * atlas_violation + 
             coherence_weight * coherence_loss +  # Dynamic weight for coherence loss
             connectivity_weight * connectivity_loss +  # Dynamic weight for connectivity loss
-            3.0 * feature_matching_loss  # Feature matching to stabilize training
+            3.0 * feature_matching_loss +  # Feature matching to stabilize training
+            10.0 * empty_penalty  # Strong penalty for empty outputs
         )
         
         # Backpropagation
@@ -1997,6 +2005,7 @@ class HIELesionGANTrainer:
             'g_coherence': coherence_loss.item(),
             'g_connectivity': connectivity_loss.item(),
             'g_feature_matching': feature_matching_loss.item(),
+            'g_empty_penalty': empty_penalty.item(),
             'fake_lesions': fake_lesions.detach()
         }
 
