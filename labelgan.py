@@ -293,12 +293,12 @@ class SelfAttention3D(nn.Module):
 
 # Discriminator model
 class Discriminator(nn.Module):
-    def __init__(self, in_channels=2, feature_maps=64, use_attention=True):
+    def __init__(self, in_channels=3, feature_maps=64, use_attention=True):
         """
         PatchGAN diskriminátor pro 3D data
         
         Args:
-            in_channels: Počet vstupních kanálů (normativní atlas + léze)
+            in_channels: Počet vstupních kanálů (normativní atlas + léze + volitelně atlas lézí)
             feature_maps: Počet základních feature map
             use_attention: Použít self-attention mechanismus
         """
@@ -331,11 +331,15 @@ class Discriminator(nn.Module):
         Returns:
             PatchGAN výstupy [B, 1, D//8, H//8, W//8]
         """
-        # Spojení vstupu
+        # Spojení vstupu - vždy zahrnout atlas a label
+        inputs = [atlas, label]
+        
+        # Pokud je k dispozici lesion_atlas, přidáme jej
         if lesion_atlas is not None:
-            x = torch.cat([atlas, label, lesion_atlas], dim=1)
-        else:
-            x = torch.cat([atlas, label], dim=1)
+            inputs.append(lesion_atlas)
+        
+        # Spojení všech vstupů
+        x = torch.cat(inputs, dim=1)
         
         # Sequence of convolutional layers
         x = self.conv1(x)
@@ -579,13 +583,13 @@ def train_labelgan(args):
     
     # Konfigurace vstupních kanálů
     if args.lesion_atlas_path:
-        in_channels = 3  # atlas + šum + lesion atlas
+        disc_in_channels = 3  # atlas + label + lesion atlas
     else:
-        in_channels = 2  # atlas + šum
+        disc_in_channels = 2  # atlas + label
     
     # Inicializace modelů
-    generator = Generator(in_channels=in_channels, out_channels=1, feature_maps=args.feature_maps).to(device)
-    discriminator = Discriminator(in_channels=2, feature_maps=args.feature_maps).to(device)
+    generator = Generator(in_channels=disc_in_channels, out_channels=1, feature_maps=args.feature_maps).to(device)
+    discriminator = Discriminator(in_channels=disc_in_channels, feature_maps=args.feature_maps).to(device)
     
     # Inicializace optimizerů
     g_optimizer = optim.Adam(generator.parameters(), lr=args.lr, betas=(args.beta1, 0.999))
@@ -639,7 +643,7 @@ def train_labelgan(args):
                 d_optimizer.zero_grad()
                 
                 # Vstup pro diskriminátor - skutečné léze
-                real_outputs = discriminator(normal_atlas, real_labels)
+                real_outputs = discriminator(normal_atlas, real_labels, lesion_atlas)
                 
                 # Generování falešných lézí
                 if lesion_atlas is not None:
@@ -652,7 +656,7 @@ def train_labelgan(args):
                     fake_labels = generator(gen_input)
                 
                 # Vstup pro diskriminátor - falešné léze
-                fake_outputs = discriminator(normal_atlas, fake_labels.detach())
+                fake_outputs = discriminator(normal_atlas, fake_labels.detach(), lesion_atlas)
                 
                 # Výpočet lossu diskriminátoru
                 d_real_loss = adversarial_loss(real_outputs, torch.ones_like(real_outputs))
@@ -680,7 +684,7 @@ def train_labelgan(args):
                     fake_labels = generator(gen_input)
                 
                 # Diskriminátor klasifikuje falešné léze
-                fake_outputs = discriminator(normal_atlas, fake_labels)
+                fake_outputs = discriminator(normal_atlas, fake_labels, lesion_atlas)
                 
                 # Výpočet lossu generátoru
                 g_adv_loss = adversarial_loss(fake_outputs, torch.ones_like(fake_outputs))
