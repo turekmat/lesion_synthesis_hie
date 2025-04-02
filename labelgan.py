@@ -1280,7 +1280,7 @@ def main():
     
     # Volání hlavních funkcí podle režimu
     if args.command == 'train':
-        train(args)  # Volání funkce train()
+        train_labelgan(args)
     elif args.command == 'generate':
         generate(args)
     else:
