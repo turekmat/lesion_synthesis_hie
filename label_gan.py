@@ -10,11 +10,6 @@ import nibabel as nib
 from torch.nn import functional as F
 from pathlib import Path
 import scipy.ndimage as ndimage
-from matplotlib.backends.backend_pdf import PdfPages
-import matplotlib.pyplot as plt
-import matplotlib.gridspec as gridspec
-
-
 
 # Třída pro jednoduchou 3D datovou augmentaci
 class Simple3DAugmentation:
@@ -268,11 +263,11 @@ class LabelGenerator(nn.Module):
             nn.Dropout3d(dropout_rate)
         )
         
-        # Výstupní vrstva pro LABEL mapy
+        # Výstupní vrstva pro LABEL mapy - upravená pro lepší aktivaci lézí
         self.label_output = nn.Sequential(
             nn.ReLU(),
             nn.ConvTranspose3d(features*2, 1, kernel_size=4, stride=2, padding=1),
-            nn.Sigmoid()  # Výstup v rozsahu [0, 1] pro LABEL
+            # Nepoužíváme standardní sigmoid, ale upravený pro lepší aktivaci lézí
         )
         
     def forward(self, x, noise, lesion_atlas=None):
@@ -310,8 +305,12 @@ class LabelGenerator(nn.Module):
         d3 = self.dec3(d2)
         d3 = torch.cat([d3, e1], dim=1)
         
-        # Generování LABEL mapy
-        label_map = self.label_output(d3)
+        # Generování LABEL mapy s upravený aktivací pro lepší detekci lézí
+        raw_output = self.label_output(d3)
+        
+        # Upravená aktivační funkce - místo standardního sigmoidu používáme 
+        # upravenou verzi, která má vyšší pravděpodobnost vytvoření lézí
+        label_map = torch.sigmoid(raw_output * 1.2)  # Zvýšená citlivost pro léze
         
         return label_map
 
@@ -411,6 +410,67 @@ class DiceLoss(nn.Module):
         dice = (2. * intersection + self.smooth) / (union + self.smooth)
         return 1 - dice
 
+# Přidáváme třídu pro vážený Dice loss, který dává větší váhu pozitivní třídě (léze)
+class WeightedDiceLoss(nn.Module):
+    """Vážená Dice loss dávající větší důraz na pozitivní třídu (léze)"""
+    def __init__(self, smooth=1.0, pos_weight=5.0):
+        super(WeightedDiceLoss, self).__init__()
+        self.smooth = smooth
+        self.pos_weight = pos_weight
+        
+    def forward(self, pred, target):
+        pred_flat = pred.view(-1)
+        target_flat = target.view(-1)
+        
+        # Váha pro pozitivní třídu
+        weights = torch.ones_like(target_flat)
+        weights[target_flat > 0] = self.pos_weight
+        
+        # Vážená Dice loss
+        weighted_intersection = (weights * pred_flat * target_flat).sum()
+        weighted_union = (weights * pred_flat).sum() + (weights * target_flat).sum()
+        
+        dice = (2. * weighted_intersection + self.smooth) / (weighted_union + self.smooth)
+        return 1 - dice
+
+# Přidáváme třídu pro Focal loss - lepší pro nevyvážené třídy
+class FocalLoss(nn.Module):
+    """Focal loss pro nevyvážené třídy"""
+    def __init__(self, alpha=0.8, gamma=2.0, reduction='mean'):
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+        self.bce = nn.BCEWithLogitsLoss(reduction='none')
+        
+    def forward(self, inputs, targets):
+        BCE_loss = self.bce(inputs, targets)
+        pt = torch.exp(-BCE_loss)
+        F_loss = self.alpha * (1-pt)**self.gamma * BCE_loss
+        
+        if self.reduction == 'mean':
+            return F_loss.mean()
+        elif self.reduction == 'sum':
+            return F_loss.sum()
+        else:
+            return F_loss
+
+# Trestná funkce pro situace, kdy model generuje jen černé pixely
+class BlackImagePenaltyLoss(nn.Module):
+    """Penalizuje prázdné/černé výstupy"""
+    def __init__(self, threshold=0.01, target_percentage=0.01):
+        super(BlackImagePenaltyLoss, self).__init__()
+        self.threshold = threshold
+        self.target_percentage = target_percentage
+        
+    def forward(self, pred):
+        # Procento pixelů nad prahem
+        activated_percentage = (pred > self.threshold).float().mean()
+        
+        # Penalizace když je aktivních pixelů méně než cílové procento
+        penalty = torch.relu(self.target_percentage - activated_percentage)
+        return penalty * 10.0  # Silná penalizace
+
 def save_sample(data, path):
     """Uložení vzorku jako .nii.gz soubor"""
     nii = nib.Nifti1Image(data, np.eye(4))
@@ -502,12 +562,23 @@ def train_label_gan(args):
     g_scheduler = optim.lr_scheduler.MultiStepLR(g_optimizer, milestones=milestones, gamma=0.5)
     d_scheduler = optim.lr_scheduler.MultiStepLR(d_optimizer, milestones=milestones, gamma=0.5)
     
-    # Loss funkce
+    # Loss funkce - použijeme vylepšené verze
     adversarial_loss = nn.BCEWithLogitsLoss()
-    dice_loss = DiceLoss()  # Pro lepší segmentaci lézí
+    # Vážený Dice loss s vyšší váhou pro léze
+    weighted_dice_loss = WeightedDiceLoss(pos_weight=args.pos_weight)
+    # Focal loss pro lepší zvládání nevyvážených tříd
+    focal_loss = FocalLoss(alpha=0.8, gamma=2.0)
+    # Penalizace prázdných výstupů - cílíme na zadané procento aktivních pixelů
+    black_penalty_loss = BlackImagePenaltyLoss(threshold=0.1, target_percentage=args.target_lesion_percentage)
+    
+    # Sledování statistik lézí během tréninku
+    best_lesion_percentage = 0.0
+    best_epoch = 0
     
     # Trénovací smyčka
     for epoch in range(args.epochs):
+        # Statistiky pro tuto epochu
+        epoch_lesion_percentages = []
         for i, batch in enumerate(dataloader):
             # Přesun dat na správné zařízení
             normal_atlas = batch['normal_atlas'].to(device)
@@ -557,16 +628,55 @@ def train_label_gan(args):
             # -------------------------
             g_optimizer.zero_grad()
             
-            # Nové generování vzorků pro G krok (pro lepší stabilitu)
+            # Strukturovaný šum který podpoří vznik lézí - použijeme směs náhodného šumu 
+            # a koncentrovaných "seedů" lézí pro podporu generování aktivních regionů
             noise = torch.randn_like(normal_atlas).to(device)
+            
+            # Přidáme "seedy" lézí - malé aktivní oblasti které pomáhají generátoru vytvořit léze
+            # Vytvoříme 1-3 náhodné "seedy" lézí v každém vzorku
+            batch_size = normal_atlas.size(0)
+            for b in range(batch_size):
+                num_seeds = torch.randint(1, 4, (1,)).item()  # 1-3 seedy
+                for _ in range(num_seeds):
+                    # Náhodná pozice v objemu
+                    d, h, w = normal_atlas.shape[2:]
+                    seed_d = torch.randint(0, d, (1,)).item()
+                    seed_h = torch.randint(0, h, (1,)).item()
+                    seed_w = torch.randint(0, w, (1,)).item()
+                    
+                    # Vytvoření "seedu" léze (Gaussovský blob)
+                    seed_size = torch.randint(2, 5, (1,)).item()
+                    d_indices = torch.arange(max(0, seed_d-seed_size), min(d, seed_d+seed_size+1)).long()
+                    h_indices = torch.arange(max(0, seed_h-seed_size), min(h, seed_h+seed_size+1)).long()
+                    w_indices = torch.arange(max(0, seed_w-seed_size), min(w, seed_w+seed_size+1)).long()
+                    
+                    for id in d_indices:
+                        for ih in h_indices:
+                            for iw in w_indices:
+                                dist = ((id-seed_d)**2 + (ih-seed_h)**2 + (iw-seed_w)**2) ** 0.5
+                                if dist <= seed_size:
+                                    intensity = 2.0 * (1.0 - dist/seed_size)
+                                    noise[b, 0, id, ih, iw] = intensity
+            
+            # Pokud máme lesion_atlas, zvýšíme šum v oblastech s vyšší pravděpodobností lézí
+            if lesion_atlas is not None:
+                # Vážíme šum podle pravděpodobnosti lézí
+                noise = noise * (1.0 + lesion_atlas * 2.0)
+            
             fake_label = generator(normal_atlas, noise, lesion_atlas)
             
             # Adversarial loss
             fake_output = discriminator(normal_atlas, fake_label)
             g_adv_loss = adversarial_loss(fake_output, real_labels)
             
-            # Dice loss pro segmentaci lézí
-            g_dice_loss = dice_loss(fake_label, real_label)
+            # Vážený Dice loss pro lepší segmentaci lézí
+            g_dice_loss = weighted_dice_loss(fake_label, real_label)
+            
+            # Focal loss pro ještě lepší zvládání nevyvážených tříd
+            g_focal_loss = focal_loss(fake_label, real_label)
+            
+            # Penalizace prázdných/černých výstupů
+            g_black_loss = black_penalty_loss(fake_label)
             
             # Přidáváme anatomicky konzistentní loss
             anatomically_informed_loss = 0.0
@@ -579,16 +689,24 @@ def train_label_gan(args):
             g_loss = (
                 g_adv_loss +
                 args.lambda_dice * g_dice_loss +
+                args.lambda_focal * g_focal_loss +  # Použití parametru z příkazové řádky
+                args.lambda_black * g_black_loss +  # Použití parametru z příkazové řádky
                 anatomically_informed_loss
             )
             g_loss.backward()
             g_optimizer.step()
+            
+            # Výpočet statistik léze
+            with torch.no_grad():
+                lesion_percentage = (fake_label > 0.5).float().mean().item() * 100.0
+                epoch_lesion_percentages.append(lesion_percentage)
             
             # Výpis stavu tréninku
             if i % 10 == 0:
                 print(f"Epoch [{epoch}/{args.epochs}], Batch {i}/{len(dataloader)}, "
                       f"D Loss: {d_loss.item():.4f}, G Loss: {g_loss.item():.4f}, "
                       f"ADV: {g_adv_loss.item():.4f}, DICE: {g_dice_loss.item():.4f}, "
+                      f"Lesion %: {lesion_percentage:.2f}%, "
                       f"LR: {g_optimizer.param_groups[0]['lr']:.6f}")
         
         # Aktualizace learning rate na konci každé epochy
@@ -622,29 +740,49 @@ def train_label_gan(args):
                 save_sample(sample_fake_label[0, 0].cpu().numpy(), f"{sample_path}_fake_label.nii.gz")
                 save_sample(sample_atlas[0, 0].cpu().numpy(), f"{sample_path}_atlas.nii.gz")
                 save_sample(real_label[0, 0].cpu().numpy(), f"{sample_path}_real_label.nii.gz")
+        
+        # Aktualizace statistik lézí
+        lesion_percentage = (fake_label > 0.5).float().mean().item()
+        epoch_lesion_percentages.append(lesion_percentage)
+        
+        # Aktualizace nejlepšího modelu
+        if lesion_percentage > best_lesion_percentage:
+            best_lesion_percentage = lesion_percentage
+            best_epoch = epoch
     
     print("LabelGAN Training completed!")
+    print(f"Best lesion percentage: {best_lesion_percentage:.4f} at epoch {best_epoch}")
 
 def generate_label_samples(args):
+    """Generování vzorků LABEL map pomocí natrénovaného modelu"""
+    
+    # Nastavení zařízení
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     
+    # Načtení normativního atlasu
     if args.normal_atlas_path.endswith('.nii.gz') or args.normal_atlas_path.endswith('.nii'):
         normal_atlas = nib.load(args.normal_atlas_path).get_fdata()
     else:
         normal_atlas = sitk.GetArrayFromImage(sitk.ReadImage(args.normal_atlas_path))
-    normal_atlas = (normal_atlas - normal_atlas.min()) / (normal_atlas.max() - normal_atlas.min())
-    normal_atlas = torch.FloatTensor(normal_atlas).unsqueeze(0).unsqueeze(0).to(device)
     
+    # Normalizace
+    normal_atlas = (normal_atlas - normal_atlas.min()) / (normal_atlas.max() - normal_atlas.min())
+    normal_atlas = torch.FloatTensor(normal_atlas).unsqueeze(0).unsqueeze(0).to(device)  # [1, 1, D, H, W]
+    
+    # Načtení atlasu frekvence lézí (pokud je dostupný)
     lesion_atlas = None
     if args.lesion_atlas_path:
         if args.lesion_atlas_path.endswith('.nii.gz') or args.lesion_atlas_path.endswith('.nii'):
             lesion_atlas = nib.load(args.lesion_atlas_path).get_fdata()
         else:
             lesion_atlas = sitk.GetArrayFromImage(sitk.ReadImage(args.lesion_atlas_path))
+        
+        # Normalizace
         lesion_atlas = (lesion_atlas - lesion_atlas.min()) / (lesion_atlas.max() - lesion_atlas.min())
-        lesion_atlas = torch.FloatTensor(lesion_atlas).unsqueeze(0).unsqueeze(0).to(device)
+        lesion_atlas = torch.FloatTensor(lesion_atlas).unsqueeze(0).unsqueeze(0).to(device)  # [1, 1, D, H, W]
     
+    # Inicializace a načtení generátoru
     generator = LabelGenerator(
         in_channels=2,
         features=args.generator_filters,
@@ -656,60 +794,99 @@ def generate_label_samples(args):
     generator.load_state_dict(checkpoint['generator'])
     generator.eval()
     
+    # Generování vzorků
     os.makedirs(args.output_dir, exist_ok=True)
+    
+    # Vytvoření adresáře pro LABEL mapy
     label_output_dir = os.path.join(args.output_dir, "label")
     os.makedirs(label_output_dir, exist_ok=True)
     
-    generated_labels = []
+    # Sledování úspěšnosti generování lézí
+    generated_lesion_percentages = []
+    
     for i in range(args.num_samples):
         with torch.no_grad():
+            # Vytvoření základního náhodného šumu
             noise = torch.randn_like(normal_atlas).to(device)
+            
+            # Přidáme "seedy" lézí - náhodné aktivní oblasti pro pomoc generátoru
+            # Vytvoříme 2-5 náhodných "seedů" lézí
+            d, h, w = normal_atlas.shape[2:]
+            num_seeds = torch.randint(2, 6, (1,)).item()  # 2-5 seedů
+            
+            for _ in range(num_seeds):
+                # Náhodná pozice v objemu
+                seed_d = torch.randint(0, d, (1,)).item()
+                seed_h = torch.randint(0, h, (1,)).item()
+                seed_w = torch.randint(0, w, (1,)).item()
+                
+                # Vytvoříme Gaussovský blob jako "seed" léze
+                seed_size = torch.randint(2, 6, (1,)).item()  # Mírně větší seedy pro generování
+                
+                # Vytvoření indexových rozsahů s kontrolou hranic
+                d_indices = torch.arange(max(0, seed_d-seed_size), min(d, seed_d+seed_size+1)).long()
+                h_indices = torch.arange(max(0, seed_h-seed_size), min(h, seed_h+seed_size+1)).long()
+                w_indices = torch.arange(max(0, seed_w-seed_size), min(w, seed_w+seed_size+1)).long()
+                
+                # Vytvoření Gaussovského blobu
+                for id in d_indices:
+                    for ih in h_indices:
+                        for iw in w_indices:
+                            dist = ((id-seed_d)**2 + (ih-seed_h)**2 + (iw-seed_w)**2) ** 0.5
+                            if dist <= seed_size:
+                                intensity = 2.5 * (1.0 - dist/seed_size)  # Silnější intenzita pro lepší inicializaci
+                                noise[0, 0, id, ih, iw] = intensity
+            
+            # Pokud máme atlas lézí, vážíme šum podle pravděpodobnosti výskytu lézí
             if lesion_atlas is not None:
+                # Posílíme šum v oblastech s vyšší pravděpodobností lézí
+                noise = noise * (1.0 + lesion_atlas * 3.0)  # Silnější váhování pro generování
+                # Generujeme label
                 fake_label = generator(normal_atlas, noise, lesion_atlas)
             else:
+                # Generujeme bez atlasu
                 fake_label = generator(normal_atlas, noise)
-            fake_label_binary = (fake_label > 0.5).float()
-            label_np = fake_label_binary[0, 0].cpu().numpy()  # [D, H, W]
-            generated_labels.append(label_np)
+            
+            # Použijeme nižší práh pro pozitivnější detekci lézí
+            threshold = 0.3  # Začínáme s nižším prahem než při tréninku
+            fake_label_binary = (fake_label > threshold).float()
+            
+            # Kontrola, zda máme nějaké léze - pokud ne, snížíme práh
+            lesion_percentage = fake_label_binary.mean().item() * 100.0
+            print(f"Sample {i}: Lesion percentage = {lesion_percentage:.2f}%")
+            
+            # Pokud je příliš málo lézí, snížíme práh
+            if lesion_percentage < 0.05:
+                threshold = 0.2
+                print(f"  Very few lesions detected, lowering threshold to {threshold}...")
+                fake_label_binary = (fake_label > threshold).float()
+                lesion_percentage = fake_label_binary.mean().item() * 100.0
+                print(f"  After threshold adjustment: Lesion percentage = {lesion_percentage:.2f}%")
+                
+                # Pokud stále nemáme léze, zkusíme ještě nižší práh
+                if lesion_percentage < 0.02:
+                    threshold = 0.1
+                    print(f"  Still insufficient lesions, lowering threshold to {threshold}...")
+                    fake_label_binary = (fake_label > threshold).float()
+                    lesion_percentage = fake_label_binary.mean().item() * 100.0
+                    print(f"  After second threshold adjustment: Lesion percentage = {lesion_percentage:.2f}%")
+            
+            # Sledování průměrného procenta lézí
+            generated_lesion_percentages.append(lesion_percentage)
+            
+            # Uložení výsledné binární label mapy
             label_output_path = os.path.join(label_output_dir, f'sample_{i}_label.nii.gz')
-            save_sample(label_np, label_output_path)
+            save_sample(fake_label_binary[0, 0].cpu().numpy(), label_output_path)
+            
+            # Uložení také syrové predikce pro možnou analýzu
+            raw_output_path = os.path.join(label_output_dir, f'sample_{i}_raw_pred.nii.gz')
+            save_sample(fake_label[0, 0].cpu().numpy(), raw_output_path)
     
-    if args.vizualize_generated:
-        pdf_output_path = os.path.join(args.output_dir, "generated_labels.pdf")
-        visualize_all_generated_labels(generated_labels, pdf_output_path)
-    
+    # Výpis statistik generování
+    avg_lesion_percentage = sum(generated_lesion_percentages) / len(generated_lesion_percentages)
     print(f"Generated {args.num_samples} LABEL maps")
+    print(f"Average lesion percentage: {avg_lesion_percentage:.2f}%")
     print(f"LABEL maps saved to: {label_output_dir}")
-    
-    
-def visualize_all_generated_labels(generated_labels, output_pdf_path, slices_per_row=5):
-    """
-    Vytvoří jeden PDF dokument s vizualizací všech generovaných LABEL map.
-    Každá LABEL mapa je zobrazena na samostatných stránkách, přičemž každá stránka obsahuje
-    mřížku řezu (slices_per_row řezu na řádek).
-    
-    Args:
-        generated_labels: List numpy polí s vygenerovanými LABEL mapami, každé s tvarem [D, H, W]
-        output_pdf_path: Cesta k uložení výsledného PDF
-        slices_per_row: Počet řezu na řádek
-    """
-    with PdfPages(output_pdf_path) as pdf:
-        for idx, label_np in enumerate(generated_labels):
-            D, H, W = label_np.shape
-            n_rows = int(np.ceil(D / slices_per_row))
-            fig = plt.figure(figsize=(slices_per_row*3, n_rows*3))
-            gs = gridspec.GridSpec(n_rows, slices_per_row)
-            for slice_idx in range(D):
-                row = slice_idx // slices_per_row
-                col = slice_idx % slices_per_row
-                ax = fig.add_subplot(gs[row, col])
-                ax.imshow(label_np[slice_idx, :, :], cmap='gray')
-                ax.set_title(f"Sample {idx+1}, Slice {slice_idx+1}")
-                ax.axis('off')
-            plt.tight_layout()
-            pdf.savefig(fig)
-            plt.close(fig)
-    print(f"Všechny generované LABEL mapy byly uloženy do PDF: {output_pdf_path}")
 
 def main():
     """Hlavní funkce skriptu"""
@@ -752,17 +929,28 @@ def main():
                              help='Beta1 parametr pro Adam optimizér')
     train_parser.add_argument('--beta2', type=float, default=0.999,
                              help='Beta2 parametr pro Adam optimizér')
-    train_parser.add_argument('--lambda_dice', type=float, default=50.0,
+    train_parser.add_argument('--lambda_dice', type=float, default=200.0,
                              help='Váha pro Dice loss (segmentace lézí)')
+    train_parser.add_argument('--lambda_focal', type=float, default=5.0,
+                             help='Váha pro Focal loss (lepší zvládání nevyvážených tříd)')
+    train_parser.add_argument('--lambda_black', type=float, default=10.0,
+                             help='Váha pro Black Image Penalty (prevence generování černých výstupů)')
+    train_parser.add_argument('--pos_weight', type=float, default=5.0,
+                             help='Váha pro pozitivní třídu ve váženém Dice loss')
+    
     # Nové parametry pro vylepšení stability
-    train_parser.add_argument('--use_augmentation', action='store_true',
+    train_parser.add_argument('--use_augmentation', action='store_true', default=True,
                               help='Použít mírnou datovou augmentaci pro zvýšení variability vzorků')
-    train_parser.add_argument('--use_gradient_penalty', action='store_true',
+    train_parser.add_argument('--use_gradient_penalty', action='store_true', default=True,
                               help='Použít gradient penalty pro stabilnější trénink')
     train_parser.add_argument('--gradient_penalty_weight', type=float, default=10.0,
                               help='Váha pro gradient penalty')
-    train_parser.add_argument('--n_critic', type=int, default=1,
+    train_parser.add_argument('--n_critic', type=int, default=2,
                               help='Počet kroků diskriminátoru na jeden krok generátoru')
+    
+    # Parametry pro kontrolu generování lézí
+    train_parser.add_argument('--target_lesion_percentage', type=float, default=0.01,
+                             help='Cílové procento lézí (1% = 0.01)')
     
     # Parser pro generování
     generate_parser = subparsers.add_parser('generate', parents=[parent_parser],
@@ -771,8 +959,6 @@ def main():
                                 help='Cesta k checkpointu modelu')
     generate_parser.add_argument('--num_samples', type=int, default=10,
                                 help='Počet vzorků k vygenerování')
-    generate_parser.add_argument('--vizualize_generated', action='store_true',
-                                help='Vytvoří PDF s vizualizací vygenerovaných LABEL map')
     
     args = parser.parse_args()
     
