@@ -1662,6 +1662,173 @@ class HIELesionGANTrainer:
             'fake_lesions': fake_lesions.detach()  # Add this for visualization
         }
 
+    def generate_pdf_slices(self, epoch, num_samples=3):
+        """
+        Generuje ukázkové léze a ukládá jejich řezy do PDF.
+        
+        Args:
+            epoch: Aktuální epocha
+            num_samples: Počet lézí k vygenerování
+        """
+        print(f"Generuji PDF vizualizaci pro epochu {epoch}...")
+        # Vytvoření adresáře pro PDF
+        pdf_dir = os.path.join(self.save_dir, 'pdf_visualizations')
+        os.makedirs(pdf_dir, exist_ok=True)
+        
+        # Název výsledného PDF
+        pdf_path = os.path.join(pdf_dir, f'lesion_slices_epoch_{epoch}.pdf')
+        
+        # Get a batch of data to extract atlas and brain mask
+        for batch in self.dataloader:
+            atlas = batch['atlas'].to(self.device)
+            brain_mask = batch['brain_mask'].to(self.device)
+            
+            # Ensure they have batch dimension
+            if atlas.dim() == 3:
+                atlas = atlas.unsqueeze(0)
+            if brain_mask.dim() == 3:
+                brain_mask = brain_mask.unsqueeze(0)
+            
+            # Create binary mask versions
+            atlas_binary = (atlas > 0).float()
+            brain_mask_binary = (brain_mask > 0).float()
+            
+            # Switch model to eval mode
+            self.generator.eval()
+            
+            # Připravíme obrázky pro PDF
+            from matplotlib.backends.backend_pdf import PdfPages
+            import matplotlib.pyplot as plt
+            from matplotlib.gridspec import GridSpec
+            
+            # Definujeme anatomické orientace
+            orientations = {
+                'axial': {'title': 'Axiální', 'labels': ['A', 'P', 'L', 'R']},  # Anterior, Posterior, Left, Right
+                'coronal': {'title': 'Koronální', 'labels': ['S', 'I', 'L', 'R']},  # Superior, Inferior, Left, Right
+                'sagittal': {'title': 'Sagitální', 'labels': ['S', 'I', 'A', 'P']}  # Superior, Inferior, Anterior, Posterior
+            }
+            
+            with PdfPages(pdf_path) as pdf:
+                # Pro každou lézi
+                for i in range(num_samples):
+                    # Generování náhodného latentního vektoru
+                    z = torch.randn(1, self.z_dim, device=self.device)
+                    
+                    # Generování léze
+                    with torch.no_grad():
+                        fake_lesion = self.generator(z, atlas[:1], brain_mask[:1])
+                    
+                    # Aplikace atlas masky a brain masky
+                    fake_lesion = fake_lesion * atlas_binary[:1] * brain_mask_binary[:1]
+                    
+                    # Konverze na skutečně binární masku (0 nebo 1)
+                    binary_lesion = (fake_lesion > 0.5).float()
+                    
+                    # Převod na NumPy pro vizualizaci
+                    binary_np = binary_lesion[0, 0].cpu().numpy()
+                    
+                    # Získáme velikosti 3D objemu
+                    depth, height, width = binary_np.shape
+                    
+                    # Vypočteme objem a počet komponent
+                    total_volume = np.sum(binary_np)
+                    components, num_components = measure_label(binary_np, return_num=True)
+                    
+                    # Pro každou anatomickou orientaci vytvoříme stránku
+                    for orient_name, orient_info in orientations.items():
+                        # Připravíme řezy podle orientace
+                        if orient_name == 'axial':
+                            slices = [binary_np[i, :, :] for i in range(depth)]
+                            non_empty_indices = list(range(depth))
+                        elif orient_name == 'coronal':
+                            slices = [binary_np[:, i, :] for i in range(height)]
+                            non_empty_indices = list(range(height))
+                        else:  # sagittal
+                            slices = [binary_np[:, :, i] for i in range(width)]
+                            non_empty_indices = list(range(width))
+                        
+                        # Pokud nejsou nalezeny žádné neprázdné řezy, použijeme všechny
+                        if not non_empty_indices:
+                            if orient_name == 'axial':
+                                non_empty_indices = list(range(depth))
+                            elif orient_name == 'coronal':
+                                non_empty_indices = list(range(height))
+                            else:  # sagittal
+                                non_empty_indices = list(range(width))
+                        
+                        # Omezíme počet řezů na zobrazení (maximum 16 řezů na stránku)
+                        if len(non_empty_indices) > 16:
+                            # Zvolíme rovnoměrně rozložené řezy
+                            step = len(non_empty_indices) // 16
+                            non_empty_indices = non_empty_indices[::step][:16]
+                        
+                        # Vypočteme metadata pro PDF
+                        slices_per_row = 4
+                        num_slices = len(non_empty_indices)
+                        rows_needed = (num_slices + slices_per_row - 1) // slices_per_row
+                        
+                        # Určení rozsahů řezů pro lepší popis
+                        slice_range_text = f"Řezy {min(non_empty_indices)}-{max(non_empty_indices)}" if len(non_empty_indices) > 1 else f"Řez {non_empty_indices[0]}"
+                        
+                        # Vytvoříme stránku pro tuto orientaci
+                        fig = plt.figure(figsize=(12, rows_needed * 3 + 1))
+                        
+                        # Přidáme titulky s metadaty
+                        plt.suptitle(f"Generovaná HIE léze #{i+1} - Epocha {epoch} - {orient_info['title']} pohled", fontsize=16)
+                        fig.text(0.5, 0.95, f"Objem: {total_volume} voxelů, Počet komponent: {num_components}, {slice_range_text}", 
+                                ha='center', fontsize=12)
+                        
+                        # Zobrazení jednotlivých řezů
+                        for idx, j in enumerate(non_empty_indices):
+                            # Určíme pozici tohoto řezu v gridu
+                            row = idx // slices_per_row
+                            col = idx % slices_per_row
+                            
+                            # Přidáme subplot
+                            ax = plt.subplot(rows_needed, slices_per_row, row * slices_per_row + col + 1)
+                            
+                            # Zobrazíme odpovídající řez
+                            ax.imshow(slices[j], cmap='binary', interpolation='none', vmin=0, vmax=1)
+                            
+                            # Přidáme orientační značky
+                            top, bottom = orient_info['labels'][0], orient_info['labels'][1]
+                            left, right = orient_info['labels'][2], orient_info['labels'][3]
+                            
+                            # Přidáme značky orientace
+                            ax.text(0.5, 0.02, bottom, transform=ax.transAxes, ha='center', va='bottom', color='black', fontweight='bold')
+                            ax.text(0.5, 0.98, top, transform=ax.transAxes, ha='center', va='top', color='black', fontweight='bold')
+                            ax.text(0.02, 0.5, left, transform=ax.transAxes, ha='left', va='center', color='black', fontweight='bold')
+                            ax.text(0.98, 0.5, right, transform=ax.transAxes, ha='right', va='center', color='black', fontweight='bold')
+                            
+                            ax.set_title(f"Řez {j}")
+                            ax.axis('off')  # Vypnout osy
+                        
+                        # Uložíme stránku do PDF
+                        plt.tight_layout(rect=[0, 0, 1, 0.92])  # Nechat místo pro nadpisy
+                        pdf.savefig(fig)
+                        plt.close(fig)
+                
+                # Přidáme souhrnnou stránku s informacemi
+                fig = plt.figure(figsize=(8, 6))
+                plt.axis('off')
+                plt.text(0.5, 0.8, f"HIE léze generované v epoše {epoch}", ha='center', fontsize=16)
+                plt.text(0.5, 0.7, f"Počet ukázek: {num_samples}", ha='center', fontsize=14)
+                plt.text(0.5, 0.6, f"Datum a čas generování: {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}", ha='center', fontsize=14)
+                plt.text(0.5, 0.5, "Generováno pomocí HIE Lesion GAN", ha='center', fontsize=14)
+                plt.text(0.5, 0.4, f"Pohledy: {', '.join([o['title'] for o in orientations.values()])}", ha='center', fontsize=14)
+                plt.text(0.5, 0.3, f"PDF uloženo do: {pdf_path}", ha='center', fontsize=12)
+                plt.tight_layout()
+                pdf.savefig(fig)
+                plt.close(fig)
+            
+            # Vrátit generátor do režimu tréninku
+            self.generator.train()
+            
+            # Stačí zpracovat jeden batch pro získání atlasu a brain masky
+            break
+        
+        print(f"PDF vizualizace uložena do: {pdf_path}")
+
     def train(self, num_epochs, validate_every=5):
         start_time = time.time()
         
@@ -1736,6 +1903,10 @@ class HIELesionGANTrainer:
             # Uložení checkpointu
             if (epoch + 1) % self.save_interval == 0:
                 self.save_checkpoint(epoch + 1)
+            
+            # Generovat PDF s řezy každých 10 epoch
+            if (epoch + 1) % 10 == 0:
+                self.generate_pdf_slices(epoch + 1)
             
             # Výpis informací o epoše
             epoch_time = time.time() - epoch_start_time
