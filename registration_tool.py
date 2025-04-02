@@ -11,109 +11,132 @@ import matplotlib.gridspec as gridspec
 
 def register_image_to_atlas(moving_image_path, fixed_image_path, output_path):
     """
-    Registruje vstupní obraz na atlas pomocí ANTs (pokročilá registrace)
+    Registruje vstupní ADC obraz (moving) na atlas (fixed) pomocí ANTs a provede vlastní 
+    normalizaci a následnou denormalizaci, aby se zachoval původní dynamický rozsah ADC hodnot.
     
     Args:
-        moving_image_path: Cesta k obrazu, který bude registrován
-        fixed_image_path: Cesta k obrazu atlasu
-        output_path: Cesta pro uložení registrovaného obrazu
+        moving_image_path: Cesta k ADC obrazu, který bude registrován
+        fixed_image_path: Cesta k obrazu atlasu (také ADC mapa)
+        output_path: Cesta pro uložení registrovaného obrazu s původními intenzitami
     """
     print(f"Registering {moving_image_path} to {fixed_image_path}")
     
     # Načtení obrazů pomocí ANTsPy
     fixed_ant = ants.image_read(str(fixed_image_path))
     moving_ant = ants.image_read(str(moving_image_path))
-    # Načtení původního obrazu (bez normalizace) pro získání cílového rozsahu
+    # Načtení původního ADC obrazu (bez normalizace) pro zachování původního rozsahu
     orig_moving_ant = ants.image_read(str(moving_image_path))
     
-    # Normalizace intenzity vstupních obrazů pro lepší registraci
-    fixed_ant = ants.iMath(fixed_ant, "Normalize")
-    moving_ant = ants.iMath(moving_ant, "Normalize")
+    # Získání dat z obou obrazů
+    fixed_np = fixed_ant.numpy()
+    moving_np = moving_ant.numpy()
+    
+    # Vypočítáme globální min a max ze sady obou obrazů (abychom normalizovali konzistentně)
+    global_min = np.min(np.concatenate([fixed_np.flatten(), moving_np.flatten()]))
+    global_max = np.max(np.concatenate([fixed_np.flatten(), moving_np.flatten()]))
+    
+    print(f"Globální intenzitní rozsah: min={global_min}, max={global_max}")
+    
+    # Vytvoření normalizovaných verzí obou obrazů (na rozsah [0, 1])
+    fixed_norm_np = (fixed_np - global_min) / (global_max - global_min)
+    moving_norm_np = (moving_np - global_min) / (global_max - global_min)
+    
+    # Převedeme normalizované numpy pole zpět do ANTs image a zachováme původní geometrii
+    fixed_ant_norm = ants.from_numpy(fixed_norm_np)
+    fixed_ant_norm.set_origin(fixed_ant.origin)
+    fixed_ant_norm.set_spacing(fixed_ant.spacing)
+    fixed_ant_norm.set_direction(fixed_ant.direction)
+    
+    moving_ant_norm = ants.from_numpy(moving_norm_np)
+    moving_ant_norm.set_origin(moving_ant.origin)
+    moving_ant_norm.set_spacing(moving_ant.spacing)
+    moving_ant_norm.set_direction(moving_ant.direction)
+    
+    # Uchováme původní rozsah ADC hodnot z moving obrazu pro pozdější denormalizaci
+    desired_min = moving_np.min()
+    desired_max = moving_np.max()
+    print(f"Původní ADC rozsah (moving): min={desired_min}, max={desired_max}")
     
     try:
-        # Dvoustupňová registrace: Nejprve afinní a poté SyN (nelineární)
+        # Dvoustupňová registrace: nejprve afinní a poté SyN (nelineární)
         print("Provádím afinní registraci...")
         init_reg = ants.registration(
-            fixed=fixed_ant, 
-            moving=moving_ant,
+            fixed=fixed_ant_norm, 
+            moving=moving_ant_norm,
             type_of_transform='Affine', 
             verbose=False
         )
         
         print("Provádím SyN registraci...")
         reg = ants.registration(
-            fixed=fixed_ant, 
-            moving=moving_ant,
+            fixed=fixed_ant_norm, 
+            moving=moving_ant_norm,
             type_of_transform='SyN',
             initial_transform=init_reg['fwdtransforms'][0],
-            reg_iterations=[50, 30, 20],   # Počet iterací pro každou úroveň
+            reg_iterations=[50, 30, 20],
             verbose=False
         )
         
-        # Aplikace transformace na pohyblivý obraz
-        registered_image = ants.apply_transforms(
-            fixed=fixed_ant,
-            moving=moving_ant,
+        # Aplikace získaných transformací na moving obraz (normalizovaný)
+        registered_norm = ants.apply_transforms(
+            fixed=fixed_ant_norm,
+            moving=moving_ant_norm,
             transformlist=reg['fwdtransforms'],
             interpolator='linear',
             verbose=False
         )
         
-        # Vytvoření masky mozku z atlasu
+        # Vytvoření masky mozku z atlasu (fixed_ant_norm) – využijeme hodnoty > 0.05
         print("Vytvářím masku mozku z atlasu...")
-        brain_mask = ants.threshold_image(fixed_ant, 0.05, 2.0)  # Vytvoření binární masky pro hodnoty > 0.05
+        brain_mask = ants.threshold_image(fixed_ant_norm, 0.05, 1.0)  # maska binární
         
-        # Aplikace masky na registrovaný obraz
+        # Aplikace masky – pouze uvnitř mozku ponecháme hodnoty
         print("Aplikuji masku na registrovaný obraz...")
-        masked_registered_image = registered_image * brain_mask
+        masked_registered_norm = registered_norm * brain_mask
         
-        # Získání původního dynamického rozsahu z původního obrazu
-        orig_moving_np = orig_moving_ant.numpy()
-        desired_min, desired_max = orig_moving_np.min(), orig_moving_np.max()
-        # Vypočítáme statistiky původního obrazu
-        orig_avg = orig_moving_np.mean()
-        orig_zero_pct = np.sum(orig_moving_np == 0) / orig_moving_np.size * 100
-        print(f"Originální image statistiky: min={desired_min}, max={desired_max}, avg={orig_avg}, %0={orig_zero_pct:.2f}%")
-        
-        # Zpětné škálování intenzit na cílový rozsah (z původního obrazu)
-        print("Aplikuji zpětné škálování intenzit na registrovaný obraz...")
-        masked_np = masked_registered_image.numpy()
-        mask = masked_np != 0  # škálujeme pouze pixely uvnitř masky
+        # Denormalizace: převod registrovaného obrazu z [0,1] zpět do původního ADC rozsahu
+        masked_np = masked_registered_norm.numpy()
+        mask = masked_np != 0  # škálujeme pouze uvnitř masky
         if np.any(mask):
+            # Aktuální min a max uvnitř masky
             current_min = masked_np[mask].min()
             current_max = masked_np[mask].max()
         else:
-            current_min, current_max = 0, 1  # záložní hodnoty, pokud je maska prázdná
+            current_min, current_max = 0, 1
         
+        # Lineární denormalizace: převod z [current_min, current_max] na [desired_min, desired_max]
         scaled_np = np.copy(masked_np)
-        scaled_np[mask] = (masked_np[mask] - current_min) / (current_max - current_min) * (desired_max - desired_min) + desired_min
+        if current_max - current_min != 0:
+            scaled_np[mask] = (masked_np[mask] - current_min) / (current_max - current_min) * (desired_max - desired_min) + desired_min
+        else:
+            scaled_np[mask] = desired_min
         
-        # Vytvoření nového ANTs image ze škálovaného numpy pole a zachování geometrie původního obrazu
+        # Vytvoření nového ANTs obrazu se škálovanými hodnotami a zachování geometrie
         scaled_registered_image = ants.from_numpy(scaled_np)
-        scaled_registered_image.set_origin(masked_registered_image.origin)
-        scaled_registered_image.set_spacing(masked_registered_image.spacing)
-        scaled_registered_image.set_direction(masked_registered_image.direction)
+        scaled_registered_image.set_origin(masked_registered_norm.origin)
+        scaled_registered_image.set_spacing(masked_registered_norm.spacing)
+        scaled_registered_image.set_direction(masked_registered_norm.direction)
         
         # Vypočítáme statistiky registrovaného obrazu
         scaled_avg = scaled_np.mean()
         scaled_zero_pct = np.sum(scaled_np == 0) / scaled_np.size * 100
         scaled_min = scaled_np.min()
         scaled_max = scaled_np.max()
-        print(f"Registrovaný image statistiky: min={scaled_min}, max={scaled_max}, avg={scaled_avg}, %0={scaled_zero_pct:.2f}%")
+        print(f"Registrovaný ADC obraz statistiky: min={scaled_min}, max={scaled_max}, avg={scaled_avg}, %0={scaled_zero_pct:.2f}%")
         
-        # Uložení registrovaného obrazu se škálováním
         print(f"Ukládám registrovaný obraz (se zpětným škálováním) do {output_path}")
         ants.image_write(scaled_registered_image, str(output_path))
         
-        # Vrácení transformačních parametrů a referencí (vracíme škálovanou verzi)
+        # Vracíme transformační parametry a relevantní obrazy
         return {
             'fwdtransforms': reg['fwdtransforms'],
             'invtransforms': reg['invtransforms']
-        }, fixed_ant, moving_ant, scaled_registered_image
+        }, fixed_ant_norm, moving_ant_norm, scaled_registered_image
         
     except Exception as e:
         print(f"Chyba při registraci: {e}")
         raise
+
 
 def transform_label_map(label_map_path, transforms, fixed_image, output_path):
     """
