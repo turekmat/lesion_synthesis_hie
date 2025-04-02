@@ -218,9 +218,15 @@ class Generator(nn.Module):
         e3 = self.atlas_enc3(e2)     # 16x16x8
         e4 = self.atlas_enc4(e3)     # 8x8x4
         
+        # Debug: Print shape to understand the expected shape for z_3d
+        # print(f"e4 shape: {e4.shape}")
+        
         # Zpracování náhodného šumu a reshape na 3D feature mapu
         z_flat = self.fc_z(z)
-        z_3d = z_flat.view(batch_size, self.base_filters, 4, 8, 8)
+        
+        # Shape fix: Get the actual shape from e4 to ensure compatibility
+        _, _, D, H, W = e4.shape
+        z_3d = z_flat.view(batch_size, self.base_filters, D, H, W)
         z_3d = self.reshape_z(z_3d)
         
         # Kombinace atlasu a šumu v bottlenecku
@@ -246,6 +252,10 @@ class Generator(nn.Module):
         
         # Finální dekódování do lesion mapy
         out = self.dec1(d2_skip)                           # 128x128x64
+        
+        # Ensure lesions only appear where atlas is non-zero
+        atlas_mask = (atlas > 0).float()
+        out = out * atlas_mask
         
         return out
 
@@ -480,6 +490,10 @@ class HIELesionGANTrainer:
         z = self.get_random_z(batch_size)
         fake_lesions = self.generator(z, atlas)
         
+        # Ensure generated lesions respect the atlas - make atlas constraint more explicit
+        atlas_mask = (atlas > 0).float()
+        fake_lesions = fake_lesions * atlas_mask  # Enforce constraint again for safety
+        
         # Forward pass diskriminátorem
         fake_patch_pred, fake_global_pred = self.discriminator(fake_lesions, atlas)
         
@@ -489,19 +503,26 @@ class HIELesionGANTrainer:
         # Další pomocné loss funkce pro lepší generování
         
         # Atlas-guided Focal Loss - podporuje generování v oblastech, kde se léze častěji vyskytují
+        # Scale the loss by the atlas values to emphasize areas with higher lesion probability
         atlas_guided_focal = self.focal_loss(fake_lesions * atlas, real_lesions * atlas)
         
         # L1 Loss pro stabilitu tréninku a zachycení nízkofrekvečních detailů
-        g_l1_loss = self.l1_loss(fake_lesions, real_lesions)
+        # Only compute L1 loss in atlas-positive regions to avoid penalizing negative areas
+        masked_l1_loss = self.l1_loss(fake_lesions * atlas_mask, real_lesions * atlas_mask)
         
         # Dice Loss pro lepší segmentace
         g_dice_loss = self.dice_loss(fake_lesions, real_lesions)
         
+        # Atlas violation penalty - strongly discourage generating lesions where atlas is 0
+        atlas_zero_mask = (1.0 - atlas_mask)
+        violation_penalty = torch.mean(fake_lesions * atlas_zero_mask) * 10.0  # Higher weight for violations
+        
         # Kombinace všech loss funkcí
         g_loss = (self.lambda_adv * g_adv_loss + 
-                 self.lambda_l1 * g_l1_loss + 
+                 self.lambda_l1 * masked_l1_loss + 
                  self.lambda_dice * g_dice_loss + 
-                 atlas_guided_focal)
+                 atlas_guided_focal + 
+                 violation_penalty)
         
         # Backpropagation
         g_loss.backward()
@@ -510,9 +531,10 @@ class HIELesionGANTrainer:
         return {
             'g_loss': g_loss.item(),
             'g_adv_loss': g_adv_loss.item(),
-            'g_l1_loss': g_l1_loss.item(),
+            'g_l1_loss': masked_l1_loss.item(),
             'g_dice_loss': g_dice_loss.item(),
             'g_focal_loss': atlas_guided_focal.item(),
+            'atlas_violation': violation_penalty.item(),
             'fake_lesions': fake_lesions.detach()
         }
     
@@ -528,6 +550,7 @@ class HIELesionGANTrainer:
             'val_g_adv_loss': 0,
             'val_g_l1_loss': 0,
             'val_g_dice_loss': 0,
+            'val_atlas_violation': 0,
             'val_d_loss': 0
         }
         
@@ -541,6 +564,10 @@ class HIELesionGANTrainer:
                 z = self.get_random_z(batch_size)
                 fake_lesions = self.generator(z, atlas)
                 
+                # Apply atlas mask
+                atlas_mask = (atlas > 0).float()
+                fake_lesions = fake_lesions * atlas_mask
+                
                 # Diskriminátor výstupy
                 real_patch_pred, real_global_pred = self.discriminator(real_lesions, atlas)
                 fake_patch_pred, fake_global_pred = self.discriminator(fake_lesions, atlas)
@@ -548,16 +575,21 @@ class HIELesionGANTrainer:
                 # Adversarial Loss
                 g_adv_loss = self.gan_loss(fake_patch_pred, True) + self.gan_loss(fake_global_pred, True)
                 
-                # L1 Loss
-                g_l1_loss = self.l1_loss(fake_lesions, real_lesions)
+                # L1 Loss only in atlas-positive regions
+                masked_l1_loss = self.l1_loss(fake_lesions * atlas_mask, real_lesions * atlas_mask)
                 
                 # Dice Loss
                 g_dice_loss = self.dice_loss(fake_lesions, real_lesions)
                 
+                # Atlas violation penalty
+                atlas_zero_mask = (1.0 - atlas_mask)
+                violation_penalty = torch.mean(fake_lesions * atlas_zero_mask) * 10.0
+                
                 # Kombinace
                 g_loss = (self.lambda_adv * g_adv_loss + 
-                         self.lambda_l1 * g_l1_loss + 
-                         self.lambda_dice * g_dice_loss)
+                         self.lambda_l1 * masked_l1_loss + 
+                         self.lambda_dice * g_dice_loss +
+                         violation_penalty)
                 
                 # Diskriminátor loss
                 d_real_loss = self.gan_loss(real_patch_pred, True) + self.gan_loss(real_global_pred, True)
@@ -566,8 +598,9 @@ class HIELesionGANTrainer:
                 
                 val_losses['val_g_loss'] += g_loss.item()
                 val_losses['val_g_adv_loss'] += g_adv_loss.item()
-                val_losses['val_g_l1_loss'] += g_l1_loss.item()
+                val_losses['val_g_l1_loss'] += masked_l1_loss.item()
                 val_losses['val_g_dice_loss'] += g_dice_loss.item()
+                val_losses['val_atlas_violation'] += violation_penalty.item()
                 val_losses['val_d_loss'] += d_loss.item()
         
         # Průměrování
@@ -629,19 +662,62 @@ class HIELesionGANTrainer:
     def generate_samples(self, atlas, num_samples=10, output_dir='./generated_samples'):
         os.makedirs(output_dir, exist_ok=True)
         
+        # Create a directory for visualization
+        vis_dir = os.path.join(output_dir, 'visualizations')
+        os.makedirs(vis_dir, exist_ok=True)
+        
+        # Statistics dictionary
+        stats = {
+            'lesion_volumes': [],
+            'lesion_counts': [],
+            'atlas_coverage': []
+        }
+        
         self.generator.eval()
         with torch.no_grad():
             # Zajistíme, že atlas má batch rozměr
             if atlas.dim() == 4:  # [C, D, H, W]
                 atlas = atlas.unsqueeze(0)  # [1, C, D, H, W]
             
+            # Get atlas binary mask for constraint
+            atlas_mask = (atlas > 0).float()
+            
+            # Uložení atlasu pro referenci
+            atlas_np = atlas.squeeze().cpu().numpy()
+            atlas_path = os.path.join(output_dir, 'atlas_reference.nii.gz')
+            
+            # Pokud máme informace o atlasu, použijeme stejné parametry
+            if hasattr(self.dataloader.dataset, 'lesion_atlas_path'):
+                atlas_nib = nib.load(self.dataloader.dataset.lesion_atlas_path)
+                nib.save(nib.Nifti1Image(atlas_np, atlas_nib.affine, atlas_nib.header), atlas_path)
+            
             # Vygenerování vzorků
+            print(f"Generuji {num_samples} vzorků...")
             for i in range(num_samples):
                 # Získání náhodného latentního vektoru
                 z = self.get_random_z(1)
                 
                 # Generování léze
                 fake_lesion = self.generator(z, atlas)
+                
+                # Enforce atlas constraint
+                fake_lesion = fake_lesion * atlas_mask
+                
+                # Binarize for statistics (threshold at 0.5)
+                binary_lesion = (fake_lesion > 0.5).float()
+                
+                # Compute statistics
+                lesion_volume = binary_lesion.sum().item()
+                stats['lesion_volumes'].append(lesion_volume)
+                
+                # Convert to numpy for connected component analysis
+                binary_np = binary_lesion.squeeze().cpu().numpy()
+                labeled_array, num_features = measure_label(binary_np, connectivity=3, return_num=True)
+                stats['lesion_counts'].append(num_features)
+                
+                # Calculate atlas coverage (percentage of atlas covered by lesions)
+                atlas_coverage = (binary_lesion * atlas_mask).sum() / atlas_mask.sum()
+                stats['atlas_coverage'].append(atlas_coverage.item() * 100)  # as percentage
                 
                 # Převod na numpy array a binarizace pro uložení jako nifti
                 lesion_np = fake_lesion.squeeze().cpu().numpy()
@@ -660,7 +736,66 @@ class HIELesionGANTrainer:
                 
                 # Uložení
                 nib.save(lesion_nib, sample_path)
+                
+                # Create visualization - mid-slice for 3 planes
+                vis_path = os.path.join(vis_dir, f'viz_lesion_{i}.png')
+                
+                # Create mid slices for visualization
+                D, H, W = lesion_np.shape
+                mid_z = D // 2
+                mid_y = H // 2
+                mid_x = W // 2
+                
+                # Create figure with 3 subplots for 3 orthogonal planes
+                fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+                
+                # Axial view
+                axes[0].imshow(lesion_np[mid_z, :, :], cmap='jet')
+                axes[0].set_title(f"Axial (z={mid_z})")
+                axes[0].imshow(atlas_np[mid_z, :, :], cmap='gray', alpha=0.3)
+                
+                # Coronal view
+                axes[1].imshow(lesion_np[:, mid_y, :], cmap='jet')
+                axes[1].set_title(f"Coronal (y={mid_y})")
+                axes[1].imshow(atlas_np[:, mid_y, :], cmap='gray', alpha=0.3)
+                
+                # Sagittal view
+                axes[2].imshow(lesion_np[:, :, mid_x], cmap='jet')
+                axes[2].set_title(f"Sagittal (x={mid_x})")
+                axes[2].imshow(atlas_np[:, :, mid_x], cmap='gray', alpha=0.3)
+                
+                plt.tight_layout()
+                plt.savefig(vis_path)
+                plt.close()
+                
                 print(f"Vygenerován vzorek: {sample_path}")
+                print(f"  - Počet lézí: {num_features}")
+                print(f"  - Objem lézí: {lesion_volume} voxelů")
+                print(f"  - Pokrytí atlasu: {atlas_coverage.item() * 100:.2f}%")
+        
+        # Create a summary statistics file
+        stats_path = os.path.join(output_dir, 'lesion_stats.txt')
+        with open(stats_path, 'w') as f:
+            f.write("=== Statistiky generovaných lézí ===\n\n")
+            f.write(f"Počet vygenerovaných vzorků: {num_samples}\n\n")
+            
+            avg_vol = sum(stats['lesion_volumes']) / num_samples
+            avg_count = sum(stats['lesion_counts']) / num_samples
+            avg_coverage = sum(stats['atlas_coverage']) / num_samples
+            
+            f.write(f"Průměrný počet lézí na vzorek: {avg_count:.2f}\n")
+            f.write(f"Průměrný objem lézí na vzorek: {avg_vol:.2f} voxelů\n")
+            f.write(f"Průměrné pokrytí atlasu: {avg_coverage:.2f}%\n\n")
+            
+            f.write("Detaily jednotlivých vzorků:\n")
+            for i in range(num_samples):
+                f.write(f"Vzorek {i}:\n")
+                f.write(f"  - Počet lézí: {stats['lesion_counts'][i]}\n")
+                f.write(f"  - Objem lézí: {stats['lesion_volumes'][i]} voxelů\n")
+                f.write(f"  - Pokrytí atlasu: {stats['atlas_coverage'][i]:.2f}%\n\n")
+        
+        print(f"\nStatistiky byly uloženy do: {stats_path}")
+        print(f"Vizualizace byly uloženy do: {vis_dir}")
         
         self.generator.train()
     
