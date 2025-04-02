@@ -11,6 +11,8 @@ from torch.nn import functional as F
 from pathlib import Path
 import scipy.ndimage as ndimage
 from matplotlib.backends.backend_pdf import PdfPages
+import matplotlib.pyplot as plt
+
 
 
 # Třída pro jednoduchou 3D datovou augmentaci
