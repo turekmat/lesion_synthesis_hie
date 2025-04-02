@@ -911,6 +911,9 @@ class HIELesionGANTrainer:
             'val_atlas_violation': 0.0
         }
         
+        # Pro vizualizaci ukládej první batch z validačních dat
+        first_batch_samples = None
+        
         num_batches = 0
         
         with torch.no_grad():
@@ -941,6 +944,15 @@ class HIELesionGANTrainer:
                         max_val = fake_lesions.max().item()
                         print(f"[WARNING] fake_lesions outside range [0,1] during validation: min={min_val}, max={max_val}")
                     fake_lesions = torch.clamp(fake_lesions, 0.0, 1.0)
+                
+                # Uložení prvního batche pro vizualizaci
+                if num_batches == 1:
+                    first_batch_samples = {
+                        'real_lesions': real_lesions.detach(),
+                        'fake_lesions': fake_lesions.detach(),
+                        'atlas': atlas.detach(),
+                        'brain_mask': brain_mask.detach()
+                    }
                 
                 # Debug prints of tensor shapes if needed
                 if self.debug_print:
@@ -1030,7 +1042,7 @@ class HIELesionGANTrainer:
                     self.violation_penalty_weight * atlas_violation
                 )
                 
-                # Accumulate validation losses
+                # Accumulate validation losses - ensure scalar values
                 val_losses['val_d_loss'] += d_loss.item()
                 val_losses['val_g_loss'] += g_loss.item()
                 val_losses['val_l1_loss'] += masked_l1_loss.item()
@@ -1052,9 +1064,14 @@ class HIELesionGANTrainer:
         self.log_metrics(val_losses, epoch)
         
         # Log validation images to tensorboard
-        if hasattr(self, 'writer') and self.writer is not None and len(real_lesions) > 0:
+        if hasattr(self, 'writer') and self.writer is not None and first_batch_samples is not None:
             with torch.no_grad():
-                self.log_images(real_lesions, fake_lesions, atlas, epoch)
+                self.log_images(
+                    first_batch_samples['real_lesions'],
+                    first_batch_samples['fake_lesions'],
+                    first_batch_samples['atlas'],
+                    epoch
+                )
         
         self.generator.train()
         self.discriminator.train()
@@ -1142,6 +1159,16 @@ class HIELesionGANTrainer:
             prefix = f'step_{step}/'
         
         for key, value in metrics.items():
+            # OPRAVA: Zajisti, že všechny hodnoty jsou skalární
+            if isinstance(value, torch.Tensor):
+                if value.numel() != 1:
+                    # Pokud tensor není skalární, loguj pouze jeho průměr
+                    if self.debug:
+                        print(f"WARNING: Non-scalar tensor for {key} with shape {value.shape}, logging mean value")
+                    value = value.mean().item()
+                else:
+                    # Pokud tensor je skalární, převeď na Python číslo
+                    value = value.item()
             self.writer.add_scalar(f'{prefix}{key}', value, epoch)
     
     def log_images(self, real_lesions, fake_lesions, atlas, epoch, n_samples=4):
@@ -1650,6 +1677,9 @@ class HIELesionGANTrainer:
             # Progress bar
             pbar = tqdm(self.dataloader, desc=f'Epoch {epoch+1}/{num_epochs}')
             
+            # Storage for visualization
+            last_batch_data = None
+            
             for i, batch in enumerate(pbar):
                 real_lesions = batch['label'].to(self.device)
                 atlas = batch['atlas'].to(self.device)
@@ -1674,15 +1704,30 @@ class HIELesionGANTrainer:
                 # Logování metrik pro každý batch
                 if i % 10 == 0:
                     step = epoch * len(self.dataloader) + i
-                    all_metrics = {**d_metrics, **{k: v for k, v in g_metrics.items() if k != 'g_atlas_violation'}}
+                    # OPRAVA: Explicitně vyfiltruj 'fake_lesions' z metrik, protože to není skalární hodnota
+                    all_metrics = {**d_metrics, **{k: v for k, v in g_metrics.items() if k != 'fake_lesions' and k != 'g_atlas_violation'}}
                     self.log_metrics(all_metrics, epoch, step)
+                
+                # Uložení posledního batche pro vizualizaci
+                if i == len(pbar) - 1:
+                    last_batch_data = {
+                        'real_lesions': real_lesions.detach(),
+                        'fake_lesions': g_metrics['fake_lesions'].detach(),  # Here we use the detached tensor
+                        'atlas': atlas.detach()
+                    }
             
             # Průměrování ztrát za epoch
             epoch_d_loss /= len(self.dataloader)
             epoch_g_loss /= len(self.dataloader)
             
-            # Logování obrazů
-            self.log_images(real_lesions, g_metrics['fake_lesions'], atlas, epoch)
+            # Logování obrazů pokud máme data
+            if last_batch_data is not None:
+                self.log_images(
+                    last_batch_data['real_lesions'],
+                    last_batch_data['fake_lesions'],
+                    last_batch_data['atlas'],
+                    epoch
+                )
             
             # Generate and save validation samples every X epochs
             if (epoch + 1) % validate_every == 0 and self.val_dataloader is not None:
