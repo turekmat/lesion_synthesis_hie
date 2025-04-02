@@ -662,36 +662,26 @@ def train_label_gan(args):
     
     # Loss funkce - použijeme vylepšené verze
     adversarial_loss = nn.BCEWithLogitsLoss()
-    # Vážený Dice loss s vyšší váhou pro léze
-    weighted_dice_loss = WeightedDiceLoss(pos_weight=args.pos_weight)
-    # Focal loss pro lepší zvládání nevyvážených tříd
-    focal_loss = FocalLoss(alpha=0.8, gamma=2.0)
-    # Penalizace prázdných výstupů - cílíme na zadané procento aktivních pixelů
-    black_penalty_loss = BlackImagePenaltyLoss(threshold=0.1, target_percentage=args.target_lesion_percentage)
-    
-    # Sledování statistik lézí během tréninku
-    best_lesion_percentage = 0.0
-    best_epoch = 0
-    
-    # Loss funkce - použijeme vylepšené verze
-    adversarial_loss = nn.BCEWithLogitsLoss()
     
     # Vážený Dice loss s vylepšenou verzí pro extrémní nevyváženost tříd
-    weighted_dice_loss = WeightedDiceLoss(
+    dice_loss_fn = WeightedDiceLoss(
         pos_weight=args.pos_weight, 
         bg_weight=args.bg_weight
     )
     
     # Focal loss pro lepší zvládání nevyvážených tříd
-    focal_loss = FocalLoss(alpha=0.8, gamma=2.0)
+    focal_loss_fn = FocalLoss(alpha=0.8, gamma=2.0)
     
     # Vylepšená penalizace pro kontrolu generování lézí
-    lesion_penalty_loss = EnhancedLesionPenaltyLoss(
+    lesion_penalty_loss_fn = EnhancedLesionPenaltyLoss(
         min_threshold=0.1,
         max_threshold=0.5,
         target_min_percentage=args.target_lesion_percentage,
         target_max_percentage=args.target_lesion_percentage * 3.0  # Horní limit 3x větší než minimální
     )
+    
+    # Penalizace prázdných výstupů - cílíme na zadané procento aktivních pixelů
+    black_penalty_loss_fn = BlackImagePenaltyLoss(threshold=0.1, target_percentage=args.target_lesion_percentage)
     
     # Gradient clipování pro stabilnější trénink
     max_grad_norm = 1.0
@@ -702,6 +692,10 @@ def train_label_gan(args):
         param_group['lr'] = initial_lr
     for param_group in d_optimizer.param_groups:
         param_group['lr'] = initial_lr
+    
+    # Sledování statistik lézí během tréninku
+    best_lesion_percentage = 0.0
+    best_epoch = 0
     
     # Trénovací smyčka
     for epoch in range(args.epochs):
@@ -798,13 +792,13 @@ def train_label_gan(args):
             g_adv_loss = adversarial_loss(fake_output, real_labels)
             
             # Vážený Dice loss pro lepší segmentaci lézí
-            g_dice_loss = weighted_dice_loss(fake_label, real_label)
+            g_dice_loss = dice_loss_fn(fake_label, real_label)
             
             # Focal loss pro ještě lepší zvládání nevyvážených tříd
-            g_focal_loss = focal_loss(fake_label, real_label)
+            g_focal_loss = focal_loss_fn(fake_label, real_label)
             
             # Penalizace prázdných/černých výstupů
-            g_black_loss = black_penalty_loss(fake_label)
+            g_black_loss = black_penalty_loss_fn(fake_label)
             
             # Přidáváme anatomicky konzistentní loss
             anatomically_informed_loss = 0.0
@@ -814,27 +808,27 @@ def train_label_gan(args):
                 anatomically_informed_loss = (fake_label * low_probability_mask).mean() * 10.0
             
             # Vylepšená penalizace pro kontrolu generování lézí
-            g_lesion_loss = lesion_penalty_loss(fake_label)
+            g_lesion_loss = lesion_penalty_loss_fn(fake_label)
             
             # Vypočítáme jednotlivé složky ztráty s jejich vahami
-            weighted_adv_loss = g_adv_loss  # Adversarial loss váha 1.0
-            weighted_dice_loss = args.lambda_dice * g_dice_loss
-            weighted_focal_loss = args.lambda_focal * g_focal_loss
-            weighted_black_loss = args.lambda_black * g_black_loss
-            weighted_lesion_loss = args.lambda_black * g_lesion_loss
+            weighted_adv_loss_value = g_adv_loss  # Adversarial loss váha 1.0
+            weighted_dice_loss_value = args.lambda_dice * g_dice_loss
+            weighted_focal_loss_value = args.lambda_focal * g_focal_loss
+            weighted_black_loss_value = args.lambda_black * g_black_loss
+            weighted_lesion_loss_value = args.lambda_black * g_lesion_loss
             
             # Pro lepší debugging vypisujeme všechny složky ztráty
             if i % 10 == 0:
-                print(f"Loss components: ADV={weighted_adv_loss:.4f}, DICE={weighted_dice_loss:.4f}, "
-                      f"FOCAL={weighted_focal_loss:.4f}, LESION={weighted_lesion_loss:.4f}, "
+                print(f"Loss components: ADV={weighted_adv_loss_value:.4f}, DICE={weighted_dice_loss_value:.4f}, "
+                      f"FOCAL={weighted_focal_loss_value:.4f}, LESION={weighted_lesion_loss_value:.4f}, "
                       f"ANATOM={anatomically_informed_loss:.4f}")
             
             # Celková ztráta jako součet všech složek
             g_loss = (
-                weighted_adv_loss +
-                weighted_dice_loss +
-                weighted_focal_loss +
-                weighted_lesion_loss +
+                weighted_adv_loss_value +
+                weighted_dice_loss_value +
+                weighted_focal_loss_value +
+                weighted_lesion_loss_value +
                 anatomically_informed_loss
             )
             
