@@ -11,125 +11,120 @@ import matplotlib.gridspec as gridspec
 
 def register_image_to_atlas(moving_image_path, fixed_image_path, output_path):
     """
-    Registruje vstupní ADC obraz (moving) na atlas (fixed) pomocí ANTs a provede vlastní 
-    normalizaci a následnou denormalizaci, aby se zachoval původní dynamický rozsah ADC hodnot.
-    Zároveň využívá masku mozku z atlasu, aby mimo mozek zůstala nula.
+    Registruje vstupní obraz na atlas pomocí ANTs (pokročilá registrace)
     
     Args:
-        moving_image_path: Cesta k ADC obrazu, který bude registrován
-        fixed_image_path: Cesta k obrazu atlasu (také ADC mapa)
-        output_path: Cesta pro uložení registrovaného obrazu s původními intenzitami
+        moving_image_path: Cesta k obrazu, který bude registrován
+        fixed_image_path: Cesta k obrazu atlasu
+        output_path: Cesta pro uložení registrovaného obrazu
     """
     print(f"Registering {moving_image_path} to {fixed_image_path}")
     
-    # 1) Načtení obrazů pomocí ANTs
+    # Načtení obrazů pomocí ANTsPy
     fixed_ant = ants.image_read(str(fixed_image_path))
     moving_ant = ants.image_read(str(moving_image_path))
-    orig_moving_ant = ants.image_read(str(moving_image_path))  # pro pozdější denormalizaci
+    # Načtení původního obrazu (bez normalizace) pro získání cílového rozsahu
+    orig_moving_ant = ants.image_read(str(moving_image_path))
     
-    # 2) Získání numpy polí a výpočet globálního min/max
-    fixed_np = fixed_ant.numpy()
+    # Uložení původního rozsahu hodnot ADC pro zpětné škálování
+    orig_moving_np = orig_moving_ant.numpy()
+    orig_min, orig_max = orig_moving_np.min(), orig_moving_np.max()
+    print(f"Původní ADC rozsah hodnot: min={orig_min}, max={orig_max}")
+    
+    # Normalizace intenzity vstupních obrazů pro lepší registraci
+    # Pro ADC mapy: speciální normalizace, která zachová vztahy mezi hodnotami (i záporné hodnoty)
+    fixed_ant = ants.iMath(fixed_ant, "Normalize")
+    
+    # Pro ADC mapy: normalizace do rozsahu [0,1] zachovávajíc relativní vzdálenosti
     moving_np = moving_ant.numpy()
-    global_min = np.min([fixed_np.min(), moving_np.min()])
-    global_max = np.max([fixed_np.max(), moving_np.max()])
-    print(f"Globální rozsah intenzit: min={global_min:.4f}, max={global_max:.4f}")
+    moving_min, moving_max = moving_np.min(), moving_np.max()
     
-    # 3) Normalizace do [0,1]
-    fixed_norm_np = (fixed_np - global_min) / (global_max - global_min)
-    moving_norm_np = (moving_np - global_min) / (global_max - global_min)
-    
-    # Vytvoření ANTs obrazů z normalizovaných numpy polí
-    fixed_ant_norm = ants.from_numpy(fixed_norm_np, origin=fixed_ant.origin, spacing=fixed_ant.spacing, direction=fixed_ant.direction)
-    moving_ant_norm = ants.from_numpy(moving_norm_np, origin=moving_ant.origin, spacing=moving_ant.spacing, direction=moving_ant.direction)
-    
-    # 4) Vytvoření masky mozku z normalizovaného atlasu
-    #    Hodnoty > 0.05 budeme považovat za mozek (práh lze upravit podle potřeb)
-    brain_mask = ants.threshold_image(fixed_ant_norm, 0.05, 1.0)
-    
-    # Uchování původního rozsahu z moving obrazu pro denormalizaci
-    desired_min = moving_np.min()
-    desired_max = moving_np.max()
-    print(f"Původní ADC rozsah (moving): min={desired_min:.4f}, max={desired_max:.4f}")
+    # Normalizace pomocí min-max škálování
+    normalized_moving_np = (moving_np - moving_min) / (moving_max - moving_min)
+    moving_ant = ants.from_numpy(
+        normalized_moving_np, 
+        origin=moving_ant.origin, 
+        spacing=moving_ant.spacing, 
+        direction=moving_ant.direction
+    )
     
     try:
-        # 5) Dvoustupňová registrace (Affine -> SyN)
+        # Dvoustupňová registrace: Nejprve afinní a poté SyN (nelineární)
         print("Provádím afinní registraci...")
         init_reg = ants.registration(
-            fixed=fixed_ant_norm, 
-            moving=moving_ant_norm,
-            type_of_transform='Affine',
+            fixed=fixed_ant, 
+            moving=moving_ant,
+            type_of_transform='Affine', 
             verbose=False
         )
         
         print("Provádím SyN registraci...")
         reg = ants.registration(
-            fixed=fixed_ant_norm,
-            moving=moving_ant_norm,
+            fixed=fixed_ant, 
+            moving=moving_ant,
             type_of_transform='SyN',
             initial_transform=init_reg['fwdtransforms'][0],
-            reg_iterations=[50, 30, 20],
+            reg_iterations=[50, 30, 20],   # Počet iterací pro každou úroveň
             verbose=False
         )
         
-        # Aplikace transformací na normalizovaný moving
-        registered_norm = ants.apply_transforms(
-            fixed=fixed_ant_norm,
-            moving=moving_ant_norm,
+        # Aplikace transformace na pohyblivý obraz
+        registered_image = ants.apply_transforms(
+            fixed=fixed_ant,
+            moving=moving_ant,
             transformlist=reg['fwdtransforms'],
             interpolator='linear',
             verbose=False
         )
         
-        # 6) Vynásobíme registrovaný obraz maskou, abychom mimo mozek dostali nulu
-        masked_registered_norm = registered_norm * brain_mask
+        # Vytvoření masky mozku z atlasu
+        print("Vytvářím masku mozku z atlasu...")
+        brain_mask = ants.threshold_image(fixed_ant, 0.05, 2.0)  # Vytvoření binární masky pro hodnoty > 0.05
         
-        # 7) Denormalizace do původního ADC rozsahu
-        masked_np = masked_registered_norm.numpy()
-        mask = (masked_np != 0)
+        # Aplikace masky na registrovaný obraz
+        print("Aplikuji masku na registrovaný obraz...")
+        masked_registered_image = registered_image * brain_mask
         
+        # Zpětné škálování intenzit na původní rozsah hodnot (z původního ADC obrazu)
+        print("Aplikuji zpětné škálování intenzit na registrovaný obraz...")
+        masked_np = masked_registered_image.numpy()
+        mask = masked_np != 0  # škálujeme pouze pixely uvnitř masky
+        
+        # Zpětné škálování na původní rozsah hodnot ADC
+        scaled_np = np.copy(masked_np)
         if np.any(mask):
             current_min = masked_np[mask].min()
             current_max = masked_np[mask].max()
-        else:
-            current_min, current_max = 0, 1
+            
+            # Škálování zpět do původního rozsahu
+            scaled_np[mask] = (masked_np[mask] - current_min) / (current_max - current_min) * (orig_max - orig_min) + orig_min
         
-        scaled_np = masked_np.copy()
-        if current_max > current_min:
-            scaled_np[mask] = (masked_np[mask] - current_min) / (current_max - current_min) * (desired_max - desired_min) + desired_min
-        else:
-            # fallback, kdyby current_min == current_max
-            scaled_np[mask] = desired_min
+        # Vytvoření nového ANTs image ze škálovaného numpy pole a zachování geometrie původního obrazu
+        scaled_registered_image = ants.from_numpy(scaled_np)
+        scaled_registered_image.set_origin(masked_registered_image.origin)
+        scaled_registered_image.set_spacing(masked_registered_image.spacing)
+        scaled_registered_image.set_direction(masked_registered_image.direction)
         
-        # Vytvoření ANTs obrazu s denormalizovanými hodnotami
-        scaled_registered_image = ants.from_numpy(
-            scaled_np, 
-            origin=masked_registered_norm.origin, 
-            spacing=masked_registered_norm.spacing, 
-            direction=masked_registered_norm.direction
-        )
-        
-        # Kontrola statistik registrovaného obrazu
-        scaled_min = scaled_np.min()
-        scaled_max = scaled_np.max()
+        # Vypočítáme statistiky registrovaného obrazu
         scaled_avg = scaled_np.mean()
-        zero_pct = np.sum(scaled_np == 0) / scaled_np.size * 100
-        print(f"Registrovaný ADC: min={scaled_min:.4f}, max={scaled_max:.4f}, avg={scaled_avg:.4f}, %0={zero_pct:.2f}%")
+        scaled_zero_pct = np.sum(scaled_np == 0) / scaled_np.size * 100
+        scaled_min = scaled_np[mask].min() if np.any(mask) else 0
+        scaled_max = scaled_np[mask].max() if np.any(mask) else 0
+        print(f"Registrovaný ADC statistiky: min={scaled_min}, max={scaled_max}, avg={scaled_avg}, %0={scaled_zero_pct:.2f}%")
         
-        # Uložení výsledného obrazu
-        print(f"Ukládám registrovaný obraz do: {output_path}")
+        # Uložení registrovaného obrazu se škálováním
+        print(f"Ukládám registrovaný obraz (se zpětným škálováním) do {output_path}")
         ants.image_write(scaled_registered_image, str(output_path))
         
-        # Vracíme transformy a relevantní reference
+        # Vrácení transformačních parametrů a referencí (vracíme škálovanou verzi)
         return {
             'fwdtransforms': reg['fwdtransforms'],
             'invtransforms': reg['invtransforms']
-        }, fixed_ant_norm, moving_ant_norm, scaled_registered_image
-    
+        }, fixed_ant, moving_ant, scaled_registered_image
+        
     except Exception as e:
         print(f"Chyba při registraci: {e}")
         raise
-
-
 
 def transform_label_map(label_map_path, transforms, fixed_image, output_path):
     """
@@ -160,15 +155,15 @@ def transform_label_map(label_map_path, transforms, fixed_image, output_path):
     
     return label_map_ant, transformed_label
 
-def create_registration_visualization_pdf(atlas_image, orig_zadc, reg_zadc, orig_label, reg_label, output_pdf_path):
+def create_registration_visualization_pdf(atlas_image, orig_adc, reg_adc, orig_label, reg_label, output_pdf_path):
     """
-    Vytvoří PDF vizualizaci registrace s 5 sloupci: atlas, původní ZADC, registrovaná ZADC,
+    Vytvoří PDF vizualizaci registrace s 5 sloupci: atlas, původní ADC, registrovaná ADC,
     původní label, registrovaná label.
     
     Args:
         atlas_image: Normativní atlas (ANTs image)
-        orig_zadc: Původní ZADC mapa (ANTs image)
-        reg_zadc: Registrovaná ZADC mapa (ANTs image)
+        orig_adc: Původní ADC mapa (ANTs image)
+        reg_adc: Registrovaná ADC mapa (ANTs image)
         orig_label: Původní label mapa (ANTs image)
         reg_label: Registrovaná label mapa (ANTs image)
         output_pdf_path: Cesta pro uložení PDF vizualizace
@@ -177,33 +172,39 @@ def create_registration_visualization_pdf(atlas_image, orig_zadc, reg_zadc, orig
     
     # Konverze ANTs obrazů na numpy pole
     atlas_np = atlas_image.numpy()
-    orig_zadc_np = orig_zadc.numpy()
-    reg_zadc_np = reg_zadc.numpy()
+    orig_adc_np = orig_adc.numpy()
+    reg_adc_np = reg_adc.numpy()
     orig_label_np = orig_label.numpy()
     reg_label_np = reg_label.numpy()
     
     # Vytvoření binární masky z atlasu (nenulové hodnoty)
     brain_mask = (atlas_np > 0.05)
     
-    # Aplikace masky na registrovanou ZADC mapu - nastavíme hodnoty mimo masku na 0
-    masked_reg_zadc_np = np.copy(reg_zadc_np)
-    for slice_idx in range(masked_reg_zadc_np.shape[2]):
+    # Aplikace masky na registrovanou ADC mapu - nastavíme hodnoty mimo masku na 0
+    masked_reg_adc_np = np.copy(reg_adc_np)
+    for slice_idx in range(masked_reg_adc_np.shape[2]):
         if slice_idx < brain_mask.shape[2]:
-            masked_reg_zadc_np[:, :, slice_idx] = masked_reg_zadc_np[:, :, slice_idx] * brain_mask[:, :, slice_idx]
+            masked_reg_adc_np[:, :, slice_idx] = masked_reg_adc_np[:, :, slice_idx] * brain_mask[:, :, slice_idx]
     
     # Zjištění počtu řezů pro každý obraz
     atlas_slices = atlas_np.shape[2]
-    orig_zadc_slices = orig_zadc_np.shape[2]
-    reg_zadc_slices = masked_reg_zadc_np.shape[2]
+    orig_adc_slices = orig_adc_np.shape[2]
+    reg_adc_slices = masked_reg_adc_np.shape[2]
     orig_label_slices = orig_label_np.shape[2]
     reg_label_slices = reg_label_np.shape[2]
     
-    print(f"Počet řezů - Atlas: {atlas_slices}, Původní ZADC: {orig_zadc_slices}, Reg ZADC: {reg_zadc_slices}, " +
+    print(f"Počet řezů - Atlas: {atlas_slices}, Původní ADC: {orig_adc_slices}, Reg ADC: {reg_adc_slices}, " +
           f"Původní Label: {orig_label_slices}, Reg Label: {reg_label_slices}")
+    
+    # Nastavení barevných map pro ADC - použijeme 'viridis' pro ADC mapy
+    adc_cmap = 'viridis'
+    
+    # Výpočet vhodných limitů pro barevné mapy ADC
+    adc_vmin, adc_vmax = np.percentile(orig_adc_np[orig_adc_np != 0], [1, 99]) if np.any(orig_adc_np != 0) else (0, 1)
     
     # Vytvoříme PDF
     with PdfPages(output_pdf_path) as pdf:
-        max_slices = max(atlas_slices, orig_zadc_slices, reg_zadc_slices, orig_label_slices, reg_label_slices)
+        max_slices = max(atlas_slices, orig_adc_slices, reg_adc_slices, orig_label_slices, reg_label_slices)
         
         for slice_idx in range(max_slices):
             plt.figure(figsize=(20, 5))
@@ -217,17 +218,17 @@ def create_registration_visualization_pdf(atlas_image, orig_zadc, reg_zadc, orig
             ax1.axis('off')
             
             ax2 = plt.subplot(gs[1])
-            if slice_idx < orig_zadc_slices:
-                orig_zadc_slice = orig_zadc_np[:, :, slice_idx] if orig_zadc_np.ndim == 3 else orig_zadc_np[:, :, slice_idx, 0]
-                ax2.imshow(orig_zadc_slice, cmap='gray')
-            ax2.set_title(f'Původní ZADC (řez {slice_idx+1})')
+            if slice_idx < orig_adc_slices:
+                orig_adc_slice = orig_adc_np[:, :, slice_idx] if orig_adc_np.ndim == 3 else orig_adc_np[:, :, slice_idx, 0]
+                ax2.imshow(orig_adc_slice, cmap=adc_cmap, vmin=adc_vmin, vmax=adc_vmax)
+            ax2.set_title(f'Původní ADC (řez {slice_idx+1})')
             ax2.axis('off')
             
             ax3 = plt.subplot(gs[2])
-            if slice_idx < reg_zadc_slices:
-                reg_zadc_slice = masked_reg_zadc_np[:, :, slice_idx] if masked_reg_zadc_np.ndim == 3 else masked_reg_zadc_np[:, :, slice_idx, 0]
-                ax3.imshow(reg_zadc_slice, cmap='gray')
-            ax3.set_title(f'Registrovaná ZADC (řez {slice_idx+1})')
+            if slice_idx < reg_adc_slices:
+                reg_adc_slice = masked_reg_adc_np[:, :, slice_idx] if masked_reg_adc_np.ndim == 3 else masked_reg_adc_np[:, :, slice_idx, 0]
+                ax3.imshow(reg_adc_slice, cmap=adc_cmap, vmin=adc_vmin, vmax=adc_vmax)
+            ax3.set_title(f'Registrovaná ADC (řez {slice_idx+1})')
             ax3.axis('off')
             
             ax4 = plt.subplot(gs[3])
@@ -257,36 +258,36 @@ def process_dataset(args):
     Args:
         args: Argumenty příkazové řádky
     """
-    zadc_output_dir = Path(args.output_dir) / "registered_zadc"
+    adc_output_dir = Path(args.output_dir) / "registered_adc"
     label_output_dir = Path(args.output_dir) / "registered_label"
     
     if args.pdf_viz_registration:
         pdf_dir = Path(args.output_dir) / "registration_visualizations"
         pdf_dir.mkdir(parents=True, exist_ok=True)
     
-    zadc_output_dir.mkdir(parents=True, exist_ok=True)
+    adc_output_dir.mkdir(parents=True, exist_ok=True)
     label_output_dir.mkdir(parents=True, exist_ok=True)
     
-    zadc_files = sorted([f for f in Path(args.zadc_dir).glob("*") if f.suffix in ['.mha', '.nii.gz', '.nii']])
+    adc_files = sorted([f for f in Path(args.adc_dir).glob("*") if f.suffix in ['.mha', '.nii.gz', '.nii']])
     label_files = sorted([f for f in Path(args.label_dir).glob("*") if f.suffix in ['.mha', '.nii.gz', '.nii']])
     
-    if len(zadc_files) != len(label_files):
-        print(f"Varování: Rozdílný počet ZADC ({len(zadc_files)}) a LABEL ({len(label_files)}) souborů!")
+    if len(adc_files) != len(label_files):
+        print(f"Varování: Rozdílný počet ADC ({len(adc_files)}) a LABEL ({len(label_files)}) souborů!")
     
-    for i, (zadc_path, label_path) in enumerate(zip(zadc_files, label_files)):
-        print(f"\n=== Zpracování {i+1}/{len(zadc_files)}: {zadc_path.name} ===")
-        zadc_output_path = zadc_output_dir / f"reg_{zadc_path.name}"
+    for i, (adc_path, label_path) in enumerate(zip(adc_files, label_files)):
+        print(f"\n=== Zpracování {i+1}/{len(adc_files)}: {adc_path.name} ===")
+        adc_output_path = adc_output_dir / f"reg_{adc_path.name}"
         label_output_path = label_output_dir / f"reg_{label_path.name}"
         
         if args.output_format == 'nii.gz':
-            zadc_output_path = zadc_output_path.with_suffix('.nii.gz')
+            adc_output_path = adc_output_path.with_suffix('.nii.gz')
             label_output_path = label_output_path.with_suffix('.nii.gz')
         
         try:
-            transforms, fixed_ref, orig_zadc, reg_zadc = register_image_to_atlas(
-                zadc_path,
+            transforms, fixed_ref, orig_adc, reg_adc = register_image_to_atlas(
+                adc_path,
                 args.normal_atlas_path,
-                zadc_output_path
+                adc_output_path
             )
             
             orig_label, reg_label = transform_label_map(
@@ -296,31 +297,31 @@ def process_dataset(args):
                 label_output_path
             )
             
-            print(f"Hotovo: {zadc_output_path} a {label_output_path}")
+            print(f"Hotovo: {adc_output_path} a {label_output_path}")
             
             if args.pdf_viz_registration:
-                pdf_path = pdf_dir / f"registration_viz_{zadc_path.stem}.pdf"
+                pdf_path = pdf_dir / f"registration_viz_{adc_path.stem}.pdf"
                 create_registration_visualization_pdf(
                     atlas_image=fixed_ref,
-                    orig_zadc=orig_zadc,
-                    reg_zadc=reg_zadc,
+                    orig_adc=orig_adc,
+                    reg_adc=reg_adc,
                     orig_label=orig_label,
                     reg_label=reg_label,
                     output_pdf_path=str(pdf_path)
                 )
             
         except Exception as e:
-            print(f"Zpracování selhalo pro pár {zadc_path.name} a {label_path.name}: {e}")
+            print(f"Zpracování selhalo pro pár {adc_path.name} a {label_path.name}: {e}")
             print("Pokračuji s dalším párem...")
             continue
 
 def main():
-    parser = argparse.ArgumentParser(description="Registrace ZADC a LABEL map na normativní atlas")
+    parser = argparse.ArgumentParser(description="Registrace ADC a LABEL map na normativní atlas")
     
     parser.add_argument('--normal_atlas_path', type=str, required=True,
                         help='Cesta k normativnímu atlasu')
-    parser.add_argument('--zadc_dir', type=str, required=True,
-                        help='Adresář s ZADC mapami')
+    parser.add_argument('--adc_dir', type=str, required=True,
+                        help='Adresář s ADC mapami')
     parser.add_argument('--label_dir', type=str, required=True,
                         help='Adresář s LABEL mapami')
     parser.add_argument('--output_dir', type=str, default='./registered_data',
@@ -334,7 +335,7 @@ def main():
     
     paths_to_check = [
         ("Normativní atlas", args.normal_atlas_path),
-        ("Adresář ZADC", args.zadc_dir),
+        ("Adresář ADC", args.adc_dir),
         ("Adresář LABEL", args.label_dir)
     ]
     
