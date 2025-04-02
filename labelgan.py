@@ -754,6 +754,13 @@ class HIELesionGANTrainer:
     
     def log_images(self, real_lesions, fake_lesions, atlas, epoch, n_samples=4):
         with torch.no_grad():
+            # Ensure we don't try to visualize more samples than we have
+            n_samples = min(n_samples, real_lesions.size(0))
+            
+            # Exit if no samples to visualize
+            if n_samples == 0:
+                return
+            
             # Výběr n_samples vzorků
             real_samples = real_lesions[:n_samples].cpu().detach()
             fake_samples = fake_lesions[:n_samples].cpu().detach()
@@ -763,7 +770,7 @@ class HIELesionGANTrainer:
             def visualize_slice(volume, slice_idx=None):
                 if slice_idx is None:
                     slice_idx = volume.shape[2] // 2  # Střední řez podél Z
-                return volume[0, :, slice_idx, :, :]  # Výběr pro jeden batch
+                return volume[0, 0, slice_idx, :, :] if volume.dim() == 5 else volume[0, slice_idx, :, :]
             
             # Log středových řezů pro každý vzorek
             for i in range(n_samples):
@@ -773,7 +780,7 @@ class HIELesionGANTrainer:
                 atlas_slice = visualize_slice(atlas_samples[i:i+1])
                 
                 # Vytvoření gridu pro vizualizaci
-                grid = torch.cat([real_slice, fake_slice, atlas_slice], dim=2)
+                grid = torch.cat([real_slice, fake_slice, atlas_slice], dim=1)
                 
                 # Log do tensorboard
                 self.writer.add_image(f'sample_{i}/real_fake_atlas', grid, epoch)
@@ -929,6 +936,102 @@ class HIELesionGANTrainer:
         
         self.generator.train()
     
+    def visualize_validation_samples(self, epoch, num_samples=4, slices_per_row=4, output_dir=None):
+        """Generate and visualize samples from validation data every N epochs"""
+        if self.val_dataloader is None or epoch % 10 != 0:
+            return
+        
+        if output_dir is None:
+            output_dir = os.path.join(self.log_dir, 'validation_samples')
+        os.makedirs(output_dir, exist_ok=True)
+        
+        self.generator.eval()
+        
+        with torch.no_grad():
+            # Get a batch from validation data
+            for val_batch in self.val_dataloader:
+                real_lesions = val_batch['label'].to(self.device)
+                atlas = val_batch['atlas'].to(self.device)
+                batch_size = real_lesions.size(0)
+                
+                # Generate samples
+                z = self.get_random_z(batch_size)
+                fake_lesions = self.generator(z, atlas)
+                
+                # Apply atlas constraint
+                atlas_mask = (atlas > 0).float()
+                if fake_lesions.shape[2:] != atlas_mask.shape[2:]:
+                    atlas_mask = F.interpolate(atlas_mask, size=fake_lesions.shape[2:], mode='nearest')
+                fake_lesions = fake_lesions * atlas_mask
+                
+                # Process each sample
+                for i in range(min(batch_size, num_samples)):
+                    # Get current sample
+                    real_sample = real_lesions[i:i+1].cpu().detach()
+                    fake_sample = fake_lesions[i:i+1].cpu().detach()
+                    atlas_sample = atlas[i:i+1].cpu().detach()
+                    
+                    # Create visualization with multiple slices
+                    D, H, W = fake_sample.shape[2:]
+                    total_slices = min(D, 24)  # Limit to 24 slices max
+                    rows = (total_slices + slices_per_row - 1) // slices_per_row
+                    
+                    fig, axes = plt.subplots(rows * 3, slices_per_row, 
+                                             figsize=(slices_per_row * 3, rows * 9))
+                    
+                    # Handle case where we only have one row (make axes 2D)
+                    if rows == 1 and slices_per_row == 1:
+                        axes = np.array([[axes[0]], [axes[1]], [axes[2]]])
+                    elif rows == 1:
+                        axes = axes.reshape(3, slices_per_row)
+                        
+                    # Select evenly spaced slices
+                    slice_indices = np.linspace(0, D-1, total_slices).astype(int)
+                    
+                    # Plot the slices
+                    for j, slice_idx in enumerate(slice_indices):
+                        row = j // slices_per_row
+                        col = j % slices_per_row
+                        
+                        # Get real sample slice
+                        real_slice = real_sample[0, 0, slice_idx].numpy()
+                        axes[row*3, col].imshow(real_slice, cmap='gray')
+                        if col == 0:
+                            axes[row*3, col].set_ylabel("Real")
+                        axes[row*3, col].set_title(f"Slice {slice_idx}")
+                        axes[row*3, col].axis('off')
+                        
+                        # Get fake sample slice
+                        fake_slice = fake_sample[0, 0, slice_idx].numpy()
+                        axes[row*3+1, col].imshow(fake_slice, cmap='jet')
+                        if col == 0:
+                            axes[row*3+1, col].set_ylabel("Generated")
+                        axes[row*3+1, col].axis('off')
+                        
+                        # Get atlas slice
+                        atlas_slice = atlas_sample[0, 0, slice_idx].numpy()
+                        axes[row*3+2, col].imshow(atlas_slice, cmap='gray')
+                        if col == 0:
+                            axes[row*3+2, col].set_ylabel("Atlas")
+                        axes[row*3+2, col].axis('off')
+                    
+                    # Hide any unused subplots
+                    for j in range(len(slice_indices), rows * slices_per_row):
+                        row = j // slices_per_row
+                        col = j % slices_per_row
+                        for k in range(3):
+                            axes[row*3+k, col].axis('off')
+                    
+                    # Save the figure
+                    plt.tight_layout()
+                    plt.savefig(os.path.join(output_dir, f'validation_epoch_{epoch}_sample_{i}.pdf'))
+                    plt.close(fig)
+                
+                # Only process one batch
+                break
+        
+        self.generator.train()
+    
     def train(self, num_epochs, validate_every=5):
         start_time = time.time()
         
@@ -976,6 +1079,9 @@ class HIELesionGANTrainer:
             
             # Logování obrazů
             self.log_images(real_lesions, g_metrics['fake_lesions'], atlas, epoch)
+            
+            # Generate and save validation samples every 10 epochs
+            self.visualize_validation_samples(epoch)
             
             # Validace
             if (epoch + 1) % validate_every == 0 and self.val_dataloader is not None:
