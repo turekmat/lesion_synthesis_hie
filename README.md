@@ -13,14 +13,16 @@ Tento dvoustupňový přístup umožňuje lepší kontrolu nad generačním proc
 
 ## Komponenty systému
 
-### 1. LabelGAN (label_gan.py)
+### 1. LabelGAN (labelgan.py)
 
 LabelGAN se specializuje na generování binárních segmentačních map lézí. Tento model:
 
-- Využívá normativní atlas jako vstup
-- Může používat volitelný atlas frekvence lézí pro klinicky relevantnější distribuci lézí
-- Generuje binární mapy, které označují lokace lézí
-- Obsahuje anatomicky informovanou ztrátovou funkci pro penalizaci lézí v nepravděpodobných oblastech
+- Využívá atlas frekvence lézí jako vstup pro určení pravděpodobných lokací lézí
+- Generuje realistické binární mapy lézí s rozměry 128x128x64
+- Využívá pokročilou U-Net architekturu s attention mechanismem pro lepší detaily
+- Implementuje specializované ztrátové funkce (váhovaný BCE, Dice loss, Focal loss) pro řešení třídní nevyváženosti
+- Má implementované pokročilé techniky stabilizace GAN tréninku (spektrální normalizace, gradient penalty)
+- Podporuje datové augmentace (rotace, flipy) pro lepší generalizaci při omezeném datasetu
 
 ### 2. IntensityGAN (intensity_gan.py)
 
@@ -72,24 +74,27 @@ python synthetic_pipeline.py --run_complete_pipeline \
 ### 2. Samostatný trénink LabelGAN
 
 ```bash
-python label_gan.py train \
-    --normal_atlas_path /cesta/k/atlasu.nii.gz \
-    --lesion_atlas_path /cesta/k/atlasu_lezi.nii.gz \
-    --label_dir /cesta/k/label_mapam \
+python labelgan.py --mode train \
+    --lesion_atlas_path data/archive/lesion_atlases/lesion_atlas.nii \
+    --label_dir data/BONBID2023_Train/3LABEL \
     --output_dir ./output/labelgan \
     --epochs 100 \
-    --batch_size 2
+    --batch_size 2 \
+    --use_attention \
+    --use_dice_loss \
+    --use_focal_loss \
+    --use_spectral_norm
 ```
 
 ### 3. Samostatné generování LABEL map
 
 ```bash
-python label_gan.py generate \
-    --normal_atlas_path /cesta/k/atlasu.nii.gz \
-    --lesion_atlas_path /cesta/k/atlasu_lezi.nii.gz \
-    --checkpoint_path ./output/labelgan/labelgan_checkpoint_epoch99.pt \
-    --output_dir ./output/label_mapy \
-    --num_samples 200
+python labelgan.py --mode generate \
+    --lesion_atlas_path data/archive/lesion_atlases/lesion_atlas.nii \
+    --model_path ./output/labelgan/models/best_model.pt \
+    --output_dir ./output/generated_lesions \
+    --n_samples 100 \
+    --use_thresholding
 ```
 
 ### 4. Samostatný trénink IntensityGAN
