@@ -187,6 +187,7 @@ class LesionGenerator(nn.Module):
         
         self.use_attention = use_attention
         self.depth = depth
+        self.features = features
         
         # Encoder část - stejná jako u U-Net
         self.encoder = nn.ModuleList()
@@ -221,9 +222,13 @@ class LesionGenerator(nn.Module):
                 in_ch = features * (2**(depth-1))
                 out_ch = features * (2**(depth-2))
             else:
-                # Další decode vrstvy se skip connections
-                in_ch = features * (2**(depth-i-1)) * 2  # x2 kvůli skip connections
-                out_ch = features * (2**(depth-i-2)) if i < depth-1 else features
+                # Další decode vrstvy se skip connections - OPRAVENO
+                # Pro každou vrstvu správně vypočítáme počet výstupních kanálů
+                in_ch = features * (2**(depth-i-1)) + features * (2**(depth-i-2))  # Skip connection + předchozí vrstva
+                if i == depth - 1:  # Pro poslední vrstvu
+                    out_ch = features
+                else:
+                    out_ch = features * (2**(depth-i-2))
             
             # Decoder vrstvy s batch normalizací a dropoutem
             self.decoder.append(
@@ -238,7 +243,7 @@ class LesionGenerator(nn.Module):
         # Výstupní vrstva pro binární LABEL mapu
         self.output_layer = nn.Sequential(
             nn.ReLU(),
-            nn.ConvTranspose3d(features * 2, 1, kernel_size=4, stride=2, padding=1),
+            nn.ConvTranspose3d(features + features, 1, kernel_size=4, stride=2, padding=1),
             nn.Sigmoid()  # Sigmoid pro binární mapu (0-1)
         )
         
@@ -250,11 +255,15 @@ class LesionGenerator(nn.Module):
         Returns:
             Generovaná binární LABEL mapa (B, 1, D, H, W)
         """
+        # Zapamatujeme si původní rozměry pro zajištění stejného výstupu
+        orig_shape = lesion_atlas.shape
+        
         # Spojení atlasu lézí a šumu jako vstup
         x = torch.cat([lesion_atlas, noise], dim=1)
         
-        # Debug informace o rozměrech
-        # print(f"Input shape: {x.shape}")
+        if hasattr(torch, '_C') and hasattr(torch._C, '_log_api_usage_once'):
+            if hasattr(torch._C, '_log_api_usage_once'):
+                torch._C._log_api_usage_once(f"Input shape: {x.shape}")
         
         # Uložíme si výstupy z encoderu pro skip connections
         encoder_outputs = []
@@ -262,7 +271,9 @@ class LesionGenerator(nn.Module):
         # Encoder forward pass
         for i, layer in enumerate(self.encoder):
             x = layer(x)
-            # print(f"Encoder {i} output shape: {x.shape}")
+            if hasattr(torch, '_C') and hasattr(torch._C, '_log_api_usage_once'):
+                if hasattr(torch._C, '_log_api_usage_once'):
+                    torch._C._log_api_usage_once(f"Encoder {i} output shape: {x.shape}")
             if i < self.depth - 1:  # Uložíme všechny kromě poslední vrstvy
                 encoder_outputs.append(x)
         
@@ -275,40 +286,42 @@ class LesionGenerator(nn.Module):
             # Pro první vrstvu dekodéru nepřidáváme skip connection
             if i > 0:
                 skip_idx = self.depth - i - 1
-                # print(f"Decoder {i} input shape before skip: {x.shape}")
-                # print(f"Skip connection from encoder {skip_idx} shape: {encoder_outputs[skip_idx].shape}")
                 
                 # Bezpečné spojení s kontrolou rozměrů
                 try:
-                    x = torch.cat([x, encoder_outputs[skip_idx]], dim=1)
-                except RuntimeError as e:
-                    # Pokud se rozměry neshodují, použijeme resize pomocí interpolace
                     skip_x = encoder_outputs[skip_idx]
+                    # Před spojením se ujistíme, že rozměry odpovídají
                     if x.shape[2:] != skip_x.shape[2:]:
                         skip_x = F.interpolate(skip_x, size=x.shape[2:], mode='trilinear', align_corners=False)
                     x = torch.cat([x, skip_x], dim=1)
+                except Exception as e:
+                    print(f"Chyba při skip connection {i}: {e}")
+                    print(f"Dekodér {i} - x.shape: {x.shape}, skip_x.shape: {skip_x.shape}")
+                    # Pokud spojení selže, pokračujeme bez skip connection
+                    pass
             
-            # print(f"Decoder {i} input shape after skip: {x.shape}")
             x = layer(x)
-            # print(f"Decoder {i} output shape: {x.shape}")
+            if hasattr(torch, '_C') and hasattr(torch._C, '_log_api_usage_once'):
+                if hasattr(torch._C, '_log_api_usage_once'):
+                    torch._C._log_api_usage_once(f"Decoder {i} output shape: {x.shape}")
         
         # Poslední skip connection a výstupní vrstva
-        # print(f"Shape before final skip: {x.shape}")
-        # print(f"Final skip connection shape: {encoder_outputs[0].shape}")
-        
-        # Bezpečné spojení s kontrolou rozměrů pro poslední skip connection
         try:
-            x = torch.cat([x, encoder_outputs[0]], dim=1)
-        except RuntimeError as e:
-            # Pokud se rozměry neshodují, použijeme resize pomocí interpolace
             skip_x = encoder_outputs[0]
+            # Před spojením se ujistíme, že rozměry odpovídají
             if x.shape[2:] != skip_x.shape[2:]:
                 skip_x = F.interpolate(skip_x, size=x.shape[2:], mode='trilinear', align_corners=False)
             x = torch.cat([x, skip_x], dim=1)
+        except Exception as e:
+            print(f"Chyba při finální skip connection: {e}")
+            # Pokud spojení selže, pokračujeme bez skip connection
+            pass
         
-        # print(f"Shape after final skip: {x.shape}")
         lesion_map = self.output_layer(x)
-        # print(f"Final output shape: {lesion_map.shape}")
+        
+        # Ujistíme se, že výstup má stejné prostorové rozměry jako vstup
+        if lesion_map.shape[2:] != orig_shape[2:]:
+            lesion_map = F.interpolate(lesion_map, size=orig_shape[2:], mode='trilinear', align_corners=False)
         
         return lesion_map
 
@@ -357,6 +370,14 @@ class LesionDiscriminator(nn.Module):
         Returns:
             Pravděpodobnost, že LABEL mapa je reálná
         """
+        # Kontrola a úprava rozměrů, pokud je to potřeba
+        if lesion_atlas.shape != label.shape:
+            # Vypíšeme varování, pokud se rozměry neshodují
+            print(f"Varování: Rozměry lesion_atlas {lesion_atlas.shape} a label {label.shape} se neshodují")
+            
+            # Použijeme interpolaci, abychom změnili rozměr label na stejný jako lesion_atlas
+            label = F.interpolate(label, size=lesion_atlas.shape[2:], mode='trilinear', align_corners=False)
+        
         # Spojení atlasu lézí a LABEL mapy
         x = torch.cat([lesion_atlas, label], dim=1)
         
@@ -487,9 +508,13 @@ def train_lesion_gan(args):
             - save_interval: Interval pro ukládání checkpointů
             - device: Zařízení pro trénink (cpu/cuda)
             - seed: Seed pro reprodukovatelnost
+            - debug: Režim pro diagnostiku a ladění
     """
     # Nastavení seedu pro reprodukovatelnost
     set_seed(args.seed)
+    
+    # Aktivace debug režimu
+    debug_mode = hasattr(args, 'debug') and args.debug
     
     # Kontrola a vytvoření výstupního adresáře
     os.makedirs(args.output_dir, exist_ok=True)
@@ -505,6 +530,33 @@ def train_lesion_gan(args):
         lesion_atlas_path=args.lesion_atlas_path,
         augment=True  # Použití augmentací
     )
+    
+    # Kontrola rozměrů dat a ověření vhodné hloubky sítě
+    if len(dataset) > 0:
+        sample = dataset[0]
+        label_shape = sample['label'].shape
+        atlas_shape = sample['lesion_atlas'].shape
+        
+        if debug_mode:
+            print(f"Rozměry dat: LABEL mapa {label_shape}, Atlas lézí {atlas_shape}")
+            
+            # Zjištění minimálního rozměru a doporučené hloubky
+            min_dim = min(label_shape[1:])
+            max_depth = 0
+            while min_dim > 1:
+                min_dim = min_dim // 2
+                max_depth += 1
+            
+            recommended_depth = min(max_depth - 1, 5)  # Omezení max. hloubky na 5
+            if args.gen_depth > recommended_depth:
+                print(f"VAROVÁNÍ: Zadaná hloubka sítě (gen_depth={args.gen_depth}) může být příliš velká pro dané rozměry dat!")
+                print(f"Doporučená hloubka pro tyto rozměry je: {recommended_depth}")
+                print(f"Malý rozměr (Z=64) může způsobit problémy při downsamplingu ve větší hloubce.")
+                
+                # V debug režimu můžeme automaticky upravit hloubku
+                if debug_mode:
+                    print(f"V debug režimu automaticky upravuji hloubku na doporučenou hodnotu {recommended_depth}")
+                    args.gen_depth = recommended_depth
     
     dataloader = DataLoader(
         dataset,
@@ -532,7 +584,7 @@ def train_lesion_gan(args):
     ).to(args.device)
     
     # Registrace debug hooks, pokud je debug mód aktivován
-    if hasattr(args, 'debug') and args.debug:
+    if debug_mode:
         print("Registruji debug hooks pro sledování rozměrů tenzorů...")
         
         def hook_fn(module, input, output):
@@ -554,6 +606,26 @@ def train_lesion_gan(args):
         print(generator)
         print("\nArchitektura diskriminátoru:")
         print(discriminator)
+        
+        # Testovací průchod generátorem pro ověření rozměrů
+        print("\nTestovací průchod generátorem pro ověření rozměrů...")
+        with torch.no_grad():
+            test_input_atlas = torch.randn(1, 1, 128, 128, 64).to(args.device)
+            test_input_noise = torch.randn(1, 1, 128, 128, 64).to(args.device)
+            try:
+                test_output = generator(test_input_atlas, test_input_noise)
+                print(f"Testovací průchod úspěšný! Vstup: {test_input_atlas.shape}, Výstup: {test_output.shape}")
+                
+                # Kontrola, zda výstup má stejné rozměry jako vstup
+                if test_output.shape[2:] != test_input_atlas.shape[2:]:
+                    print(f"VAROVÁNÍ: Výstup generátoru má jiné rozměry ({test_output.shape[2:]}) než vstup ({test_input_atlas.shape[2:]})!")
+                    print("Pro trénink je důležité, aby výstup měl stejné rozměry jako vstup.")
+            except Exception as e:
+                print(f"Chyba při testovacím průchodu: {e}")
+                print("Zkontrolujte architekturu sítě a hloubku.")
+                if hasattr(e, '__traceback__'):
+                    import traceback
+                    traceback.print_tb(e.__traceback__)
     
     # Inicializace optimizérů
     optimizer_G = optim.Adam(generator.parameters(), lr=args.lr, betas=(args.b1, args.b2))
@@ -708,6 +780,10 @@ def train_lesion_gan(args):
             
             batch_size = real_labels.size(0)
             
+            # Výpis rozměrů v debug režimu
+            if debug_mode and global_step == 0:
+                print(f"Rozměry vstupních dat - real_labels: {real_labels.shape}, lesion_atlas: {lesion_atlas.shape}, noise: {noise.shape}")
+            
             # ----------
             # Trénink diskriminátoru
             # ----------
@@ -716,6 +792,18 @@ def train_lesion_gan(args):
             # Generování fake LABEL map
             with torch.no_grad():
                 fake_labels = generator(lesion_atlas, noise)
+                
+                # Kontrola rozměrů v debug režimu
+                if debug_mode and global_step == 0:
+                    print(f"Rozměry generovaných dat - fake_labels: {fake_labels.shape}")
+                    
+                    # Kontrola shodnosti rozměrů
+                    if fake_labels.shape != real_labels.shape:
+                        print(f"VAROVÁNÍ: Rozměry generovaných dat ({fake_labels.shape}) se neshodují s reálnými daty ({real_labels.shape})!")
+                        
+                        # Interpolace na správnou velikost
+                        fake_labels = F.interpolate(fake_labels, size=real_labels.shape[2:], mode='trilinear', align_corners=False)
+                        print(f"Provedena interpolace - nové rozměry: {fake_labels.shape}")
             
             # Diskriminační skóre pro reálné a fake vzorky
             real_pred = discriminator(lesion_atlas, real_labels)
@@ -749,6 +837,12 @@ def train_lesion_gan(args):
                 
                 # Generování fake LABEL map
                 fake_labels = generator(lesion_atlas, noise)
+                
+                # Kontrola a případná úprava rozměrů
+                if fake_labels.shape != real_labels.shape:
+                    if debug_mode:
+                        print(f"Úprava rozměrů generovaných dat: {fake_labels.shape} -> {real_labels.shape}")
+                    fake_labels = F.interpolate(fake_labels, size=real_labels.shape[2:], mode='trilinear', align_corners=False)
                 
                 # Diskriminační skóre pro fake vzorky (pohled G)
                 fake_pred = discriminator(lesion_atlas, fake_labels)
@@ -784,6 +878,14 @@ def train_lesion_gan(args):
                         'lesion_atlas': lesion_atlas,
                         'fake_label': generator(lesion_atlas, noise)
                     }
+                    # Kontrola a případná úprava rozměrů
+                    if sample_data['fake_label'].shape != real_labels.shape:
+                        sample_data['fake_label'] = F.interpolate(
+                            sample_data['fake_label'], 
+                            size=real_labels.shape[2:], 
+                            mode='trilinear', 
+                            align_corners=False
+                        )
                     save_sample(
                         sample_data,
                         os.path.join(samples_dir, f"step_{global_step}")
