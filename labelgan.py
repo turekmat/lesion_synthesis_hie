@@ -1703,6 +1703,28 @@ class HIELesionGANTrainer:
             
             # Otevřeme PDF soubor jednou pro všechny stránky
             with PdfPages(pdf_path) as pdf:
+                # Přidáme stránku s informacemi o významu barev
+                fig_info = plt.figure(figsize=(8, 6))
+                plt.axis('off')
+                plt.text(0.5, 0.9, "Informace o zobrazení lézí", ha='center', fontsize=16, weight='bold')
+                plt.text(0.5, 0.8, "V tomto PDF jsou léze zobrazeny jako BÍLÉ oblasti (hodnota 1)", ha='center', fontsize=14)
+                plt.text(0.5, 0.75, "Pozadí je zobrazeno jako ČERNÉ (hodnota 0)", ha='center', fontsize=14)
+                
+                # Ukázka barev
+                ax_sample = plt.axes([0.3, 0.5, 0.4, 0.15])
+                sample_data = np.zeros((10, 20))
+                sample_data[2:8, 5:15] = 1  # Ukázková léze (bílá)
+                ax_sample.imshow(sample_data, cmap='binary', vmin=0, vmax=1)
+                ax_sample.set_title("Ukázka: bílá = léze (1), černá = pozadí (0)")
+                ax_sample.axis('off')
+                
+                plt.text(0.5, 0.3, f"PDF generováno v epoše {epoch}", ha='center', fontsize=14)
+                plt.text(0.5, 0.25, f"Datum: {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}", ha='center', fontsize=12)
+                
+                plt.tight_layout()
+                pdf.savefig(fig_info)
+                plt.close(fig_info)
+                
                 # Generujeme více vzorků (3 jako výchozí)
                 for sample_idx in range(num_samples):
                     print(f"  Generuji vzorek {sample_idx+1}/{num_samples}...")
@@ -1721,6 +1743,16 @@ class HIELesionGANTrainer:
                         # Převod na numpy
                         binary_np = binary_lesion[0, 0].cpu().numpy()
                     
+                    # Kontrola hodnot - pokud jsou hodnoty převážně 1, je to opačně než očekáváme
+                    # a pravděpodobně léze mají hodnotu 0 a pozadí hodnotu 1
+                    zeros_percentage = np.mean(binary_np == 0) * 100
+                    ones_percentage = np.mean(binary_np == 1) * 100
+                    
+                    # Invertujeme pokud většina hodnot je 1 (což by znamenalo, že léze jsou 0)
+                    if ones_percentage > 90:
+                        print(f"  UPOZORNĚNÍ: Hodnoty vypadají invertované - {ones_percentage:.2f}% jsou jedničky!")
+                        binary_np = 1 - binary_np  # Invertujeme hodnoty
+                    
                     # Získáme velikosti 3D objemu
                     depth, height, width = binary_np.shape
                     
@@ -1734,9 +1766,16 @@ class HIELesionGANTrainer:
                     
                     # Přidáme informace o objemu a dalších vlastnostech
                     total_volume = np.sum(binary_np)
+                    total_voxels = binary_np.size
+                    zero_percentage = (binary_np == 0).sum() / total_voxels * 100
                     components, num_components = measure_label(binary_np, return_num=True)
-                    fig.text(0.5, 0.97, f"Objem: {total_volume} voxelů, Počet komponent: {num_components}", 
-                             ha='center', fontsize=12)
+                    
+                    info_text = (
+                        f"Objem léze: {total_volume} voxelů ({(100-zero_percentage):.2f}% objemu), "
+                        f"Počet komponent: {num_components}, "
+                        f"Pozadí: {zero_percentage:.2f}% voxelů"
+                    )
+                    fig.text(0.5, 0.97, info_text, ha='center', fontsize=12)
                     
                     # Axiální řezy - zobrazíme VŠECHNY řezy
                     for i in range(depth):
@@ -1750,11 +1789,14 @@ class HIELesionGANTrainer:
                         # Získáme řez v axiální rovině a zobrazíme ho
                         slice_data = binary_np[i, :, :]
                         
+                        # Spočítáme procento nul v tomto řezu
+                        slice_zero_percentage = (slice_data == 0).sum() / slice_data.size * 100
+                        
                         # Zobrazení řezu v černobílé barvě (0=černá, 1=bílá)
                         ax.imshow(slice_data, cmap='binary', interpolation='none', vmin=0, vmax=1)
                         
-                        # Přidáme označení řezu
-                        ax.set_title(f"Řez {i}")
+                        # Přidáme označení řezu včetně informace o procentu nul
+                        ax.set_title(f"Řez {i} ({slice_zero_percentage:.1f}% pozadí)")
                         ax.axis('off')  # Skryjeme osy
                     
                     # Přizpůsobíme rozložení a uložíme do PDF
