@@ -410,28 +410,48 @@ class DiceLoss(nn.Module):
         dice = (2. * intersection + self.smooth) / (union + self.smooth)
         return 1 - dice
 
-# Přidáváme třídu pro vážený Dice loss, který dává větší váhu pozitivní třídě (léze)
+# Přidáváme vylepšenou třídu pro vážený Dice loss, který lépe zvládá extrémní nevyváženost tříd
 class WeightedDiceLoss(nn.Module):
-    """Vážená Dice loss dávající větší důraz na pozitivní třídu (léze)"""
-    def __init__(self, smooth=1.0, pos_weight=5.0):
+    """Vylepšená vážená Dice loss pro lépe zvládání extrémní nevyváženosti tříd"""
+    def __init__(self, smooth=1.0, pos_weight=5.0, bg_weight=0.1):
         super(WeightedDiceLoss, self).__init__()
         self.smooth = smooth
-        self.pos_weight = pos_weight
+        self.pos_weight = pos_weight  # Váha pro léze (pozitivní třída)
+        self.bg_weight = bg_weight    # Váha pro pozadí (negativní třída)
         
     def forward(self, pred, target):
+        # Zploštíme predikce a cílové hodnoty
         pred_flat = pred.view(-1)
         target_flat = target.view(-1)
         
-        # Váha pro pozitivní třídu
-        weights = torch.ones_like(target_flat)
-        weights[target_flat > 0] = self.pos_weight
+        # Vytvoříme masky pro pozitivní a negativní třídu
+        pos_mask = (target_flat > 0.5).float()
+        neg_mask = 1.0 - pos_mask
         
-        # Vážená Dice loss
-        weighted_intersection = (weights * pred_flat * target_flat).sum()
-        weighted_union = (weights * pred_flat).sum() + (weights * target_flat).sum()
+        # Výpočet vážené intersekce a unie pro pozitivní třídu (léze)
+        pos_pred = pred_flat * pos_mask
+        pos_target = target_flat * pos_mask
+        pos_intersection = (pos_pred * pos_target).sum()
+        pos_union = pos_pred.sum() + pos_target.sum() + self.smooth
+        pos_dice = (2. * pos_intersection + self.smooth) / pos_union
         
-        dice = (2. * weighted_intersection + self.smooth) / (weighted_union + self.smooth)
-        return 1 - dice
+        # Výpočet vážené intersekce a unie pro negativní třídu (pozadí)
+        neg_pred = pred_flat * neg_mask
+        neg_target = target_flat * neg_mask
+        neg_intersection = (neg_pred * neg_target).sum()
+        neg_union = neg_pred.sum() + neg_target.sum() + self.smooth
+        neg_dice = (2. * neg_intersection + self.smooth) / neg_union
+        
+        # Kombinace pozitivní a negativní Dice s vahami
+        weighted_dice = self.pos_weight * pos_dice + self.bg_weight * neg_dice
+        weighted_dice = weighted_dice / (self.pos_weight + self.bg_weight)
+        
+        # Místo přímého vrácení (1 - dice), použijeme -log(dice) pro stabilnější gradienty
+        # Tato úprava způsobí, že ztráta nikdy není příliš blízko nule a poskytuje lepší signál
+        # pro trénink v případech s extrémní nevyvážeností tříd
+        log_dice_loss = -torch.log(torch.clamp(weighted_dice, min=0.001, max=0.999))
+        
+        return log_dice_loss
 
 # Přidáváme třídu pro Focal loss - lepší pro nevyvážené třídy
 class FocalLoss(nn.Module):
@@ -470,6 +490,84 @@ class BlackImagePenaltyLoss(nn.Module):
         # Penalizace když je aktivních pixelů méně než cílové procento
         penalty = torch.relu(self.target_percentage - activated_percentage)
         return penalty * 10.0  # Silná penalizace
+
+# Vylepšená trestná funkce s dodatečnými kontrolami pro generování lézí
+class EnhancedLesionPenaltyLoss(nn.Module):
+    """Vylepšená penalizace pro kontrolu generování lézí"""
+    def __init__(self, min_threshold=0.01, max_threshold=0.5, 
+                 target_min_percentage=0.005, target_max_percentage=0.03,
+                 component_weights=None):
+        super(EnhancedLesionPenaltyLoss, self).__init__()
+        self.min_threshold = min_threshold
+        self.max_threshold = max_threshold
+        self.target_min_percentage = target_min_percentage
+        self.target_max_percentage = target_max_percentage
+        
+        # Váhy pro různé složky ztráty
+        self.component_weights = {
+            'min_penalty': 15.0,  # Penalizace za příliš málo lézí
+            'max_penalty': 5.0,   # Penalizace za příliš mnoho lézí 
+            'continuity': 5.0,    # Penalizace za nespojité léze
+            'size_var': 7.0       # Penalizace za příliš uniformní velikost lézí
+        }
+        
+        # Přepíšeme výchozí váhy, pokud jsou zadané
+        if component_weights is not None:
+            for key, value in component_weights.items():
+                if key in self.component_weights:
+                    self.component_weights[key] = value
+        
+    def forward(self, pred):
+        batch_size = pred.size(0)
+        total_loss = 0.0
+        
+        for b in range(batch_size):
+            # Pro každý vzorek v batchi
+            sample = pred[b, 0]  # Vzorek má tvar [D, H, W]
+            
+            # 1. Kontrola minimálního procenta lézí
+            activated_percentage = (sample > self.min_threshold).float().mean()
+            min_penalty = torch.relu(self.target_min_percentage - activated_percentage)
+            total_loss += min_penalty * self.component_weights['min_penalty']
+            
+            # 2. Kontrola maximálního procenta lézí
+            high_activation = (sample > self.max_threshold).float().mean()
+            max_penalty = torch.relu(high_activation - self.target_max_percentage)
+            total_loss += max_penalty * self.component_weights['max_penalty']
+            
+            # 3. Kontrola spojitosti lézí (léze by měly být spojité, ne roztroušené jednotlivé pixely)
+            # Detekujeme léze s použitím středního prahu
+            lesion_mask = (sample > 0.3).float()
+            
+            # Pokud máme léze, kontrolujeme jejich spojitost pomocí gradientů
+            if lesion_mask.sum() > 0:
+                # Výpočet gradientů v každém směru (d, h, w) - vyšší gradienty znamenají méně spojité léze
+                d_grad = torch.abs(sample[1:, :, :] - sample[:-1, :, :]).mean()
+                h_grad = torch.abs(sample[:, 1:, :] - sample[:, :-1, :]).mean()
+                w_grad = torch.abs(sample[:, :, 1:] - sample[:, :, :-1]).mean()
+                
+                # Průměrný gradient - vyšší hodnota znamená méně spojité léze
+                avg_grad = (d_grad + h_grad + w_grad) / 3.0
+                continuity_penalty = torch.min(avg_grad, torch.tensor(1.0, device=pred.device))
+                total_loss += continuity_penalty * self.component_weights['continuity']
+            
+            # 4. Variabilita velikosti lézí - chceme různě velké léze
+            # Pokud máme dostatek aktivovaných pixelů, kontrolujeme variabilitu
+            if activated_percentage > 0.001:
+                # Extrahujeme hodnoty aktivních pixelů
+                active_values = sample[sample > self.min_threshold]
+                if len(active_values) > 1:
+                    # Vypočítáme variabilitu jako relativní směrodatnou odchylku
+                    value_std = torch.std(active_values)
+                    value_mean = torch.mean(active_values)
+                    relative_std = value_std / (value_mean + 1e-6)
+                    
+                    # Penalizace za nízkou variabilitu (uniformní léze)
+                    size_var_penalty = torch.exp(-5.0 * relative_std)
+                    total_loss += size_var_penalty * self.component_weights['size_var']
+        
+        # Vrátíme průměrnou ztrátu přes všechny vzorky v batchi
+        return total_loss / batch_size
 
 def save_sample(data, path):
     """Uložení vzorku jako .nii.gz soubor"""
@@ -574,6 +672,36 @@ def train_label_gan(args):
     # Sledování statistik lézí během tréninku
     best_lesion_percentage = 0.0
     best_epoch = 0
+    
+    # Loss funkce - použijeme vylepšené verze
+    adversarial_loss = nn.BCEWithLogitsLoss()
+    
+    # Vážený Dice loss s vylepšenou verzí pro extrémní nevyváženost tříd
+    weighted_dice_loss = WeightedDiceLoss(
+        pos_weight=args.pos_weight, 
+        bg_weight=args.bg_weight
+    )
+    
+    # Focal loss pro lepší zvládání nevyvážených tříd
+    focal_loss = FocalLoss(alpha=0.8, gamma=2.0)
+    
+    # Vylepšená penalizace pro kontrolu generování lézí
+    lesion_penalty_loss = EnhancedLesionPenaltyLoss(
+        min_threshold=0.1,
+        max_threshold=0.5,
+        target_min_percentage=args.target_lesion_percentage,
+        target_max_percentage=args.target_lesion_percentage * 3.0  # Horní limit 3x větší než minimální
+    )
+    
+    # Gradient clipování pro stabilnější trénink
+    max_grad_norm = 1.0
+
+    # Upravíme learning rate - začneme s vyšší hodnotou a postupně ji snížíme
+    initial_lr = args.lr
+    for param_group in g_optimizer.param_groups:
+        param_group['lr'] = initial_lr
+    for param_group in d_optimizer.param_groups:
+        param_group['lr'] = initial_lr
     
     # Trénovací smyčka
     for epoch in range(args.epochs):
@@ -685,15 +813,42 @@ def train_label_gan(args):
                 low_probability_mask = (lesion_atlas < threshold).float()
                 anatomically_informed_loss = (fake_label * low_probability_mask).mean() * 10.0
             
-            # Celková ztráta generátoru
+            # Vylepšená penalizace pro kontrolu generování lézí
+            g_lesion_loss = lesion_penalty_loss(fake_label)
+            
+            # Vypočítáme jednotlivé složky ztráty s jejich vahami
+            weighted_adv_loss = g_adv_loss  # Adversarial loss váha 1.0
+            weighted_dice_loss = args.lambda_dice * g_dice_loss
+            weighted_focal_loss = args.lambda_focal * g_focal_loss
+            weighted_black_loss = args.lambda_black * g_black_loss
+            weighted_lesion_loss = args.lambda_black * g_lesion_loss
+            
+            # Pro lepší debugging vypisujeme všechny složky ztráty
+            if i % 10 == 0:
+                print(f"Loss components: ADV={weighted_adv_loss:.4f}, DICE={weighted_dice_loss:.4f}, "
+                      f"FOCAL={weighted_focal_loss:.4f}, LESION={weighted_lesion_loss:.4f}, "
+                      f"ANATOM={anatomically_informed_loss:.4f}")
+            
+            # Celková ztráta jako součet všech složek
             g_loss = (
-                g_adv_loss +
-                args.lambda_dice * g_dice_loss +
-                args.lambda_focal * g_focal_loss +  # Použití parametru z příkazové řádky
-                args.lambda_black * g_black_loss +  # Použití parametru z příkazové řádky
+                weighted_adv_loss +
+                weighted_dice_loss +
+                weighted_focal_loss +
+                weighted_lesion_loss +
                 anatomically_informed_loss
             )
+            
+            # Aplikujeme normalizaci, aby ztráta nebyla příliš velká a nezpůsobovala nestabilní gradienty
+            # To pomůže zlepšit trénink a konvergenci
+            if g_loss > 100:
+                g_loss_factor = 100 / g_loss.item()
+                g_loss = g_loss * g_loss_factor
+                
             g_loss.backward()
+            
+            # Gradient clipping pro lepší stabilitu tréninku
+            nn.utils.clip_grad_norm_(generator.parameters(), max_grad_norm)
+            
             g_optimizer.step()
             
             # Výpočet statistik léze
@@ -701,11 +856,25 @@ def train_label_gan(args):
                 lesion_percentage = (fake_label > 0.5).float().mean().item() * 100.0
                 epoch_lesion_percentages.append(lesion_percentage)
             
+            # Výpočet skutečného DICE skóre (ne ztráty) pro monitorování tréninku
+            with torch.no_grad():
+                # Binarizace predikce a ground truth
+                pred_binary = (fake_label > 0.5).float()
+                target_binary = (real_label > 0.5).float()
+                
+                # Flatten pro výpočet DICE
+                pred_flat = pred_binary.view(-1)
+                target_flat = target_binary.view(-1)
+                
+                # Výpočet DICE koeficientu
+                intersection = (pred_flat * target_flat).sum()
+                dice_score = (2. * intersection + 1.0) / (pred_flat.sum() + target_flat.sum() + 1.0)
+            
             # Výpis stavu tréninku
             if i % 10 == 0:
                 print(f"Epoch [{epoch}/{args.epochs}], Batch {i}/{len(dataloader)}, "
                       f"D Loss: {d_loss.item():.4f}, G Loss: {g_loss.item():.4f}, "
-                      f"ADV: {g_adv_loss.item():.4f}, DICE: {g_dice_loss.item():.4f}, "
+                      f"DICE Score: {dice_score.item():.4f}, "  # Skutečný DICE koeficient (vyšší je lepší)
                       f"Lesion %: {lesion_percentage:.2f}%, "
                       f"LR: {g_optimizer.param_groups[0]['lr']:.6f}")
         
@@ -929,14 +1098,16 @@ def main():
                              help='Beta1 parametr pro Adam optimizér')
     train_parser.add_argument('--beta2', type=float, default=0.999,
                              help='Beta2 parametr pro Adam optimizér')
-    train_parser.add_argument('--lambda_dice', type=float, default=200.0,
+    train_parser.add_argument('--lambda_dice', type=float, default=50.0,
                              help='Váha pro Dice loss (segmentace lézí)')
-    train_parser.add_argument('--lambda_focal', type=float, default=5.0,
+    train_parser.add_argument('--lambda_focal', type=float, default=10.0,
                              help='Váha pro Focal loss (lepší zvládání nevyvážených tříd)')
-    train_parser.add_argument('--lambda_black', type=float, default=10.0,
+    train_parser.add_argument('--lambda_black', type=float, default=15.0,
                              help='Váha pro Black Image Penalty (prevence generování černých výstupů)')
-    train_parser.add_argument('--pos_weight', type=float, default=5.0,
+    train_parser.add_argument('--pos_weight', type=float, default=20.0,
                              help='Váha pro pozitivní třídu ve váženém Dice loss')
+    train_parser.add_argument('--bg_weight', type=float, default=0.1,
+                             help='Váha pro negativní třídu (pozadí) ve váženém Dice loss')
     
     # Nové parametry pro vylepšení stability
     train_parser.add_argument('--use_augmentation', action='store_true', default=True,
