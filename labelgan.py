@@ -1663,13 +1663,6 @@ class HIELesionGANTrainer:
         }
 
     def generate_pdf_slices(self, epoch, num_samples=3):
-        """
-        Generuje ukázkové léze a ukládá jejich řezy do PDF.
-        
-        Args:
-            epoch: Aktuální epocha
-            num_samples: Počet lézí k vygenerování
-        """
         print(f"Generuji PDF vizualizaci pro epochu {epoch}...")
         # Vytvoření adresáře pro PDF
         pdf_dir = os.path.join(self.save_dir, 'pdf_visualizations')
@@ -1696,68 +1689,58 @@ class HIELesionGANTrainer:
             # Switch model to eval mode
             self.generator.eval()
             
-            # Připravíme obrázky pro PDF
             from matplotlib.backends.backend_pdf import PdfPages
             import matplotlib.pyplot as plt
-            from matplotlib.gridspec import GridSpec
             
-            # Definujeme anatomické orientace
-            orientations = {
-                'axial': {'title': 'Axiální', 'labels': ['A', 'P', 'L', 'R']},  # Anterior, Posterior, Left, Right
-                'coronal': {'title': 'Koronální', 'labels': ['S', 'I', 'L', 'R']},  # Superior, Inferior, Left, Right
-                'sagittal': {'title': 'Sagitální', 'labels': ['S', 'I', 'A', 'P']}  # Superior, Inferior, Anterior, Posterior
-            }
+            # Vygenerujte jeden vzorek pro získání 3D dat
+            with torch.no_grad():
+                z = torch.randn(1, self.z_dim, device=self.device)
+                fake_lesion = self.generator(z, atlas[:1], brain_mask[:1])
+            fake_lesion = (fake_lesion > 0.5).float()
+            binary_np = fake_lesion[0, 0].cpu().numpy()
+            depth, height, width = binary_np.shape
             
+            # Pouze axiální zobrazení – všechny řezy
+            slices = [binary_np[i, :, :] for i in range(depth)]
+            all_slice_indices = list(range(depth))
+
+            # Vypočítejte počet řádků a sloupců pro mřížku – například 4 sloupce
+            slices_per_row = 4
+            num_slices = len(all_slice_indices)
+            rows_needed = (num_slices + slices_per_row - 1) // slices_per_row
+
+            # Vytvořte stránku s řezy
+            fig = plt.figure(figsize=(12, rows_needed * 3))
+            plt.suptitle(f"Generovaná HIE léze - Epocha {epoch} - Axiální pohled", fontsize=16)
+
+            for idx, slice_idx in enumerate(all_slice_indices):
+                ax = plt.subplot(rows_needed, slices_per_row, idx + 1)
+                ax.imshow(slices[slice_idx], cmap='binary', interpolation='none', vmin=0, vmax=1)
+                ax.set_title(f"Řez {slice_idx}")
+                ax.axis('off')
+
+            plt.tight_layout(rect=[0, 0, 1, 0.95])
             with PdfPages(pdf_path) as pdf:
-                # Pro každou lézi
-                # Pouze axiální zobrazení – všechny řezy
-                slices = [binary_np[i, :, :] for i in range(depth)]
-                # Nepoužívejte filtrování; zobrazíme všechny řezy:
-                all_slice_indices = list(range(depth))
-
-                # Vypočítejte počet řádků a sloupců pro mřížku – například 4 sloupce
-                slices_per_row = 4
-                num_slices = len(all_slice_indices)
-                rows_needed = (num_slices + slices_per_row - 1) // slices_per_row
-
-                # Vytvořte stránku s řezy
-                fig = plt.figure(figsize=(12, rows_needed * 3))
-                plt.suptitle(f"Generovaná HIE léze #{i+1} - Epocha {epoch} - Axiální pohled", fontsize=16)
-
-                for idx, slice_idx in enumerate(all_slice_indices):
-                    row = idx // slices_per_row
-                    col = idx % slices_per_row
-                    ax = plt.subplot(rows_needed, slices_per_row, idx + 1)
-                    # Zobrazte řez ve tvaru img_array[i, :, :]
-                    ax.imshow(slices[slice_idx], cmap='binary', interpolation='none', vmin=0, vmax=1)
-                    ax.set_title(f"Řez {slice_idx}")
-                    ax.axis('off')
-
-                plt.tight_layout(rect=[0, 0, 1, 0.95])
                 pdf.savefig(fig)
-                plt.close(fig)
-
-                
-                # Přidáme souhrnnou stránku s informacemi
-                fig = plt.figure(figsize=(8, 6))
-                plt.axis('off')
-                plt.text(0.5, 0.8, f"HIE léze generované v epoše {epoch}", ha='center', fontsize=16)
-                plt.text(0.5, 0.7, f"Počet ukázek: {num_samples}", ha='center', fontsize=14)
-                plt.text(0.5, 0.6, f"Datum a čas generování: {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}", ha='center', fontsize=14)
-                plt.text(0.5, 0.5, "Generováno pomocí HIE Lesion GAN", ha='center', fontsize=14)
-                plt.text(0.5, 0.4, f"Pohledy: {', '.join([o['title'] for o in orientations.values()])}", ha='center', fontsize=14)
-                plt.text(0.5, 0.3, f"PDF uloženo do: {pdf_path}", ha='center', fontsize=12)
-                plt.tight_layout()
-                pdf.savefig(fig)
-                plt.close(fig)
+            plt.close(fig)
             
-            # Vrátit generátor do režimu tréninku
+            # Přidáme souhrnnou stránku s informacemi
+            fig = plt.figure(figsize=(8, 6))
+            plt.axis('off')
+            plt.text(0.5, 0.8, f"HIE léze generované v epoše {epoch}", ha='center', fontsize=16)
+            plt.text(0.5, 0.7, f"Datum a čas generování: {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}", ha='center', fontsize=14)
+            plt.text(0.5, 0.6, "Generováno pomocí HIE Lesion GAN", ha='center', fontsize=14)
+            plt.text(0.5, 0.5, f"PDF uloženo do: {pdf_path}", ha='center', fontsize=12)
+            plt.tight_layout()
+            with PdfPages(pdf_path) as pdf:
+                pdf.savefig(fig)
+            plt.close(fig)
+            
             self.generator.train()
-            
-            # Stačí zpracovat jeden batch pro získání atlasu a brain masky
             break
         
         print(f"PDF vizualizace uložena do: {pdf_path}")
+
 
     def train(self, num_epochs, validate_every=5):
         start_time = time.time()
