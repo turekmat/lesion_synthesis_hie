@@ -324,13 +324,13 @@ class Generator(nn.Module):
         )
         
         # Enhanced atlas-based attention for probabilistic guidance
-        # Operates on d2_skip (base_filters*2 channels)
+        # Operates on d2 (base_filters channels) + atlas_channels
         self.atlas_attention = nn.Sequential(
-            spectral_norm(nn.Conv3d(base_filters * 2 + atlas_channels, base_filters * 2, 3, 1, 1), use_spectral_norm),
-            nn.InstanceNorm3d(base_filters * 2),
+            spectral_norm(nn.Conv3d(base_filters + atlas_channels, base_filters, 3, 1, 1), use_spectral_norm),
+            nn.InstanceNorm3d(base_filters),
             nn.LeakyReLU(0.2, inplace=True),
-            spectral_norm(nn.Conv3d(base_filters * 2, base_filters * 2, 3, 1, 1), use_spectral_norm),
-            nn.InstanceNorm3d(base_filters * 2),
+            spectral_norm(nn.Conv3d(base_filters, base_filters, 3, 1, 1), use_spectral_norm),
+            nn.InstanceNorm3d(base_filters),
             nn.Sigmoid()
         )
         
@@ -1696,7 +1696,7 @@ class HIELesionGANTrainer:
         
         self.generator.train()
 
-    def train_discriminator(self, real_lesions, atlas):
+    def train_discriminator(self, real_lesions, atlas, brain_mask=None):
         batch_size = real_lesions.size(0)
         
         # Reset discriminator gradients
@@ -1715,7 +1715,8 @@ class HIELesionGANTrainer:
         
         # Don't need gradient for the generator when training discriminator
         with torch.no_grad():
-            fake_lesions = self.generator(z, atlas)
+            # Předáme i brain_mask pro konzistenci s forward metodou
+            fake_lesions = self.generator(z, atlas, brain_mask)
             
             # NEW: Add noise to fake samples too
             if self.noise_std > 0:
@@ -2239,7 +2240,7 @@ class HIELesionGANTrainer:
                 brain_mask = batch['brain_mask'].to(self.device)
                 
                 # Train discriminator
-                d_metrics = self.train_discriminator(real_lesions, atlas)
+                d_metrics = self.train_discriminator(real_lesions, atlas, brain_mask)
                 
                 # NEW: Only train generator if discriminator loss is reasonable
                 # Skip generator update if discriminator is still too weak
