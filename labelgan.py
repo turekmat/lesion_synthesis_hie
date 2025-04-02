@@ -587,10 +587,18 @@ class GANLoss:
             target = torch.ones_like(prediction) if target_is_real else torch.zeros_like(prediction)
             return self.loss(prediction, target)
         elif self.gan_mode == 'hinge':
-            if target_is_real:
-                return -torch.mean(torch.min(torch.zeros_like(prediction), -1 + prediction))
+            if isinstance(target_is_real, bool):
+                if target_is_real:
+                    return -torch.mean(torch.min(torch.zeros_like(prediction), -1 + prediction))
+                else:
+                    return -torch.mean(torch.min(torch.zeros_like(prediction), -1 - prediction))
             else:
-                return -torch.mean(torch.min(torch.zeros_like(prediction), -1 - prediction))
+                # Pokud target_is_real není bool, rozhodneme se podle průměrné hodnoty tensoru.
+                if target_is_real.mean().item() > 0.5:
+                    return -torch.mean(torch.min(torch.zeros_like(prediction), -1 + prediction))
+                else:
+                    return -torch.mean(torch.min(torch.zeros_like(prediction), -1 - prediction))
+
 
 
 class DiceLoss(nn.Module):
