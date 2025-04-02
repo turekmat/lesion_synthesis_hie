@@ -798,16 +798,36 @@ class HIELesionGANTrainer:
             if n_samples == 0:
                 return
             
+            # Apply thresholding to ensure binary representation
+            binary_fake_lesions = (fake_lesions > 0.5).float()
+            
             # Výběr n_samples vzorků
             real_samples = real_lesions[:n_samples].cpu().detach()
-            fake_samples = fake_lesions[:n_samples].cpu().detach()
+            fake_samples = binary_fake_lesions[:n_samples].cpu().detach()  # Use binary version
             atlas_samples = atlas[:n_samples].cpu().detach()
             
             # Funkce pro vizualizaci středových řezů
             def visualize_slice(volume, slice_idx=None):
                 if slice_idx is None:
-                    slice_idx = volume.shape[2] // 2  # Střední řez podél Z
-                return volume[0, 0, slice_idx, :, :] if volume.dim() == 5 else volume[0, slice_idx, :, :]
+                    # Try to find a non-empty slice
+                    if volume.dim() == 5:  # [B,C,D,H,W]
+                        D = volume.shape[2]
+                        for potential_idx in range(D//3, 2*D//3):  # Check middle third of volume
+                            if volume[0, 0, potential_idx].sum() > 0:
+                                slice_idx = potential_idx
+                                break
+                        if slice_idx is None:  # If no non-empty slice found, use middle
+                            slice_idx = D // 2
+                    else:
+                        slice_idx = volume.shape[2] // 2
+                
+                # Extract the slice and ensure it's binary (for lesions)
+                if volume.dim() == 5:  # [B,C,D,H,W]
+                    slice_data = volume[0, 0, slice_idx].clone()
+                else:  # Handle unexpected dimensions
+                    slice_data = volume[0, slice_idx].clone() if volume.dim() == 4 else volume[slice_idx].clone()
+                
+                return slice_data
             
             # Log středových řezů pro každý vzorek
             for i in range(n_samples):
@@ -816,14 +836,31 @@ class HIELesionGANTrainer:
                 fake_slice = visualize_slice(fake_samples[i:i+1])
                 atlas_slice = visualize_slice(atlas_samples[i:i+1])
                 
-                # Vytvoření gridu pro vizualizaci
-                grid = torch.cat([real_slice, fake_slice, atlas_slice], dim=1)
+                # Ensure binary values for visualization
+                real_slice = (real_slice > 0.5).float()
+                fake_slice = (fake_slice > 0.5).float()
                 
-                # Add channel dimension for TensorBoard (convert HW to CHW format)
-                grid = grid.unsqueeze(0)
+                # Create a more visually distinct representation for TensorBoard
+                # White (1) for lesion, black (0) for background
+                # Stack these for RGB channels with different colors
+                colored_real = torch.zeros((3, real_slice.shape[0], real_slice.shape[1]))
+                colored_real[0] = real_slice  # Red channel
                 
-                # Log do tensorboard - specify dataformats='CHW'
-                self.writer.add_image(f'sample_{i}/real_fake_atlas', grid, epoch, dataformats='CHW')
+                colored_fake = torch.zeros((3, fake_slice.shape[0], fake_slice.shape[1]))
+                colored_fake[1] = fake_slice  # Green channel
+                
+                # Normalize atlas to 0-1 range if needed
+                if atlas_slice.max() > 0:
+                    atlas_slice = atlas_slice / atlas_slice.max()
+                
+                colored_atlas = torch.zeros((3, atlas_slice.shape[0], atlas_slice.shape[1]))
+                colored_atlas[2] = atlas_slice  # Blue channel
+                
+                # Combine into a visualization grid
+                grid = torch.cat([colored_real, colored_fake, colored_atlas], dim=2)
+                
+                # Log to tensorboard
+                self.writer.add_image(f'sample_{i}/real_fake_atlas', grid, epoch)
     
     def save_checkpoint(self, epoch):
         checkpoint_path = os.path.join(self.save_dir, f'checkpoint_epoch_{epoch}.pt')
@@ -897,7 +934,7 @@ class HIELesionGANTrainer:
                 stats['atlas_coverage'].append(atlas_coverage.item() * 100)  # as percentage
                 
                 # Převod na numpy array a binarizace pro uložení jako nifti
-                lesion_np = fake_lesion.squeeze().cpu().numpy()
+                lesion_np = binary_lesion.squeeze().cpu().numpy()  # Use binary version for NIFTI
                 
                 # Uložení jako .nii soubor
                 sample_path = os.path.join(output_dir, f'generated_lesion_{i}.nii.gz')
@@ -927,22 +964,39 @@ class HIELesionGANTrainer:
                 fig, axes = plt.subplots(1, 3, figsize=(15, 5))
                 
                 # Axial view
-                axes[0].imshow(lesion_np[mid_z, :, :], cmap='jet')
+                axes[0].imshow(lesion_np[mid_z, :, :], cmap='binary', vmin=0, vmax=1)
                 axes[0].set_title(f"Axial (z={mid_z})")
-                axes[0].imshow(atlas_np[mid_z, :, :], cmap='gray', alpha=0.3)
+                # Overlay atlas as contour or alpha blended
+                if atlas_np.max() > 0:
+                    atlas_slice = atlas_np[mid_z, :, :] / atlas_np.max()
+                    axes[0].contour(atlas_slice, levels=[0.5], colors='red', linewidths=0.5, alpha=0.7)
                 
                 # Coronal view
-                axes[1].imshow(lesion_np[:, mid_y, :], cmap='jet')
+                axes[1].imshow(lesion_np[:, mid_y, :], cmap='binary', vmin=0, vmax=1)
                 axes[1].set_title(f"Coronal (y={mid_y})")
-                axes[1].imshow(atlas_np[:, mid_y, :], cmap='gray', alpha=0.3)
+                if atlas_np.max() > 0:
+                    atlas_slice = atlas_np[:, mid_y, :] / atlas_np.max()
+                    axes[1].contour(atlas_slice, levels=[0.5], colors='red', linewidths=0.5, alpha=0.7)
                 
                 # Sagittal view
-                axes[2].imshow(lesion_np[:, :, mid_x], cmap='jet')
+                axes[2].imshow(lesion_np[:, :, mid_x], cmap='binary', vmin=0, vmax=1)
                 axes[2].set_title(f"Sagittal (x={mid_x})")
-                axes[2].imshow(atlas_np[:, :, mid_x], cmap='gray', alpha=0.3)
+                if atlas_np.max() > 0:
+                    atlas_slice = atlas_np[:, :, mid_x] / atlas_np.max()
+                    axes[2].contour(atlas_slice, levels=[0.5], colors='red', linewidths=0.5, alpha=0.7)
+                
+                # Add proper labels and orientation markers
+                for ax in axes:
+                    ax.set_xticks([])
+                    ax.set_yticks([])
+                    # Add orientation markers (A: anterior, P: posterior, L: left, R: right)
+                    ax.text(0.05, 0.95, "A", transform=ax.transAxes, fontsize=12, color='white', 
+                            bbox=dict(facecolor='black', alpha=0.5))
+                    ax.text(0.95, 0.95, "P", transform=ax.transAxes, fontsize=12, color='white',
+                            bbox=dict(facecolor='black', alpha=0.5))
                 
                 plt.tight_layout()
-                plt.savefig(vis_path)
+                plt.savefig(vis_path, dpi=150, bbox_inches='tight')
                 plt.close()
                 
                 print(f"Vygenerován vzorek: {sample_path}")
@@ -1005,11 +1059,14 @@ class HIELesionGANTrainer:
                         atlas_mask = F.interpolate(atlas_mask, size=fake_lesions.shape[2:], mode='nearest')
                     fake_lesions = fake_lesions * atlas_mask
                     
+                    # Threshold generated lesions to ensure binary output for visualization
+                    binary_fake_lesions = (fake_lesions > 0.5).float()
+                    
                     # Process each sample
                     for i in range(min(batch_size, num_samples)):
                         # Get current sample
                         real_sample = real_lesions[i:i+1].cpu().detach()
-                        fake_sample = fake_lesions[i:i+1].cpu().detach()
+                        fake_sample = binary_fake_lesions[i:i+1].cpu().detach()  # Use binary version for visualization
                         atlas_sample = atlas[i:i+1].cpu().detach()
                         
                         # Create visualization with multiple slices
@@ -1026,8 +1083,10 @@ class HIELesionGANTrainer:
                         elif rows == 1:
                             axes = axes.reshape(3, slices_per_row)
                         
-                        # Select evenly spaced slices
-                        slice_indices = np.linspace(0, D-1, total_slices).astype(int)
+                        # Select evenly spaced slices - start from deeper in the volume to skip empty slices
+                        start_idx = D // 6  # Start at 1/6 of the volume depth
+                        end_idx = 5 * D // 6  # End at 5/6 of the volume depth
+                        slice_indices = np.linspace(start_idx, end_idx, total_slices).astype(int)
                         
                         # Plot the slices
                         for j, slice_idx in enumerate(slice_indices):
@@ -1042,10 +1101,12 @@ class HIELesionGANTrainer:
                                 else:  # Handle unexpected dimensions
                                     real_slice = real_sample[0, slice_idx].numpy() if real_sample.dim() == 4 else real_sample[slice_idx].numpy()
                                     
-                                axes[row*3, col].imshow(real_slice, cmap='gray')
+                                # Ensure binary display by thresholding
+                                real_slice = (real_slice > 0.5).astype(np.float32)
+                                axes[row*3, col].imshow(real_slice, cmap='binary', vmin=0, vmax=1)
                                 if col == 0:
-                                    axes[row*3, col].set_ylabel("Real")
-                                axes[row*3, col].set_title(f"Slice {slice_idx}")
+                                    axes[row*3, col].set_ylabel("Real", fontsize=12)
+                                axes[row*3, col].set_title(f"Slice {slice_idx}", fontsize=10)
                                 axes[row*3, col].axis('off')
                                 
                                 # Get fake sample slice - safely handle dimensionality
@@ -1054,9 +1115,11 @@ class HIELesionGANTrainer:
                                 else:  # Handle unexpected dimensions
                                     fake_slice = fake_sample[0, slice_idx].numpy() if fake_sample.dim() == 4 else fake_sample[slice_idx].numpy()
                                     
-                                axes[row*3+1, col].imshow(fake_slice, cmap='jet')
+                                # Ensure binary display
+                                fake_slice = (fake_slice > 0.5).astype(np.float32)
+                                axes[row*3+1, col].imshow(fake_slice, cmap='binary', vmin=0, vmax=1)
                                 if col == 0:
-                                    axes[row*3+1, col].set_ylabel("Generated")
+                                    axes[row*3+1, col].set_ylabel("Generated", fontsize=12)
                                 axes[row*3+1, col].axis('off')
                                 
                                 # Get atlas slice - safely handle dimensionality
@@ -1065,9 +1128,12 @@ class HIELesionGANTrainer:
                                 else:  # Handle unexpected dimensions
                                     atlas_slice = atlas_sample[0, slice_idx].numpy() if atlas_sample.dim() == 4 else atlas_sample[slice_idx].numpy()
                                     
-                                axes[row*3+2, col].imshow(atlas_slice, cmap='gray')
+                                # Normalize atlas display
+                                if atlas_slice.max() > 0:
+                                    atlas_slice = atlas_slice / atlas_slice.max()
+                                axes[row*3+2, col].imshow(atlas_slice, cmap='hot', alpha=0.7)
                                 if col == 0:
-                                    axes[row*3+2, col].set_ylabel("Atlas")
+                                    axes[row*3+2, col].set_ylabel("Atlas", fontsize=12)
                                 axes[row*3+2, col].axis('off')
                         
                         # Hide any unused subplots
@@ -1080,14 +1146,16 @@ class HIELesionGANTrainer:
                         
                         # Save the figure
                         plt.tight_layout()
-                        plt.savefig(os.path.join(output_dir, f'validation_epoch_{epoch}_sample_{i}.pdf'))
+                        plt.savefig(os.path.join(output_dir, f'validation_epoch_{epoch}_sample_{i}.pdf'), 
+                                   bbox_inches='tight', dpi=150)
                         plt.close(fig)
                     
                     # Only process one batch
                     break
         except Exception as e:
             print(f"Error generating validation visualizations: {e}")
-            # Continue training even if visualization fails
+            import traceback
+            traceback.print_exc()
         
         self.generator.train()
     
