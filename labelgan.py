@@ -202,15 +202,21 @@ class Generator(nn.Module):
             nn.Sigmoid()  # Výstup v rozsahu [0, 1] pro binární segmentaci
         )
         
-        # Atlas integration
+        # Atlas integration - Fix: Change to use base_filters*2 to match d2_skip dimensions
         self.atlas_attention = nn.Sequential(
-            spectral_norm(nn.Conv3d(base_filters, base_filters, 3, 1, 1), use_spectral_norm),
-            nn.InstanceNorm3d(base_filters),
+            spectral_norm(nn.Conv3d(base_filters * 2, base_filters * 2, 3, 1, 1), use_spectral_norm),
+            nn.InstanceNorm3d(base_filters * 2),
             nn.Sigmoid()
         )
         
+        # Debug flag - set to True to print tensor shapes during forward pass
+        self.debug = False
+        
     def forward(self, z, atlas):
         batch_size = atlas.size(0)
+        
+        if self.debug:
+            print(f"Input atlas shape: {atlas.shape}, z shape: {z.shape}")
         
         # Encoder - atlas
         e1 = self.atlas_enc1(atlas)  # 64x64x32
@@ -218,8 +224,8 @@ class Generator(nn.Module):
         e3 = self.atlas_enc3(e2)     # 16x16x8
         e4 = self.atlas_enc4(e3)     # 8x8x4
         
-        # Debug: Print shape to understand the expected shape for z_3d
-        # print(f"e4 shape: {e4.shape}")
+        if self.debug:
+            print(f"Encoder outputs - e1: {e1.shape}, e2: {e2.shape}, e3: {e3.shape}, e4: {e4.shape}")
         
         # Zpracování náhodného šumu a reshape na 3D feature mapu
         z_flat = self.fc_z(z)
@@ -229,33 +235,70 @@ class Generator(nn.Module):
         z_3d = z_flat.view(batch_size, self.base_filters, D, H, W)
         z_3d = self.reshape_z(z_3d)
         
+        if self.debug:
+            print(f"Latent z_3d shape: {z_3d.shape}")
+        
         # Kombinace atlasu a šumu v bottlenecku
         combined = torch.cat([e4, z_3d], dim=1)
+        if self.debug:
+            print(f"Combined bottleneck shape: {combined.shape}")
+            
         bottleneck = self.bottleneck_conv(combined)
         
         # Self-attention
         attended = self.self_attn(bottleneck)
+        if self.debug:
+            print(f"After self-attention: {attended.shape}")
         
         # Decoder s skip connections
         d4 = self.dec4(attended)                           # 16x16x8
+        if self.debug:
+            print(f"d4 shape: {d4.shape}, e3 shape: {e3.shape}")
+            
         d4_skip = torch.cat([d4, e3], dim=1)
+        if self.debug:
+            print(f"d4_skip shape: {d4_skip.shape}")
         
         d3 = self.dec3(d4_skip)                            # 32x32x16
+        if self.debug:
+            print(f"d3 shape: {d3.shape}, e2 shape: {e2.shape}")
+            
         d3_skip = torch.cat([d3, e2], dim=1)
+        if self.debug:
+            print(f"d3_skip shape: {d3_skip.shape}")
         
         d2 = self.dec2(d3_skip)                            # 64x64x32
-        d2_skip = torch.cat([d2, e1], dim=1)
+        if self.debug:
+            print(f"d2 shape: {d2.shape}, e1 shape: {e1.shape}")
+            
+        d2_skip = torch.cat([d2, e1], dim=1)               # Concatenate to get [batch, base_filters*2, D, H, W]
+        if self.debug:
+            print(f"d2_skip shape (before attention): {d2_skip.shape}")
         
-        # Atlas-based attention mapa pro zdůraznění relevantních oblastí
-        atlas_attention = self.atlas_attention(d2)
-        d2_skip = d2_skip * atlas_attention + d2_skip
+        # Atlas-based attention - Fix: Apply attention to the concatenated features
+        atlas_attention = self.atlas_attention(d2_skip)    # Now operates on d2_skip (base_filters*2 channels)
+        if self.debug:
+            print(f"atlas_attention shape: {atlas_attention.shape}")
+            
+        d2_skip = d2_skip * atlas_attention + d2_skip      # Element-wise multiplication now matches dimensions
         
         # Finální dekódování do lesion mapy
         out = self.dec1(d2_skip)                           # 128x128x64
+        if self.debug:
+            print(f"Output shape (before masking): {out.shape}")
         
         # Ensure lesions only appear where atlas is non-zero
         atlas_mask = (atlas > 0).float()
+        
+        # Ensure atlas_mask has the same spatial dimensions as the output
+        if out.shape[2:] != atlas.shape[2:]:
+            atlas_mask = F.interpolate(atlas_mask, size=out.shape[2:], mode='nearest')
+            if self.debug:
+                print(f"Resized atlas_mask to match output: {atlas_mask.shape}")
+        
         out = out * atlas_mask
+        if self.debug:
+            print(f"Final output shape: {out.shape}")
         
         return out
 
@@ -263,6 +306,9 @@ class Generator(nn.Module):
 class Discriminator(nn.Module):
     def __init__(self, input_channels=2, base_filters=64, use_spectral_norm=True):
         super(Discriminator, self).__init__()
+        
+        # Debug flag for printing tensor shapes
+        self.debug = False
         
         # Vstup je konkatenovaný atlas a label/generovaná léze
         self.layer1 = nn.Sequential(
@@ -299,24 +345,52 @@ class Discriminator(nn.Module):
         self.fc = spectral_norm(nn.Linear(base_filters * 8, 1), use_spectral_norm)
         
     def forward(self, x, atlas):
+        # Ensure x and atlas have same spatial dimensions
+        if x.shape[2:] != atlas.shape[2:]:
+            if self.debug:
+                print(f"WARNING: Mismatched shapes - x: {x.shape}, atlas: {atlas.shape}")
+            # Resize atlas to match x's spatial dimensions
+            atlas = F.interpolate(atlas, size=x.shape[2:], mode='nearest')
+            if self.debug:
+                print(f"Resized atlas to: {atlas.shape}")
+                
         # Konkatenace vstupu a atlasu podél kanálové dimenze
-        x = torch.cat([x, atlas], dim=1)
+        x_combined = torch.cat([x, atlas], dim=1)
         
-        x = self.layer1(x)
+        if self.debug:
+            print(f"Discriminator input (combined): {x_combined.shape}")
+        
+        x = self.layer1(x_combined)
+        if self.debug:
+            print(f"After layer1: {x.shape}")
+            
         x = self.layer2(x)
+        if self.debug:
+            print(f"After layer2: {x.shape}")
+            
         x = self.layer3(x)
+        if self.debug:
+            print(f"After layer3: {x.shape}")
         
         # Self-attention
         x = self.self_attn(x)
+        if self.debug:
+            print(f"After self-attention: {x.shape}")
         
         x = self.layer4(x)
+        if self.debug:
+            print(f"After layer4: {x.shape}")
         
         # PatchGAN výstup - mapa skóre
         patch_out = self.layer5(x)
+        if self.debug:
+            print(f"Patch output shape: {patch_out.shape}")
         
         # Globální posouzení
         global_features = self.global_pool(x).view(x.size(0), -1)
         global_out = self.fc(global_features)
+        if self.debug:
+            print(f"Global output shape: {global_out.shape}")
         
         return patch_out, global_out
 
@@ -406,7 +480,8 @@ class HIELesionGANTrainer:
                  label_smoothing=0.9,
                  log_dir='./logs',
                  save_dir='./checkpoints',
-                 save_interval=10):
+                 save_interval=10,
+                 debug=False):
         
         self.generator = generator.to(device)
         self.discriminator = discriminator.to(device)
@@ -414,6 +489,11 @@ class HIELesionGANTrainer:
         self.dataloader = dataloader
         self.val_dataloader = val_dataloader
         self.z_dim = z_dim
+        
+        # Set debug mode
+        self.debug = debug
+        self.generator.debug = debug
+        self.discriminator.debug = debug
         
         # Optimizéry
         self.optimizer_g = optim.Adam(generator.parameters(), lr=lr_g, betas=(beta1, beta2))
@@ -453,12 +533,19 @@ class HIELesionGANTrainer:
         # Reset gradientů
         self.optimizer_d.zero_grad()
         
+        # Ensure shapes are consistent
+        if self.debug:
+            print(f"D training - real_lesions: {real_lesions.shape}, atlas: {atlas.shape}")
+            
         # Forward pass s reálnými lézemi
         real_patch_pred, real_global_pred = self.discriminator(real_lesions, atlas)
         
         # Generování fake lézí
         z = self.get_random_z(batch_size)
         fake_lesions = self.generator(z, atlas)
+        
+        if self.debug:
+            print(f"D training - generated fake_lesions: {fake_lesions.shape}")
         
         # Forward pass s falešnými lézemi
         fake_patch_pred, fake_global_pred = self.discriminator(fake_lesions.detach(), atlas)
@@ -483,6 +570,9 @@ class HIELesionGANTrainer:
     def train_generator(self, real_lesions, atlas):
         batch_size = real_lesions.size(0)
         
+        if self.debug:
+            print(f"G training - real_lesions: {real_lesions.shape}, atlas: {atlas.shape}")
+            
         # Reset gradientů
         self.optimizer_g.zero_grad()
         
@@ -490,8 +580,18 @@ class HIELesionGANTrainer:
         z = self.get_random_z(batch_size)
         fake_lesions = self.generator(z, atlas)
         
+        if self.debug:
+            print(f"G training - generated fake_lesions: {fake_lesions.shape}")
+        
         # Ensure generated lesions respect the atlas - make atlas constraint more explicit
         atlas_mask = (atlas > 0).float()
+        
+        # Resize mask if needed
+        if fake_lesions.shape[2:] != atlas_mask.shape[2:]:
+            if self.debug:
+                print(f"Resizing atlas_mask from {atlas_mask.shape} to match fake_lesions {fake_lesions.shape[2:]}")
+            atlas_mask = F.interpolate(atlas_mask, size=fake_lesions.shape[2:], mode='nearest')
+            
         fake_lesions = fake_lesions * atlas_mask  # Enforce constraint again for safety
         
         # Forward pass diskriminátorem
@@ -560,13 +660,32 @@ class HIELesionGANTrainer:
                 atlas = batch['atlas'].to(self.device)
                 batch_size = real_lesions.size(0)
                 
+                if self.debug:
+                    print(f"Validation batch {i} - real_lesions: {real_lesions.shape}, atlas: {atlas.shape}")
+                
                 # Generování fake lézí
                 z = self.get_random_z(batch_size)
                 fake_lesions = self.generator(z, atlas)
                 
+                if self.debug:
+                    print(f"Validation - generated fake_lesions: {fake_lesions.shape}")
+                
                 # Apply atlas mask
                 atlas_mask = (atlas > 0).float()
+                
+                # Ensure dimensions match before applying mask
+                if fake_lesions.shape[2:] != atlas_mask.shape[2:]:
+                    if self.debug:
+                        print(f"Validation - resizing atlas_mask from {atlas_mask.shape} to {fake_lesions.shape[2:]}")
+                    atlas_mask = F.interpolate(atlas_mask, size=fake_lesions.shape[2:], mode='nearest')
+                
                 fake_lesions = fake_lesions * atlas_mask
+                
+                # Ensure real_lesions and fake_lesions have the same spatial dimensions for loss computation
+                if real_lesions.shape[2:] != fake_lesions.shape[2:]:
+                    if self.debug:
+                        print(f"Validation - resizing real_lesions from {real_lesions.shape} to {fake_lesions.shape[2:]}")
+                    real_lesions = F.interpolate(real_lesions, size=fake_lesions.shape[2:], mode='nearest')
                 
                 # Diskriminátor výstupy
                 real_patch_pred, real_global_pred = self.discriminator(real_lesions, atlas)
@@ -602,11 +721,22 @@ class HIELesionGANTrainer:
                 val_losses['val_g_dice_loss'] += g_dice_loss.item()
                 val_losses['val_atlas_violation'] += violation_penalty.item()
                 val_losses['val_d_loss'] += d_loss.item()
+                
+                if self.debug and i == 0:
+                    print(f"Validation metrics for first batch:")
+                    print(f"  G Loss: {g_loss.item():.4f}")
+                    print(f"  D Loss: {d_loss.item():.4f}")
+                    print(f"  Atlas Violation: {violation_penalty.item():.4f}")
         
         # Průměrování
         num_batches = len(self.val_dataloader)
         for k in val_losses.keys():
             val_losses[k] /= num_batches
+            
+        if self.debug:
+            print("Validation results:")
+            for k, v in val_losses.items():
+                print(f"  {k}: {v:.4f}")
         
         self.generator.train()
         self.discriminator.train()
@@ -911,6 +1041,8 @@ def main():
                         help='Path to the trained model for generation')
     parser.add_argument('--num_samples', type=int, default=10,
                         help='Number of samples to generate')
+    parser.add_argument('--debug', action='store_true',
+                        help='Enable debug output of tensor shapes during forward pass')
     
     args = parser.parse_args()
     
@@ -974,6 +1106,11 @@ def main():
         use_spectral_norm=args.use_spectral_norm
     )
     
+    # Set debug mode if requested
+    if args.debug:
+        generator.debug = True
+        discriminator.debug = True
+    
     # Pokud máme cestu k natrénovanému modelu, načteme jej
     if args.model_path:
         checkpoint = torch.load(args.model_path, map_location=device)
@@ -994,7 +1131,8 @@ def main():
         lr_d=args.lr_d,
         log_dir=log_dir,
         save_dir=save_dir,
-        save_interval=args.save_interval
+        save_interval=args.save_interval,
+        debug=args.debug
     )
     
     # Pokud chceme pouze generovat vzorky
