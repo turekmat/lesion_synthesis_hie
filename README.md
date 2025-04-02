@@ -1,195 +1,87 @@
-# Dvou-GAN systém pro syntézu HIE lézí
+# HIE Lesion Synthesis GAN
 
-Tento projekt implementuje dvoustupňový GAN přístup pro syntézu realistických hypoxicko-ischemických encefalopatických (HIE) lézí v MRI obrazech novorozenců.
+Generativní adversariální síť (GAN) pro syntézu realistických hypoxicko-ischemických encefalopatických (HIE) lézí na základě lézního atlasu a mozečkové masky.
 
-## Přehled
+## Popis
 
-Systém se skládá ze dvou specializovaných GANů:
+Tento projekt implementuje pokročilý GAN model, který generuje realistické HIE léze na základě:
 
-1. **LabelGAN** - Generuje binární segmentační mapy lézí (LABEL mapy) na základě normativního atlasu mozku a volitelného atlasu frekvence lézí.
-2. **IntensityGAN** - Upravuje intenzity voxelů v normativním atlasu podle vygenerovaných LABEL map, což vede k realistickým ZADC mapám s lézemi.
+1. Lézního atlasu, který definuje pravděpodobnost výskytu lézí v různých částech mozku
+2. Mozečkové masky, která omezuje generování lézí pouze na reálné tkáně mozku
 
-Tento dvoustupňový přístup umožňuje lepší kontrolu nad generačním procesem a dosahuje vyšší kvality syntetizovaných dat, než by bylo možné s jediným modelem.
+Model využívá několik pokročilých technik:
 
-## Komponenty systému
-
-### 1. LabelGAN (labelgan.py)
-
-LabelGAN se specializuje na generování binárních segmentačních map lézí. Tento model:
-
-- Využívá atlas frekvence lézí jako vstup pro určení pravděpodobných lokací lézí
-- Generuje realistické binární mapy lézí s rozměry 128x128x64
-- Využívá pokročilou U-Net architekturu s attention mechanismem pro lepší detaily
-- Implementuje specializované ztrátové funkce (váhovaný BCE, Dice loss, Focal loss) pro řešení třídní nevyváženosti
-- Má implementované pokročilé techniky stabilizace GAN tréninku (spektrální normalizace, gradient penalty)
-- Podporuje datové augmentace (rotace, flipy) pro lepší generalizaci při omezeném datasetu
-
-### 2. IntensityGAN (intensity_gan.py)
-
-IntensityGAN se specializuje na úpravu intenzit voxelů podle segmentačních map lézí. Tento model:
-
-- Využívá normativní atlas a LABEL mapu jako vstup
-- Generuje ZADC mapy s realistickými intenzitami v místech lézí
-- Upravuje také okolní tkáň pro větší variabilitu mezi vzorky
-- Obsahuje specializované ztrátové funkce pro oblasti s lézemi a bez lézí
-
-### 3. Integrační pipeline (synthetic_pipeline.py)
-
-Skript `synthetic_pipeline.py` propojuje oba GAN modely a umožňuje spustit celý proces syntézy dat v jednom kroku.
-
-## Požadavky
-
-- Python 3.6+
-- PyTorch 1.8+
-- CUDA (doporučeno pro trénink)
-- SimpleITK
-- Nibabel
-- NumPy
-- ZADC mapy a LABEL mapy pro trénink
-- Normativní atlas mozku novorozence
+- Atlas-aware attention mechanism - směruje pozornost modelu na oblasti s vyšší pravděpodobností výskytu lézí
+- Probabilistic atlas integration - využívá pravděpodobnostní informace z atlasu pro lepší generaci lézí
+- Multiple specialized loss functions - kombinace loss funkcí pro dosažení realističtějších výsledků
+- Distribution matching - zajišťuje, že distribuce lézí odpovídá atlasu
 
 ## Instalace
 
+Doporučujeme použít virtuální prostředí pro instalaci požadovaných knihoven:
+
 ```bash
+# Vytvoření virtuálního prostředí
+python -m venv env
+
+# Aktivace prostředí
+# Pro Linux/Mac:
+source env/bin/activate
+# Pro Windows:
+env\Scripts\activate
+
 # Instalace závislostí
-pip install torch torchvision nibabel SimpleITK numpy
+pip install -r requirements.txt
 ```
 
 ## Použití
 
-Systém lze používat několika způsoby:
-
-### 1. Kompletní pipeline (trénink a generování)
+Model lze trénovat pomocí následujícího příkazu:
 
 ```bash
-python synthetic_pipeline.py --run_complete_pipeline \
-    --normal_atlas_path /cesta/k/atlasu.nii.gz \
-    --lesion_atlas_path /cesta/k/atlasu_lezi.nii.gz \
-    --zadc_dir /cesta/k/zadc_mapam \
-    --label_dir /cesta/k/label_mapam \
-    --synthetic_data_dir ./output/syntetická_data \
-    --num_samples 200
+python labelgan.py --label_dir <cesta_k_datům> --atlas_path <cesta_k_atlasu> --brain_mask_path <cesta_k_mozečkové_masce> --batch_size 4 --epochs 100
 ```
 
-### 2. Samostatný trénink LabelGAN
+### Příklad:
 
 ```bash
-python labelgan.py --mode train \
-    --lesion_atlas_path data/archive/lesion_atlases/lesion_atlas.nii \
-    --label_dir data/BONBID2023_Train/3LABEL \
-    --output_dir ./output/labelgan \
-    --epochs 100 \
-    --batch_size 2 \
-    --use_attention \
-    --use_dice_loss \
-    --use_focal_loss \
-    --use_spectral_norm
+python labelgan.py --label_dir /data/registered_label --atlas_path /data/atlases/lesion_atlas.nii --brain_mask_path /data/atlases/brainmask.nii --batch_size 4 --epochs 100
 ```
 
-### 3. Samostatné generování LABEL map
+### Parametry:
 
-```bash
-python labelgan.py --mode generate \
-    --lesion_atlas_path data/archive/lesion_atlases/lesion_atlas.nii \
-    --model_path ./output/labelgan/models/best_model.pt \
-    --output_dir ./output/generated_lesions \
-    --n_samples 100 \
-    --use_thresholding
-```
+- `--label_dir`: Adresář obsahující léze ve formátu NIfTI
+- `--atlas_path`: Cesta k léznímu atlasu ve formátu NIfTI
+- `--brain_mask_path`: Cesta k mozečkové masce ve formátu NIfTI
+- `--batch_size`: Velikost batche pro trénink (výchozí 4)
+- `--epochs`: Počet epochy tréninku (výchozí 100)
+- `--learning_rate`: Learning rate optimizéru (výchozí 0.0002)
+- `--z_dim`: Dimenze latentního prostoru (výchozí 128)
+- `--save_dir`: Adresář pro ukládání výsledků (výchozí './results')
+- `--debug`: Flag pro zapnutí debug módu pro podrobnější výpisy
 
-### 4. Samostatný trénink IntensityGAN
+## Výstupy
 
-```bash
-python intensity_gan.py train \
-    --normal_atlas_path /cesta/k/atlasu.nii.gz \
-    --zadc_dir /cesta/k/zadc_mapam \
-    --label_dir /cesta/k/label_mapam \
-    --output_dir ./output/intensitygan \
-    --epochs 100 \
-    --batch_size 2
-```
+Po tréninku model ukládá:
 
-### 5. Samostatné generování ZADC map
+1. Checkpointy modelu (každých 10 epoch)
+2. Vizualizace generovaných lézí
+3. Statistiky o generovaných lézích
+4. TensorBoard logy pro sledování tréninku
 
-```bash
-python intensity_gan.py generate \
-    --normal_atlas_path /cesta/k/atlasu.nii.gz \
-    --label_dir ./output/label_mapy/label \
-    --checkpoint_path ./output/intensitygan/intensitygan_checkpoint_epoch99.pt \
-    --output_dir ./output/zadc_mapy \
-    --num_samples 200
-```
+Generované léze lze prohlížet v adresáři `<save_dir>/samples`.
 
-## Doporučené hyperparametry
+## Struktura kódu
 
-Pro dosažení nejlepších výsledků doporučujeme následující nastavení:
+- `HIELesionDataset`: Třída pro načítání dat
+- `Generator`: 3D generativní síť s atlasovým mechanismem
+- `Discriminator`: 3D diskriminační síť s PatchGAN architekturou
+- `HIELesionGANTrainer`: Třída pro trénink modelu a generování vzorků
 
-```bash
-# LabelGAN
---label_generator_filters 64 \
---label_discriminator_filters 64 \
---lambda_dice 50.0 \
---use_self_attention \
---dropout_rate 0.3
+## Požadavky
 
-# IntensityGAN
---intensity_generator_filters 64 \
---intensity_discriminator_filters 64 \
---lambda_l1 100.0 \
---lambda_lesion 50.0 \
---lambda_non_lesion 25.0 \
---lambda_intensity_var 10.0 \
---use_self_attention
-```
+Viz soubor `requirements.txt` pro seznam požadovaných knihoven.
 
-## Výstupní adresářová struktura
+## Poznámky
 
-Po spuštění kompletního pipeline bude vytvořena následující adresářová struktura:
-
-```
-output/
-  ├── labelgan/                      # Výstup tréninku LabelGAN
-  │   ├── labelgan_checkpoint_epoch*.pt    # Checkpointy modelu
-  │   └── labelgan_sample_epoch*_*.nii.gz  # Vzorky z tréninku
-  │
-  ├── intensitygan/                  # Výstup tréninku IntensityGAN
-  │   ├── intensitygan_checkpoint_epoch*.pt   # Checkpointy modelu
-  │   └── intensitygan_sample_epoch*_*.nii.gz # Vzorky z tréninku
-  │
-  └── synthetic_data/                # Výsledná syntetická data
-      ├── label/                     # Vygenerované LABEL mapy
-      │   └── sample_*_label.nii.gz  # Jednotlivé LABEL mapy
-      │
-      └── zadc/                      # Vygenerované ZADC mapy
-          └── sample_*_zadc.nii.gz   # Jednotlivé ZADC mapy
-```
-
-## Poznámky k použití
-
-- Pro trénink jsou potřeba registrované ZADC mapy a LABEL mapy se stejnými rozměry jako normativní atlas
-- Použití atlasu frekvence lézí je volitelné, ale může výrazně zlepšit klinickou relevanci generovaných dat
-- Pro trénink na CPU snižte velikost vstupu nebo velikost batch
-
-## Rozšíření a budoucí vývoj
-
-- Přidání podmíněné generace podle specifických parametrů (např. věk, závažnost)
-- Rozšíření na více modalit MRI (T1, T2, FLAIR)
-- Implementace 3D patchů pro trénink na větších objemových datech
-- Modelování progresivního růstu lézí
-
-## Citování
-
-Pokud použijete tento kód ve svém výzkumu, prosím citujte naši práci:
-
-```
-@article{hie_lesion_synthesis,
-  title={Dvou-GAN přístup pro syntézu HIE lézí v MRI obrazech novorozenců},
-  author={Váš Autor},
-  journal={Váš Journal},
-  year={2023}
-}
-```
-
-## Licence
-
-Tento projekt je licencován pod MIT licencí - viz soubor LICENSE pro více detailů.
+Varování typu "Unable to register cuFFT factory" jsou způsobena konfliktem TensorFlow a PyTorch CUDA knihoven a lze je bezpečně ignorovat, jelikož neovlivňují chod modelu.
