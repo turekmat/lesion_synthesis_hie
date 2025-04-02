@@ -53,9 +53,17 @@ class RandomFlip3D:
         
     def __call__(self, tensor):
         if random.random() < self.p:
-            # Náhodný flip v jedné z os
-            axis = random.randint(2, 4)  # Vybíráme dimenzi 2, 3 nebo 4 (D, H, W)
-            return torch.flip(tensor, [axis])
+            # Získání maximální dimenze tenzoru
+            max_dim = len(tensor.shape) - 1  # Pro 4D tenzor [C,D,H,W] je max_dim=3
+            
+            # Vybíráme náhodnou prostorovou dimenzi (ignorujeme batch a channel)
+            # Začínáme od indexu 2 (první prostorová dimenze)
+            spatial_dims = list(range(2, max_dim + 1))
+            
+            # Pokud existují prostorové dimenze k flipování
+            if spatial_dims:
+                axis = random.choice(spatial_dims)
+                return torch.flip(tensor, [axis])
         return tensor
 
 # Dataset pro LabelGAN
