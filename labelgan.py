@@ -358,9 +358,9 @@ class Generator(nn.Module):
         if self.debug:
             print(f"Logits output shape: {logits.shape}")
         
-        # Apply hard sigmoid with temperature scaling to get sharper binary-like outputs
-        # This makes the gradient more abrupt around 0, pushing values towards 0 or 1
-        temperature = 20.0  # Higher value = sharper transition
+        # MODIFIED: Apply a more nuanced sigmoid activation for more natural lesion transitions
+        # Use a moderate temperature that doesn't make the output too binary
+        temperature = 10.0  # Reduced from 20.0 for softer transitions
         out = torch.sigmoid(logits * temperature)
         
         # Resize atlas to match output size if needed
@@ -372,15 +372,40 @@ class Generator(nn.Module):
         # Apply atlas modulation - enhance probability in regions with higher atlas values
         atlas_mod = self.atlas_modulation(atlas_final)
         
-        # Blend the generated output with the atlas probability
-        # This makes lesions more likely in high-probability regions
-        # MODIFIED: Ensure output is clamped to [0,1] range
-        out = torch.clamp(out * (1.0 + atlas_mod), 0.0, 1.0)
+        # MODIFIED: Blend the generated output with the atlas probability using a smoother approach
+        # This creates more continuous, anatomically plausible lesions
+        blend_factor = 0.7  # Controls how much the atlas influences the output
+        out = torch.clamp((out * (1.0 + atlas_mod * blend_factor)), 0.0, 1.0)
         
-        # Binarize the output to ensure truly binary masks during inference
-        # During training we use the continuous version for gradient flow
+        # MODIFIED: During inference, apply a softer thresholding approach
+        # Use morphological operations to create more cohesive lesions  
         if not self.training:
-            out = (out > 0.5).float()
+            # Instead of hard threshold, use a continuous activation that favors outputs
+            # with more defined structures
+            
+            # First threshold to determine foreground regions
+            foreground = (out > 0.35).float()  # Lower threshold captures more potential lesion areas
+            
+            # MODIFIED: Apply a spatial smoothing to encourage lesion coherence
+            # This acts as a simple morphological operation that helps connect nearby voxels
+            # Implement a 3D average pooling with small kernel as a smoothing operation
+            kernel_size = 3
+            padding = kernel_size // 2
+            smoothed = F.avg_pool3d(
+                F.pad(foreground, (padding, padding, padding, padding, padding, padding)),
+                kernel_size,
+                stride=1
+            )
+            
+            # Apply a threshold to the smoothed output to get more coherent regions
+            coherent = (smoothed > 0.2).float()  # Lower threshold to encourage connectivity
+            
+            # Combine with original output for final result with more connected components
+            out = out * coherent
+            
+            # Apply a final threshold that keeps more of the original probability values
+            # but zeroes out very low activations
+            out = torch.where(out > 0.2, out, torch.zeros_like(out))
         
         if self.debug:
             print(f"Output shape (before masking): {out.shape}")
@@ -1319,9 +1344,9 @@ class HIELesionGANTrainer:
             # Switch model to eval mode
             self.generator.eval()
             
-            # Set random seed for reproducibility
-            if use_fixed_z:
-                torch.manual_seed(42)
+            # FIXED: Remove the global random seed setting
+            # If use_fixed_z is True, we'll use a predefined z across all samples
+            fixed_z = torch.randn(1, self.z_dim, device=self.device) if use_fixed_z else None
             
             # Generate samples
             with open(stats_path, 'w') as f:
@@ -1330,21 +1355,56 @@ class HIELesionGANTrainer:
                 
                 # Generate samples
                 for i in range(num_samples):
-                    # Generate latent vectors
-                    z = torch.randn(1, self.z_dim, device=self.device)
+                    # FIXED: Generate diverse latent vectors for each sample
+                    # Only reuse fixed_z if use_fixed_z is True
+                    if use_fixed_z and fixed_z is not None:
+                        z = fixed_z
+                    else:
+                        # Set a different seed for each sample to ensure diversity
+                        torch.manual_seed(42 + i) if use_fixed_z else None
+                        z = torch.randn(1, self.z_dim, device=self.device)
                     
                     # Generate lesions
                     with torch.no_grad():
                         fake_lesion = self.generator(z, atlas[:1], brain_mask[:1])
                     
+                    # MODIFIED: Use a smoother approach to map the outputs to a binary-like distribution
                     # Apply atlas mask to ensure lesions only appear in atlas-positive regions
                     fake_lesion = fake_lesion * atlas_binary[:1]
                     
                     # Apply brain mask to ensure lesions are only within the brain
                     fake_lesion = fake_lesion * brain_mask_binary[:1]
                     
-                    # Ensure lesions are truly binary (0 or 1)
-                    binary_lesion = (fake_lesion > 0.5).float()
+                    # MODIFIED: Instead of hard thresholding, preserve some of the continuous values
+                    # for a more natural appearance but still prioritize strong activations
+                    # Apply a softer threshold to get more coherent lesions
+                    # Using temperature scaling to sharpen the transition but not fully binarize
+                    temperature = 8.0  # Less aggressive than 20.0 used in the Generator
+                    soft_binary = torch.sigmoid(temperature * (fake_lesion - 0.5))
+                    
+                    # MODIFIED: Apply connected component filtering to remove isolated pixels
+                    # First get a binary version for component analysis
+                    binary_np = (soft_binary[0, 0] > 0.5).cpu().float().numpy()
+                    
+                    # Find connected components
+                    labeled_components, num_components = measure_label(binary_np, return_num=True)
+                    
+                    # MODIFIED: Filter out very small components (likely noise)
+                    component_sizes = np.bincount(labeled_components.flatten())[1:] if num_components > 0 else []
+                    min_component_size = 3  # Minimum size to keep a component
+                    
+                    # Create cleaned binary mask
+                    cleaned_binary = np.zeros_like(binary_np)
+                    for comp_id in range(1, num_components + 1):
+                        if component_sizes[comp_id - 1] >= min_component_size:
+                            cleaned_binary[labeled_components == comp_id] = 1
+                    
+                    # MODIFIED: Convert back to tensor and ensure it's the same structure as original
+                    cleaned_binary_tensor = torch.from_numpy(cleaned_binary).float().to(self.device)
+                    cleaned_binary_tensor = cleaned_binary_tensor.unsqueeze(0).unsqueeze(0)
+                    
+                    # Final binary lesion combines the soft values with the cleaned binary mask
+                    binary_lesion = soft_binary * cleaned_binary_tensor
                     
                     # Get lesion volume and count
                     lesion_volume = binary_lesion.sum().item()
@@ -1561,8 +1621,14 @@ class HIELesionGANTrainer:
         # Reset generator gradients
         self.generator_optimizer.zero_grad()
         
-        # Generate latent vector z
-        z = torch.randn(batch_size, self.z_dim, device=self.device)
+        # MODIFIED: Generate diverse latent vectors z with batch-specific noise
+        # This ensures better diversity in training and helps the model learn to use the noise effectively
+        # Mix in iteration and batch size information to ensure different patterns across training
+        z_base = torch.randn(batch_size, self.z_dim, device=self.device)
+        
+        # Add a small perturbation based on the iteration to increase diversity
+        iteration_noise = torch.sin(torch.tensor(iteration * 0.1)) * 0.1
+        z = z_base + torch.randn_like(z_base) * iteration_noise
         
         # Generate fake lesions using the Generator
         fake_lesions = self.generator(z, atlas, brain_mask)
@@ -1609,6 +1675,33 @@ class HIELesionGANTrainer:
             if self.debug:
                 self.debug_print("Resized valid_regions mask", valid_regions)
         
+        # MODIFIED: Add a structural coherence loss to encourage connected lesions
+        # First get a binary mask of the fake lesions for structural analysis
+        binary_fake = (fake_lesions > 0.5).float()
+        
+        # Apply a spatial gradient to detect edges
+        # Calculate gradients in all 3 directions
+        dx = torch.abs(binary_fake[:, :, 1:, :, :] - binary_fake[:, :, :-1, :, :])
+        dy = torch.abs(binary_fake[:, :, :, 1:, :] - binary_fake[:, :, :, :-1, :])
+        dz = torch.abs(binary_fake[:, :, :, :, 1:] - binary_fake[:, :, :, :, :-1])
+        
+        # Pad the gradients to match original size
+        dx = F.pad(dx, (0, 0, 0, 0, 1, 0))
+        dy = F.pad(dy, (0, 0, 1, 0, 0, 0))
+        dz = F.pad(dz, (1, 0, 0, 0, 0, 0))
+        
+        # Sum gradients to get total edge map
+        edge_map = dx + dy + dz
+        
+        # Calculate edge ratio (edges / total positive pixels)
+        # Higher edge ratio means more fragmented lesions
+        total_positive = torch.sum(binary_fake) + 1e-8
+        total_edges = torch.sum(edge_map) + 1e-8
+        edge_ratio = total_edges / total_positive
+        
+        # Coherence loss: penalize high edge ratio (fragmented lesions)
+        coherence_loss = torch.clamp(edge_ratio - 0.8, min=0)  # 0.8 is a threshold for acceptable fragmentation
+        
         # Calculate masked L1 loss (only consider atlas-positive regions within the brain)
         masked_l1_loss = torch.sum(torch.abs(real_lesions - fake_lesions) * valid_regions) / (torch.sum(valid_regions) + 1e-8)
         
@@ -1643,7 +1736,8 @@ class HIELesionGANTrainer:
             self.dice_loss_weight * weighted_dice_loss +
             self.focal_loss_weight * focal_loss_term +
             self.distribution_loss_weight * distribution_loss +
-            self.violation_penalty_weight * atlas_violation
+            self.violation_penalty_weight * atlas_violation + 
+            5.0 * coherence_loss  # Coherence loss weight
         )
         
         # Backpropagation
@@ -1660,6 +1754,7 @@ class HIELesionGANTrainer:
             'g_focal': focal_loss_term.item(),
             'g_distribution': distribution_loss.item(),
             'g_atlas_violation': atlas_violation.item(),
+            'g_coherence': coherence_loss.item(),  # Add this for logging
             'fake_lesions': fake_lesions.detach()  # Add this for visualization
         }
 
