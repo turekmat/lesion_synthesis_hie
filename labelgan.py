@@ -524,6 +524,22 @@ class HIELesionGANTrainer:
         os.makedirs(self.log_dir, exist_ok=True)
         os.makedirs(self.save_dir, exist_ok=True)
         
+    def debug_print(self, message, tensor=None):
+        """Helper method to print debug information only when debug mode is enabled"""
+        if self.debug:
+            output = message
+            if tensor is not None:
+                if isinstance(tensor, torch.Tensor):
+                    shape_str = 'x'.join([str(s) for s in tensor.shape])
+                    dtype_str = str(tensor.dtype).split('.')[-1]
+                    device_str = str(tensor.device)
+                    min_val = tensor.min().item() if tensor.numel() > 0 else "N/A"
+                    max_val = tensor.max().item() if tensor.numel() > 0 else "N/A"
+                    output += f" shape={shape_str}, dtype={dtype_str}, device={device_str}, range=[{min_val:.4f}, {max_val:.4f}]"
+                else:
+                    output += f" {tensor}"
+            print(f"[DEBUG] {output}")
+    
     def get_random_z(self, batch_size):
         return torch.randn(batch_size, self.z_dim).to(self.device)
     
@@ -570,48 +586,66 @@ class HIELesionGANTrainer:
     def train_generator(self, real_lesions, atlas):
         batch_size = real_lesions.size(0)
         
-        if self.debug:
-            print(f"G training - real_lesions: {real_lesions.shape}, atlas: {atlas.shape}")
-            
+        self.debug_print(f"G training - real_lesions", real_lesions)
+        self.debug_print(f"G training - atlas", atlas)
+        
         # Reset gradientů
         self.optimizer_g.zero_grad()
         
         # Generování fake lézí
         z = self.get_random_z(batch_size)
-        fake_lesions = self.generator(z, atlas)
+        self.debug_print(f"G training - random z", z)
         
-        if self.debug:
-            print(f"G training - generated fake_lesions: {fake_lesions.shape}")
+        fake_lesions = self.generator(z, atlas)
+        self.debug_print(f"G training - generated fake_lesions", fake_lesions)
         
         # Ensure generated lesions respect the atlas - make atlas constraint more explicit
         atlas_mask = (atlas > 0).float()
+        self.debug_print(f"G training - atlas_mask", atlas_mask)
         
         # Resize mask if needed
         if fake_lesions.shape[2:] != atlas_mask.shape[2:]:
-            if self.debug:
-                print(f"Resizing atlas_mask from {atlas_mask.shape} to match fake_lesions {fake_lesions.shape[2:]}")
+            self.debug_print(f"Resizing atlas_mask from {atlas_mask.shape} to match fake_lesions {fake_lesions.shape[2:]}")
             atlas_mask = F.interpolate(atlas_mask, size=fake_lesions.shape[2:], mode='nearest')
-            
+            self.debug_print(f"G training - resized atlas_mask", atlas_mask)
+        
         fake_lesions = fake_lesions * atlas_mask  # Enforce constraint again for safety
+        self.debug_print(f"G training - masked fake_lesions", fake_lesions)
         
         # Forward pass diskriminátorem
         fake_patch_pred, fake_global_pred = self.discriminator(fake_lesions, atlas)
+        self.debug_print(f"G training - fake_patch_pred", fake_patch_pred)
+        self.debug_print(f"G training - fake_global_pred", fake_global_pred)
         
         # Adversarial loss
         g_adv_loss = self.gan_loss(fake_patch_pred, True) + self.gan_loss(fake_global_pred, True)
         
         # Další pomocné loss funkce pro lepší generování
         
+        # Ensure atlas and real_lesions dimensions match for loss computation
+        if atlas.shape[2:] != real_lesions.shape[2:]:
+            self.debug_print(f"Resizing atlas from {atlas.shape} to match real_lesions {real_lesions.shape[2:]}")
+            atlas_resized = F.interpolate(atlas, size=real_lesions.shape[2:], mode='nearest')
+        else:
+            atlas_resized = atlas
+        
         # Atlas-guided Focal Loss - podporuje generování v oblastech, kde se léze častěji vyskytují
         # Scale the loss by the atlas values to emphasize areas with higher lesion probability
-        atlas_guided_focal = self.focal_loss(fake_lesions * atlas, real_lesions * atlas)
+        atlas_guided_focal = self.focal_loss(fake_lesions * atlas_resized, real_lesions * atlas_resized)
+        
+        # Ensure dimensions match for L1 loss
+        if fake_lesions.shape != real_lesions.shape:
+            self.debug_print(f"Resizing real_lesions from {real_lesions.shape} to match fake_lesions {fake_lesions.shape}")
+            real_lesions_resized = F.interpolate(real_lesions, size=fake_lesions.shape[2:], mode='nearest')
+        else:
+            real_lesions_resized = real_lesions
         
         # L1 Loss pro stabilitu tréninku a zachycení nízkofrekvečních detailů
         # Only compute L1 loss in atlas-positive regions to avoid penalizing negative areas
-        masked_l1_loss = self.l1_loss(fake_lesions * atlas_mask, real_lesions * atlas_mask)
+        masked_l1_loss = self.l1_loss(fake_lesions * atlas_mask, real_lesions_resized * atlas_mask)
         
         # Dice Loss pro lepší segmentace
-        g_dice_loss = self.dice_loss(fake_lesions, real_lesions)
+        g_dice_loss = self.dice_loss(fake_lesions, real_lesions_resized)
         
         # Atlas violation penalty - strongly discourage generating lesions where atlas is 0
         atlas_zero_mask = (1.0 - atlas_mask)
@@ -627,6 +661,9 @@ class HIELesionGANTrainer:
         # Backpropagation
         g_loss.backward()
         self.optimizer_g.step()
+        
+        # Log losses for debugging
+        self.debug_print(f"G loss components: adv={g_adv_loss.item():.4f}, l1={masked_l1_loss.item():.4f}, dice={g_dice_loss.item():.4f}, focal={atlas_guided_focal.item():.4f}, violation={violation_penalty.item():.4f}")
         
         return {
             'g_loss': g_loss.item(),
@@ -782,8 +819,11 @@ class HIELesionGANTrainer:
                 # Vytvoření gridu pro vizualizaci
                 grid = torch.cat([real_slice, fake_slice, atlas_slice], dim=1)
                 
-                # Log do tensorboard
-                self.writer.add_image(f'sample_{i}/real_fake_atlas', grid, epoch)
+                # Add channel dimension for TensorBoard (convert HW to CHW format)
+                grid = grid.unsqueeze(0)
+                
+                # Log do tensorboard - specify dataformats='CHW'
+                self.writer.add_image(f'sample_{i}/real_fake_atlas', grid, epoch, dataformats='CHW')
     
     def save_checkpoint(self, epoch):
         checkpoint_path = os.path.join(self.save_dir, f'checkpoint_epoch_{epoch}.pt')
@@ -947,88 +987,107 @@ class HIELesionGANTrainer:
         
         self.generator.eval()
         
-        with torch.no_grad():
-            # Get a batch from validation data
-            for val_batch in self.val_dataloader:
-                real_lesions = val_batch['label'].to(self.device)
-                atlas = val_batch['atlas'].to(self.device)
-                batch_size = real_lesions.size(0)
-                
-                # Generate samples
-                z = self.get_random_z(batch_size)
-                fake_lesions = self.generator(z, atlas)
-                
-                # Apply atlas constraint
-                atlas_mask = (atlas > 0).float()
-                if fake_lesions.shape[2:] != atlas_mask.shape[2:]:
-                    atlas_mask = F.interpolate(atlas_mask, size=fake_lesions.shape[2:], mode='nearest')
-                fake_lesions = fake_lesions * atlas_mask
-                
-                # Process each sample
-                for i in range(min(batch_size, num_samples)):
-                    # Get current sample
-                    real_sample = real_lesions[i:i+1].cpu().detach()
-                    fake_sample = fake_lesions[i:i+1].cpu().detach()
-                    atlas_sample = atlas[i:i+1].cpu().detach()
+        try:
+            with torch.no_grad():
+                # Get a batch from validation data
+                for val_batch in self.val_dataloader:
+                    real_lesions = val_batch['label'].to(self.device)
+                    atlas = val_batch['atlas'].to(self.device)
+                    batch_size = real_lesions.size(0)
                     
-                    # Create visualization with multiple slices
-                    D, H, W = fake_sample.shape[2:]
-                    total_slices = min(D, 24)  # Limit to 24 slices max
-                    rows = (total_slices + slices_per_row - 1) // slices_per_row
+                    # Generate samples
+                    z = self.get_random_z(batch_size)
+                    fake_lesions = self.generator(z, atlas)
                     
-                    fig, axes = plt.subplots(rows * 3, slices_per_row, 
-                                             figsize=(slices_per_row * 3, rows * 9))
+                    # Apply atlas constraint
+                    atlas_mask = (atlas > 0).float()
+                    if fake_lesions.shape[2:] != atlas_mask.shape[2:]:
+                        atlas_mask = F.interpolate(atlas_mask, size=fake_lesions.shape[2:], mode='nearest')
+                    fake_lesions = fake_lesions * atlas_mask
                     
-                    # Handle case where we only have one row (make axes 2D)
-                    if rows == 1 and slices_per_row == 1:
-                        axes = np.array([[axes[0]], [axes[1]], [axes[2]]])
-                    elif rows == 1:
-                        axes = axes.reshape(3, slices_per_row)
+                    # Process each sample
+                    for i in range(min(batch_size, num_samples)):
+                        # Get current sample
+                        real_sample = real_lesions[i:i+1].cpu().detach()
+                        fake_sample = fake_lesions[i:i+1].cpu().detach()
+                        atlas_sample = atlas[i:i+1].cpu().detach()
                         
-                    # Select evenly spaced slices
-                    slice_indices = np.linspace(0, D-1, total_slices).astype(int)
-                    
-                    # Plot the slices
-                    for j, slice_idx in enumerate(slice_indices):
-                        row = j // slices_per_row
-                        col = j % slices_per_row
+                        # Create visualization with multiple slices
+                        D, H, W = fake_sample.shape[2:]
+                        total_slices = min(D, 24)  # Limit to 24 slices max
+                        rows = (total_slices + slices_per_row - 1) // slices_per_row
                         
-                        # Get real sample slice
-                        real_slice = real_sample[0, 0, slice_idx].numpy()
-                        axes[row*3, col].imshow(real_slice, cmap='gray')
-                        if col == 0:
-                            axes[row*3, col].set_ylabel("Real")
-                        axes[row*3, col].set_title(f"Slice {slice_idx}")
-                        axes[row*3, col].axis('off')
+                        fig, axes = plt.subplots(rows * 3, slices_per_row, 
+                                                figsize=(slices_per_row * 3, rows * 9))
                         
-                        # Get fake sample slice
-                        fake_slice = fake_sample[0, 0, slice_idx].numpy()
-                        axes[row*3+1, col].imshow(fake_slice, cmap='jet')
-                        if col == 0:
-                            axes[row*3+1, col].set_ylabel("Generated")
-                        axes[row*3+1, col].axis('off')
+                        # Handle case where we only have one row (make axes 2D)
+                        if rows == 1 and slices_per_row == 1:
+                            axes = np.array([[axes[0]], [axes[1]], [axes[2]]])
+                        elif rows == 1:
+                            axes = axes.reshape(3, slices_per_row)
                         
-                        # Get atlas slice
-                        atlas_slice = atlas_sample[0, 0, slice_idx].numpy()
-                        axes[row*3+2, col].imshow(atlas_slice, cmap='gray')
-                        if col == 0:
-                            axes[row*3+2, col].set_ylabel("Atlas")
-                        axes[row*3+2, col].axis('off')
+                        # Select evenly spaced slices
+                        slice_indices = np.linspace(0, D-1, total_slices).astype(int)
+                        
+                        # Plot the slices
+                        for j, slice_idx in enumerate(slice_indices):
+                            row = j // slices_per_row
+                            col = j % slices_per_row
+                            
+                            # Safely access axes based on computed indices
+                            if row*3 < axes.shape[0] and col < axes.shape[1]:
+                                # Get real sample slice - safely handle dimensionality
+                                if real_sample.dim() == 5:  # [B,C,D,H,W]
+                                    real_slice = real_sample[0, 0, slice_idx].numpy()
+                                else:  # Handle unexpected dimensions
+                                    real_slice = real_sample[0, slice_idx].numpy() if real_sample.dim() == 4 else real_sample[slice_idx].numpy()
+                                    
+                                axes[row*3, col].imshow(real_slice, cmap='gray')
+                                if col == 0:
+                                    axes[row*3, col].set_ylabel("Real")
+                                axes[row*3, col].set_title(f"Slice {slice_idx}")
+                                axes[row*3, col].axis('off')
+                                
+                                # Get fake sample slice - safely handle dimensionality
+                                if fake_sample.dim() == 5:  # [B,C,D,H,W]
+                                    fake_slice = fake_sample[0, 0, slice_idx].numpy()
+                                else:  # Handle unexpected dimensions
+                                    fake_slice = fake_sample[0, slice_idx].numpy() if fake_sample.dim() == 4 else fake_sample[slice_idx].numpy()
+                                    
+                                axes[row*3+1, col].imshow(fake_slice, cmap='jet')
+                                if col == 0:
+                                    axes[row*3+1, col].set_ylabel("Generated")
+                                axes[row*3+1, col].axis('off')
+                                
+                                # Get atlas slice - safely handle dimensionality
+                                if atlas_sample.dim() == 5:  # [B,C,D,H,W]
+                                    atlas_slice = atlas_sample[0, 0, slice_idx].numpy()
+                                else:  # Handle unexpected dimensions
+                                    atlas_slice = atlas_sample[0, slice_idx].numpy() if atlas_sample.dim() == 4 else atlas_sample[slice_idx].numpy()
+                                    
+                                axes[row*3+2, col].imshow(atlas_slice, cmap='gray')
+                                if col == 0:
+                                    axes[row*3+2, col].set_ylabel("Atlas")
+                                axes[row*3+2, col].axis('off')
+                        
+                        # Hide any unused subplots
+                        for j in range(len(slice_indices), rows * slices_per_row):
+                            row = j // slices_per_row
+                            col = j % slices_per_row
+                            for k in range(3):
+                                if row*3+k < axes.shape[0] and col < axes.shape[1]:
+                                    axes[row*3+k, col].axis('off')
+                        
+                        # Save the figure
+                        plt.tight_layout()
+                        plt.savefig(os.path.join(output_dir, f'validation_epoch_{epoch}_sample_{i}.pdf'))
+                        plt.close(fig)
                     
-                    # Hide any unused subplots
-                    for j in range(len(slice_indices), rows * slices_per_row):
-                        row = j // slices_per_row
-                        col = j % slices_per_row
-                        for k in range(3):
-                            axes[row*3+k, col].axis('off')
-                    
-                    # Save the figure
-                    plt.tight_layout()
-                    plt.savefig(os.path.join(output_dir, f'validation_epoch_{epoch}_sample_{i}.pdf'))
-                    plt.close(fig)
-                
-                # Only process one batch
-                break
+                    # Only process one batch
+                    break
+        except Exception as e:
+            print(f"Error generating validation visualizations: {e}")
+            # Continue training even if visualization fails
         
         self.generator.train()
     
