@@ -67,8 +67,8 @@ class HIEDataset(Dataset):
         # Normalize lesion atlas to [0, 1]
         atlas_tensor = atlas_tensor / 0.34
         
-        # Generate random noise
-        noise = torch.randn(1, 100, 1, 1, 1)
+        # Generate random noise (shape [100, 1, 1, 1] without extra dimension)
+        noise = torch.randn(100, 1, 1, 1)
         
         return {
             'label': label_tensor,
@@ -180,9 +180,14 @@ class Generator(nn.Module):
     def forward(self, noise, atlas):
         # Resize noise to match spatial dimensions
         batch_size = noise.size(0)
-        noise_expanded = noise.expand(batch_size, 100, 1, 1, 1)
-        noise_resized = noise_expanded.expand(batch_size, 100, 
-                                             atlas.size(2), atlas.size(3), atlas.size(4))
+        
+        # Handle noise shape - reshape if necessary
+        if noise.dim() > 5:  # If noise has extra dimensions
+            noise = noise.squeeze(1)  # Remove the extra dimension
+        
+        # Expand noise to match spatial dimensions
+        noise_resized = noise.expand(batch_size, 100, 
+                                     atlas.size(2), atlas.size(3), atlas.size(4))
         
         # Concatenate noise with atlas
         x = torch.cat([noise_resized, atlas], dim=1)
