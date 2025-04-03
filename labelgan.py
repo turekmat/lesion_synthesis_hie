@@ -2364,6 +2364,174 @@ class HIELesionGANTrainer:
         self.generator.train()
         
         print(f"PDF vizualizace uložena do: {pdf_path}")
+    
+    def generate_overlay_pdf_from_samples(self, epoch, num_samples=3):
+        """
+        Generuje PDF se všemi axiálními řezy 3D imagu, kde léze jsou zobrazeny červeně
+        na pozadí normativního mozku (atlasu).
+        V každém slice nad obrázkem je číslo řezu a počet nenulových pixelů léze.
+        Řezy jsou uspořádány po 4 na řádek.
+
+        Args:
+            epoch: Aktuální epocha
+            num_samples: Počet generovaných vzorků
+        """
+        print(f"Generuji PDF vizualizaci lézí na normativním mozku pro epochu {epoch}...")
+        
+        # Vytvoření adresáře pro PDF
+        pdf_dir = os.path.join(self.save_dir, 'pdf_visualizations')
+        os.makedirs(pdf_dir, exist_ok=True)
+        
+        # Název výsledného PDF
+        pdf_path = os.path.join(pdf_dir, f'lesion_overlay_epoch_{epoch}.pdf')
+        
+        # Přepneme model do eval režimu
+        self.generator.eval()
+        
+        # Získáme potřebné údaje z loaderu
+        for batch in self.dataloader:
+            atlas = batch['atlas'].to(self.device)
+            brain_mask = batch['brain_mask'].to(self.device)
+            
+            # Zajistíme batch rozměr
+            if atlas.dim() == 3:
+                atlas = atlas.unsqueeze(0)
+            if brain_mask.dim() == 3:
+                brain_mask = brain_mask.unsqueeze(0)
+            
+            # Binární masky
+            atlas_binary = (atlas > 0).float()
+            brain_mask_binary = (brain_mask > 0).float()
+            
+            # Převod atlasu do numpy pro vizualizaci
+            atlas_np = atlas[0, 0].cpu().numpy()
+            
+            from matplotlib.backends.backend_pdf import PdfPages
+            import matplotlib.pyplot as plt
+            from matplotlib.colors import LinearSegmentedColormap
+            
+            # Vytvoření vlastní barevné mapy pro překryv - šedá pro mozek, červená pro léze
+            # Vytvořím custom colormap pro zobrazení překryvu
+            colors = [(0.85, 0.85, 0.85), (0.85, 0.85, 0.85), (1, 0, 0)]  # šedá, šedá, červená
+            cmap_name = 'gray_red'
+            cm = LinearSegmentedColormap.from_list(cmap_name, colors, N=256)
+            
+            # Otevření PDF souboru (všechny vzorky na samostatných stránkách)
+            with PdfPages(pdf_path) as pdf:
+                # Pro každý vzorek vygenerujeme podobně jako v generate_samples
+                for sample_idx in range(num_samples):
+                    print(f"  Generuji vzorek {sample_idx+1}/{num_samples}...")
+                    
+                    # Vygenerování latentního vektoru
+                    z = torch.randn(1, self.z_dim, device=self.device)
+                    
+                    # Generování léze
+                    with torch.no_grad():
+                        fake_lesion = self.generator(z, atlas[:1], brain_mask[:1])
+                    
+                    # Aplikace atlasu a brain masky
+                    fake_lesion = fake_lesion * atlas_binary[:1] * brain_mask_binary[:1]
+                    
+                    # ZMĚNA: Aplikace nucené aktivace podobně jako v generate_samples
+                    atlas_threshold = torch.quantile(atlas[:1].view(-1), 0.9)  # Horních 10% hodnot atlasu
+                    high_prob_regions = (atlas[:1] > atlas_threshold).float() * brain_mask[:1]
+                    
+                    # Generování náhodné aktivační masky
+                    act_mask = torch.zeros_like(fake_lesion)
+                    random_strength = torch.rand(1, device=self.device) * 0.3 + 0.7  # Aktivace 0.7-1.0
+                    
+                    # Přidání nucené aktivace do části vysoce pravděpodobných oblastí
+                    activation_regions = high_prob_regions * (torch.rand_like(high_prob_regions) > 0.5).float()
+                    act_mask = act_mask.scatter_(1, torch.zeros_like(fake_lesion, dtype=torch.long), 
+                                               activation_regions * random_strength)
+                    
+                    # Smíchání s původním výstupem - 40% generovaný obsah, 60% nucená aktivace
+                    fake_lesion = fake_lesion * 0.4 + act_mask * 0.6
+                    
+                    # Aplikace teplotního škálování pro ostřejší přechody
+                    temperature = 8.0
+                    soft_binary = torch.sigmoid(temperature * (fake_lesion - 0.5))
+                    
+                    # Převod na numpy pro další zpracování
+                    binary_np = soft_binary[0, 0].cpu().numpy()
+                    
+                    # Odfiltrování malých komponent (podobně jako v generate_samples)
+                    binary_thresh = (binary_np > 0.5).astype(np.float32)
+                    labeled_components, num_components = measure_label(binary_thresh, return_num=True)
+                    
+                    # Filtrování malých komponent
+                    component_sizes = np.bincount(labeled_components.flatten())[1:] if num_components > 0 else []
+                    min_component_size = 3  # Minimální velikost komponenty pro zachování
+                    
+                    cleaned_binary = np.zeros_like(binary_np)
+                    for comp_id in range(1, num_components + 1):
+                        if component_sizes[comp_id - 1] >= min_component_size:
+                            cleaned_binary[labeled_components == comp_id] = 1
+                    
+                    # Kontrola inverzních hodnot
+                    ones_percentage = np.mean(cleaned_binary == 1) * 100
+                    if ones_percentage > 90:
+                        print(f"  UPOZORNĚNÍ: Hodnoty vypadají invertované - {ones_percentage:.2f}% jsou jedničky!")
+                        cleaned_binary = 1 - cleaned_binary
+                    
+                    # Použijeme všechny řezy
+                    depth = cleaned_binary.shape[0]
+                    
+                    # Uspořádání: 4 řezy na řádek
+                    cols = 4
+                    rows = int(np.ceil(depth / cols))
+                    fig, axs = plt.subplots(rows, cols, figsize=(cols * 3, rows * 3))
+                    # Pokud je pouze jeden řádek, zajistíme konzistentní iteraci
+                    axs = np.array(axs).reshape(-1)
+                    
+                    # Pro každý slice
+                    for i in range(depth):
+                        # Získáme řez atlasu
+                        atlas_slice = atlas_np[i, :, :]
+                        
+                        # Získáme řez léze
+                        lesion_slice = cleaned_binary[i, :, :]
+                        nonzero_count = np.count_nonzero(lesion_slice > 0.5)
+                        
+                        # Vytvoříme překryv - normalizujeme atlas na hodnoty 0-0.5 (šedá)
+                        # a nastavíme léze na hodnotu 1 (červená)
+                        overlay = np.zeros_like(atlas_slice)
+                        
+                        # Normalizace atlasu na rozsah 0-0.5
+                        if atlas_slice.max() > 0:
+                            atlas_norm = atlas_slice / atlas_slice.max() * 0.5
+                            overlay = atlas_norm.copy()
+                        
+                        # Přidáme léze jako 1 (červená barva v custom colormapě)
+                        overlay[lesion_slice > 0.5] = 1.0
+                        
+                        # Nad každým slice zobrazíme číslo slice a počet nenulových pixelů léze
+                        axs[i].set_title(f"{i+1}/{depth}, léze: {nonzero_count} px", fontsize=8)
+                        axs[i].imshow(overlay, cmap=cm, vmin=0, vmax=1)
+                        axs[i].axis('off')
+                    
+                    # Skryjeme prázdné subplots (pokud nějaké zbydou)
+                    for j in range(depth, len(axs)):
+                        axs[j].axis('off')
+                    
+                    # Přidáme legendu pro celou figuru
+                    fig.subplots_adjust(bottom=0.05)
+                    import matplotlib.patches as mpatches
+                    red_patch = mpatches.Patch(color='red', label='Léze')
+                    gray_patch = mpatches.Patch(color='gray', label='Normativní mozek')
+                    fig.legend(handles=[gray_patch, red_patch], loc='lower center', ncol=2)
+                    
+                    plt.tight_layout(rect=[0, 0.05, 1, 1])  # Ponecháme místo pro legendu
+                    pdf.savefig(fig)
+                    plt.close(fig)
+            
+            # Použijeme pouze první batch
+            break
+        
+        # Vrátíme model do tréninkového režimu
+        self.generator.train()
+        
+        print(f"PDF vizualizace s překryvem lézí na normativním mozku uložena do: {pdf_path}")
 
     def train(self, num_epochs, validate_every=5):
         start_time = time.time()
@@ -2506,6 +2674,7 @@ class HIELesionGANTrainer:
             # Generate PDF with slices every 10 epochs
             if (epoch + 1) % 10 == 0:
                 self.generate_pdf_from_samples(epoch + 1, num_samples=5)
+                self.generate_overlay_pdf_from_samples(epoch + 1, num_samples=5)
             
             # Check for training stability
             if epoch > 0:
