@@ -16,7 +16,7 @@ IMAGE_SIZE = (128, 128, 64)
 LATENT_DIM = 100
 BATCH_SIZE = 1
 DEFAULT_EPOCHS = 200  # Výchozí počet epoch
-LAMBDA_SPARSITY = 8.0  # Snížená váha pro sparsity loss - příliš vysoká způsobovala prázdné výstupy
+LAMBDA_SPARSITY = 1.0  # Snížená váha pro sparsity loss - příliš vysoká způsobovala prázdné výstupy
 LAMBDA_ATLAS = 5.0      # Váha pro atlas guidance loss
 LAMBDA_STRUCTURAL = 4.0  # Snížená váha pro strukturální loss - menší důraz na přesné struktury
 HETEROGENEITY_LEVEL = 0.5  # Zvýšená konstanta pro úroveň heterogenity (0-1)
@@ -142,17 +142,22 @@ class HIELesionDataset(Dataset):
     def __len__(self):
         return len(self.label_files)
     
-    def get_weighted_sample_indices(self, batch_size=BATCH_SIZE):
+    def get_weighted_sample_indices(self, batch_size=BATCH_SIZE, current_epoch=0, total_epochs=100):
         """Vrátí indexy pro vzorkování podle vah"""
-        if hasattr(self, 'sample_weights'):
-            return np.random.choice(
-                len(self.label_files), 
-                size=batch_size, 
-                replace=True, 
-                p=self.sample_weights/np.sum(self.sample_weights)
-            )
-        else:
-            return np.random.choice(len(self.label_files), size=batch_size)
+        alpha = min(1.0, current_epoch / (total_epochs * 0.5))  # Transition halfway through training
+        
+        # Calculate weights based on coverage (inverse to favor less sparse samples)
+        weights = 1.0 / (self.sparsity_values + 0.001)  # Add small value to avoid division by zero
+        
+        # Transition from inverse weights to normal distribution as training progresses
+        weights = (1 - alpha) * weights + alpha * np.ones_like(weights)
+        
+        # Normalize weights to create probability distribution
+        weights = weights / np.sum(weights)
+        
+        # Sample indices according to weights
+        indices = np.random.choice(len(self), size=batch_size, replace=True, p=weights)
+        return indices
     
     def __getitem__(self, idx):
         label_path = os.path.join(self.labels_dir, self.label_files[idx])
@@ -313,7 +318,7 @@ class Generator(nn.Module):
         
         # Nastavení prahu pro řídkost - snížená hodnota pro méně agresivní prahování
         # Původní hodnota 0.7 byla příliš vysoká a efektivně odstranila všechny léze
-        self.sparsity_threshold = nn.Parameter(torch.tensor([0.3]))
+        self.sparsity_threshold = nn.Parameter(torch.tensor([0.1]))  # Start with a lower value
         
         # Inicializace vah pro lepší start trénování
         self._initialize_weights()
@@ -1623,6 +1628,16 @@ def post_process_lesions(generated_sample, threshold=0.5, min_size=10, heterogen
         binary = ndimage.gaussian_filter(binary.astype(float), sigma=0.5)
         binary = (binary > 0.5).astype(np.float32)
         return binary
+
+# Add a non-empty penalty to explicitly discourage all-zero outputs
+def empty_output_penalty(generated_images):
+    """Penalize completely empty outputs"""
+    batch_size = generated_images.size(0)
+    # Calculate the mean number of active voxels per sample
+    active_voxels = torch.sum(generated_images > 0.1, dim=(1,2,3))
+    # Heavily penalize samples with zero active voxels
+    penalty = torch.exp(-active_voxels * 0.1) 
+    return penalty.mean()
 
 if __name__ == "__main__":
     import argparse
