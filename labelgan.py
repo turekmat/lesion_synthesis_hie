@@ -2505,7 +2505,7 @@ class HIELesionGANTrainer:
             
             # Generate PDF with slices every 10 epochs
             if (epoch + 1) % 10 == 0:
-                self.generate_pdf_from_samples(epoch + 1, num_samples=3)
+                self.generate_pdf_from_samples(epoch + 1, num_samples=5)
             
             # Check for training stability
             if epoch > 0:
