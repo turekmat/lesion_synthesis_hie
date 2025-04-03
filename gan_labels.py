@@ -463,9 +463,8 @@ def add_controlled_heterogeneity(input_volume, heterogeneity_level=HETEROGENEITY
         noise_medium = ndimage.gaussian_filter(noise_medium, sigma=1.5)
         noise_coarse = ndimage.gaussian_filter(noise_coarse, sigma=3.0)
         
-        # Kombinace šumů s různými váhami
-        # Vyšší váha pro jemnější šum vytvoří více detailů
-        noise = noise_fine * 0.6 + noise_medium * 0.3 + noise_coarse * 0.1
+        # Kombinace šumů s různými váhami pro různé textury
+        smooth_noise = noise_fine * 0.6 + noise_medium * 0.3 + noise_coarse * 0.1
     else:
         # Původní implementace s jednou úrovní šumu
         noise = np.random.normal(0, heterogeneity_level, input_np.shape)
