@@ -1539,21 +1539,21 @@ class HIELesionGANTrainer:
                     
                     # ZMĚNA: VŽDY aplikujeme nucenou aktivaci na vzorky, ne jen když jsou prázdné
                     # Vytvoření masky z vysoce pravděpodobných oblastí atlasu
-                    atlas_threshold = torch.quantile(atlas[:1].view(-1), 0.95)  # Horních 5% hodnot atlasu (původně 0.9)
+                    atlas_threshold = torch.quantile(atlas[:1].view(-1), 0.98)  # Horních 2% hodnot atlasu (původně 0.95)
                     high_prob_regions = (atlas[:1] > atlas_threshold).float() * brain_mask[:1]
                     
                     # Generování náhodné aktivační masky
                     act_mask = torch.zeros_like(fake_lesion)
-                    random_strength = torch.rand(1, device=self.device) * 0.3 + 0.5  # Aktivace 0.5-0.8 (původně 0.7-1.0)
+                    random_strength = torch.rand(1, device=self.device) * 0.2 + 0.3  # Aktivace 0.3-0.5 (původně 0.5-0.8)
                     
                     # Přidání nucené aktivace do části vysoce pravděpodobných oblastí
-                    activation_regions = high_prob_regions * (torch.rand_like(high_prob_regions) > 0.7).float()  # Snížení pravděpodobnosti aktivace (původně 0.5)
+                    activation_regions = high_prob_regions * (torch.rand_like(high_prob_regions) > 0.85).float()  # Snížení pravděpodobnosti aktivace (původně 0.7)
                     act_mask = act_mask.scatter_(1, torch.zeros_like(fake_lesion, dtype=torch.long), 
                                                activation_regions * random_strength)
                     
-                    # Smíchání s původním výstupem - 70% generovaný obsah, 30% nucená aktivace (původně 40/60)
-                    fake_lesion = fake_lesion * 0.7 + act_mask * 0.3
-                    print(f"[SAMPLE {i}] Aplikována nucená aktivace pro zajištění viditelných lézí")
+                    # Smíchání s původním výstupem - 90% generovaný obsah, 10% nucená aktivace (původně 70/30)
+                    fake_lesion = fake_lesion * 0.9 + act_mask * 0.1
+                    print(f"[SAMPLE {i}] Aplikována jemná nucená aktivace pro zajištění viditelných lézí")
                     
                     # MODIFIED: Use a smoother approach to map the outputs to a binary-like distribution
                     # Apply atlas mask to ensure lesions only appear in atlas-positive regions
@@ -1571,7 +1571,7 @@ class HIELesionGANTrainer:
                     
                     # MODIFIED: Apply connected component filtering to remove isolated pixels
                     # First get a binary version for component analysis
-                    binary_np = (soft_binary[0, 0] > 0.6).cpu().float().numpy()  # Zvýšení prahu na 0.6 (původně 0.5)
+                    binary_np = (soft_binary[0, 0] > 0.7).cpu().float().numpy()  # Zvýšení prahu na 0.7 (původně 0.6)
                     
                     # Find connected components
                     labeled_components, num_components = measure_label(binary_np, return_num=True)
@@ -1580,10 +1580,13 @@ class HIELesionGANTrainer:
                     component_sizes = np.bincount(labeled_components.flatten())[1:] if num_components > 0 else []
                     min_component_size = 3  # Minimum size to keep a component
                     
+                    # NOVÉ: Také ořežeme příliš velké komponenty
+                    max_component_size = 500  # Maximální velikost komponenty (omezení velikosti lézí)
+                    
                     # Create cleaned binary mask
                     cleaned_binary = np.zeros_like(binary_np)
                     for comp_id in range(1, num_components + 1):
-                        if component_sizes[comp_id - 1] >= min_component_size:
+                        if component_sizes[comp_id - 1] >= min_component_size and comp_size <= max_component_size:
                             cleaned_binary[labeled_components == comp_id] = 1
                     
                     # Convert back to tensor
@@ -1863,20 +1866,20 @@ class HIELesionGANTrainer:
         early_training = iteration < 3000  # Zvýšeno z 1000 na 3000 iterací
         if early_training and total_lesion_volume < 500:  # Zvýšeno z 10 na 500 pro agresivnější nucení aktivací
             # Create a mask from high-probability atlas regions
-            atlas_threshold = torch.quantile(atlas.view(-1), 0.9)  # Top 10% místo 5% of atlas values
+            atlas_threshold = torch.quantile(atlas.view(-1), 0.95)  # Top 5% místo 10% of atlas values
             high_prob_regions = (atlas > atlas_threshold).float() * brain_mask
             
             # Generate a random activation mask
             act_mask = torch.zeros_like(fake_lesions)
-            random_strength = torch.rand(1, device=self.device) * 0.3 + 0.7  # 0.7-1.0 activation
+            random_strength = torch.rand(1, device=self.device) * 0.2 + 0.3  # 0.3-0.5 activation (původně 0.7-1.0)
             
             # Add forced activation to a portion of high probability regions
-            activation_regions = high_prob_regions * (torch.rand_like(high_prob_regions) > 0.5).float()  # Změna z 0.7 na 0.5 pro větší aktivaci
+            activation_regions = high_prob_regions * (torch.rand_like(high_prob_regions) > 0.8).float()  # Změna z 0.5 na 0.8 pro menší aktivaci
             act_mask = act_mask.scatter_(1, torch.zeros_like(fake_lesions, dtype=torch.long), 
                                          activation_regions * random_strength)
             
             # Blend with the original output - stronger in early iterations, weaker later
-            blend_factor = max(0.2, 1.0 - (iteration / 2000))  # Starts at 1.0, decreases to 0.2, pomaleji klesá
+            blend_factor = max(0.1, 0.5 - (iteration / 2000))  # Starts at 0.5, decreases to 0.1 (původně 1.0 až 0.2)
             fake_lesions = fake_lesions * (1 - blend_factor) + act_mask * blend_factor
             
             # Track and report when forced activation is applied
@@ -1952,7 +1955,7 @@ class HIELesionGANTrainer:
         # NEW: Enhanced coherence loss with perimeter/area ratio penalty
         # Lower values of this ratio indicate more compact, less fragmented objects
         # V raných fázích tréninku snížíme threshold, abychom dovolili více fragmentované léze
-        threshold = 0.3  # Sníženo z 0.5 na 0.3
+        threshold = 0.2  # Sníženo z 0.3 na 0.2
         coherence_loss = torch.clamp(edge_ratio - threshold, min=0)
         
         # NEW: Connectivity loss using morphological analysis
@@ -1977,7 +1980,7 @@ class HIELesionGANTrainer:
         # Penalize having too many distinct components
         # Původně se penalty zvyšovala nad 5 komponent, nyní ji zvýšíme až nad 10 komponent
         # Tím dovolíme větší fragmentaci v raných fázích
-        connectivity_loss = torch.clamp(mean_components - 10, min=0) * 0.1  # Sníženo z 0.2 na 0.1 a z thresholdu 5 na 10
+        connectivity_loss = torch.clamp(mean_components - 15, min=0) * 0.1  # Zvýšení z 10 na 15 povolených komponent
         
         # Calculate masked L1 loss (only consider atlas-positive regions within the brain)
         masked_l1_loss = torch.sum(torch.abs(real_lesions - fake_lesions) * valid_regions) / (torch.sum(valid_regions) + 1e-8)
@@ -2023,13 +2026,13 @@ class HIELesionGANTrainer:
         # COMPLETELY NEW: Direct minimum activation target loss
         # We directly specify a minimum percentage of pixels that should be activated
         # This forces the model to generate at least some lesions
-        min_activation_target = 0.02  # Zvýšeno z 0.005 (0.5%) na 0.02 (2%) minimum activation
+        min_activation_target = 0.01  # Sníženo z 0.02 (2%) na 0.01 (1%) minimum activation
         
         # ZMĚNA: Použít silnější target pro aktivaci
         # Cíl bude podobný jako procento aktivace v reálných datech
         if real_valid_region_filled.item() > 0.01:  # Pokud reálný vzorek má aktivaci > 1%
-            # Cíl bude 80% aktivace reálného vzorku, ale minimálně min_activation_target
-            min_activation_target = max(min_activation_target, real_valid_region_filled.item() * 0.8)
+            # Cíl bude 40% aktivace reálného vzorku, ale minimálně min_activation_target (sníženo z 80% na 40%)
+            min_activation_target = max(min_activation_target, real_valid_region_filled.item() * 0.4)
         
         # Apply linear ramping of the target during early training
         if iteration < 1000:
@@ -2289,20 +2292,20 @@ class HIELesionGANTrainer:
                     fake_lesion = fake_lesion * atlas_binary[:1] * brain_mask_binary[:1]
                     
                     # ZMĚNA: Aplikace nucené aktivace podobně jako v generate_samples
-                    atlas_threshold = torch.quantile(atlas[:1].view(-1), 0.95)  # Horních 5% hodnot atlasu (původně 0.9)
+                    atlas_threshold = torch.quantile(atlas[:1].view(-1), 0.98)  # Horních 2% hodnot atlasu (původně 0.95)
                     high_prob_regions = (atlas[:1] > atlas_threshold).float() * brain_mask[:1]
                     
                     # Generování náhodné aktivační masky
                     act_mask = torch.zeros_like(fake_lesion)
-                    random_strength = torch.rand(1, device=self.device) * 0.3 + 0.5  # Aktivace 0.5-0.8 (původně 0.7-1.0)
+                    random_strength = torch.rand(1, device=self.device) * 0.2 + 0.3  # Aktivace 0.3-0.5 (původně 0.5-0.8)
                     
                     # Přidání nucené aktivace do části vysoce pravděpodobných oblastí
-                    activation_regions = high_prob_regions * (torch.rand_like(high_prob_regions) > 0.7).float()  # Snížení pravděpodobnosti aktivace (původně 0.5)
+                    activation_regions = high_prob_regions * (torch.rand_like(high_prob_regions) > 0.85).float()  # Snížení pravděpodobnosti aktivace (původně 0.7)
                     act_mask = act_mask.scatter_(1, torch.zeros_like(fake_lesion, dtype=torch.long), 
                                                activation_regions * random_strength)
                     
-                    # Smíchání s původním výstupem - 70% generovaný obsah, 30% nucená aktivace (původně 40/60)
-                    fake_lesion = fake_lesion * 0.7 + act_mask * 0.3
+                    # Smíchání s původním výstupem - 90% generovaný obsah, 10% nucená aktivace (původně 70/30)
+                    fake_lesion = fake_lesion * 0.9 + act_mask * 0.1
                     
                     # Aplikace teplotního škálování pro ostřejší přechody
                     temperature = 8.0
@@ -2312,7 +2315,7 @@ class HIELesionGANTrainer:
                     binary_np = soft_binary[0, 0].cpu().numpy()
                     
                     # Odfiltrování malých komponent (podobně jako v generate_samples)
-                    binary_thresh = (binary_np > 0.6).astype(np.float32)  # Zvýšení prahu na 0.6 (původně 0.5)
+                    binary_thresh = (binary_np > 0.7).astype(np.float32)  # Zvýšení prahu na 0.7 (původně 0.6)
                     labeled_components, num_components = measure_label(binary_thresh, return_num=True)
                     
                     # Filtrování malých komponent
@@ -2458,20 +2461,20 @@ class HIELesionGANTrainer:
                     fake_lesion = fake_lesion * atlas_binary[:1] * brain_mask_binary[:1]
                     
                     # ZMĚNA: Aplikace nucené aktivace podobně jako v generate_samples
-                    atlas_threshold = torch.quantile(atlas[:1].view(-1), 0.95)  # Horních 5% hodnot atlasu (původně 0.9)
+                    atlas_threshold = torch.quantile(atlas[:1].view(-1), 0.98)  # Horních 2% hodnot atlasu (původně 0.95)
                     high_prob_regions = (atlas[:1] > atlas_threshold).float() * brain_mask[:1]
                     
                     # Generování náhodné aktivační masky
                     act_mask = torch.zeros_like(fake_lesion)
-                    random_strength = torch.rand(1, device=self.device) * 0.3 + 0.5  # Aktivace 0.5-0.8 (původně 0.7-1.0)
+                    random_strength = torch.rand(1, device=self.device) * 0.2 + 0.3  # Aktivace 0.3-0.5 (původně 0.5-0.8)
                     
                     # Přidání nucené aktivace do části vysoce pravděpodobných oblastí
-                    activation_regions = high_prob_regions * (torch.rand_like(high_prob_regions) > 0.7).float()  # Snížení pravděpodobnosti aktivace (původně 0.5)
+                    activation_regions = high_prob_regions * (torch.rand_like(high_prob_regions) > 0.85).float()  # Snížení pravděpodobnosti aktivace (původně 0.7)
                     act_mask = act_mask.scatter_(1, torch.zeros_like(fake_lesion, dtype=torch.long), 
                                                activation_regions * random_strength)
                     
-                    # Smíchání s původním výstupem - 70% generovaný obsah, 30% nucená aktivace (původně 40/60)
-                    fake_lesion = fake_lesion * 0.7 + act_mask * 0.3
+                    # Smíchání s původním výstupem - 90% generovaný obsah, 10% nucená aktivace (původně 70/30)
+                    fake_lesion = fake_lesion * 0.9 + act_mask * 0.1
                     
                     # Aplikace teplotního škálování pro ostřejší přechody
                     temperature = 8.0
@@ -2481,7 +2484,7 @@ class HIELesionGANTrainer:
                     binary_np = soft_binary[0, 0].cpu().numpy()
                     
                     # Odfiltrování malých komponent (podobně jako v generate_samples)
-                    binary_thresh = (binary_np > 0.6).astype(np.float32)  # Zvýšení prahu na 0.6 (původně 0.5)
+                    binary_thresh = (binary_np > 0.7).astype(np.float32)  # Zvýšení prahu na 0.7 (původně 0.6)
                     labeled_components, num_components = measure_label(binary_thresh, return_num=True)
                     
                     # Filtrování malých komponent
