@@ -78,9 +78,9 @@ class HIEDataset(Dataset):
 
 # Generator spatial attention block
 class SpatialAttention(nn.Module):
-    def __init__(self):
+    def __init__(self, in_channels):
         super(SpatialAttention, self).__init__()
-        self.conv = nn.Conv3d(2, 1, kernel_size=3, padding=1)
+        self.conv = nn.Conv3d(in_channels + 1, 1, kernel_size=3, padding=1)
         
     def forward(self, x, atlas):
         # Concatenate input features with atlas
@@ -134,11 +134,11 @@ class Generator(nn.Module):
             nn.LeakyReLU(0.2, inplace=True)
         )
         
-        # Spatial attention modules
-        self.attn1 = SpatialAttention()
-        self.attn2 = SpatialAttention()
-        self.attn3 = SpatialAttention()
-        self.attn4 = SpatialAttention()
+        # Spatial attention modules with correct channel counts
+        self.attn1 = SpatialAttention(128)
+        self.attn2 = SpatialAttention(256)
+        self.attn3 = SpatialAttention(512)
+        self.attn4 = SpatialAttention(512)
         
         # Decoder blocks with lesion gates
         self.up1 = nn.Sequential(
@@ -534,6 +534,89 @@ def evaluate(generator, dataloader, device):
     generator.train()
     return np.mean(dice_scores)
 
+# Generation function to create new images from a trained model
+def generate_samples(model_path, lesion_atlas_path, output_dir, num_samples=10, threshold=0.5):
+    """
+    Generate new lesion samples using a trained generator model
+    
+    Args:
+        model_path: Path to the saved model checkpoint
+        lesion_atlas_path: Path to the lesion atlas .nii file
+        output_dir: Directory to save the generated samples
+        num_samples: Number of samples to generate
+        threshold: Threshold for binarizing the output
+    """
+    # Create output directory
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Set device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # Initialize model
+    generator = Generator().to(device)
+    
+    # Load model
+    checkpoint = torch.load(model_path, map_location=device)
+    generator.load_state_dict(checkpoint['generator'])
+    generator.eval()
+    
+    # Load lesion atlas
+    nifti_img = nib.load(lesion_atlas_path)
+    lesion_atlas = nifti_img.get_fdata()
+    lesion_atlas = np.clip(lesion_atlas, 0, 1)
+    
+    # Get original affine for saving nifti files
+    affine = nifti_img.affine
+    
+    # Convert to tensor
+    atlas_tensor = torch.from_numpy(lesion_atlas).float().unsqueeze(0).unsqueeze(0)
+    
+    # Normalize atlas
+    atlas_tensor = atlas_tensor / 0.34
+    atlas_tensor = atlas_tensor.to(device)
+    
+    # Generate samples
+    with torch.no_grad():
+        for i in range(num_samples):
+            # Generate random noise
+            noise = torch.randn(1, 100, 1, 1, 1).to(device)
+            
+            # Generate fake sample
+            fake_label = generator(noise, atlas_tensor)
+            
+            # Convert to binary if requested
+            if threshold is not None:
+                fake_label_binary = (fake_label > threshold).float()
+            else:
+                fake_label_binary = fake_label
+            
+            # Convert to numpy
+            fake_np = fake_label_binary[0, 0].cpu().numpy()
+            
+            # Save as .nii file
+            fake_nii = nib.Nifti1Image(fake_np, affine)
+            nib.save(fake_nii, os.path.join(output_dir, f'sample_{i+1}.nii.gz'))
+            
+            # Also save middle slice as image for quick preview
+            mid_z = fake_np.shape[2] // 2
+            
+            plt.figure(figsize=(10, 5))
+            plt.subplot(1, 2, 1)
+            plt.imshow(fake_np[:, :, mid_z], cmap='gray')
+            plt.title(f'Sample {i+1} - Axial')
+            plt.axis('off')
+            
+            plt.subplot(1, 2, 2)
+            plt.imshow(fake_np[:, mid_z, :], cmap='gray')
+            plt.title(f'Sample {i+1} - Sagittal')
+            plt.axis('off')
+            
+            plt.tight_layout()
+            plt.savefig(os.path.join(output_dir, f'sample_{i+1}.png'))
+            plt.close()
+    
+    print(f"Generated {num_samples} samples in {output_dir}")
+
 # Main function
 def main(args):
     # Set device
@@ -579,6 +662,16 @@ if __name__ == "__main__":
     parser.add_argument("--num_epochs", type=int, default=100, help="Number of epochs")
     parser.add_argument("--checkpoint", type=str, default=None, help="Path to checkpoint to resume from")
     parser.add_argument("--eval_only", action="store_true", help="Only run evaluation, no training")
+    parser.add_argument("--generate", action="store_true", help="Generate samples from a trained model")
+    parser.add_argument("--model_path", type=str, help="Path to the trained model for generation")
+    parser.add_argument("--num_samples", type=int, default=10, help="Number of samples to generate")
     
     args = parser.parse_args()
-    main(args)
+    
+    if args.generate:
+        if args.model_path is None:
+            print("Error: --model_path must be specified when using --generate")
+            exit(1)
+        generate_samples(args.model_path, args.lesion_atlas_path, args.output_dir, args.num_samples)
+    else:
+        main(args)
