@@ -25,9 +25,12 @@ SHAPE_VARIATION = 0.6     # Míra variability tvaru (0-1) při generování růz
 LESION_PATTERN_TYPES = 5  # Počet různých "vzorů" lézí pro generování
 CONNECTIVITY_VARIATION = 0.5  # Míra variability spojitosti lézí (0-1)
 COVERAGE_VARIATION = True     # Variabilita procentuálního pokrytí lézemi
-DEFAULT_TARGET_COVERAGE = 0.01  # Výchozí cílové pokrytí lézemi (1%)
+DEFAULT_TARGET_COVERAGE = 0.002  # Sníženo na 0.2% (0.002) namísto 1% (0.01)
 SAVE_INTERVAL = 10      # Jak často ukládat modely a vizualizace
 GRADIENT_ACCUMULATION_STEPS = 4  # Akumulace gradientů pro simulaci větších batchů
+# Přidané konstanty pro sparsity distribution
+SPARSITY_DISTRIBUTION_WEIGHTS = [0.65, 0.10, 0.05, 0.05, 0.05, 0.05, 0.01, 0.01, 0.01, 0.01, 0.01]
+SPARSITY_DISTRIBUTION_VALUES = [0.001, 0.003, 0.005, 0.007, 0.009, 0.012, 0.015, 0.02, 0.025, 0.03]
 
 # Dataset
 class HIELesionDataset(Dataset):
@@ -49,22 +52,105 @@ class HIELesionDataset(Dataset):
         
         # Seznam labelů a filtrování prázdných (celočerných)
         self.label_files = []
-        for file in os.listdir(labels_dir):
+        self.sparsity_values = []  # Ukládáme hodnoty sparsity pro každý soubor
+        self.file_metadata = []    # Metadata o souborech - sparsity, počet lézí, atd.
+        
+        print("Analyzuji trénovací data...")
+        for file in tqdm(os.listdir(labels_dir)):
             if file.endswith('.nii') or file.endswith('.nii.gz'):
                 file_path = os.path.join(labels_dir, file)
                 # Efektivnější načítání dat s explicitním typem
-                label_data = nib.load(file_path).get_fdata(dtype=np.float32)
-                # Kontrola, zda label není celočerný
-                if np.sum(label_data) > 0:
-                    self.label_files.append(file)
+                try:
+                    label_data = nib.load(file_path).get_fdata(dtype=np.float32)
+                    # Kontrola, zda label není celočerný
+                    sparsity = np.mean(label_data > 0.5)
+                    if sparsity > 0:
+                        self.label_files.append(file)
+                        self.sparsity_values.append(sparsity)
+                        
+                        # Další metadata
+                        binary = label_data > 0.5
+                        labeled, num_components = ndimage.label(binary)
+                        
+                        metadata = {
+                            'file': file,
+                            'sparsity': sparsity,
+                            'num_components': num_components
+                        }
+                        self.file_metadata.append(metadata)
+                except Exception as e:
+                    print(f"Chyba při načítání souboru {file}: {str(e)}")
+                    
                 # Explicitní uvolnění paměti
-                del label_data
                 gc.collect()
+        
+        # Analýza histogramu sparsity
+        if self.sparsity_values:
+            self._analyze_sparsity_distribution()
         
         print(f"Načteno {len(self.label_files)} labelů po odfiltrování celočerných")
     
+    def _analyze_sparsity_distribution(self):
+        """Analyzuje distribuci sparsity v trénovacím datasetu"""
+        sparsity_array = np.array(self.sparsity_values) * 100  # Převod na procenta pro lepší čitelnost
+        
+        # Výpočet histogramu
+        hist, bin_edges = np.histogram(sparsity_array, bins=20, range=(0, 3.5))
+        
+        print("\nHistogram % nenulových voxelů:")
+        for i in range(len(hist)):
+            print(f"Rozsah {bin_edges[i]:.2f} - {bin_edges[i+1]:.2f}: {hist[i]} obrázků")
+        
+        # Statistiky
+        self.min_sparsity = np.min(sparsity_array) / 100
+        self.max_sparsity = np.max(sparsity_array) / 100
+        self.mean_sparsity = np.mean(sparsity_array) / 100
+        self.median_sparsity = np.median(sparsity_array) / 100
+        
+        print(f"\nStatistiky sparsity v datasetu:")
+        print(f"Minimum: {self.min_sparsity*100:.4f}%")
+        print(f"Maximum: {self.max_sparsity*100:.4f}%")
+        print(f"Průměr: {self.mean_sparsity*100:.4f}%")
+        print(f"Medián: {self.median_sparsity*100:.4f}%")
+        
+        # Příprava vah pro vzorkování - chceme víc vzorkovat řídké případy, ale stále reprezentovat všechny
+        # Výpočet vah pro lepší representaci celého spektra
+        low_sparsity = np.array([s for s in self.sparsity_values if s < 0.005])  # < 0.5%
+        medium_sparsity = np.array([s for s in self.sparsity_values if 0.005 <= s < 0.02])  # 0.5-2%
+        high_sparsity = np.array([s for s in self.sparsity_values if s >= 0.02])  # >= 2%
+        
+        print(f"Rozdělení datasetu:")
+        print(f"Nízká sparsity (<0.5%): {len(low_sparsity)} vzorků")
+        print(f"Střední sparsity (0.5-2%): {len(medium_sparsity)} vzorků")
+        print(f"Vysoká sparsity (≥2%): {len(high_sparsity)} vzorků")
+        
+        # Vytvoření vah pro lepší vzorkování - dáme větší váhu méně četným případům
+        self.sample_weights = np.ones(len(self.sparsity_values))
+        
+        # Pokud máme dostatek dat, vyvažujeme dataset
+        if len(self.sparsity_values) > 20:
+            for i, s in enumerate(self.sparsity_values):
+                if s < 0.005:  # Vysoká četnost, nízká váha
+                    self.sample_weights[i] = 0.5 + 50 * s  # Lineárně roste s hodnotou
+                elif 0.005 <= s < 0.02:  # Střední četnost, střední váha
+                    self.sample_weights[i] = 1.0
+                else:  # Nízká četnost, vysoká váha
+                    self.sample_weights[i] = 1.5
+    
     def __len__(self):
         return len(self.label_files)
+    
+    def get_weighted_sample_indices(self, batch_size=BATCH_SIZE):
+        """Vrátí indexy pro vzorkování podle vah"""
+        if hasattr(self, 'sample_weights'):
+            return np.random.choice(
+                len(self.label_files), 
+                size=batch_size, 
+                replace=True, 
+                p=self.sample_weights/np.sum(self.sample_weights)
+            )
+        else:
+            return np.random.choice(len(self.label_files), size=batch_size)
     
     def __getitem__(self, idx):
         label_path = os.path.join(self.labels_dir, self.label_files[idx])
@@ -76,7 +162,7 @@ class HIELesionDataset(Dataset):
         if self.transform:
             label = self.transform(label)
             
-        return {'label': label, 'atlas': self.atlas}
+        return {'label': label, 'atlas': self.atlas, 'sparsity': self.sparsity_values[idx] if hasattr(self, 'sparsity_values') else 0.0}
 
 # Původní verze generátoru pro zpětnou kompatibilitu
 class LegacyGenerator(nn.Module):
@@ -213,6 +299,19 @@ class Generator(nn.Module):
             nn.Sigmoid()
         )
         
+        # Nový threshold modul pro lepší kontrolu řídkosti
+        self.threshold_module = nn.Sequential(
+            nn.Conv3d(1, 8, 3, stride=1, padding=1),
+            nn.ReLU(True),
+            nn.Conv3d(8, 8, 3, stride=1, padding=1),
+            nn.ReLU(True),
+            nn.Conv3d(8, 1, 1, stride=1, padding=0),
+            nn.Sigmoid()
+        )
+        
+        # Nastavení prahu pro řídkost - bude se učit během tréninku
+        self.sparsity_threshold = nn.Parameter(torch.tensor([0.7]))
+        
         # Inicializace vah pro lepší start trénování
         self._initialize_weights()
     
@@ -260,10 +359,22 @@ class Generator(nn.Module):
         x = self.res_block5(x)
         
         # Finální konvoluce
-        out = self.final_conv(x)
+        raw_out = self.final_conv(x)
         
         # Aplikace frekvenčního atlasu jako masky - léze mohou být jen v nenulových oblastech
-        out = out * (atlas_expanded > 0).float()
+        atlas_mask = (atlas_expanded > 0).float()
+        raw_out = raw_out * atlas_mask
+        
+        # Aplikace threshold modulu pro zvýšení řídkosti a lepší kontrolu
+        threshold_mask = self.threshold_module(raw_out)
+        
+        # Dynamický práh pro řízení řídkosti - aplikujeme efekt hard thresholdingu pomocí sigmoid se strmou křivkou
+        # Hodnota self.sparsity_threshold se učí během tréninku
+        beta = 10.0  # Strmý přechod Sigmoid
+        sparse_out = torch.sigmoid(beta * (raw_out - self.sparsity_threshold))
+        
+        # Modulace výstupu pomocí threshold masky - kombinace tvrdého a měkkého prahování
+        out = sparse_out * threshold_mask * atlas_mask
         
         # Přidání heterogenity během forward průchodu - pouze pro inference
         if not self.training and HETEROGENEITY_LEVEL > 0:
@@ -374,14 +485,40 @@ def atlas_guided_loss(generated_images, atlas):
     loss = -torch.mean(torch.log(1e-8 + generated_images) * atlas_expanded)
     return loss
 
-def sparsity_loss(generated_images, target_sparsity=0.01):
+def sparsity_loss(generated_images, real_images=None):
     """
-    Loss funkce pro řídkost lézí (0.01% - 2.5%)
+    Loss funkce pro řídkost lézí s dynamickým cílem
+    
+    Args:
+        generated_images: Generované obrazy
+        real_images: Skutečné obrazy pro porovnání (pokud jsou k dispozici)
+        
+    Returns:
+        Loss hodnota
     """
-    # Výpočet aktuální sparsity
+    # Výpočet aktuální sparsity generovaných dat
     current_sparsity = torch.mean(generated_images)
-    # Penalizace když je sparsity mimo požadovaný rozsah (0.0001 - 0.025)
-    loss = torch.abs(current_sparsity - target_sparsity)
+    
+    if real_images is not None:
+        # Pokud jsou k dispozici skutečné obrazy, použijeme jejich sparsity jako cíl
+        target_sparsity = torch.mean(real_images)
+        loss = torch.abs(current_sparsity - target_sparsity)
+    else:
+        # Jinak použijeme váženou náhodnou hodnotu z distribuce podobné trénovacím datům
+        # S vysokou pravděpodobností velmi nízké hodnoty (0.1-0.2%)
+        if torch.rand(1).item() < 0.7:  # 70% šance na velmi nízkou hodnotu
+            target_sparsity = torch.distributions.Uniform(0.0005, 0.0019).sample((1,)).item()
+        else:
+            # Zbývajících 30% - rozloženo přes širší rozsah
+            target_sparsity = torch.distributions.Uniform(0.002, 0.03).sample((1,)).item()
+            
+        # Penalizace, když je sparsity mimo požadovaný rozsah (0.0005 - 0.03)
+        loss = torch.abs(current_sparsity - target_sparsity)
+        
+        # Exponenciální penalizace pro hodnoty výrazně nad cílem
+        if current_sparsity > 2 * target_sparsity:
+            loss = loss * (1.0 + torch.log(current_sparsity / target_sparsity))
+    
     return loss
 
 def structural_similarity_loss(generated, real):
@@ -521,7 +658,11 @@ def train(labels_dir, atlas_path, output_dir, epochs=DEFAULT_EPOCHS,
     
     # Inicializace datasetů a dataloaderů - omezený počet workers pro menší spotřebu paměti
     dataset = HIELesionDataset(labels_dir, atlas_path)
-    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=2,
+    
+    # Používáme vlastní sampler místo náhodného výběru pro lepší reprezentaci dat
+    # Tato třída WeightedRandomSampler by přepisovala Dataset.__getitem__, což není to,
+    # co potřebujeme. Místo toho budeme používat vlastní funkci pro vzorkování.
+    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=2,
                            pin_memory=(device=='cuda'), persistent_workers=True)
     
     # Inicializace modelů
@@ -532,6 +673,10 @@ def train(labels_dir, atlas_path, output_dir, epochs=DEFAULT_EPOCHS,
     optimizer_G = optim.Adam(generator.parameters(), lr=0.0001, betas=(0.5, 0.999))
     optimizer_D = optim.Adam(discriminator.parameters(), lr=0.0001, betas=(0.5, 0.999))
     
+    # Learning rate schedulers pro postupné snižování learning rate
+    scheduler_G = optim.lr_scheduler.StepLR(optimizer_G, step_size=30, gamma=0.9)
+    scheduler_D = optim.lr_scheduler.StepLR(optimizer_D, step_size=30, gamma=0.9)
+    
     # Loss funkce - změna na BCEWithLogitsLoss, který je bezpečný pro autocast
     adversarial_loss = nn.BCEWithLogitsLoss()
     
@@ -540,17 +685,40 @@ def train(labels_dir, atlas_path, output_dir, epochs=DEFAULT_EPOCHS,
     
     # Trénovací smyčka
     for epoch in range(epochs):
-        with tqdm(dataloader, unit="batch") as tepoch:
+        with tqdm(enumerate(dataloader), total=len(dataloader), unit="batch") as tepoch:
             tepoch.set_description(f"Epoch {epoch+1}/{epochs}")
             
             # Resetování akumulovaných gradientů
             optimizer_G.zero_grad()
             optimizer_D.zero_grad()
             
-            for i, batch in enumerate(tepoch):
-                # Přesun dat na device s explicitním uvolněním paměti
-                labels = batch['label'].to(device, non_blocking=True)
-                atlas = batch['atlas'].to(device, non_blocking=True)
+            # Průchod přes všechny batche, ale vzorkované pomocí naší váhové strategie
+            epoch_d_loss = 0.0
+            epoch_g_loss = 0.0
+            batch_count = 0
+            
+            for i, batch in tepoch:
+                # Místo náhodného výběru použijeme vážené vzorkování
+                if hasattr(dataset, 'sample_weights') and i > 0:  # První batch necháme tak
+                    # Získáme vážené indexy
+                    indices = dataset.get_weighted_sample_indices(BATCH_SIZE)
+                    
+                    # Vytvoříme nový batch
+                    labels = []
+                    sparsities = []
+                    for idx in indices:
+                        sample = dataset[idx]
+                        labels.append(sample['label'])
+                        sparsities.append(sample['sparsity'])
+                    
+                    # Převedeme na tensory a přesuneme na device
+                    labels = torch.stack(labels).to(device, non_blocking=True)
+                    atlas = batch['atlas'].to(device, non_blocking=True)
+                else:
+                    # První nebo pokud nemáme váhy, použijeme původní batch
+                    labels = batch['label'].to(device, non_blocking=True)
+                    atlas = batch['atlas'].to(device, non_blocking=True)
+                    sparsities = batch['sparsity'] if 'sparsity' in batch else None
                 
                 # Reálné a falešné labely pro discriminator
                 real_labels = torch.ones(labels.size(0), 1).to(device)
@@ -616,8 +784,18 @@ def train(labels_dir, atlas_path, output_dir, epochs=DEFAULT_EPOCHS,
                         # Atlas-guided loss
                         g_atlas_loss = atlas_guided_loss(fake_images, atlas)
                         
-                        # Sparsity loss
-                        g_sparsity_loss = sparsity_loss(fake_images, target_sparsity=0.01)
+                        # Sparsity loss with adaptive weighting
+                        g_sparsity_loss = sparsity_loss(fake_images, labels)
+                        
+                        # Adaptivní váha pro sparsity loss - zvýšíme váhu pokud model generuje příliš velké léze
+                        real_sparsity = torch.mean(labels)
+                        fake_sparsity = torch.mean(fake_images)
+                        sparsity_ratio = fake_sparsity / (real_sparsity + 1e-8)  # Zabránění dělení nulou
+                        
+                        # Pokud generované léze jsou výrazně větší než reálné, zvýšíme váhu sparsity loss
+                        adaptive_lambda_sparsity = LAMBDA_SPARSITY
+                        if sparsity_ratio > 1.5:  # Pokud jsou léze více než 1.5x větší než reálné
+                            adaptive_lambda_sparsity = LAMBDA_SPARSITY * (1.0 + torch.log(sparsity_ratio))
                         
                         # Strukturální loss - porovnání feature map z diskriminátoru
                         _, real_features = discriminator(labels_unsqueeze, atlas)
@@ -626,7 +804,7 @@ def train(labels_dir, atlas_path, output_dir, epochs=DEFAULT_EPOCHS,
                         # Celková loss generátoru
                         g_loss = (g_adversarial_loss 
                                  + LAMBDA_ATLAS * g_atlas_loss 
-                                 + LAMBDA_SPARSITY * g_sparsity_loss
+                                 + adaptive_lambda_sparsity * g_sparsity_loss
                                  + LAMBDA_STRUCTURAL * g_structural_loss)
                         g_loss = g_loss / GRADIENT_ACCUMULATION_STEPS  # Normalizace pro accumulation
                     
@@ -646,7 +824,16 @@ def train(labels_dir, atlas_path, output_dir, epochs=DEFAULT_EPOCHS,
                     g_adversarial_loss = adversarial_loss(fake_validity, real_labels)
                     
                     g_atlas_loss = atlas_guided_loss(fake_images, atlas)
-                    g_sparsity_loss = sparsity_loss(fake_images, target_sparsity=0.01)
+                    g_sparsity_loss = sparsity_loss(fake_images, labels)
+                    
+                    # Adaptivní váha pro sparsity loss
+                    real_sparsity = torch.mean(labels)
+                    fake_sparsity = torch.mean(fake_images)
+                    sparsity_ratio = fake_sparsity / (real_sparsity + 1e-8)
+                    
+                    adaptive_lambda_sparsity = LAMBDA_SPARSITY
+                    if sparsity_ratio > 1.5:
+                        adaptive_lambda_sparsity = LAMBDA_SPARSITY * (1.0 + torch.log(sparsity_ratio))
                     
                     # Strukturální loss
                     _, real_features = discriminator(labels_unsqueeze, atlas)
@@ -655,7 +842,7 @@ def train(labels_dir, atlas_path, output_dir, epochs=DEFAULT_EPOCHS,
                     # Celková loss
                     g_loss = (g_adversarial_loss 
                              + LAMBDA_ATLAS * g_atlas_loss 
-                             + LAMBDA_SPARSITY * g_sparsity_loss
+                             + adaptive_lambda_sparsity * g_sparsity_loss
                              + LAMBDA_STRUCTURAL * g_structural_loss)
                     g_loss = g_loss / GRADIENT_ACCUMULATION_STEPS
                     g_loss.backward()
@@ -664,17 +851,33 @@ def train(labels_dir, atlas_path, output_dir, epochs=DEFAULT_EPOCHS,
                         optimizer_G.step()
                         optimizer_G.zero_grad()
                 
+                # Aktualizace průměrných loss hodnot
+                epoch_d_loss += d_loss.item() * GRADIENT_ACCUMULATION_STEPS
+                epoch_g_loss += g_loss.item() * GRADIENT_ACCUMULATION_STEPS
+                batch_count += 1
+                
                 # Aktualizace progress baru
                 sparsity_value = torch.mean(fake_images).item()
                 tepoch.set_postfix(D_loss=d_loss.item() * GRADIENT_ACCUMULATION_STEPS, 
                                   G_loss=g_loss.item() * GRADIENT_ACCUMULATION_STEPS, 
                                   Sparsity=sparsity_value,
+                                  Real_Sparsity=real_sparsity.item(),
+                                  Sparsity_Ratio=sparsity_ratio.item(),
                                   Struct_loss=g_structural_loss.item())
                 
                 # Explicitní uvolnění paměti pro proměnné, které už nepotřebujeme
                 del labels, atlas, fake_images, real_validity, fake_validity, real_features, fake_features
                 if device == 'cuda':
                     torch.cuda.empty_cache()
+                    
+        # Aktualizace learning rate
+        scheduler_G.step()
+        scheduler_D.step()
+        
+        # Výpočet průměrných loss hodnot za epochu
+        epoch_d_loss /= batch_count
+        epoch_g_loss /= batch_count
+        print(f"Epocha {epoch+1}/{epochs} - Průměr D_loss: {epoch_d_loss:.4f}, G_loss: {epoch_g_loss:.4f}")
         
         # Uložení modelů podle intervalu ukládání
         if (epoch + 1) % save_interval == 0 or (epoch + 1) == epochs:
