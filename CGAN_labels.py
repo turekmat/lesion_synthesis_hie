@@ -436,7 +436,7 @@ def train(generator, discriminator, dataloader, num_epochs, device, output_dir):
             save_samples(generator, dataloader, device, epoch, output_dir)
             
         # Save model
-        if (epoch + 1) % 10 == 0:
+        if (epoch + 1) % 4 == 0:
             torch.save({
                 'generator': generator.state_dict(),
                 'discriminator': discriminator.state_dict(),
