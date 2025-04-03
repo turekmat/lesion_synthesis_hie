@@ -12,8 +12,8 @@ import matplotlib.pyplot as plt
 # Konstanty
 IMAGE_SIZE = (128, 128, 64)
 LATENT_DIM = 100
-BATCH_SIZE = 4
-EPOCHS = 200
+BATCH_SIZE = 1
+DEFAULT_EPOCHS = 200  # Výchozí počet epoch
 LAMBDA_SPARSITY = 10.0  # Váha pro sparsity loss
 LAMBDA_ATLAS = 5.0      # Váha pro atlas guidance loss
 
@@ -184,7 +184,7 @@ def sparsity_loss(generated_images, target_sparsity=0.01):
     return loss
 
 # Hlavní trénovací funkce
-def train(labels_dir, atlas_path, output_dir, device='cuda'):
+def train(labels_dir, atlas_path, output_dir, epochs=DEFAULT_EPOCHS, device='cuda'):
     # Vytvoření output adresáře
     os.makedirs(output_dir, exist_ok=True)
     
@@ -204,9 +204,9 @@ def train(labels_dir, atlas_path, output_dir, device='cuda'):
     adversarial_loss = nn.BCELoss()
     
     # Trénovací smyčka
-    for epoch in range(EPOCHS):
+    for epoch in range(epochs):
         with tqdm(dataloader, unit="batch") as tepoch:
-            tepoch.set_description(f"Epoch {epoch+1}/{EPOCHS}")
+            tepoch.set_description(f"Epoch {epoch+1}/{epochs}")
             
             for i, batch in enumerate(tepoch):
                 labels = batch['label'].to(device)
@@ -264,7 +264,7 @@ def train(labels_dir, atlas_path, output_dir, device='cuda'):
                                   Sparsity=torch.mean(fake_images).item())
         
         # Uložení modelů každých 10 epoch
-        if (epoch + 1) % 10 == 0 or (epoch + 1) == EPOCHS:
+        if (epoch + 1) % 10 == 0 or (epoch + 1) == epochs:
             torch.save(generator.state_dict(), os.path.join(output_dir, f'generator_{epoch+1}.pt'))
             torch.save(discriminator.state_dict(), os.path.join(output_dir, f'discriminator_{epoch+1}.pt'))
             
@@ -340,6 +340,7 @@ if __name__ == "__main__":
     parser.add_argument('--output_dir', type=str, help='adresář pro výstupy')
     parser.add_argument('--generator_path', type=str, help='cesta k natrénovanému generátoru (pro generování)')
     parser.add_argument('--num_samples', type=int, default=10, help='počet vzorků k vygenerování')
+    parser.add_argument('--epochs', type=int, default=DEFAULT_EPOCHS, help='počet trénovacích epoch')
     parser.add_argument('--gpu', action='store_true', help='použít GPU')
     
     args = parser.parse_args()
@@ -348,6 +349,6 @@ if __name__ == "__main__":
     print(f"Použití zařízení: {device}")
     
     if args.mode == 'train':
-        train(args.labels_dir, args.atlas_path, args.output_dir, device)
+        train(args.labels_dir, args.atlas_path, args.output_dir, args.epochs, device)
     else:
         generate_samples(args.generator_path, args.atlas_path, args.output_dir, args.num_samples, device)
