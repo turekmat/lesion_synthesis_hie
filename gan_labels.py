@@ -9,6 +9,7 @@ import gc
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 import matplotlib.pyplot as plt
+from scipy import ndimage
 
 # Konstanty
 IMAGE_SIZE = (128, 128, 64)
@@ -17,6 +18,7 @@ BATCH_SIZE = 1
 DEFAULT_EPOCHS = 200  # Výchozí počet epoch
 LAMBDA_SPARSITY = 10.0  # Váha pro sparsity loss
 LAMBDA_ATLAS = 5.0      # Váha pro atlas guidance loss
+LAMBDA_STRUCTURAL = 8.0  # Váha pro strukturální loss
 SAVE_INTERVAL = 10      # Jak často ukládat modely a vizualizace
 GRADIENT_ACCUMULATION_STEPS = 4  # Akumulace gradientů pro simulaci větších batchů
 
@@ -69,7 +71,7 @@ class HIELesionDataset(Dataset):
             
         return {'label': label, 'atlas': self.atlas}
 
-# Optimalizovaný Generátor s menší spotřebou paměti
+# Optimalizovaný Generátor s menší spotřebou paměti a lepší strukturální schopností
 class Generator(nn.Module):
     def __init__(self, latent_dim):
         super(Generator, self).__init__()
@@ -98,33 +100,53 @@ class Generator(nn.Module):
         )
         
         # 3D Transposed convolutions pro zvětšování dimenzí
-        # Postupné snížení počtu filtrů pro úsporu paměti
-        self.deconv_blocks = nn.Sequential(
+        # Přidáváme residuální bloky pro lepší učení struktur
+        self.deconv1 = nn.Sequential(
             nn.BatchNorm3d(init_channels),
             nn.ReLU(True),
-            
-            nn.ConvTranspose3d(init_channels, 192, 4, stride=2, padding=1),  # 8x8x4
+            nn.ConvTranspose3d(init_channels, 192, 4, stride=2, padding=1)  # 8x8x4
+        )
+        
+        self.res_block1 = ResidualBlock3D(192)
+        
+        self.deconv2 = nn.Sequential(
             nn.BatchNorm3d(192),
             nn.ReLU(True),
-            
-            nn.ConvTranspose3d(192, 96, 4, stride=2, padding=1),  # 16x16x8
+            nn.ConvTranspose3d(192, 96, 4, stride=2, padding=1)  # 16x16x8
+        )
+        
+        self.res_block2 = ResidualBlock3D(96)
+        
+        self.deconv3 = nn.Sequential(
             nn.BatchNorm3d(96),
             nn.ReLU(True),
-            
-            nn.ConvTranspose3d(96, 48, 4, stride=2, padding=1),  # 32x32x16
+            nn.ConvTranspose3d(96, 48, 4, stride=2, padding=1)  # 32x32x16
+        )
+        
+        self.res_block3 = ResidualBlock3D(48)
+        
+        self.deconv4 = nn.Sequential(
             nn.BatchNorm3d(48),
             nn.ReLU(True),
-            
-            nn.ConvTranspose3d(48, 24, 4, stride=2, padding=1),  # 64x64x32
+            nn.ConvTranspose3d(48, 24, 4, stride=2, padding=1)  # 64x64x32
+        )
+        
+        self.res_block4 = ResidualBlock3D(24)
+        
+        self.deconv5 = nn.Sequential(
             nn.BatchNorm3d(24),
             nn.ReLU(True),
-            
-            nn.ConvTranspose3d(24, 12, 4, stride=2, padding=1),  # 128x128x64
-            nn.BatchNorm3d(12),
+            nn.ConvTranspose3d(24, 12, 4, stride=2, padding=1)  # 128x128x64
+        )
+        
+        self.res_block5 = ResidualBlock3D(12)
+        
+        # Finální konvoluce pro výstup
+        self.final_conv = nn.Sequential(
+            nn.Conv3d(12, 12, 3, stride=1, padding=1),
             nn.ReLU(True),
-            
             nn.Conv3d(12, 1, 3, stride=1, padding=1),
-            nn.Sigmoid()  # Ponecháme sigmoid pro výstup generátoru, protože potřebujeme hodnoty 0-1
+            nn.Sigmoid()
         )
         
         # Inicializace vah pro lepší start trénování
@@ -155,15 +177,51 @@ class Generator(nn.Module):
         x = self.fc2(x)
         
         # Reshape pro dekonvoluci
-        out = x.view(x.shape[0], 384, *self.init_size)
+        x = x.view(x.shape[0], 384, *self.init_size)
         
-        # Postupné dekonvoluce
-        out = self.deconv_blocks(out)
+        # Postupné dekonvoluce s residuálními bloky
+        x = self.deconv1(x)
+        x = self.res_block1(x)
+        
+        x = self.deconv2(x)
+        x = self.res_block2(x)
+        
+        x = self.deconv3(x)
+        x = self.res_block3(x)
+        
+        x = self.deconv4(x)
+        x = self.res_block4(x)
+        
+        x = self.deconv5(x)
+        x = self.res_block5(x)
+        
+        # Finální konvoluce
+        out = self.final_conv(x)
         
         # Aplikace frekvenčního atlasu jako masky - léze mohou být jen v nenulových oblastech
-        # Používáme inplace operaci pro úsporu paměti
         out = out * (atlas_expanded > 0).float()
         
+        return out
+
+# Residuální blok pro lepší učení strukturálních vlastností
+class ResidualBlock3D(nn.Module):
+    def __init__(self, channels):
+        super(ResidualBlock3D, self).__init__()
+        self.conv1 = nn.Conv3d(channels, channels, kernel_size=3, padding=1)
+        self.bn1 = nn.BatchNorm3d(channels)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv3d(channels, channels, kernel_size=3, padding=1)
+        self.bn2 = nn.BatchNorm3d(channels)
+    
+    def forward(self, x):
+        residual = x
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+        out = self.conv2(out)
+        out = self.bn2(out)
+        out += residual  # Skip connection
+        out = self.relu(out)
         return out
 
 # Optimalizovaný Diskriminátor s menší spotřebou paměti
@@ -172,33 +230,32 @@ class Discriminator(nn.Module):
         super(Discriminator, self).__init__()
         
         # Menší model - postupné snižování počtu filtrů
-        self.model = nn.Sequential(
-            # První vrstva - bez batchnorm
-            nn.Conv3d(2, 12, 4, stride=2, padding=1),  # 64x64x32
-            nn.LeakyReLU(0.2, inplace=True),
-            
-            nn.Conv3d(12, 24, 4, stride=2, padding=1),  # 32x32x16
-            nn.BatchNorm3d(24),
-            nn.LeakyReLU(0.2, inplace=True),
-            
-            nn.Conv3d(24, 48, 4, stride=2, padding=1),  # 16x16x8
-            nn.BatchNorm3d(48),
-            nn.LeakyReLU(0.2, inplace=True),
-            
-            nn.Conv3d(48, 96, 4, stride=2, padding=1),  # 8x8x4
-            nn.BatchNorm3d(96),
-            nn.LeakyReLU(0.2, inplace=True),
-            
-            nn.Conv3d(96, 192, 4, stride=2, padding=1),  # 4x4x2
-            nn.BatchNorm3d(192),
-            nn.LeakyReLU(0.2, inplace=True)
-        )
+        self.conv1 = nn.Conv3d(2, 12, 4, stride=2, padding=1)  # 64x64x32
+        self.lrelu1 = nn.LeakyReLU(0.2, inplace=True)
         
-        # Výstupní vrstva s menším počtem parametrů - odstraníme sigmoid, protože BCEWithLogitsLoss ho má integrovaný
-        self.output_layer = nn.Sequential(
-            nn.Linear(192 * 4 * 4 * 2, 1)
-            # Odstranění sigmoidu - bude součástí BCEWithLogitsLoss
-        )
+        self.conv2 = nn.Conv3d(12, 24, 4, stride=2, padding=1)  # 32x32x16
+        self.bn2 = nn.BatchNorm3d(24)
+        self.lrelu2 = nn.LeakyReLU(0.2, inplace=True)
+        
+        self.conv3 = nn.Conv3d(24, 48, 4, stride=2, padding=1)  # 16x16x8
+        self.bn3 = nn.BatchNorm3d(48)
+        self.lrelu3 = nn.LeakyReLU(0.2, inplace=True)
+        
+        self.conv4 = nn.Conv3d(48, 96, 4, stride=2, padding=1)  # 8x8x4
+        self.bn4 = nn.BatchNorm3d(96)
+        self.lrelu4 = nn.LeakyReLU(0.2, inplace=True)
+        
+        self.conv5 = nn.Conv3d(96, 192, 4, stride=2, padding=1)  # 4x4x2
+        self.bn5 = nn.BatchNorm3d(192)
+        self.lrelu5 = nn.LeakyReLU(0.2, inplace=True)
+        
+        # Přidáváme průchod pro strukturální analýzu
+        self.structure_conv = nn.Conv3d(192, 192, 3, stride=1, padding=1)
+        self.structure_bn = nn.BatchNorm3d(192)
+        self.structure_lrelu = nn.LeakyReLU(0.2, inplace=True)
+        
+        # Výstupní vrstva bez sigmoidu (používáme BCEWithLogitsLoss)
+        self.output_layer = nn.Linear(192 * 4 * 4 * 2, 1)
         
         # Inicializace vah pro lepší start trénování
         self._initialize_weights()
@@ -217,18 +274,25 @@ class Discriminator(nn.Module):
                 nn.init.constant_(m.bias, 0)
     
     def forward(self, img, atlas):
-        # Spojení vstupu a atlasu jako kanály - efektivnější
+        # Spojení vstupu a atlasu jako kanály
         atlas_expanded = atlas.unsqueeze(1)  # Přidání kanálového rozměru
         x = torch.cat([img, atlas_expanded], dim=1)
         
-        # Konvoluční vrstvy
-        features = self.model(x)
-        features = features.view(features.size(0), -1)
+        # Konvoluční vrstvy s extrakcí feature map pro strukturální loss
+        x = self.lrelu1(self.conv1(x))
+        x = self.lrelu2(self.bn2(self.conv2(x)))
+        x = self.lrelu3(self.bn3(self.conv3(x)))
+        x = self.lrelu4(self.bn4(self.conv4(x)))
+        x = self.lrelu5(self.bn5(self.conv5(x)))
         
-        # Klasifikace
+        # Strukturální features
+        structure_features = self.structure_lrelu(self.structure_bn(self.structure_conv(x)))
+        
+        # Výstup
+        features = x.view(x.size(0), -1)
         validity = self.output_layer(features)
         
-        return validity
+        return validity, structure_features
 
 # Custom loss funkce - optimalizované
 def atlas_guided_loss(generated_images, atlas):
@@ -238,7 +302,6 @@ def atlas_guided_loss(generated_images, atlas):
     # Přizpůsobení generování podle frekvencí v atlasu
     atlas_expanded = atlas.unsqueeze(1)
     # Penalizace generování v oblastech s nízkou frekvencí
-    # Použití stabilnějšího výpočtu
     loss = -torch.mean(torch.log(1e-8 + generated_images) * atlas_expanded)
     return loss
 
@@ -251,6 +314,82 @@ def sparsity_loss(generated_images, target_sparsity=0.01):
     # Penalizace když je sparsity mimo požadovaný rozsah (0.0001 - 0.025)
     loss = torch.abs(current_sparsity - target_sparsity)
     return loss
+
+def structural_similarity_loss(generated, real):
+    """
+    Loss funkce pro strukturální podobnost generovaných a skutečných lézí
+    Používá feature mapy z diskriminátoru pro hodnocení strukturální podobnosti
+    """
+    # L1 distance mezi feature mapami
+    return F.l1_loss(generated, real)
+
+def gradient_penalty_loss(real_images, fake_images, discriminator, atlas, device):
+    """
+    Gradient penalty pro Wasserstein GAN s gradient penalty (WGAN-GP)
+    Pomáhá stabilizovat trénink
+    """
+    batch_size = real_images.size(0)
+    alpha = torch.rand(batch_size, 1, 1, 1, 1).to(device)
+    
+    # Generování interpolovaných vzorků
+    interpolated = alpha * real_images + (1 - alpha) * fake_images
+    interpolated = interpolated.requires_grad_(True)
+    
+    # Forward pass diskriminátoru
+    d_interpolated, _ = discriminator(interpolated, atlas)
+    
+    # Výpočet gradientů
+    gradients = torch.autograd.grad(
+        outputs=d_interpolated,
+        inputs=interpolated,
+        grad_outputs=torch.ones_like(d_interpolated),
+        create_graph=True,
+        retain_graph=True,
+        only_inputs=True
+    )[0]
+    
+    # Flatten gradients
+    gradients = gradients.view(batch_size, -1)
+    
+    # Výpočet gradient penalty
+    gradient_norm = gradients.norm(2, dim=1)
+    gradient_penalty = ((gradient_norm - 1) ** 2).mean()
+    
+    return gradient_penalty
+
+# Post-processing funkce pro vylepšení výsledků
+def post_process_lesions(generated_sample, threshold=0.5, min_size=10):
+    """
+    Post-processing pro vylepšení struktury generovaných lézí
+    
+    Args:
+        generated_sample: Generovaný vzorek (numpy array)
+        threshold: Hodnota pro binarizaci
+        min_size: Minimální velikost komponenty pro zachování
+    
+    Returns:
+        Vylepšený binární obraz
+    """
+    # Binarizace
+    binary = (generated_sample > threshold).astype(np.int32)
+    
+    # Odstranění malých komponent
+    labeled, num_features = ndimage.label(binary)
+    sizes = np.bincount(labeled.ravel())
+    mask_sizes = sizes > min_size
+    mask_sizes[0] = 0  # Ignorování pozadí
+    binary = mask_sizes[labeled]
+    
+    # Použití morfologické operace pro vyplnění děr
+    binary = ndimage.binary_closing(binary, structure=np.ones((3,3,3))).astype(np.float32)
+    
+    # Použití mírného vyhlazení pro realistické tvary
+    binary = ndimage.gaussian_filter(binary.astype(float), sigma=0.5)
+    
+    # Konečná binarizace
+    binary = (binary > 0.5).astype(np.float32)
+    
+    return binary
 
 # Kontrola a hlášení dostupné CUDA paměti
 def report_gpu_memory():
@@ -293,7 +432,6 @@ def train(labels_dir, atlas_path, output_dir, epochs=DEFAULT_EPOCHS,
     adversarial_loss = nn.BCEWithLogitsLoss()
     
     # Zapnutí automatického mixed precision (FP16) pro úsporu paměti na podporovaných GPU
-    # Aktualizujeme na nové API
     scaler = torch.amp.GradScaler() if device == 'cuda' else None
     
     # Trénovací smyčka
@@ -317,21 +455,17 @@ def train(labels_dir, atlas_path, output_dir, epochs=DEFAULT_EPOCHS,
                 # -----------------
                 # Trénink discriminatoru
                 # -----------------
-                # Použití gradient accumulation pro simulaci větších batchů
-                # Pomáhá stabilizovat trénink a ušetřit paměť
-                
                 if scaler:
                     with torch.amp.autocast(device_type='cuda'):
                         # Diskriminátor na reálných datech
                         labels_unsqueeze = labels.unsqueeze(1)  # Přidání kanálového rozměru
-                        real_validity = discriminator(labels_unsqueeze, atlas)
+                        real_validity, real_features = discriminator(labels_unsqueeze, atlas)
                         d_real_loss = adversarial_loss(real_validity, real_labels)
                         
                         # Diskriminátor na generovaných datech
                         z = torch.randn(labels.size(0), LATENT_DIM).to(device)
-                        # Detachujeme generator output pro úsporu paměti
                         fake_images = generator(z, atlas).detach()
-                        fake_validity = discriminator(fake_images, atlas)
+                        fake_validity, fake_features = discriminator(fake_images, atlas)
                         d_fake_loss = adversarial_loss(fake_validity, fake_labels)
                         
                         # Celková loss discriminatoru
@@ -348,12 +482,12 @@ def train(labels_dir, atlas_path, output_dir, epochs=DEFAULT_EPOCHS,
                 else:
                     # Standardní trénink bez mixed precision
                     labels_unsqueeze = labels.unsqueeze(1)
-                    real_validity = discriminator(labels_unsqueeze, atlas)
+                    real_validity, real_features = discriminator(labels_unsqueeze, atlas)
                     d_real_loss = adversarial_loss(real_validity, real_labels)
                     
                     z = torch.randn(labels.size(0), LATENT_DIM).to(device)
                     fake_images = generator(z, atlas).detach()
-                    fake_validity = discriminator(fake_images, atlas)
+                    fake_validity, fake_features = discriminator(fake_images, atlas)
                     d_fake_loss = adversarial_loss(fake_validity, fake_labels)
                     
                     d_loss = (d_real_loss + d_fake_loss) / 2
@@ -372,7 +506,7 @@ def train(labels_dir, atlas_path, output_dir, epochs=DEFAULT_EPOCHS,
                         # Generátor se snaží oklamat diskriminátor
                         z = torch.randn(labels.size(0), LATENT_DIM).to(device)
                         fake_images = generator(z, atlas)
-                        fake_validity = discriminator(fake_images, atlas)
+                        fake_validity, fake_features = discriminator(fake_images, atlas)
                         g_adversarial_loss = adversarial_loss(fake_validity, real_labels)
                         
                         # Atlas-guided loss
@@ -381,8 +515,15 @@ def train(labels_dir, atlas_path, output_dir, epochs=DEFAULT_EPOCHS,
                         # Sparsity loss
                         g_sparsity_loss = sparsity_loss(fake_images, target_sparsity=0.01)
                         
+                        # Strukturální loss - porovnání feature map z diskriminátoru
+                        _, real_features = discriminator(labels_unsqueeze, atlas)
+                        g_structural_loss = structural_similarity_loss(fake_features, real_features)
+                        
                         # Celková loss generátoru
-                        g_loss = g_adversarial_loss + LAMBDA_ATLAS * g_atlas_loss + LAMBDA_SPARSITY * g_sparsity_loss
+                        g_loss = (g_adversarial_loss 
+                                 + LAMBDA_ATLAS * g_atlas_loss 
+                                 + LAMBDA_SPARSITY * g_sparsity_loss
+                                 + LAMBDA_STRUCTURAL * g_structural_loss)
                         g_loss = g_loss / GRADIENT_ACCUMULATION_STEPS  # Normalizace pro accumulation
                     
                     # Škálování gradientu a zpětná propagace
@@ -397,14 +538,22 @@ def train(labels_dir, atlas_path, output_dir, epochs=DEFAULT_EPOCHS,
                     # Standardní trénink bez mixed precision
                     z = torch.randn(labels.size(0), LATENT_DIM).to(device)
                     fake_images = generator(z, atlas)
-                    fake_validity = discriminator(fake_images, atlas)
+                    fake_validity, fake_features = discriminator(fake_images, atlas)
                     g_adversarial_loss = adversarial_loss(fake_validity, real_labels)
                     
                     g_atlas_loss = atlas_guided_loss(fake_images, atlas)
                     g_sparsity_loss = sparsity_loss(fake_images, target_sparsity=0.01)
                     
-                    g_loss = g_adversarial_loss + LAMBDA_ATLAS * g_atlas_loss + LAMBDA_SPARSITY * g_sparsity_loss
-                    g_loss = g_loss / GRADIENT_ACCUMULATION_STEPS  # Normalizace pro accumulation
+                    # Strukturální loss
+                    _, real_features = discriminator(labels_unsqueeze, atlas)
+                    g_structural_loss = structural_similarity_loss(fake_features, real_features)
+                    
+                    # Celková loss
+                    g_loss = (g_adversarial_loss 
+                             + LAMBDA_ATLAS * g_atlas_loss 
+                             + LAMBDA_SPARSITY * g_sparsity_loss
+                             + LAMBDA_STRUCTURAL * g_structural_loss)
+                    g_loss = g_loss / GRADIENT_ACCUMULATION_STEPS
                     g_loss.backward()
                     
                     if (i + 1) % GRADIENT_ACCUMULATION_STEPS == 0:
@@ -412,12 +561,14 @@ def train(labels_dir, atlas_path, output_dir, epochs=DEFAULT_EPOCHS,
                         optimizer_G.zero_grad()
                 
                 # Aktualizace progress baru
+                sparsity_value = torch.mean(fake_images).item()
                 tepoch.set_postfix(D_loss=d_loss.item() * GRADIENT_ACCUMULATION_STEPS, 
                                   G_loss=g_loss.item() * GRADIENT_ACCUMULATION_STEPS, 
-                                  Sparsity=torch.mean(fake_images).item())
+                                  Sparsity=sparsity_value,
+                                  Struct_loss=g_structural_loss.item())
                 
                 # Explicitní uvolnění paměti pro proměnné, které už nepotřebujeme
-                del labels, atlas, fake_images, real_validity, fake_validity
+                del labels, atlas, fake_images, real_validity, fake_validity, real_features, fake_features
                 if device == 'cuda':
                     torch.cuda.empty_cache()
         
@@ -442,14 +593,17 @@ def train(labels_dir, atlas_path, output_dir, epochs=DEFAULT_EPOCHS,
                 with torch.amp.autocast(device_type='cuda', enabled=(device=='cuda')):
                     sample = generator(z, atlas_sample).cpu().numpy()
                 
+                # Post-processing pro zlepšení struktury
+                processed_sample = post_process_lesions(sample[0, 0])
+                
                 # Uložení vzorků jako nii file
-                sample_img = nib.Nifti1Image(sample[0, 0], np.eye(4))
+                sample_img = nib.Nifti1Image(processed_sample, np.eye(4))
                 nib.save(sample_img, os.path.join(output_dir, f'sample_epoch_{epoch+1}.nii.gz'))
                 
                 # Vizualizace středového řezu
                 plt.figure(figsize=(10, 5))
                 plt.subplot(1, 2, 1)
-                plt.imshow(sample[0, 0, :, :, sample.shape[4]//2], cmap='gray')
+                plt.imshow(processed_sample[:, :, processed_sample.shape[2]//2], cmap='gray')
                 plt.title(f'Generated - Epoch {epoch+1}')
                 plt.subplot(1, 2, 2)
                 plt.imshow(atlas_sample[0, :, :, atlas_sample.shape[3]//2].cpu(), cmap='hot')
@@ -458,7 +612,7 @@ def train(labels_dir, atlas_path, output_dir, epochs=DEFAULT_EPOCHS,
                 plt.close()
                 
                 # Explicitní uvolnění paměti
-                del z, atlas_sample, sample
+                del z, atlas_sample, sample, processed_sample
                 if device == 'cuda':
                     torch.cuda.empty_cache()
             
@@ -502,17 +656,17 @@ def generate_samples(generator_path, atlas_path, output_dir, num_samples=10, dev
             # Přesun dat na CPU a konverze na NumPy
             sample_cpu = sample.cpu().numpy()
             
-            # Binarizace generovaných dat
-            binary_sample = (sample_cpu[0, 0] > 0.5).astype(np.float32)
+            # Post-processing pro zlepšení struktury
+            processed_sample = post_process_lesions(sample_cpu[0, 0])
             
             # Uložení výsledku
-            sample_img = nib.Nifti1Image(binary_sample, atlas_nii.affine)
+            sample_img = nib.Nifti1Image(processed_sample, atlas_nii.affine)
             nib.save(sample_img, os.path.join(output_dir, f'generated_sample_{i+1}.nii.gz'))
             
             # Vizualizace středového řezu
             plt.figure(figsize=(10, 5))
             plt.subplot(1, 2, 1)
-            plt.imshow(binary_sample[:, :, binary_sample.shape[2]//2], cmap='gray')
+            plt.imshow(processed_sample[:, :, processed_sample.shape[2]//2], cmap='gray')
             plt.title(f'Generated Sample {i+1}')
             plt.subplot(1, 2, 2)
             plt.imshow(atlas[0, :, :, atlas.shape[3]//2].cpu(), cmap='hot')
@@ -520,10 +674,10 @@ def generate_samples(generator_path, atlas_path, output_dir, num_samples=10, dev
             plt.savefig(os.path.join(output_dir, f'generated_sample_{i+1}.png'))
             plt.close()
             
-            print(f"Vygenerován vzorek {i+1}: Sparsity = {np.mean(binary_sample):.6f}")
+            print(f"Vygenerován vzorek {i+1}: Sparsity = {np.mean(processed_sample):.6f}")
             
             # Explicitní uvolnění paměti
-            del sample, sample_cpu, binary_sample
+            del sample, sample_cpu, processed_sample
             if device == 'cuda':
                 torch.cuda.empty_cache()
 
