@@ -18,7 +18,8 @@ BATCH_SIZE = 1
 DEFAULT_EPOCHS = 200  # Výchozí počet epoch
 LAMBDA_SPARSITY = 10.0  # Váha pro sparsity loss
 LAMBDA_ATLAS = 5.0      # Váha pro atlas guidance loss
-LAMBDA_STRUCTURAL = 8.0  # Váha pro strukturální loss
+LAMBDA_STRUCTURAL = 4.0  # Snížená váha pro strukturální loss - menší důraz na přesné struktury
+HETEROGENEITY_LEVEL = 0.3  # Nová konstanta pro úroveň heterogenity (0-1)
 SAVE_INTERVAL = 10      # Jak často ukládat modely a vizualizace
 GRADIENT_ACCUMULATION_STEPS = 4  # Akumulace gradientů pro simulaci větších batchů
 
@@ -70,6 +71,63 @@ class HIELesionDataset(Dataset):
             label = self.transform(label)
             
         return {'label': label, 'atlas': self.atlas}
+
+# Původní verze generátoru pro zpětnou kompatibilitu
+class LegacyGenerator(nn.Module):
+    def __init__(self, latent_dim):
+        super(LegacyGenerator, self).__init__()
+        self.latent_dim = latent_dim
+        
+        # Počáteční velikost (4x4x2)
+        self.init_size = (4, 4, 2)
+        init_channels = 512
+        
+        # Fully connected vrstva pro převod latentního vektoru
+        self.fc = nn.Linear(latent_dim + np.prod(IMAGE_SIZE), np.prod(self.init_size) * init_channels)
+        
+        # 3D Transposed convolutions pro zvětšování dimenzí
+        self.deconv_blocks = nn.Sequential(
+            nn.BatchNorm3d(init_channels),
+            nn.ReLU(True),
+            
+            nn.ConvTranspose3d(init_channels, 256, 4, stride=2, padding=1),  # 8x8x4
+            nn.BatchNorm3d(256),
+            nn.ReLU(True),
+            
+            nn.ConvTranspose3d(256, 128, 4, stride=2, padding=1),  # 16x16x8
+            nn.BatchNorm3d(128),
+            nn.ReLU(True),
+            
+            nn.ConvTranspose3d(128, 64, 4, stride=2, padding=1),  # 32x32x16
+            nn.BatchNorm3d(64),
+            nn.ReLU(True),
+            
+            nn.ConvTranspose3d(64, 32, 4, stride=2, padding=1),  # 64x64x32
+            nn.BatchNorm3d(32),
+            nn.ReLU(True),
+            
+            nn.ConvTranspose3d(32, 16, 4, stride=2, padding=1),  # 128x128x64
+            nn.BatchNorm3d(16),
+            nn.ReLU(True),
+            
+            nn.Conv3d(16, 1, 3, stride=1, padding=1),
+            nn.Sigmoid()
+        )
+    
+    def forward(self, z, atlas):
+        # Atlas jako podmínka pro generování
+        atlas_flat = atlas.view(atlas.size(0), -1)
+        z = torch.cat([z, atlas_flat], dim=1)
+        
+        out = self.fc(z)
+        out = out.view(out.shape[0], 512, *self.init_size)
+        out = self.deconv_blocks(out)
+        
+        # Aplikace frekvenčního atlasu jako masky - léze mohou být jen v nenulových oblastech
+        atlas_expanded = atlas.unsqueeze(1)  # Přidání kanálového rozměru
+        out = out * (atlas_expanded > 0).float()
+        
+        return out
 
 # Optimalizovaný Generátor s menší spotřebou paměti a lepší strukturální schopností
 class Generator(nn.Module):
@@ -200,6 +258,11 @@ class Generator(nn.Module):
         
         # Aplikace frekvenčního atlasu jako masky - léze mohou být jen v nenulových oblastech
         out = out * (atlas_expanded > 0).float()
+        
+        # Přidání heterogenity během forward průchodu - pouze pro inference
+        if not self.training and HETEROGENEITY_LEVEL > 0:
+            out = torch.tensor(add_controlled_heterogeneity(out.cpu().numpy(), HETEROGENEITY_LEVEL), 
+                               device=out.device, dtype=out.dtype)
         
         return out
 
@@ -357,20 +420,21 @@ def gradient_penalty_loss(real_images, fake_images, discriminator, atlas, device
     
     return gradient_penalty
 
-# Post-processing funkce pro vylepšení výsledků
-def post_process_lesions(generated_sample, threshold=0.5, min_size=10):
+# Upravená post-processing funkce pro lepší heterogenitu
+def post_process_lesions(generated_sample, threshold=0.5, min_size=10, heterogeneity=HETEROGENEITY_LEVEL):
     """
-    Post-processing pro vylepšení struktury generovaných lézí
+    Post-processing pro vylepšení struktury generovaných lézí s kontrolovanou heterogenitou
     
     Args:
         generated_sample: Generovaný vzorek (numpy array)
         threshold: Hodnota pro binarizaci
         min_size: Minimální velikost komponenty pro zachování
+        heterogeneity: Úroveň požadované heterogenity (0-1), kde 0 je hladká a 1 je velmi heterogenní
     
     Returns:
-        Vylepšený binární obraz
+        Vylepšený binární obraz s heterogenní strukturou
     """
-    # Binarizace
+    # Binarizace s nižším prahem pro zachování více detailů
     binary = (generated_sample > threshold).astype(np.int32)
     
     # Odstranění malých komponent
@@ -380,16 +444,93 @@ def post_process_lesions(generated_sample, threshold=0.5, min_size=10):
     mask_sizes[0] = 0  # Ignorování pozadí
     binary = mask_sizes[labeled]
     
-    # Použití morfologické operace pro vyplnění děr
-    binary = ndimage.binary_closing(binary, structure=np.ones((3,3,3))).astype(np.float32)
+    # Použití morfologické operace pro vyplnění děr - méně agresivní
+    binary = ndimage.binary_closing(binary, structure=np.ones((2,2,2))).astype(np.float32)
     
-    # Použití mírného vyhlazení pro realistické tvary
-    binary = ndimage.gaussian_filter(binary.astype(float), sigma=0.5)
+    # Přidání kontrolované heterogenity uvnitř lézí
+    if heterogeneity > 0:
+        # Vytvoříme šumový pattern s požadovanou úrovní heterogenity
+        noise = np.random.normal(0, heterogeneity, binary.shape)
+        # Aplikujeme šum pouze na oblasti s lézemi
+        binary_float = binary.astype(float)
+        # Kombinace původního obrazu a šumu pouze v oblastech léze
+        heterogeneous = binary_float + (noise * binary_float * 0.5)
+        # Normalizace hodnot mezi 0.5-1 pro léze (místo 0-1) pro zachování celkové struktury
+        heterogeneous = np.clip(heterogeneous, 0, 1)
+        # V oblastech léze zajistíme minimální hodnotu 0.5
+        heterogeneous = np.where(binary > 0, 0.5 + heterogeneous * 0.5, 0)
+        # Vyhladíme vznikající oblasti, ale méně agresivně
+        heterogeneous = ndimage.gaussian_filter(heterogeneous, sigma=0.3)
+        
+        # Opětovná binarizace s adaptivním prahem, abychom zachovali přibližně stejnou velikost
+        vol_before = np.sum(binary)
+        binary_het = heterogeneous > 0.3  # Nižší práh pro zachování detailů
+        
+        # Pokud je potřeba, upravíme práh pro zachování přibližně stejného objemu
+        if np.sum(binary_het) < vol_before * 0.9:
+            # Hledání prahu, který zachová přibližně stejný objem
+            for test_thresh in np.linspace(0.2, 0.4, 20):
+                binary_het = heterogeneous > test_thresh
+                if np.sum(binary_het) >= vol_before * 0.9:
+                    break
+        
+        # Opětovné odstranění malých izolovaných komponent, které mohly vzniknout
+        labeled, _ = ndimage.label(binary_het)
+        sizes = np.bincount(labeled.ravel())
+        mask_sizes = sizes > min_size
+        mask_sizes[0] = 0
+        binary_het = mask_sizes[labeled]
+        
+        return binary_het.astype(np.float32)
+    else:
+        # Při nulové heterogenitě použijeme původní postup
+        binary = ndimage.gaussian_filter(binary.astype(float), sigma=0.5)
+        binary = (binary > 0.5).astype(np.float32)
+        return binary
+
+# Přidání nové funkce pro vytvoření heterogenity v existujících lézích
+def add_controlled_heterogeneity(input_volume, heterogeneity_level=HETEROGENEITY_LEVEL):
+    """
+    Přidá kontrolovanou heterogenitu do vstupního objemu (během generování)
     
-    # Konečná binarizace
-    binary = (binary > 0.5).astype(np.float32)
+    Args:
+        input_volume: Tensor s generovanými lézemi
+        heterogeneity_level: Úroveň heterogenity (0-1)
+        
+    Returns:
+        Tensor s heterogenními lézemi
+    """
+    if heterogeneity_level <= 0:
+        return input_volume
     
-    return binary
+    # Převedení na numpy pro snazší manipulaci
+    is_tensor = torch.is_tensor(input_volume)
+    if is_tensor:
+        device = input_volume.device
+        input_np = input_volume.cpu().numpy()
+    else:
+        input_np = input_volume
+    
+    # Aplikace pouze na hodnoty > 0 (oblasti léze)
+    binary_mask = input_np > 0.1
+    
+    # Vytvoření Perlinova šumu nebo podobného texturního vzoru pro přirozenější vzhled
+    # Zjednodušená implementace - v produkčním kódu by zde byl složitější texturní generátor
+    noise = np.random.normal(0, heterogeneity_level, input_np.shape)
+    # Vyhladíme šum pro získání korelované textury (ne jen náhodný šum)
+    smooth_noise = ndimage.gaussian_filter(noise, sigma=0.7)
+    
+    # Aplikace šumu pouze na oblasti léze, zachování celkové struktury
+    heterogeneous = input_np.copy()
+    heterogeneous[binary_mask] = input_np[binary_mask] * (1.0 + smooth_noise[binary_mask] * 0.3)
+    
+    # Normalizace hodnot zpět do rozsahu 0-1
+    heterogeneous = np.clip(heterogeneous, 0, 1)
+    
+    # Vrácení zpět jako tensor, pokud byl vstup tensor
+    if is_tensor:
+        return torch.tensor(heterogeneous, device=device, dtype=input_volume.dtype)
+    return heterogeneous
 
 # Kontrola a hlášení dostupné CUDA paměti
 def report_gpu_memory():
@@ -621,7 +762,7 @@ def train(labels_dir, atlas_path, output_dir, epochs=DEFAULT_EPOCHS,
                 report_gpu_memory()
 
 # Funkce pro generování nových lézí pomocí natrénovaného modelu
-def generate_samples(generator_path, atlas_path, output_dir, num_samples=10, device='cuda'):
+def generate_samples(generator_path, atlas_path, output_dir, num_samples=10, heterogeneity=HETEROGENEITY_LEVEL, device='cuda'):
     # Vytvoření output adresáře
     os.makedirs(output_dir, exist_ok=True)
     
@@ -634,53 +775,110 @@ def generate_samples(generator_path, atlas_path, output_dir, num_samples=10, dev
     atlas_nii = nib.load(atlas_path)
     atlas = torch.tensor(atlas_nii.get_fdata(dtype=np.float32), dtype=torch.float32).unsqueeze(0).to(device)
     
-    # Načtení generátoru
-    generator = Generator(LATENT_DIM).to(device)
+    # Kontrola typu checkpointu
+    try:
+        # Načítáme s weights_only=True pro bezpečnost
+        checkpoint = torch.load(generator_path, map_location=device, weights_only=True)
+        print(f"Checkpoint načten z: {generator_path}")
+        
+        # Zjistíme, jestli je to nový nebo starý formát checkpointu
+        is_new_format = False
+        has_discriminator = False
+        
+        if isinstance(checkpoint, dict):
+            # Zjistíme, jestli je to dict se state_dict nebo celým modelem
+            if 'generator_state_dict' in checkpoint:
+                is_new_format = True
+                print("Detekován nový formát checkpointu (s generator_state_dict)")
+            elif 'discriminator_state_dict' in checkpoint:
+                has_discriminator = True
+                print("Detekován checkpoint discriminatoru - nelze použít pro generátor")
+            else:
+                # Pokusíme se zjistit formát z klíčů
+                keys = list(checkpoint.keys())
+                if keys and keys[0].startswith('deconv_blocks'):
+                    print("Detekován starý formát generátoru")
+                elif keys and (keys[0].startswith('fc1') or keys[0].startswith('deconv1')):
+                    is_new_format = True
+                    print("Detekován nový formát generátoru")
+        
+        # Rozhodneme, jaký generátor vytvořit na základě detekce formátu
+        if has_discriminator:
+            print("CHYBA: Načten checkpoint discriminatoru místo generátoru.")
+            print("Potřebujete zadat správnou cestu k checkpointu generátoru.")
+            return
+        
+        # Vybereme správný typ generátoru
+        if is_new_format:
+            print("Použití nového generátoru s residuálními bloky")
+            generator = Generator(LATENT_DIM).to(device)
+        else:
+            print("Použití kompatibilního generátoru pro starý formát")
+            generator = LegacyGenerator(LATENT_DIM).to(device)
+        
+        # Načtení vah s ošetřením všech možných formátů
+        try:
+            if is_new_format and 'generator_state_dict' in checkpoint:
+                generator.load_state_dict(checkpoint['generator_state_dict'])
+                print("Úspěšně načteny váhy z 'generator_state_dict'")
+            elif is_new_format:
+                generator.load_state_dict(checkpoint)
+                print("Úspěšně načteny váhy z nového formátu")
+            else:
+                # Pro starý formát
+                generator.load_state_dict(checkpoint)
+                print("Úspěšně načteny váhy ze starého formátu")
+        except Exception as e:
+            print(f"Chyba při načítání vah: {str(e)}")
+            print("\nPokud jste právě aktualizovali kód a používáte starý model, je potřeba:")
+            print("1. Buď natrénovat nový model s aktualizovanou architekturou")
+            print("2. Nebo použít starší verzi kódu pro generování\n")
+            return
+        
+        generator.eval()
+        
+        # Generování vzorků
+        for i in range(num_samples):
+            with torch.no_grad():
+                z = torch.randn(1, LATENT_DIM).to(device)
+                with torch.amp.autocast(device_type='cuda', enabled=(device=='cuda')):
+                    sample = generator(z, atlas)
+                
+                # Přesun dat na CPU a konverze na NumPy
+                sample_cpu = sample.cpu().numpy()
+                
+                # Post-processing pro zlepšení struktury s kontrolovanou heterogenitou
+                processed_sample = post_process_lesions(sample_cpu[0, 0], heterogeneity=heterogeneity)
+                
+                # Uložení výsledku
+                sample_img = nib.Nifti1Image(processed_sample, atlas_nii.affine)
+                nib.save(sample_img, os.path.join(output_dir, f'generated_sample_{i+1}.nii.gz'))
+                
+                # Vizualizace středového řezu
+                plt.figure(figsize=(10, 5))
+                plt.subplot(1, 2, 1)
+                plt.imshow(processed_sample[:, :, processed_sample.shape[2]//2], cmap='gray')
+                plt.title(f'Generated Sample {i+1}')
+                plt.subplot(1, 2, 2)
+                plt.imshow(atlas[0, :, :, atlas.shape[3]//2].cpu(), cmap='hot')
+                plt.title('Atlas')
+                plt.savefig(os.path.join(output_dir, f'generated_sample_{i+1}.png'))
+                plt.close()
+                
+                print(f"Vygenerován vzorek {i+1}: Sparsity = {np.mean(processed_sample):.6f}")
+                
+                # Explicitní uvolnění paměti
+                del sample, sample_cpu, processed_sample
+                if device == 'cuda':
+                    torch.cuda.empty_cache()
     
-    # Načtení vah - podpora pro oba formáty uložení
-    checkpoint = torch.load(generator_path, map_location=device)
-    if isinstance(checkpoint, dict) and 'generator_state_dict' in checkpoint:
-        generator.load_state_dict(checkpoint['generator_state_dict'])
-    else:
-        generator.load_state_dict(checkpoint)
-    
-    generator.eval()
-    
-    # Generování vzorků
-    for i in range(num_samples):
-        with torch.no_grad():
-            z = torch.randn(1, LATENT_DIM).to(device)
-            with torch.amp.autocast(device_type='cuda', enabled=(device=='cuda')):
-                sample = generator(z, atlas)
-            
-            # Přesun dat na CPU a konverze na NumPy
-            sample_cpu = sample.cpu().numpy()
-            
-            # Post-processing pro zlepšení struktury
-            processed_sample = post_process_lesions(sample_cpu[0, 0])
-            
-            # Uložení výsledku
-            sample_img = nib.Nifti1Image(processed_sample, atlas_nii.affine)
-            nib.save(sample_img, os.path.join(output_dir, f'generated_sample_{i+1}.nii.gz'))
-            
-            # Vizualizace středového řezu
-            plt.figure(figsize=(10, 5))
-            plt.subplot(1, 2, 1)
-            plt.imshow(processed_sample[:, :, processed_sample.shape[2]//2], cmap='gray')
-            plt.title(f'Generated Sample {i+1}')
-            plt.subplot(1, 2, 2)
-            plt.imshow(atlas[0, :, :, atlas.shape[3]//2].cpu(), cmap='hot')
-            plt.title('Atlas')
-            plt.savefig(os.path.join(output_dir, f'generated_sample_{i+1}.png'))
-            plt.close()
-            
-            print(f"Vygenerován vzorek {i+1}: Sparsity = {np.mean(processed_sample):.6f}")
-            
-            # Explicitní uvolnění paměti
-            del sample, sample_cpu, processed_sample
-            if device == 'cuda':
-                torch.cuda.empty_cache()
-
+    except Exception as e:
+        print(f"Chyba při generování vzorků: {str(e)}")
+        print("\nTipy pro řešení problémů:")
+        print("1. Zkontrolujte cestu k souboru generátoru")
+        print("2. Ujistěte se, že používáte správný formát checkpointu") 
+        print("3. Zkuste natrénovat nový model s aktuální verzí kódu")
+        
 if __name__ == "__main__":
     import argparse
     
@@ -695,6 +893,8 @@ if __name__ == "__main__":
     parser.add_argument('--epochs', type=int, default=DEFAULT_EPOCHS, help='počet trénovacích epoch')
     parser.add_argument('--save_interval', type=int, default=SAVE_INTERVAL, help='interval pro ukládání modelů')
     parser.add_argument('--gpu', action='store_true', help='použít GPU')
+    parser.add_argument('--heterogeneity', type=float, default=HETEROGENEITY_LEVEL, 
+                        help='úroveň heterogenity generovaných lézí (0-1)')
     
     args = parser.parse_args()
     
@@ -706,4 +906,4 @@ if __name__ == "__main__":
               args.epochs, args.save_interval, device)
     else:
         generate_samples(args.generator_path, args.atlas_path, args.output_dir, 
-                        args.num_samples, device)
+                        args.num_samples, args.heterogeneity, device)
