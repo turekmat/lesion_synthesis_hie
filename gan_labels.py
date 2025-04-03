@@ -1366,7 +1366,7 @@ def generate_samples(generator_path, atlas_path, output_dir, num_samples=10,
                             generator.forward = original_forward
                             
                             # Nyní získáme finální výstup
-                            sample = original_forward(generator, z, atlas)
+                            sample = original_forward(z, atlas)
                         else:
                             # Pro starší generátor jen získáme běžný výstup
                             sample = generator(z, atlas)
