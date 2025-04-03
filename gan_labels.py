@@ -124,7 +124,7 @@ class Generator(nn.Module):
             nn.ReLU(True),
             
             nn.Conv3d(12, 1, 3, stride=1, padding=1),
-            nn.Sigmoid()
+            nn.Sigmoid()  # Ponecháme sigmoid pro výstup generátoru, protože potřebujeme hodnoty 0-1
         )
         
         # Inicializace vah pro lepší start trénování
@@ -194,10 +194,10 @@ class Discriminator(nn.Module):
             nn.LeakyReLU(0.2, inplace=True)
         )
         
-        # Výstupní vrstva s menším počtem parametrů
+        # Výstupní vrstva s menším počtem parametrů - odstraníme sigmoid, protože BCEWithLogitsLoss ho má integrovaný
         self.output_layer = nn.Sequential(
-            nn.Linear(192 * 4 * 4 * 2, 1),
-            nn.Sigmoid()
+            nn.Linear(192 * 4 * 4 * 2, 1)
+            # Odstranění sigmoidu - bude součástí BCEWithLogitsLoss
         )
         
         # Inicializace vah pro lepší start trénování
@@ -289,11 +289,12 @@ def train(labels_dir, atlas_path, output_dir, epochs=DEFAULT_EPOCHS,
     optimizer_G = optim.Adam(generator.parameters(), lr=0.0001, betas=(0.5, 0.999))
     optimizer_D = optim.Adam(discriminator.parameters(), lr=0.0001, betas=(0.5, 0.999))
     
-    # Loss funkce
-    adversarial_loss = nn.BCELoss()
+    # Loss funkce - změna na BCEWithLogitsLoss, který je bezpečný pro autocast
+    adversarial_loss = nn.BCEWithLogitsLoss()
     
     # Zapnutí automatického mixed precision (FP16) pro úsporu paměti na podporovaných GPU
-    scaler = torch.cuda.amp.GradScaler() if device == 'cuda' else None
+    # Aktualizujeme na nové API
+    scaler = torch.amp.GradScaler() if device == 'cuda' else None
     
     # Trénovací smyčka
     for epoch in range(epochs):
@@ -320,7 +321,7 @@ def train(labels_dir, atlas_path, output_dir, epochs=DEFAULT_EPOCHS,
                 # Pomáhá stabilizovat trénink a ušetřit paměť
                 
                 if scaler:
-                    with torch.cuda.amp.autocast():
+                    with torch.amp.autocast(device_type='cuda'):
                         # Diskriminátor na reálných datech
                         labels_unsqueeze = labels.unsqueeze(1)  # Přidání kanálového rozměru
                         real_validity = discriminator(labels_unsqueeze, atlas)
@@ -367,7 +368,7 @@ def train(labels_dir, atlas_path, output_dir, epochs=DEFAULT_EPOCHS,
                 # Trénink generátoru
                 # -----------------
                 if scaler:
-                    with torch.cuda.amp.autocast():
+                    with torch.amp.autocast(device_type='cuda'):
                         # Generátor se snaží oklamat diskriminátor
                         z = torch.randn(labels.size(0), LATENT_DIM).to(device)
                         fake_images = generator(z, atlas)
@@ -438,7 +439,7 @@ def train(labels_dir, atlas_path, output_dir, epochs=DEFAULT_EPOCHS,
             with torch.no_grad():
                 z = torch.randn(1, LATENT_DIM).to(device)
                 atlas_sample = dataset[0]['atlas'].unsqueeze(0).to(device)
-                with torch.cuda.amp.autocast(enabled=(device=='cuda')):
+                with torch.amp.autocast(device_type='cuda', enabled=(device=='cuda')):
                     sample = generator(z, atlas_sample).cpu().numpy()
                 
                 # Uložení vzorků jako nii file
@@ -495,7 +496,7 @@ def generate_samples(generator_path, atlas_path, output_dir, num_samples=10, dev
     for i in range(num_samples):
         with torch.no_grad():
             z = torch.randn(1, LATENT_DIM).to(device)
-            with torch.cuda.amp.autocast(enabled=(device=='cuda')):
+            with torch.amp.autocast(device_type='cuda', enabled=(device=='cuda')):
                 sample = generator(z, atlas)
             
             # Přesun dat na CPU a konverze na NumPy
