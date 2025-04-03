@@ -19,7 +19,10 @@ DEFAULT_EPOCHS = 200  # Výchozí počet epoch
 LAMBDA_SPARSITY = 10.0  # Váha pro sparsity loss
 LAMBDA_ATLAS = 5.0      # Váha pro atlas guidance loss
 LAMBDA_STRUCTURAL = 4.0  # Snížená váha pro strukturální loss - menší důraz na přesné struktury
-HETEROGENEITY_LEVEL = 0.3  # Nová konstanta pro úroveň heterogenity (0-1)
+HETEROGENEITY_LEVEL = 0.5  # Zvýšená konstanta pro úroveň heterogenity (0-1)
+MULTI_SCALE_NOISE = True  # Použití víceúrovňového šumu pro realističtější heterogenitu
+SHAPE_VARIATION = 0.6     # Míra variability tvaru (0-1) při generování různých vzorků
+LESION_PATTERN_TYPES = 5  # Počet různých "vzorů" lézí pro generování
 SAVE_INTERVAL = 10      # Jak často ukládat modely a vizualizace
 GRADIENT_ACCUMULATION_STEPS = 4  # Akumulace gradientů pro simulaci větších batchů
 
@@ -420,82 +423,16 @@ def gradient_penalty_loss(real_images, fake_images, discriminator, atlas, device
     
     return gradient_penalty
 
-# Upravená post-processing funkce pro lepší heterogenitu
-def post_process_lesions(generated_sample, threshold=0.5, min_size=10, heterogeneity=HETEROGENEITY_LEVEL):
-    """
-    Post-processing pro vylepšení struktury generovaných lézí s kontrolovanou heterogenitou
-    
-    Args:
-        generated_sample: Generovaný vzorek (numpy array)
-        threshold: Hodnota pro binarizaci
-        min_size: Minimální velikost komponenty pro zachování
-        heterogeneity: Úroveň požadované heterogenity (0-1), kde 0 je hladká a 1 je velmi heterogenní
-    
-    Returns:
-        Vylepšený binární obraz s heterogenní strukturou
-    """
-    # Binarizace s nižším prahem pro zachování více detailů
-    binary = (generated_sample > threshold).astype(np.int32)
-    
-    # Odstranění malých komponent
-    labeled, num_features = ndimage.label(binary)
-    sizes = np.bincount(labeled.ravel())
-    mask_sizes = sizes > min_size
-    mask_sizes[0] = 0  # Ignorování pozadí
-    binary = mask_sizes[labeled]
-    
-    # Použití morfologické operace pro vyplnění děr - méně agresivní
-    binary = ndimage.binary_closing(binary, structure=np.ones((2,2,2))).astype(np.float32)
-    
-    # Přidání kontrolované heterogenity uvnitř lézí
-    if heterogeneity > 0:
-        # Vytvoříme šumový pattern s požadovanou úrovní heterogenity
-        noise = np.random.normal(0, heterogeneity, binary.shape)
-        # Aplikujeme šum pouze na oblasti s lézemi
-        binary_float = binary.astype(float)
-        # Kombinace původního obrazu a šumu pouze v oblastech léze
-        heterogeneous = binary_float + (noise * binary_float * 0.5)
-        # Normalizace hodnot mezi 0.5-1 pro léze (místo 0-1) pro zachování celkové struktury
-        heterogeneous = np.clip(heterogeneous, 0, 1)
-        # V oblastech léze zajistíme minimální hodnotu 0.5
-        heterogeneous = np.where(binary > 0, 0.5 + heterogeneous * 0.5, 0)
-        # Vyhladíme vznikající oblasti, ale méně agresivně
-        heterogeneous = ndimage.gaussian_filter(heterogeneous, sigma=0.3)
-        
-        # Opětovná binarizace s adaptivním prahem, abychom zachovali přibližně stejnou velikost
-        vol_before = np.sum(binary)
-        binary_het = heterogeneous > 0.3  # Nižší práh pro zachování detailů
-        
-        # Pokud je potřeba, upravíme práh pro zachování přibližně stejného objemu
-        if np.sum(binary_het) < vol_before * 0.9:
-            # Hledání prahu, který zachová přibližně stejný objem
-            for test_thresh in np.linspace(0.2, 0.4, 20):
-                binary_het = heterogeneous > test_thresh
-                if np.sum(binary_het) >= vol_before * 0.9:
-                    break
-        
-        # Opětovné odstranění malých izolovaných komponent, které mohly vzniknout
-        labeled, _ = ndimage.label(binary_het)
-        sizes = np.bincount(labeled.ravel())
-        mask_sizes = sizes > min_size
-        mask_sizes[0] = 0
-        binary_het = mask_sizes[labeled]
-        
-        return binary_het.astype(np.float32)
-    else:
-        # Při nulové heterogenitě použijeme původní postup
-        binary = ndimage.gaussian_filter(binary.astype(float), sigma=0.5)
-        binary = (binary > 0.5).astype(np.float32)
-        return binary
-
 # Přidání nové funkce pro vytvoření heterogenity v existujících lézích
-def add_controlled_heterogeneity(input_volume, heterogeneity_level=HETEROGENEITY_LEVEL):
+def add_controlled_heterogeneity(input_volume, heterogeneity_level=HETEROGENEITY_LEVEL, multi_scale=MULTI_SCALE_NOISE):
     """
     Přidá kontrolovanou heterogenitu do vstupního objemu (během generování)
+    s možností víceúrovňového šumu pro realističtější textury
     
     Args:
         input_volume: Tensor s generovanými lézemi
         heterogeneity_level: Úroveň heterogenity (0-1)
+        multi_scale: Použít víceúrovňový šum pro realističtější textury
         
     Returns:
         Tensor s heterogenními lézemi
@@ -514,15 +451,39 @@ def add_controlled_heterogeneity(input_volume, heterogeneity_level=HETEROGENEITY
     # Aplikace pouze na hodnoty > 0 (oblasti léze)
     binary_mask = input_np > 0.1
     
-    # Vytvoření Perlinova šumu nebo podobného texturního vzoru pro přirozenější vzhled
-    # Zjednodušená implementace - v produkčním kódu by zde byl složitější texturní generátor
-    noise = np.random.normal(0, heterogeneity_level, input_np.shape)
-    # Vyhladíme šum pro získání korelované textury (ne jen náhodný šum)
-    smooth_noise = ndimage.gaussian_filter(noise, sigma=0.7)
+    if multi_scale:
+        # Vytvoření víceúrovňového šumu pro realističtější textury
+        # Kombinace různých prostorových frekvencí
+        noise_fine = np.random.normal(0, heterogeneity_level, input_np.shape)
+        noise_medium = np.random.normal(0, heterogeneity_level, input_np.shape)
+        noise_coarse = np.random.normal(0, heterogeneity_level, input_np.shape)
+        
+        # Rozdílné vyhlazení pro různé frekvence
+        noise_fine = ndimage.gaussian_filter(noise_fine, sigma=0.5)
+        noise_medium = ndimage.gaussian_filter(noise_medium, sigma=1.5)
+        noise_coarse = ndimage.gaussian_filter(noise_coarse, sigma=3.0)
+        
+        # Kombinace šumů s různými váhami
+        # Vyšší váha pro jemnější šum vytvoří více detailů
+        noise = noise_fine * 0.6 + noise_medium * 0.3 + noise_coarse * 0.1
+    else:
+        # Původní implementace s jednou úrovní šumu
+        noise = np.random.normal(0, heterogeneity_level, input_np.shape)
+        smooth_noise = ndimage.gaussian_filter(noise, sigma=0.7)
     
-    # Aplikace šumu pouze na oblasti léze, zachování celkové struktury
+    # Aplikace šumu pouze na oblasti léze, posílení vnitřní heterogenity
     heterogeneous = input_np.copy()
-    heterogeneous[binary_mask] = input_np[binary_mask] * (1.0 + smooth_noise[binary_mask] * 0.3)
+    # Zvýšení faktoru vlivu šumu na hodnoty pro větší vnitřní kontrast
+    heterogeneous[binary_mask] = input_np[binary_mask] * (1.0 + smooth_noise[binary_mask] * 0.7)
+    
+    # Přidání "fluktuací hustoty" uvnitř léze pro realističtější vzhled
+    if np.sum(binary_mask) > 100:  # Jen pro dostatečně velké léze
+        # Vytvoření náhodných "prasklin" nebo kanálků uvnitř léze
+        fracture_mask = np.random.random(input_np.shape) < 0.05
+        fracture_mask = fracture_mask & binary_mask
+        if np.sum(fracture_mask) > 0:
+            # Snížení hodnot v místech "prasklin"
+            heterogeneous[fracture_mask] *= 0.3
     
     # Normalizace hodnot zpět do rozsahu 0-1
     heterogeneous = np.clip(heterogeneous, 0, 1)
@@ -761,8 +722,326 @@ def train(labels_dir, atlas_path, output_dir, epochs=DEFAULT_EPOCHS,
             if device == 'cuda':
                 report_gpu_memory()
 
-# Funkce pro generování nových lézí pomocí natrénovaného modelu
-def generate_samples(generator_path, atlas_path, output_dir, num_samples=10, heterogeneity=HETEROGENEITY_LEVEL, device='cuda'):
+# Nová funkce pro analýzu morfologických vlastností trénovacích dat
+def analyze_training_data(labels_dir):
+    """
+    Analyzuje trénovací data pro extrakci morfologických vlastností
+    
+    Args:
+        labels_dir: Adresář s trénovacími labely
+        
+    Returns:
+        Dictionary s distribucemi morfologických vlastností
+    """
+    print("Analýza morfologických vlastností trénovacích dat...")
+    
+    # Statistiky o tvarech
+    volumes = []
+    compactness = []
+    elongations = []
+    locations = []
+    
+    # Procházení všech souborů s labely
+    for file in os.listdir(labels_dir):
+        if file.endswith('.nii') or file.endswith('.nii.gz'):
+            file_path = os.path.join(labels_dir, file)
+            
+            try:
+                # Načtení dat
+                label_data = nib.load(file_path).get_fdata(dtype=np.float32)
+                
+                # Přeskočení prázdných labelů
+                if np.sum(label_data) == 0:
+                    continue
+                
+                # Binarizace dat
+                binary = (label_data > 0.5).astype(np.int32)
+                
+                # Extrakce jednotlivých komponent
+                labeled, num_features = ndimage.label(binary)
+                
+                # Pro každou komponentu vypočítat vlastnosti
+                for i in range(1, num_features + 1):
+                    component = (labeled == i)
+                    
+                    # Objem
+                    volume = np.sum(component)
+                    volumes.append(volume)
+                    
+                    # Pozice (těžiště)
+                    if volume > 0:
+                        coords = np.array(np.where(component)).T
+                        centroid = np.mean(coords, axis=0)
+                        locations.append(centroid / np.array(binary.shape))
+                    
+                    # Vlastnosti tvaru - compactness (kulatost)
+                    # Aproximace pomocí povrchu a objemu
+                    eroded = ndimage.binary_erosion(component)
+                    surface = np.sum(component) - np.sum(eroded)
+                    if surface > 0:
+                        comp = (6 * np.sqrt(np.pi) * volume) / (surface ** 1.5)
+                        compactness.append(min(comp, 1.0))  # Omezení na [0, 1]
+                    
+                    # Elongace (protáhnutí)
+                    # Jednoduchá aproximace pomocí ratio hlavních os
+                    if volume > 50:  # Jen pro dostatečně velké léze
+                        try:
+                            # Principal Component Analysis pro určení hlavních os
+                            coords = np.array(np.where(component)).T
+                            if len(coords) > 3:  # Potřebujeme dostatek bodů
+                                centered_coords = coords - np.mean(coords, axis=0)
+                                cov = np.cov(centered_coords, rowvar=False)
+                                eigenvalues = np.linalg.eigvalsh(cov)
+                                if eigenvalues[0] > 0:
+                                    elong = np.sqrt(eigenvalues[2] / eigenvalues[0])
+                                    elongations.append(min(elong, 10.0))  # Omezení outlier hodnot
+                        except:
+                            # Ignorovat chyby při výpočtu
+                            pass
+            
+            except Exception as e:
+                print(f"Chyba při analýze souboru {file}: {str(e)}")
+    
+    # Sestavení statistického modelu
+    model = {
+        "volumes": volumes,
+        "compactness": compactness,
+        "elongations": elongations,
+        "locations": locations
+    }
+    
+    # Výpis základních statistik
+    if volumes:
+        print(f"Analyzováno {len(volumes)} lézí.")
+        print(f"Průměrný objem: {np.mean(volumes):.2f} voxelů (min: {np.min(volumes)}, max: {np.max(volumes)})")
+        if compactness:
+            print(f"Průměrná kulatost: {np.mean(compactness):.2f}")
+        if elongations:
+            print(f"Průměrná elongace: {np.mean(elongations):.2f}")
+    else:
+        print("Nebyly nalezeny žádné léze pro analýzu.")
+    
+    return model
+
+# Upravená post-processing funkce pro lepší heterogenitu
+def post_process_lesions(generated_sample, threshold=0.5, min_size=10, heterogeneity=HETEROGENEITY_LEVEL, 
+                        shape_variation=SHAPE_VARIATION, multi_scale=MULTI_SCALE_NOISE):
+    """
+    Post-processing pro vylepšení struktury generovaných lézí s kontrolovanou heterogenitou
+    a variabilitou tvarů mezi vzorky
+    
+    Args:
+        generated_sample: Generovaný vzorek (numpy array)
+        threshold: Hodnota pro binarizaci
+        min_size: Minimální velikost komponenty pro zachování
+        heterogeneity: Úroveň požadované heterogenity (0-1), kde 0 je hladká a 1 je velmi heterogenní
+        shape_variation: Míra variability tvaru (0-1) při generování různých vzorků
+        multi_scale: Použít víceúrovňový šum
+        
+    Returns:
+        Vylepšený binární obraz s heterogenní strukturou
+    """
+    # Binarizace s nižším prahem pro zachování více detailů
+    # Adaptivně přizpůsobit práh podle variace tvaru
+    adaptive_threshold = threshold - (shape_variation * 0.2)
+    binary = (generated_sample > adaptive_threshold).astype(np.int32)
+    
+    # Odstranění malých komponent
+    labeled, num_features = ndimage.label(binary)
+    sizes = np.bincount(labeled.ravel())
+    mask_sizes = sizes > min_size
+    mask_sizes[0] = 0  # Ignorování pozadí
+    binary = mask_sizes[labeled]
+    
+    # Použití morfologické operace pro vyplnění děr - variabilní agresivita
+    # S rostoucí shape_variation používáme menší strukturální element
+    struct_size = max(1, int(3 - shape_variation * 2))
+    struct_element = np.ones((struct_size, struct_size, struct_size))
+    
+    # Přizpůsobení morfologických operací pro větší variabilitu
+    if shape_variation > 0.8:
+        # Pro vysokou variabilitu - minimální úpravy pro zachování originálního tvaru
+        binary = ndimage.binary_closing(binary, structure=struct_element).astype(np.float32)
+    elif shape_variation > 0.5:
+        # Pro střední variabilitu - střední úpravy
+        binary = ndimage.binary_closing(binary, structure=struct_element).astype(np.float32)
+        # Občasné použití dilatace pro změnu tvaru
+        if np.random.random() > 0.5:
+            binary = ndimage.binary_dilation(binary, structure=np.ones((2,2,2))).astype(np.float32)
+    else:
+        # Pro nízkou variabilitu - více standardizované tvary
+        binary = ndimage.binary_closing(binary, structure=np.ones((2,2,2))).astype(np.float32)
+        binary = ndimage.binary_dilation(binary, structure=np.ones((2,2,2))).astype(np.float32)
+        binary = ndimage.binary_closing(binary, structure=np.ones((3,3,3))).astype(np.float32)
+    
+    # Přidání kontrolované heterogenity uvnitř lézí
+    if heterogeneity > 0:
+        # Pokud je povolena heterogenita
+        
+        # Vytvoříme víceúrovňový šum pro realističtější textury
+        if multi_scale:
+            # Jemnější šum
+            noise_fine = np.random.normal(0, heterogeneity, binary.shape)
+            noise_fine = ndimage.gaussian_filter(noise_fine, sigma=0.5)
+            
+            # Středně hrubý šum
+            noise_medium = np.random.normal(0, heterogeneity, binary.shape)
+            noise_medium = ndimage.gaussian_filter(noise_medium, sigma=1.5)
+            
+            # Hrubší šum pro větší struktury
+            noise_coarse = np.random.normal(0, heterogeneity, binary.shape)
+            noise_coarse = ndimage.gaussian_filter(noise_coarse, sigma=3.0)
+            
+            # Kombinace šumů s různými váhami
+            # Vyšší váha pro jemnější šum vytvoří více detailů
+            noise = noise_fine * 0.6 + noise_medium * 0.3 + noise_coarse * 0.1
+        else:
+            # Jednoduchý náhodný šum
+            noise = np.random.normal(0, heterogeneity, binary.shape)
+            noise = ndimage.gaussian_filter(noise, sigma=0.7) 
+        
+        # Aplikujeme šum pouze na oblasti s lézemi
+        binary_float = binary.astype(float)
+        
+        # Kombinace původního obrazu a šumu pouze v oblastech léze
+        # Vyšší váha šumu pro výraznější heterogenitu
+        heterogeneous = binary_float + (noise * binary_float * 0.8)
+        
+        # Normalizace hodnot mezi 0.5-1 pro léze (místo 0-1) pro zachování celkové struktury
+        heterogeneous = np.clip(heterogeneous, 0, 1)
+        
+        # V oblastech léze zajistíme minimální hodnotu 0.4
+        heterogeneous = np.where(binary > 0, 0.4 + heterogeneous * 0.6, 0)
+        
+        # Přidání náhodných "prasklin" nebo nižších hodnot v některých oblastech
+        if np.random.random() < 0.7:  # 70% šance na přidání prasklin
+            # Vytvoření masky pro oblasti nižší hustoty
+            crack_mask = np.random.random(binary.shape) < 0.08
+            crack_mask = crack_mask & (binary > 0)
+            heterogeneous[crack_mask] *= 0.4  # Snížení hodnoty v těchto oblastech
+            
+        # Vyhladíme vznikající oblasti, ale méně agresivně
+        heterogeneous = ndimage.gaussian_filter(heterogeneous, sigma=0.3)
+        
+        # Opětovná binarizace s adaptivním prahem, abychom zachovali přibližně stejnou velikost
+        vol_before = np.sum(binary)
+        
+        # Variabilní práh dle požadované heterogenity
+        binary_het_threshold = 0.3 - (heterogeneity * 0.1)
+        binary_het = heterogeneous > binary_het_threshold
+        
+        # Pokud je potřeba, upravíme práh pro zachování přibližně stejného objemu
+        if np.sum(binary_het) < vol_before * 0.85:
+            # Hledání prahu, který zachová přibližně stejný objem
+            for test_thresh in np.linspace(0.2, 0.4, 20):
+                binary_het = heterogeneous > test_thresh
+                if np.sum(binary_het) >= vol_before * 0.85:
+                    break
+        
+        # Opětovné odstranění malých izolovaných komponent, které mohly vzniknout
+        labeled, _ = ndimage.label(binary_het)
+        sizes = np.bincount(labeled.ravel())
+        mask_sizes = sizes > min_size
+        mask_sizes[0] = 0
+        binary_het = mask_sizes[labeled]
+        
+        # Vrácení heterogenní léze
+        if np.random.random() < 0.3:  # 30% šance na zachování reálných hodnot místo binární masky
+            # Vrácení přímo hodnot heterogenity pro realističtější vzhled
+            # Ale jen tam, kde je binární maska
+            result = np.zeros_like(heterogeneous)
+            result[binary_het] = heterogeneous[binary_het]
+            return result
+        else:
+            # Vrácení binární masky
+            return binary_het.astype(np.float32)
+    else:
+        # Při nulové heterogenitě použijeme původní postup
+        binary = ndimage.gaussian_filter(binary.astype(float), sigma=0.5)
+        binary = (binary > 0.5).astype(np.float32)
+        return binary
+
+# Nová funkce pro generování různých vzorů lézí
+def generate_varied_samples(generator, atlas, num_samples=5, device='cuda', 
+                          heterogeneity_range=(0.3, 0.7), shape_variation_range=(0.2, 0.8)):
+    """
+    Generuje různé vzorky s variací heterogenity a tvaru
+    
+    Args:
+        generator: Natrénovaný generátor
+        atlas: Frekvenční atlas
+        num_samples: Počet vzorků k vygenerování
+        device: Zařízení pro výpočet
+        heterogeneity_range: Rozsah hodnot heterogenity (min, max)
+        shape_variation_range: Rozsah hodnot variability tvaru (min, max)
+        
+    Returns:
+        Seznam vygenerovaných vzorků
+    """
+    samples = []
+    
+    for i in range(num_samples):
+        # Náhodný latentní vektor - základ variability
+        z = torch.randn(1, LATENT_DIM).to(device)
+        
+        # Přidání náhodné perturbace pro konkrétní vzorek
+        # U každého vzorku zdůrazníme jiné vlastnosti
+        pattern_weights = np.zeros(LESION_PATTERN_TYPES)
+        dominant_pattern = np.random.randint(0, LESION_PATTERN_TYPES)
+        pattern_weights[dominant_pattern] = 0.6  # Dominantní vzor
+        
+        # Náhodné váhy pro ostatní vzory
+        for j in range(LESION_PATTERN_TYPES):
+            if j != dominant_pattern:
+                pattern_weights[j] = np.random.random() * 0.4
+        
+        # Normalizace vah, aby součet byl 1
+        pattern_weights /= np.sum(pattern_weights)
+        
+        # Přidání pattern vektoru k latentnímu prostoru
+        pattern_tensor = torch.tensor(pattern_weights, dtype=torch.float32).to(device)
+        pattern_tensor = pattern_tensor.unsqueeze(0)  # Batch dimension
+        
+        # Modulace latentního vektoru podle vzoru
+        # Vynásobíme každou sekci latentního vektoru jiným faktorem
+        section_size = LATENT_DIM // LESION_PATTERN_TYPES
+        for j in range(LESION_PATTERN_TYPES):
+            start_idx = j * section_size
+            end_idx = start_idx + section_size if j < LESION_PATTERN_TYPES - 1 else LATENT_DIM
+            z[0, start_idx:end_idx] *= (1.0 + pattern_weights[j])
+        
+        # Generování vzorku
+        with torch.no_grad():
+            with torch.amp.autocast(device_type='cuda', enabled=(device=='cuda')):
+                sample = generator(z, atlas)
+            
+            # Přesun dat na CPU
+            sample_cpu = sample.cpu().numpy()
+            
+            # Náhodná úroveň heterogenity a variace tvaru pro tento vzorek
+            heterogeneity = np.random.uniform(*heterogeneity_range)
+            shape_variation = np.random.uniform(*shape_variation_range)
+            
+            # Post-processing s kontrolovanou heterogenitou a variací tvaru
+            processed_sample = post_process_lesions(
+                sample_cpu[0, 0], 
+                heterogeneity=heterogeneity,
+                shape_variation=shape_variation,
+                multi_scale=MULTI_SCALE_NOISE
+            )
+            
+            samples.append({
+                'data': processed_sample,
+                'heterogeneity': heterogeneity,
+                'shape_variation': shape_variation,
+                'dominant_pattern': dominant_pattern
+            })
+    
+    return samples
+
+# Funkce pro generování nových lézí pomocí natrénovaného modelu - upravená verze
+def generate_samples(generator_path, atlas_path, output_dir, num_samples=10, 
+                   heterogeneity=HETEROGENEITY_LEVEL, shape_variation=SHAPE_VARIATION, device='cuda'):
     # Vytvoření output adresáře
     os.makedirs(output_dir, exist_ok=True)
     
@@ -837,43 +1116,50 @@ def generate_samples(generator_path, atlas_path, output_dir, num_samples=10, het
         
         generator.eval()
         
-        # Generování vzorků
-        for i in range(num_samples):
-            with torch.no_grad():
-                z = torch.randn(1, LATENT_DIM).to(device)
-                with torch.amp.autocast(device_type='cuda', enabled=(device=='cuda')):
-                    sample = generator(z, atlas)
-                
-                # Přesun dat na CPU a konverze na NumPy
-                sample_cpu = sample.cpu().numpy()
-                
-                # Post-processing pro zlepšení struktury s kontrolovanou heterogenitou
-                processed_sample = post_process_lesions(sample_cpu[0, 0], heterogeneity=heterogeneity)
-                
-                # Uložení výsledku
-                sample_img = nib.Nifti1Image(processed_sample, atlas_nii.affine)
-                nib.save(sample_img, os.path.join(output_dir, f'generated_sample_{i+1}.nii.gz'))
-                
-                # Vizualizace středového řezu
-                plt.figure(figsize=(10, 5))
-                plt.subplot(1, 2, 1)
-                plt.imshow(processed_sample[:, :, processed_sample.shape[2]//2], cmap='gray')
-                plt.title(f'Generated Sample {i+1}')
-                plt.subplot(1, 2, 2)
-                plt.imshow(atlas[0, :, :, atlas.shape[3]//2].cpu(), cmap='hot')
-                plt.title('Atlas')
-                plt.savefig(os.path.join(output_dir, f'generated_sample_{i+1}.png'))
-                plt.close()
-                
-                print(f"Vygenerován vzorek {i+1}: Sparsity = {np.mean(processed_sample):.6f}")
-                
-                # Explicitní uvolnění paměti
-                del sample, sample_cpu, processed_sample
-                if device == 'cuda':
-                    torch.cuda.empty_cache()
+        # Generování různorodých vzorků
+        print(f"Generování {num_samples} vzorků s variabilní heterogenitou a tvary...")
+        varied_samples = generate_varied_samples(
+            generator, 
+            atlas, 
+            num_samples=num_samples,
+            device=device,
+            heterogeneity_range=(heterogeneity * 0.6, min(heterogeneity * 1.4, 0.9)),
+            shape_variation_range=(shape_variation * 0.6, min(shape_variation * 1.4, 0.9))
+        )
+        
+        # Uložení a zobrazení vzorků
+        for i, sample_info in enumerate(varied_samples):
+            processed_sample = sample_info['data']
+            het_level = sample_info['heterogeneity']
+            shape_var = sample_info['shape_variation']
+            pattern = sample_info['dominant_pattern']
+            
+            # Uložení výsledku
+            sample_img = nib.Nifti1Image(processed_sample, atlas_nii.affine)
+            nib.save(sample_img, os.path.join(output_dir, f'generated_sample_{i+1}.nii.gz'))
+            
+            # Vizualizace středového řezu
+            plt.figure(figsize=(12, 5))
+            plt.subplot(1, 2, 1)
+            plt.imshow(processed_sample[:, :, processed_sample.shape[2]//2], cmap='gray')
+            plt.title(f'Sample {i+1}: Het={het_level:.2f}, Var={shape_var:.2f}, Pattern={pattern}')
+            plt.subplot(1, 2, 2)
+            plt.imshow(atlas[0, :, :, atlas.shape[3]//2].cpu(), cmap='hot')
+            plt.title('Atlas')
+            plt.savefig(os.path.join(output_dir, f'generated_sample_{i+1}.png'))
+            plt.close()
+            
+            print(f"Vygenerován vzorek {i+1}: Sparsity = {np.mean(processed_sample):.6f}, " +
+                 f"Heterogenita = {het_level:.2f}, Variabilita tvaru = {shape_var:.2f}, Vzor = {pattern}")
+            
+            # Explicitní uvolnění paměti
+            if device == 'cuda':
+                torch.cuda.empty_cache()
     
     except Exception as e:
         print(f"Chyba při generování vzorků: {str(e)}")
+        import traceback
+        traceback.print_exc()
         print("\nTipy pro řešení problémů:")
         print("1. Zkontrolujte cestu k souboru generátoru")
         print("2. Ujistěte se, že používáte správný formát checkpointu") 
@@ -895,6 +1181,10 @@ if __name__ == "__main__":
     parser.add_argument('--gpu', action='store_true', help='použít GPU')
     parser.add_argument('--heterogeneity', type=float, default=HETEROGENEITY_LEVEL, 
                         help='úroveň heterogenity generovaných lézí (0-1)')
+    parser.add_argument('--shape_variation', type=float, default=SHAPE_VARIATION,
+                        help='variabilita tvaru mezi generovanými vzorky (0-1)')
+    parser.add_argument('--analyze_training', action='store_true', 
+                        help='provést analýzu trénovacích dat před generováním')
     
     args = parser.parse_args()
     
@@ -905,5 +1195,9 @@ if __name__ == "__main__":
         train(args.labels_dir, args.atlas_path, args.output_dir, 
               args.epochs, args.save_interval, device)
     else:
+        # Volitelná analýza trénovacích dat pro lepší generování
+        if args.analyze_training and args.labels_dir:
+            analyze_training_data(args.labels_dir)
+            
         generate_samples(args.generator_path, args.atlas_path, args.output_dir, 
-                        args.num_samples, args.heterogeneity, device)
+                        args.num_samples, args.heterogeneity, args.shape_variation, device)
