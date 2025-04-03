@@ -960,7 +960,8 @@ class HIELesionGANTrainer:
                  validate_every=5,
                  save_interval=10,
                  device=None,
-                 debug=False):
+                 debug=False,
+                 normative_atlas_path=None):
         
         self.dataloader = dataloader
         self.val_dataloader = val_dataloader
@@ -969,6 +970,7 @@ class HIELesionGANTrainer:
         self.validate_every = validate_every
         self.save_interval = save_interval
         self.debug = debug
+        self.normative_atlas_path = normative_atlas_path
         
         # Create model save directory
         os.makedirs(save_dir, exist_ok=True)
@@ -1537,21 +1539,20 @@ class HIELesionGANTrainer:
                     
                     # ZMĚNA: VŽDY aplikujeme nucenou aktivaci na vzorky, ne jen když jsou prázdné
                     # Vytvoření masky z vysoce pravděpodobných oblastí atlasu
-                    atlas_threshold = torch.quantile(atlas[:1].view(-1), 0.9)  # Horních 10% hodnot atlasu
+                    atlas_threshold = torch.quantile(atlas[:1].view(-1), 0.95)  # Horních 5% hodnot atlasu (původně 0.9)
                     high_prob_regions = (atlas[:1] > atlas_threshold).float() * brain_mask[:1]
                     
                     # Generování náhodné aktivační masky
                     act_mask = torch.zeros_like(fake_lesion)
-                    random_strength = torch.rand(1, device=self.device) * 0.3 + 0.7  # Aktivace 0.7-1.0
+                    random_strength = torch.rand(1, device=self.device) * 0.3 + 0.5  # Aktivace 0.5-0.8 (původně 0.7-1.0)
                     
                     # Přidání nucené aktivace do části vysoce pravděpodobných oblastí
-                    activation_regions = high_prob_regions * (torch.rand_like(high_prob_regions) > 0.5).float()
+                    activation_regions = high_prob_regions * (torch.rand_like(high_prob_regions) > 0.7).float()  # Snížení pravděpodobnosti aktivace (původně 0.5)
                     act_mask = act_mask.scatter_(1, torch.zeros_like(fake_lesion, dtype=torch.long), 
                                                activation_regions * random_strength)
                     
-                    # Smíchání s původním výstupem - 40% generovaný obsah, 60% nucená aktivace
-                    # Toto zajistí, že vzorky budou mít léze, ale stále budou částečně ovlivněny generátorem
-                    fake_lesion = fake_lesion * 0.4 + act_mask * 0.6
+                    # Smíchání s původním výstupem - 70% generovaný obsah, 30% nucená aktivace (původně 40/60)
+                    fake_lesion = fake_lesion * 0.7 + act_mask * 0.3
                     print(f"[SAMPLE {i}] Aplikována nucená aktivace pro zajištění viditelných lézí")
                     
                     # MODIFIED: Use a smoother approach to map the outputs to a binary-like distribution
@@ -1570,7 +1571,7 @@ class HIELesionGANTrainer:
                     
                     # MODIFIED: Apply connected component filtering to remove isolated pixels
                     # First get a binary version for component analysis
-                    binary_np = (soft_binary[0, 0] > 0.5).cpu().float().numpy()
+                    binary_np = (soft_binary[0, 0] > 0.6).cpu().float().numpy()  # Zvýšení prahu na 0.6 (původně 0.5)
                     
                     # Find connected components
                     labeled_components, num_components = measure_label(binary_np, return_num=True)
@@ -2288,20 +2289,20 @@ class HIELesionGANTrainer:
                     fake_lesion = fake_lesion * atlas_binary[:1] * brain_mask_binary[:1]
                     
                     # ZMĚNA: Aplikace nucené aktivace podobně jako v generate_samples
-                    atlas_threshold = torch.quantile(atlas[:1].view(-1), 0.9)  # Horních 10% hodnot atlasu
+                    atlas_threshold = torch.quantile(atlas[:1].view(-1), 0.95)  # Horních 5% hodnot atlasu (původně 0.9)
                     high_prob_regions = (atlas[:1] > atlas_threshold).float() * brain_mask[:1]
                     
                     # Generování náhodné aktivační masky
                     act_mask = torch.zeros_like(fake_lesion)
-                    random_strength = torch.rand(1, device=self.device) * 0.3 + 0.7  # Aktivace 0.7-1.0
+                    random_strength = torch.rand(1, device=self.device) * 0.3 + 0.5  # Aktivace 0.5-0.8 (původně 0.7-1.0)
                     
                     # Přidání nucené aktivace do části vysoce pravděpodobných oblastí
-                    activation_regions = high_prob_regions * (torch.rand_like(high_prob_regions) > 0.5).float()
+                    activation_regions = high_prob_regions * (torch.rand_like(high_prob_regions) > 0.7).float()  # Snížení pravděpodobnosti aktivace (původně 0.5)
                     act_mask = act_mask.scatter_(1, torch.zeros_like(fake_lesion, dtype=torch.long), 
                                                activation_regions * random_strength)
                     
-                    # Smíchání s původním výstupem - 40% generovaný obsah, 60% nucená aktivace
-                    fake_lesion = fake_lesion * 0.4 + act_mask * 0.6
+                    # Smíchání s původním výstupem - 70% generovaný obsah, 30% nucená aktivace (původně 40/60)
+                    fake_lesion = fake_lesion * 0.7 + act_mask * 0.3
                     
                     # Aplikace teplotního škálování pro ostřejší přechody
                     temperature = 8.0
@@ -2311,7 +2312,7 @@ class HIELesionGANTrainer:
                     binary_np = soft_binary[0, 0].cpu().numpy()
                     
                     # Odfiltrování malých komponent (podobně jako v generate_samples)
-                    binary_thresh = (binary_np > 0.5).astype(np.float32)
+                    binary_thresh = (binary_np > 0.6).astype(np.float32)  # Zvýšení prahu na 0.6 (původně 0.5)
                     labeled_components, num_components = measure_label(binary_thresh, return_num=True)
                     
                     # Filtrování malých komponent
@@ -2378,6 +2379,13 @@ class HIELesionGANTrainer:
         """
         print(f"Generuji PDF vizualizaci lézí na normativním mozku pro epochu {epoch}...")
         
+        # Kontrola dostupnosti normativního atlasu
+        has_normative_atlas = self.normative_atlas_path is not None
+        if has_normative_atlas:
+            print(f"Používám normativní atlas z: {self.normative_atlas_path}")
+        else:
+            print("Normativní atlas nebyl zadán, použiji atlas pro léze jako pozadí.")
+        
         # Vytvoření adresáře pro PDF
         pdf_dir = os.path.join(self.save_dir, 'pdf_visualizations')
         os.makedirs(pdf_dir, exist_ok=True)
@@ -2387,6 +2395,18 @@ class HIELesionGANTrainer:
         
         # Přepneme model do eval režimu
         self.generator.eval()
+        
+        # Načtení normativního atlasu, pokud existuje
+        normative_atlas_np = None
+        if has_normative_atlas:
+            try:
+                normative_nifti = nib.load(self.normative_atlas_path)
+                normative_atlas_np = normative_nifti.get_fdata()
+                print(f"Normativní atlas načten, tvar: {normative_atlas_np.shape}")
+            except Exception as e:
+                print(f"Chyba při načítání normativního atlasu: {e}")
+                print("Použiji místo toho atlas léze.")
+                has_normative_atlas = False
         
         # Získáme potřebné údaje z loaderu
         for batch in self.dataloader:
@@ -2404,7 +2424,12 @@ class HIELesionGANTrainer:
             brain_mask_binary = (brain_mask > 0).float()
             
             # Převod atlasu do numpy pro vizualizaci
-            atlas_np = atlas[0, 0].cpu().numpy()
+            if not has_normative_atlas:
+                # Použijeme atlas léze jako pozadí, pokud nemáme normativní atlas
+                atlas_np = atlas[0, 0].cpu().numpy()
+            else:
+                # Použijeme normativní atlas jako pozadí
+                atlas_np = normative_atlas_np
             
             from matplotlib.backends.backend_pdf import PdfPages
             import matplotlib.pyplot as plt
@@ -2433,20 +2458,20 @@ class HIELesionGANTrainer:
                     fake_lesion = fake_lesion * atlas_binary[:1] * brain_mask_binary[:1]
                     
                     # ZMĚNA: Aplikace nucené aktivace podobně jako v generate_samples
-                    atlas_threshold = torch.quantile(atlas[:1].view(-1), 0.9)  # Horních 10% hodnot atlasu
+                    atlas_threshold = torch.quantile(atlas[:1].view(-1), 0.95)  # Horních 5% hodnot atlasu (původně 0.9)
                     high_prob_regions = (atlas[:1] > atlas_threshold).float() * brain_mask[:1]
                     
                     # Generování náhodné aktivační masky
                     act_mask = torch.zeros_like(fake_lesion)
-                    random_strength = torch.rand(1, device=self.device) * 0.3 + 0.7  # Aktivace 0.7-1.0
+                    random_strength = torch.rand(1, device=self.device) * 0.3 + 0.5  # Aktivace 0.5-0.8 (původně 0.7-1.0)
                     
                     # Přidání nucené aktivace do části vysoce pravděpodobných oblastí
-                    activation_regions = high_prob_regions * (torch.rand_like(high_prob_regions) > 0.5).float()
+                    activation_regions = high_prob_regions * (torch.rand_like(high_prob_regions) > 0.7).float()  # Snížení pravděpodobnosti aktivace (původně 0.5)
                     act_mask = act_mask.scatter_(1, torch.zeros_like(fake_lesion, dtype=torch.long), 
                                                activation_regions * random_strength)
                     
-                    # Smíchání s původním výstupem - 40% generovaný obsah, 60% nucená aktivace
-                    fake_lesion = fake_lesion * 0.4 + act_mask * 0.6
+                    # Smíchání s původním výstupem - 70% generovaný obsah, 30% nucená aktivace (původně 40/60)
+                    fake_lesion = fake_lesion * 0.7 + act_mask * 0.3
                     
                     # Aplikace teplotního škálování pro ostřejší přechody
                     temperature = 8.0
@@ -2456,7 +2481,7 @@ class HIELesionGANTrainer:
                     binary_np = soft_binary[0, 0].cpu().numpy()
                     
                     # Odfiltrování malých komponent (podobně jako v generate_samples)
-                    binary_thresh = (binary_np > 0.5).astype(np.float32)
+                    binary_thresh = (binary_np > 0.6).astype(np.float32)  # Zvýšení prahu na 0.6 (původně 0.5)
                     labeled_components, num_components = measure_label(binary_thresh, return_num=True)
                     
                     # Filtrování malých komponent
@@ -2486,29 +2511,39 @@ class HIELesionGANTrainer:
                     
                     # Pro každý slice
                     for i in range(depth):
-                        # Získáme řez atlasu
-                        atlas_slice = atlas_np[i, :, :]
-                        
-                        # Získáme řez léze
-                        lesion_slice = cleaned_binary[i, :, :]
-                        nonzero_count = np.count_nonzero(lesion_slice > 0.5)
-                        
-                        # Vytvoříme překryv - normalizujeme atlas na hodnoty 0-0.5 (šedá)
-                        # a nastavíme léze na hodnotu 1 (červená)
-                        overlay = np.zeros_like(atlas_slice)
-                        
-                        # Normalizace atlasu na rozsah 0-0.5
-                        if atlas_slice.max() > 0:
-                            atlas_norm = atlas_slice / atlas_slice.max() * 0.5
-                            overlay = atlas_norm.copy()
-                        
-                        # Přidáme léze jako 1 (červená barva v custom colormapě)
-                        overlay[lesion_slice > 0.5] = 1.0
-                        
-                        # Nad každým slice zobrazíme číslo slice a počet nenulových pixelů léze
-                        axs[i].set_title(f"{i+1}/{depth}, léze: {nonzero_count} px", fontsize=8)
-                        axs[i].imshow(overlay, cmap=cm, vmin=0, vmax=1)
-                        axs[i].axis('off')
+                        # Získáme řez normativního atlasu/mozku
+                        try:
+                            if has_normative_atlas:
+                                # Použití normativního atlasu
+                                atlas_slice = atlas_np[i, :, :]
+                            else:
+                                # Použití atlasu léze jako pozadí
+                                atlas_slice = atlas_np[i, :, :]
+                            
+                            # Získáme řez léze
+                            lesion_slice = cleaned_binary[i, :, :]
+                            nonzero_count = np.count_nonzero(lesion_slice > 0.5)
+                            
+                            # Vytvoříme překryv - normalizujeme atlas na hodnoty 0-0.5 (šedá)
+                            # a nastavíme léze na hodnotu 1 (červená)
+                            overlay = np.zeros_like(atlas_slice)
+                            
+                            # Normalizace atlasu na rozsah 0-0.5
+                            if atlas_slice.max() > 0:
+                                atlas_norm = atlas_slice / atlas_slice.max() * 0.5
+                                overlay = atlas_norm.copy()
+                            
+                            # Přidáme léze jako 1 (červená barva v custom colormapě)
+                            overlay[lesion_slice > 0.5] = 1.0
+                            
+                            # Nad každým slice zobrazíme číslo slice a počet nenulových pixelů léze
+                            axs[i].set_title(f"{i+1}/{depth}, léze: {nonzero_count} px", fontsize=8)
+                            axs[i].imshow(overlay, cmap=cm, vmin=0, vmax=1)
+                            axs[i].axis('off')
+                        except IndexError:
+                            print(f"  Varování: Řez {i} je mimo rozsah atlasu, přeskakuji.")
+                            axs[i].set_title(f"{i+1}/{depth}, mimo rozsah atlasu", fontsize=8)
+                            axs[i].axis('off')
                     
                     # Skryjeme prázdné subplots (pokud nějaké zbydou)
                     for j in range(depth, len(axs)):
@@ -2518,7 +2553,8 @@ class HIELesionGANTrainer:
                     fig.subplots_adjust(bottom=0.05)
                     import matplotlib.patches as mpatches
                     red_patch = mpatches.Patch(color='red', label='Léze')
-                    gray_patch = mpatches.Patch(color='gray', label='Normativní mozek')
+                    atlas_label = 'Normativní mozek' if has_normative_atlas else 'Atlas pravděpodobnosti lézí'
+                    gray_patch = mpatches.Patch(color='gray', label=atlas_label)
                     fig.legend(handles=[gray_patch, red_patch], loc='lower center', ncol=2)
                     
                     plt.tight_layout(rect=[0, 0.05, 1, 1])  # Ponecháme místo pro legendu
@@ -2531,7 +2567,8 @@ class HIELesionGANTrainer:
         # Vrátíme model do tréninkového režimu
         self.generator.train()
         
-        print(f"PDF vizualizace s překryvem lézí na normativním mozku uložena do: {pdf_path}")
+        atlas_type = "normativního mozku" if has_normative_atlas else "atlasu pravděpodobnosti lézí"
+        print(f"PDF vizualizace s překryvem lézí na {atlas_type} uložena do: {pdf_path}")
 
     def train(self, num_epochs, validate_every=5):
         start_time = time.time()
@@ -2738,21 +2775,21 @@ class HIELesionGANTrainer:
         print(f"Final model saved: {final_checkpoint_path}")
 
 def main():
-    parser = argparse.ArgumentParser(description="Train a lesion GAN")
-    parser.add_argument("--label_dir", type=str, required=True, help="Directory containing lesion label maps")
-    parser.add_argument("--atlas_path", type=str, required=True, help="Path to the lesion atlas file")
-    parser.add_argument("--brain_mask_path", type=str, default=None, help="Path to the normative brain mask file")
-    parser.add_argument("--batch_size", type=int, default=4, help="Batch size for training")
-    parser.add_argument("--epochs", type=int, default=100, help="Number of epochs to train")
-    parser.add_argument("--learning_rate", type=float, default=0.0002, help="Learning rate")
-    parser.add_argument("--z_dim", type=int, default=128, help="Dimension of latent space")
-    parser.add_argument("--save_dir", type=str, default="./results", help="Directory to save results")
-    parser.add_argument("--debug", action="store_true", help="Enable debug output")
-    parser.add_argument("--filter_empty", action="store_true", help="Filter out empty (all-black) images from the dataset")
-    
+    parser = argparse.ArgumentParser(description='GAN model for HIE lesion synthesis')
+    parser.add_argument('--label_dir', type=str, required=True, help='Path to the directory with label maps')
+    parser.add_argument('--atlas_path', type=str, required=True, help='Path to the atlas file')
+    parser.add_argument('--brain_mask_path', type=str, default=None, help='Path to the brain mask file')
+    parser.add_argument('--normative_atlas_path', type=str, default=None, help='Path to the normative atlas file (used only for PDF overlay visualization)')
+    parser.add_argument('--batch_size', type=int, default=1, help='Batch size for training')
+    parser.add_argument('--epochs', type=int, default=100, help='Number of epochs for training')
+    parser.add_argument('--learning_rate', type=float, default=0.0002, help='Learning rate for training')
+    parser.add_argument('--z_dim', type=int, default=128, help='Dimension of latent space')
+    parser.add_argument('--save_dir', type=str, default='./results', help='Directory to save results')
+    parser.add_argument('--debug', action='store_true', help='Enable debug mode')
+    parser.add_argument('--filter_empty', action='store_true', help='Filter out empty label maps')
     args = parser.parse_args()
     
-    # Create dataset
+    # Create dataset and dataloader
     dataset = HIELesionDataset(
         label_dir=args.label_dir,
         atlas_path=args.atlas_path,
@@ -2760,7 +2797,6 @@ def main():
         filter_empty=args.filter_empty
     )
     
-    # Create dataloader
     dataloader = DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -2774,7 +2810,8 @@ def main():
         z_dim=args.z_dim,
         learning_rate=args.learning_rate,
         save_dir=args.save_dir,
-        debug=args.debug
+        debug=args.debug,
+        normative_atlas_path=args.normative_atlas_path
     )
     
     # Train model
