@@ -16,7 +16,7 @@ IMAGE_SIZE = (128, 128, 64)
 LATENT_DIM = 100
 BATCH_SIZE = 1
 DEFAULT_EPOCHS = 200  # Výchozí počet epoch
-LAMBDA_SPARSITY = 10.0  # Váha pro sparsity loss
+LAMBDA_SPARSITY = 8.0  # Snížená váha pro sparsity loss - příliš vysoká způsobovala prázdné výstupy
 LAMBDA_ATLAS = 5.0      # Váha pro atlas guidance loss
 LAMBDA_STRUCTURAL = 4.0  # Snížená váha pro strukturální loss - menší důraz na přesné struktury
 HETEROGENEITY_LEVEL = 0.5  # Zvýšená konstanta pro úroveň heterogenity (0-1)
@@ -31,6 +31,8 @@ GRADIENT_ACCUMULATION_STEPS = 4  # Akumulace gradientů pro simulaci větších 
 # Přidané konstanty pro sparsity distribution
 SPARSITY_DISTRIBUTION_WEIGHTS = [0.65, 0.10, 0.05, 0.05, 0.05, 0.05, 0.01, 0.01, 0.01, 0.01, 0.01]
 SPARSITY_DISTRIBUTION_VALUES = [0.001, 0.003, 0.005, 0.007, 0.009, 0.012, 0.015, 0.02, 0.025, 0.03]
+# Minimální pokrytí pro zabránění prázdným výstupům
+MIN_COVERAGE_PERCENTAGE = 0.0001  # 0.01% minimální pokrytí, pod touto hodnotou aktivujeme korekce
 
 # Dataset
 class HIELesionDataset(Dataset):
@@ -309,8 +311,9 @@ class Generator(nn.Module):
             nn.Sigmoid()
         )
         
-        # Nastavení prahu pro řídkost - bude se učit během tréninku
-        self.sparsity_threshold = nn.Parameter(torch.tensor([0.7]))
+        # Nastavení prahu pro řídkost - snížená hodnota pro méně agresivní prahování
+        # Původní hodnota 0.7 byla příliš vysoká a efektivně odstranila všechny léze
+        self.sparsity_threshold = nn.Parameter(torch.tensor([0.3]))
         
         # Inicializace vah pro lepší start trénování
         self._initialize_weights()
@@ -368,16 +371,51 @@ class Generator(nn.Module):
         # Aplikace threshold modulu pro zvýšení řídkosti a lepší kontrolu
         threshold_mask = self.threshold_module(raw_out)
         
-        # Dynamický práh pro řízení řídkosti - aplikujeme efekt hard thresholdingu pomocí sigmoid se strmou křivkou
-        # Hodnota self.sparsity_threshold se učí během tréninku
-        beta = 10.0  # Strmý přechod Sigmoid
+        # Dynamický práh pro řízení řídkosti - používáme méně strmou sigmoidní funkci (beta=5.0 místo 10.0)
+        # To umožní více hodnotám "projít" přes práh
+        beta = 5.0  # Snížená strmost pro plynulejší přechod
         sparse_out = torch.sigmoid(beta * (raw_out - self.sparsity_threshold))
         
         # Modulace výstupu pomocí threshold masky - kombinace tvrdého a měkkého prahování
         out = sparse_out * threshold_mask * atlas_mask
         
+        # Zaručíme minimální pokrytí lézemi - pokud je výstup úplně prázdný, zachováme alespoň nejvýraznější oblasti
+        if self.training:
+            # Během tréninku - přidáme mechanismus, který zabrání úplnému vynulování
+            total_coverage = torch.mean(out)
+            
+            # Pokud je celkové pokrytí příliš nízké (méně než 0.0001%), přidáme minimální léze
+            if total_coverage < 1e-6:
+                # Použijeme top 0.01% hodnot z původního výstupu
+                k = max(1, int(0.0001 * raw_out.numel()))
+                flat_raw = raw_out.view(-1)
+                top_values, _ = torch.topk(flat_raw, k)
+                min_threshold = top_values[-1] if k > 0 else 0.0
+                
+                # Vytvoříme masku pro minimální léze
+                min_mask = (raw_out > min_threshold).float()
+                
+                # Přidáme minimální léze k výstupu
+                out = out + min_mask * raw_out * 0.5
+        
         # Přidání heterogenity během forward průchodu - pouze pro inference
         if not self.training and HETEROGENEITY_LEVEL > 0:
+            # Pokud je výstup úplně prázdný, vrátíme alespoň nejsilnější oblasti
+            if torch.sum(out > 0.05) == 0:
+                # Identifikujeme top 0.01% hodnot z raw_out
+                k = max(1, int(0.0001 * raw_out.numel()))
+                flat_raw = raw_out.view(-1)
+                top_values, top_indices = torch.topk(flat_raw, k)
+                
+                # Vytvoříme řídkou masku s několika body
+                sparse_mask = torch.zeros_like(flat_raw)
+                sparse_mask[top_indices] = top_values
+                sparse_mask = sparse_mask.view_as(raw_out)
+                
+                # Použijeme tuto masku místo prázdného výstupu
+                out = sparse_mask
+            
+            # Aplikace heterogenity
             out = torch.tensor(add_controlled_heterogeneity(out.cpu().numpy(), HETEROGENEITY_LEVEL), 
                                device=out.device, dtype=out.dtype)
         
@@ -499,27 +537,57 @@ def sparsity_loss(generated_images, real_images=None):
     # Výpočet aktuální sparsity generovaných dat
     current_sparsity = torch.mean(generated_images)
     
+    # Minimální sparsity - zaručení, že nebudou zcela prázdné výstupy
+    MIN_SPARSITY = 1e-5  # 0.001%
+    zero_penalty = 0.0
+    
+    # Penalizace zcela prázdných výstupů (blízkých nule)
+    if current_sparsity < MIN_SPARSITY:
+        zero_penalty = 2.0 * torch.abs(MIN_SPARSITY - current_sparsity)
+    
     if real_images is not None:
         # Pokud jsou k dispozici skutečné obrazy, použijeme jejich sparsity jako cíl
         target_sparsity = torch.mean(real_images)
-        loss = torch.abs(current_sparsity - target_sparsity)
+        
+        # Zajistíme minimální cílovou hodnotu, aby se zabránilo učení na téměř nulových datech
+        target_sparsity = torch.max(target_sparsity, torch.tensor(MIN_SPARSITY, device=target_sparsity.device))
+        
+        # Asymetrická loss - menší penalizace pro hodnoty menší než cílové
+        if current_sparsity < target_sparsity:
+            # Mírnější penalizace pro příliš malé hodnoty (0.8x)
+            loss = 0.8 * torch.abs(current_sparsity - target_sparsity)
+        else:
+            # Silnější penalizace pro příliš velké hodnoty
+            diff = current_sparsity - target_sparsity
+            # Progressivní penalizace - čím větší odchylka, tím větší penalizace
+            if diff > target_sparsity:
+                # Pokud je odchylka větší než samotný cíl, zvýšíme penalizaci exponenciálně
+                loss = torch.abs(diff) * (1.0 + torch.log(1.0 + diff/target_sparsity))
+            else:
+                loss = torch.abs(diff)
     else:
         # Jinak použijeme váženou náhodnou hodnotu z distribuce podobné trénovacím datům
-        # S vysokou pravděpodobností velmi nízké hodnoty (0.1-0.2%)
-        if torch.rand(1).item() < 0.7:  # 70% šance na velmi nízkou hodnotu
-            target_sparsity = torch.distributions.Uniform(0.0005, 0.0019).sample((1,)).item()
+        # Menší zaměření na velmi nízké hodnoty (50% šance na velmi nízkou hodnotu)
+        if torch.rand(1).item() < 0.5:  # Sníženo z 70% na 50%
+            # Zvýšení minimální hodnoty z 0.0005 na 0.001 - zabráníme příliš nízkým cílům
+            target_sparsity = torch.distributions.Uniform(0.001, 0.0019).sample((1,)).item()
         else:
-            # Zbývajících 30% - rozloženo přes širší rozsah
+            # Širší rozsah pro zbývajících 50%
             target_sparsity = torch.distributions.Uniform(0.002, 0.03).sample((1,)).item()
             
-        # Penalizace, když je sparsity mimo požadovaný rozsah (0.0005 - 0.03)
-        loss = torch.abs(current_sparsity - target_sparsity)
-        
-        # Exponenciální penalizace pro hodnoty výrazně nad cílem
-        if current_sparsity > 2 * target_sparsity:
-            loss = loss * (1.0 + torch.log(current_sparsity / target_sparsity))
+        # Asymetrická loss - menší penalizace pro hodnoty menší než cílové
+        if current_sparsity < target_sparsity:
+            loss = 0.8 * torch.abs(current_sparsity - target_sparsity)
+        else:
+            # Silnější penalizace pro příliš velké hodnoty
+            diff = current_sparsity - target_sparsity
+            if diff > target_sparsity:
+                loss = torch.abs(diff) * (1.0 + torch.log(1.0 + diff/target_sparsity))
+            else:
+                loss = torch.abs(diff)
     
-    return loss
+    # Přidáme penalizaci pro nulové výstupy
+    return loss + zero_penalty
 
 def structural_similarity_loss(generated, real):
     """
@@ -1018,6 +1086,72 @@ def analyze_single_file(file_path):
         print(f"Chyba při analýze souboru {file_path}: {str(e)}")
         return None
 
+# Přidání funkce pro ověření a korekci prázdných vzorků
+def ensure_non_empty_sample(sample, raw_output=None, min_coverage=0.0001):
+    """
+    Zajistí, že vzorek obsahuje viditelné léze
+    
+    Args:
+        sample: Generovaný vzorek (numpy array)
+        raw_output: Původní nezpracovaný výstup před prahováním (pokud k dispozici)
+        min_coverage: Minimální požadované pokrytí
+        
+    Returns:
+        Upravený vzorek s viditelnými lézemi
+    """
+    # Kontrola, zda je vzorek prázdný nebo téměř prázdný
+    current_coverage = np.mean(sample > 0.1)
+    
+    if current_coverage < min_coverage:
+        print(f"Detekován prázdný vzorek (pokrytí: {current_coverage*100:.6f}%), aplikuji korekci...")
+        
+        if raw_output is not None:
+            # Použití raw_output pro vytvoření minimálních lézí
+            # Vytvoříme léze z top 0.01% hodnot
+            flat_raw = raw_output.flatten()
+            k = max(1, int(0.001 * flat_raw.size))  # 0.1% nejvyšších hodnot
+            threshold = np.percentile(flat_raw, 100 - 0.1)  # Horních 0.1%
+            
+            # Vytvoření lézí z oblastí nad prahem
+            corrected_sample = np.zeros_like(sample)
+            corrected_sample[raw_output > threshold] = raw_output[raw_output > threshold]
+            
+            # Aplikace mírného rozostření pro spojitější léze
+            corrected_sample = ndimage.gaussian_filter(corrected_sample, sigma=0.7)
+            
+            print(f"Vzorek opraven použitím top hodnot z raw výstupu")
+            return corrected_sample
+        else:
+            # Pokud nemáme raw_output, vytvoříme umělé léze
+            # Vybereme náhodné body jako centra lézí
+            corrected_sample = np.zeros_like(sample)
+            shape = sample.shape
+            
+            # Vytvoření 3-10 malých lézí
+            num_lesions = np.random.randint(3, 11)
+            for _ in range(num_lesions):
+                # Náhodné centrum léze
+                center_x = np.random.randint(10, shape[0]-10)
+                center_y = np.random.randint(10, shape[1]-10)
+                center_z = np.random.randint(5, shape[2]-5)
+                
+                # Náhodná velikost léze
+                size_x = np.random.randint(1, 4)
+                size_y = np.random.randint(1, 4)
+                size_z = np.random.randint(1, 3)
+                
+                # Vytvoření léze (malá elipsa)
+                x, y, z = np.ogrid[-center_x:shape[0]-center_x, -center_y:shape[1]-center_y, -center_z:shape[2]-center_z]
+                mask = (x*x)/(size_x*size_x) + (y*y)/(size_y*size_y) + (z*z)/(size_z*size_z) <= 1
+                
+                # Přidání léze do vzorku
+                corrected_sample[mask] = 0.7 + 0.3 * np.random.random()
+            
+            print(f"Vzorek opraven vytvořením {num_lesions} umělých lézí")
+            return corrected_sample
+    
+    return sample
+
 # Funkce pro generování nových lézí pomocí natrénovaného modelu - upravená verze
 def generate_samples(generator_path, atlas_path, output_dir, num_samples=10, 
                    heterogeneity=HETEROGENEITY_LEVEL, shape_variation=SHAPE_VARIATION,
@@ -1118,6 +1252,7 @@ def generate_samples(generator_path, atlas_path, output_dir, num_samples=10,
         
         # Generování vzorků
         all_samples = []
+        max_attempts = 3  # Maximální počet pokusů pro generování validního vzorku
         
         print(f"Generování {num_samples} vzorků...")
         for i in range(num_samples):
@@ -1146,33 +1281,99 @@ def generate_samples(generator_path, atlas_path, output_dir, num_samples=10,
                     "avg_connectivity": connectivity_variation
                 }
             
-            # Generování vzorku
-            # Náhodný latentní vektor
-            z = torch.randn(1, LATENT_DIM).to(device)
+            # Generování vzorku s opakovanými pokusy, pokud je výstup prázdný
+            valid_sample = False
+            attempts = 0
+            raw_output = None
+            sample_cpu = None
             
-            # Přidání náhodné perturbace pro jedinečnost
-            pattern_weights = np.zeros(LESION_PATTERN_TYPES)
-            dominant_pattern = np.random.randint(0, LESION_PATTERN_TYPES)
-            pattern_weights[dominant_pattern] = 0.6
-            
-            for j in range(LESION_PATTERN_TYPES):
-                if j != dominant_pattern:
-                    pattern_weights[j] = np.random.random() * 0.4
-            
-            pattern_weights /= np.sum(pattern_weights)
-            
-            # Modulace latentního vektoru
-            section_size = LATENT_DIM // LESION_PATTERN_TYPES
-            for j in range(LESION_PATTERN_TYPES):
-                start_idx = j * section_size
-                end_idx = start_idx + section_size if j < LESION_PATTERN_TYPES - 1 else LATENT_DIM
-                z[0, start_idx:end_idx] *= (1.0 + pattern_weights[j])
-            
-            # Generování
-            with torch.no_grad():
-                with torch.amp.autocast(device_type='cuda', enabled=(device=='cuda')):
-                    sample = generator(z, atlas)
-                sample_cpu = sample.cpu().numpy()
+            while not valid_sample and attempts < max_attempts:
+                # Náhodný latentní vektor
+                z = torch.randn(1, LATENT_DIM).to(device)
+                
+                # Přidání náhodné perturbace pro jedinečnost
+                pattern_weights = np.zeros(LESION_PATTERN_TYPES)
+                dominant_pattern = np.random.randint(0, LESION_PATTERN_TYPES)
+                pattern_weights[dominant_pattern] = 0.6
+                
+                for j in range(LESION_PATTERN_TYPES):
+                    if j != dominant_pattern:
+                        pattern_weights[j] = np.random.random() * 0.4
+                
+                pattern_weights /= np.sum(pattern_weights)
+                
+                # Modulace latentního vektoru
+                section_size = LATENT_DIM // LESION_PATTERN_TYPES
+                for j in range(LESION_PATTERN_TYPES):
+                    start_idx = j * section_size
+                    end_idx = start_idx + section_size if j < LESION_PATTERN_TYPES - 1 else LATENT_DIM
+                    z[0, start_idx:end_idx] *= (1.0 + pattern_weights[j])
+                
+                # Generování
+                with torch.no_grad():
+                    with torch.amp.autocast(device_type='cuda', enabled=(device=='cuda')):
+                        # Uložíme si i nezpracovaný výstup pro případ, že by byl konečný výstup prázdný
+                        if isinstance(generator, Generator):
+                            # Pro nový generátor - získáme raw_output přímo
+                            # Toto je hack - upravíme dočasně forward metodu
+                            original_forward = generator.forward
+                            
+                            # Vytvoříme modifikovanou forward metodu, která vrátí oba výstupy
+                            def modified_forward(self, z, atlas):
+                                # Efektivnější zpracování atlasu - jako 3D konvoluce místo flattening
+                                atlas_expanded = atlas.unsqueeze(1)  # Přidání kanálového rozměru
+                                atlas_features = self.atlas_encoder(atlas_expanded)
+                                
+                                # Zpracování latent vektoru
+                                x = F.relu(self.fc1(z))
+                                x = x + atlas_features
+                                x = self.fc2(x)
+                                
+                                x = x.view(x.shape[0], 384, *self.init_size)
+                                
+                                x = self.deconv1(x)
+                                x = self.res_block1(x)
+                                
+                                x = self.deconv2(x)
+                                x = self.res_block2(x)
+                                
+                                x = self.deconv3(x)
+                                x = self.res_block3(x)
+                                
+                                x = self.deconv4(x)
+                                x = self.res_block4(x)
+                                
+                                x = self.deconv5(x)
+                                x = self.res_block5(x)
+                                
+                                # Finální konvoluce
+                                raw_out = self.final_conv(x)
+                                
+                                # Aplikace frekvenčního atlasu jako masky
+                                atlas_mask = (atlas_expanded > 0).float()
+                                raw_out = raw_out * atlas_mask
+                                
+                                # Vrátíme raw_out bez dalšího zpracování
+                                return raw_out
+                            
+                            # Nahradíme metodu
+                            generator.forward = modified_forward.__get__(generator, Generator)
+                            
+                            # Získáme raw_output
+                            raw_output = generator(z, atlas)
+                            
+                            # Vrátíme původní metodu
+                            generator.forward = original_forward
+                            
+                            # Nyní získáme finální výstup
+                            sample = original_forward(generator, z, atlas)
+                        else:
+                            # Pro starší generátor jen získáme běžný výstup
+                            sample = generator(z, atlas)
+                            raw_output = sample  # Použijeme stejný výstup jako raw
+                        
+                        sample_cpu = sample.cpu().numpy()
+                        raw_output_cpu = raw_output.cpu().numpy() if raw_output is not None else None
                 
                 # Nastavení parametrů na základě cílových vlastností
                 target_coverage = target_properties["coverage"]
@@ -1192,21 +1393,36 @@ def generate_samples(generator_path, atlas_path, output_dir, num_samples=10,
                     multi_scale=MULTI_SCALE_NOISE
                 )
                 
-                # Výpočet aktuálního pokrytí
-                actual_coverage = np.sum(processed_sample > 0) / np.prod(processed_sample.shape)
-                
-                # Přidání vzorku do výsledků
-                all_samples.append({
-                    'data': processed_sample,
-                    'heterogeneity': use_heterogeneity,
-                    'shape_variation': use_shape_var,
-                    'connectivity': target_connectivity,
-                    'target_coverage': target_coverage,
-                    'actual_coverage': actual_coverage,
-                    'reference_file': os.path.basename(reference_file) if reference_file else None
-                })
+                # Kontrola, zda je vzorek validní (není prázdný)
+                if np.sum(processed_sample > 0.1) > 10:  # Alespoň 10 nenulových voxelů
+                    valid_sample = True
+                else:
+                    # Pokud je vzorek prázdný, zkusíme znovu s jiným latent vektorem
+                    attempts += 1
+                    print(f"Vzorek {i+1}: Pokus {attempts} - vygenerován prázdný vzorek, zkouším znovu...")
+            
+            # Pokud jsou všechny pokusy neúspěšné, použijeme korekční mechanismus
+            if not valid_sample:
+                print(f"Vzorek {i+1}: Všechny pokusy selhaly, aplikuji nouzovou korekci...")
+                # Použijeme korekční funkci s raw_output, pokud je k dispozici
+                raw_data = raw_output_cpu[0, 0] if raw_output_cpu is not None else None
+                processed_sample = ensure_non_empty_sample(processed_sample, raw_data, min_coverage=0.0001)
+            
+            # Výpočet aktuálního pokrytí
+            actual_coverage = np.sum(processed_sample > 0) / np.prod(processed_sample.shape)
+            
+            # Přidání vzorku do výsledků
+            all_samples.append({
+                'data': processed_sample,
+                'heterogeneity': use_heterogeneity,
+                'shape_variation': use_shape_var,
+                'connectivity': target_connectivity,
+                'target_coverage': target_coverage,
+                'actual_coverage': actual_coverage,
+                'reference_file': os.path.basename(reference_file) if reference_file else None
+            })
         
-        # Uložení a zobrazení vzorků
+        # Uložení a zobrazení vzorků - zůstává stejné
         for i, sample_info in enumerate(all_samples):
             processed_sample = sample_info['data']
             het_level = sample_info['heterogeneity']
