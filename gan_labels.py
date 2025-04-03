@@ -1044,6 +1044,167 @@ def generate_samples(generator_path, atlas_path, output_dir, num_samples=10,
         print("2. Ujistěte se, že používáte správný formát checkpointu") 
         print("3. Zkuste natrénovat nový model s aktuální verzí kódu")
 
+# Přidání funkce post_process_lesions, která byla odstraněna
+def post_process_lesions(generated_sample, threshold=0.5, min_size=10, heterogeneity=HETEROGENEITY_LEVEL, 
+                        shape_variation=SHAPE_VARIATION, connectivity_variation=CONNECTIVITY_VARIATION,
+                        target_coverage=DEFAULT_TARGET_COVERAGE, multi_scale=MULTI_SCALE_NOISE):
+    """
+    Post-processing pro vylepšení struktury generovaných lézí s kontrolovanou heterogenitou,
+    variabilitou tvarů mezi vzorky a nastavitelnou spojitostí/fragmentací lézí
+    
+    Args:
+        generated_sample: Generovaný vzorek (numpy array)
+        threshold: Hodnota pro binarizaci
+        min_size: Minimální velikost komponenty pro zachování
+        heterogeneity: Úroveň požadované heterogenity (0-1), kde 0 je hladká a 1 je velmi heterogenní
+        shape_variation: Míra variability tvaru (0-1) při generování různých vzorků
+        connectivity_variation: Míra spojitosti lézí (0-1), kde 0 je více fragmentované, 1 je více spojité
+        target_coverage: Cílové pokrytí lézemi (procento objemu)
+        multi_scale: Použít víceúrovňový šum
+        
+    Returns:
+        Vylepšený binární obraz s heterogenní strukturou
+    """
+    # Binarizace s nižším prahem pro zachování více detailů
+    # Adaptivně přizpůsobit práh podle variace tvaru
+    adaptive_threshold = threshold - (shape_variation * 0.2)
+    binary = (generated_sample > adaptive_threshold).astype(np.int32)
+    
+    # Odstranění malých komponent
+    labeled, num_features = ndimage.label(binary)
+    sizes = np.bincount(labeled.ravel())
+    mask_sizes = sizes > min_size
+    mask_sizes[0] = 0  # Ignorování pozadí
+    binary = mask_sizes[labeled]
+    
+    # Aplikace morfologických operací podle požadované spojitosti
+    # Pro vysokou spojitost použijeme closing pro vyplnění děr a spojení blízkých lézí
+    # Pro nízkou spojitost použijeme opening pro fragmentaci
+    if connectivity_variation > 0.7:  # Vysoce spojité léze
+        # Silnější closing pro spojování blízkých oblastí
+        struct_size = 3
+        struct_element = np.ones((struct_size, struct_size, struct_size))
+        binary = ndimage.binary_closing(binary, structure=struct_element, iterations=2).astype(np.float32)
+        # Případně přidáme dilataci pro další spojení
+        if connectivity_variation > 0.9:
+            binary = ndimage.binary_dilation(binary, structure=np.ones((2,2,2))).astype(np.float32)
+            binary = ndimage.binary_closing(binary, structure=struct_element).astype(np.float32)
+    elif connectivity_variation > 0.4:  # Střední spojitost
+        # Standardní closing
+        struct_size = max(1, int(3 - shape_variation * 2))
+        struct_element = np.ones((struct_size, struct_size, struct_size))
+        binary = ndimage.binary_closing(binary, structure=struct_element).astype(np.float32)
+    else:  # Nízká spojitost - více fragmentů
+        # Použijeme opening pro vytvoření mezer
+        binary = ndimage.binary_closing(binary, structure=np.ones((2,2,2))).astype(np.float32)
+        if connectivity_variation < 0.2:
+            # Pro velmi nízkou spojitost použijeme erozi následovanou dilatací s menším kernelem
+            binary = ndimage.binary_erosion(binary, structure=np.ones((2,2,2))).astype(np.float32)
+            binary = ndimage.binary_dilation(binary, structure=np.ones((1,1,1))).astype(np.float32)
+    
+    # Přidání kontrolované heterogenity uvnitř lézí
+    if heterogeneity > 0:
+        # Pokud je povolena heterogenita
+        
+        # Vytvoříme víceúrovňový šum pro realističtější textury
+        if multi_scale:
+            # Jemnější šum
+            noise_fine = np.random.normal(0, heterogeneity, binary.shape)
+            noise_fine = ndimage.gaussian_filter(noise_fine, sigma=0.5)
+            
+            # Středně hrubý šum
+            noise_medium = np.random.normal(0, heterogeneity, binary.shape)
+            noise_medium = ndimage.gaussian_filter(noise_medium, sigma=1.5)
+            
+            # Hrubší šum pro větší struktury
+            noise_coarse = np.random.normal(0, heterogeneity, binary.shape)
+            noise_coarse = ndimage.gaussian_filter(noise_coarse, sigma=3.0)
+            
+            # Kombinace šumů s různými váhami
+            # Vyšší váha pro jemnější šum vytvoří více detailů
+            noise = noise_fine * 0.6 + noise_medium * 0.3 + noise_coarse * 0.1
+        else:
+            # Jednoduchý náhodný šum
+            noise = np.random.normal(0, heterogeneity, binary.shape)
+            noise = ndimage.gaussian_filter(noise, sigma=0.7) 
+        
+        # Aplikujeme šum pouze na oblasti s lézemi
+        binary_float = binary.astype(float)
+        
+        # Kombinace původního obrazu a šumu pouze v oblastech léze
+        # Vyšší váha šumu pro výraznější heterogenitu
+        heterogeneous = binary_float + (noise * binary_float * 0.8)
+        
+        # Normalizace hodnot mezi 0.5-1 pro léze (místo 0-1) pro zachování celkové struktury
+        heterogeneous = np.clip(heterogeneous, 0, 1)
+        
+        # V oblastech léze zajistíme minimální hodnotu 0.4
+        heterogeneous = np.where(binary > 0, 0.4 + heterogeneous * 0.6, 0)
+        
+        # Přidání náhodných "prasklin" nebo nižších hodnot v některých oblastech
+        # Upraveno podle connectivity_variation - fragmentovanější léze mají více prasklin
+        crack_probability = 0.08 * (1.0 - connectivity_variation)
+        if np.random.random() < 0.7:  # 70% šance na přidání prasklin
+            # Vytvoření masky pro oblasti nižší hustoty
+            crack_mask = np.random.random(binary.shape) < crack_probability
+            crack_mask = crack_mask & (binary > 0)
+            heterogeneous[crack_mask] *= 0.4  # Snížení hodnoty v těchto oblastech
+            
+        # Vyhladíme vznikající oblasti, ale méně agresivně
+        smoothing_sigma = 0.3 + (connectivity_variation * 0.2)  # Více spojité léze jsou více vyhlazené
+        heterogeneous = ndimage.gaussian_filter(heterogeneous, sigma=smoothing_sigma)
+        
+        # Opětovná binarizace s adaptivním prahem, abychom zachovali přibližně stejnou velikost
+        vol_before = np.sum(binary)
+        
+        # Variabilní práh dle požadované heterogenity
+        binary_het_threshold = 0.3 - (heterogeneity * 0.1)
+        binary_het = heterogeneous > binary_het_threshold
+        
+        # Úprava pokrytí, pokud je cílová hodnota specifikována
+        current_coverage = np.sum(binary_het) / np.prod(binary_het.shape)
+        
+        # Pokud se aktuální pokrytí výrazně liší od cílového, upravíme práh
+        if abs(current_coverage - target_coverage) > 0.002:  # Povolená 0.2% odchylka
+            # Zkusíme najít práh, který přiblíží pokrytí k cílovému
+            best_threshold = binary_het_threshold
+            best_diff = abs(current_coverage - target_coverage)
+            
+            for test_thresh in np.linspace(0.1, 0.5, 20):
+                test_binary = heterogeneous > test_thresh
+                test_coverage = np.sum(test_binary) / np.prod(test_binary.shape)
+                diff = abs(test_coverage - target_coverage)
+                
+                if diff < best_diff:
+                    best_diff = diff
+                    best_threshold = test_thresh
+            
+            # Aplikace nejlepšího prahu
+            binary_het = heterogeneous > best_threshold
+        
+        # Opětovné odstranění malých izolovaných komponent, které mohly vzniknout
+        labeled, _ = ndimage.label(binary_het)
+        sizes = np.bincount(labeled.ravel())
+        mask_sizes = sizes > min_size
+        mask_sizes[0] = 0
+        binary_het = mask_sizes[labeled]
+        
+        # Vrácení heterogenní léze
+        if np.random.random() < 0.3:  # 30% šance na zachování reálných hodnot místo binární masky
+            # Vrácení přímo hodnot heterogenity pro realističtější vzhled
+            # Ale jen tam, kde je binární maska
+            result = np.zeros_like(heterogeneous)
+            result[binary_het] = heterogeneous[binary_het]
+            return result
+        else:
+            # Vrácení binární masky
+            return binary_het.astype(np.float32)
+    else:
+        # Při nulové heterogenitě použijeme původní postup
+        binary = ndimage.gaussian_filter(binary.astype(float), sigma=0.5)
+        binary = (binary > 0.5).astype(np.float32)
+        return binary
+
 if __name__ == "__main__":
     import argparse
     
