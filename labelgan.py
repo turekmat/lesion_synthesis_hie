@@ -17,6 +17,7 @@ import matplotlib.pyplot as plt
 from skimage.measure import label as measure_label
 import scipy.ndimage as ndimage
 from matplotlib.colors import LinearSegmentedColormap
+from contextlib import nullcontext
 
 class HIELesionDataset(Dataset):
     def __init__(self, 
@@ -1476,31 +1477,36 @@ class HIELesionGANTrainer:
         correlation_denominator = fake_lesion.sum() + 1e-8
         atlas_correlation = correlation_numerator / correlation_denominator
         
-        # Pokud je korelace příliš nízká, aplikujeme jemné vodítko
-        threshold = 0.1  # Tento práh lze ladit
+        # NOVÉ: Vždy aplikujeme jemné vodítko, ale s různou intenzitou podle korelace
+        threshold = 0.3  # Zvýšení prahu z 0.1 na 0.3 pro častější aplikaci silnějšího vodítka
+        
+        # Vypočítáme pravděpodobnost aktivace podle atlasu
+        # Upravujeme sigmoid transformaci pro větší aktivaci
+        activation_prob = torch.sigmoid((normalized_atlas - 0.3) * 6) * 0.8 + 0.1
+        
+        # Vytvoříme měkkou masku vodítka
+        random_tensor = torch.rand_like(activation_prob)
+        
+        # Síla vodítka závisí na korelaci
         if atlas_correlation < threshold:
-            # Vypočítáme pravděpodobnost aktivace jako funkci hodnot atlasu
-            # Nelineární mapování zajistí, že žádná oblast nemá 100% ani 0%
-            # Sigmoid transformace (normalized_atlas - 0.5) * 4 mapuje hodnoty
-            # tak, aby středních 0.5 bylo kolem inflexního bodu sigmoid funkce
-            activation_prob = torch.sigmoid((normalized_atlas - 0.5) * 4) * 0.7 + 0.1
-            
-            # Vytvoříme měkkou masku vodítka - náhodná maska váhovaná podle pravděpodobnosti
-            random_tensor = torch.rand_like(activation_prob)
-            guidance_mask = (random_tensor < activation_prob).float()
-            
-            # Aplikujeme vodítko s požadovanou silou, mixujeme s původním výstupem
-            guided_lesion = fake_lesion * (1 - guidance_strength) + guidance_mask * guidance_strength
-            
-            # Použijeme pouze v mozku
-            guided_lesion = guided_lesion * brain_mask
-            
-            return guided_lesion
+            # Při nízké korelaci silnější aktivace
+            guidance_mask = (random_tensor < (activation_prob * 1.5)).float()
+            effective_strength = min(1.0, guidance_strength * 1.25)  # Až o 25% silnější, max 100%
         else:
-            # Pokud je korelace dostatečná, ponecháme výstup generátoru beze změny
-            return fake_lesion
-            
-    def generate_samples(self, num_samples=5, output_dir=None, use_fixed_z=False, save_nifti=True):
+            # Při dobré korelaci jemnější aktivace
+            guidance_mask = (random_tensor < activation_prob).float()
+            effective_strength = guidance_strength
+        
+        # Mixujeme původní výstup s vodítkem
+        guided_lesion = fake_lesion * (1 - effective_strength) + guidance_mask * effective_strength
+        
+        # Použijeme pouze v mozku
+        guided_lesion = guided_lesion * brain_mask
+        
+        
+        return guided_lesion
+
+    def generate_samples(self, num_samples=5, output_dir=None, use_fixed_z=False, save_nifti=True, return_data=False):
         """
         Generate samples from the trained generator
         
@@ -1509,16 +1515,40 @@ class HIELesionGANTrainer:
             output_dir: directory to save generated samples
             use_fixed_z: whether to use a fixed latent vector (False = random samples)
             save_nifti: whether to save the generated samples as NIfTI files
+            return_data: whether to return generated samples data instead of saving them
+            
+        Returns:
+            If return_data is True, returns a dictionary with generated samples and related data:
+            {
+                'cleaned_binaries': list of cleaned binary numpy arrays,
+                'atlas': atlas tensor,
+                'brain_mask': brain mask tensor,
+                'atlas_binary': binary atlas tensor,
+                'brain_mask_binary': binary brain mask tensor
+            }
+            Otherwise returns None after saving the files
         """
-        if output_dir is None:
+        if output_dir is None and not return_data:
             output_dir = os.path.join(self.save_dir, 'generated_samples')
         
-        # Create output directory if it doesn't exist
-        os.makedirs(output_dir, exist_ok=True)
+        # Return data structure
+        generated_data = {
+            'cleaned_binaries': [],
+            'raw_lesions': [],
+            'latent_vectors': [],
+            'atlas': None,
+            'brain_mask': None,
+            'atlas_binary': None,
+            'brain_mask_binary': None,
+        }
         
-        # Create directory for visualizations
-        viz_dir = os.path.join(output_dir, 'visualizations')
-        os.makedirs(viz_dir, exist_ok=True)
+        # Create output directory if it doesn't exist
+        if not return_data:
+            os.makedirs(output_dir, exist_ok=True)
+            
+            # Create directory for visualizations
+            viz_dir = os.path.join(output_dir, 'visualizations')
+            os.makedirs(viz_dir, exist_ok=True)
         
         # Create a dictionary to store statistics about generated lesions
         stats = {
@@ -1547,18 +1577,19 @@ class HIELesionGANTrainer:
             atlas_binary = (atlas > 0).float()
             brain_mask_binary = (brain_mask > 0).float()
             
+            # Store these in the return data
+            generated_data['atlas'] = atlas
+            generated_data['brain_mask'] = brain_mask
+            generated_data['atlas_binary'] = atlas_binary
+            generated_data['brain_mask_binary'] = brain_mask_binary
+            
             # Save the atlas reference
-            if hasattr(self, 'lesion_atlas_path') and self.lesion_atlas_path:
+            if not return_data and hasattr(self, 'lesion_atlas_path') and self.lesion_atlas_path:
                 atlas_nib = nib.load(self.lesion_atlas_path)
                 nib.save(atlas_nib, os.path.join(output_dir, 'atlas_reference.nii.gz'))
             
             # Create a file to save statistics
-            stats_path = os.path.join(output_dir, 'lesion_statistics.txt')
-            vis_dir = os.path.join(output_dir, 'visualizations')
-            os.makedirs(vis_dir, exist_ok=True)
-            
-            # Place to save combined visualization
-            combined_viz = []
+            stats_path = os.path.join(output_dir, 'lesion_statistics.txt') if not return_data else None
             
             # Switch model to eval mode
             self.generator.eval()
@@ -1568,9 +1599,10 @@ class HIELesionGANTrainer:
             fixed_z = torch.randn(1, self.z_dim, device=self.device) if use_fixed_z else None
             
             # Generate samples
-            with open(stats_path, 'w') as f:
-                f.write("Statistiky generovaných lézí\n")
-                f.write("==========================\n\n")
+            with open(stats_path, 'w') if not return_data else nullcontext() as f:
+                if not return_data:
+                    f.write("Statistiky generovaných lézí\n")
+                    f.write("==========================\n\n")
                 
                 # Generate samples
                 for i in range(num_samples):
@@ -1583,16 +1615,26 @@ class HIELesionGANTrainer:
                         torch.manual_seed(42 + i) if use_fixed_z else None
                     z = torch.randn(1, self.z_dim, device=self.device)
                     
+                    # Store latent vector
+                    generated_data['latent_vectors'].append(z.detach().clone())
+                    
                     # Generate lesions
                     with torch.no_grad():
                         fake_lesion = self.generator(z, atlas[:1], brain_mask[:1])
                     
                     # NOVÉ: Použití sofistikovaného přístupu s atlasem jako jemným vodítkem
-                    guidance_strength = 0.3  # Síla vlivu atlasu (0.3 = 30% vlivu atlasu)
+                    guidance_strength = 0.7  # Síla vlivu atlasu (zvýšeno z 0.3 na 0.7 - 70% vlivu atlasu)
                     fake_lesion = self.apply_soft_atlas_guidance(
                         fake_lesion, atlas[:1], brain_mask[:1], guidance_strength
                     )
-                    print(f"[SAMPLE {i}] Aplikováno adaptivní vodítko atlasu pro generování realistických lézí")
+                    
+                    # Store raw lesion
+                    generated_data['raw_lesions'].append(fake_lesion.detach().clone())
+                    
+                    # DEBUG: Vypsání počtu aktivních pixelů
+                    active_pixels = torch.sum(fake_lesion > 0.5).item()
+                    total_pixels = torch.numel(fake_lesion)
+                    print(f"  DEBUG: Po aplikaci guidance - Aktivních pixelů: {active_pixels} z {total_pixels} ({(active_pixels/total_pixels)*100:.4f}%)")
                     
                     # Aplikace atlasu a brain masky
                     fake_lesion = fake_lesion * atlas_binary[:1] * brain_mask_binary[:1]
@@ -1609,157 +1651,86 @@ class HIELesionGANTrainer:
                     # Apply a softer threshold to get more coherent lesions
                     # Using temperature scaling to sharpen the transition but not fully binarize
                     temperature = 8.0  # Less aggressive than 20.0 used in the Generator
-                    soft_binary = torch.sigmoid(temperature * (fake_lesion - 0.5))
                     
-                    # MODIFIED: Apply connected component filtering to remove isolated pixels
-                    # First get a binary version for component analysis
-                    binary_np = (soft_binary[0, 0] > 0.55).cpu().float().numpy()  # Snížení prahu z 0.7 na 0.55
+                    # Převod na numpy pro další zpracování
+                    binary_np = (fake_lesion > 0.5).float().cpu().numpy()
                     
-                    # Find connected components
-                    labeled_components, num_components = measure_label(binary_np, return_num=True)
+                    # Odfiltrování malých komponent (podobně jako v generate_samples)
+                    binary_thresh = (binary_np > 0.55).astype(np.float32)  # Snížení prahu na 0.55 (původně 0.7)
+                    labeled_components, num_components = measure_label(binary_thresh, return_num=True)
                     
-                    # MODIFIED: Filter out very small components (likely noise)
+                    # Filtrování malých komponent
                     component_sizes = np.bincount(labeled_components.flatten())[1:] if num_components > 0 else []
-                    min_component_size = 3  # Minimum size to keep a component
+                    min_component_size = 3  # Minimální velikost komponenty pro zachování
                     
-                    # NOVÉ: Také ořežeme příliš velké komponenty
-                    max_component_size = 250  # Snížení z 500 na 250 pixelů pro zajištění malých lézí
-                    
-                    # Create cleaned binary mask
                     cleaned_binary = np.zeros_like(binary_np)
                     for comp_id in range(1, num_components + 1):
-                        if component_sizes[comp_id - 1] >= min_component_size and comp_size <= max_component_size:
+                        if component_sizes[comp_id - 1] >= min_component_size:
                             cleaned_binary[labeled_components == comp_id] = 1
                     
-                    # Convert back to tensor
-                    # Fix: Use the device of an input tensor instead of self.device
-                    cleaned_binary_tensor = torch.from_numpy(cleaned_binary).float().to(fake_lesion.device)
-                    cleaned_binary_tensor = cleaned_binary_tensor.unsqueeze(0).unsqueeze(0)
+                    # Kontrola inverzních hodnot
+                    ones_percentage = np.mean(cleaned_binary == 1) * 100
+                    if ones_percentage > 90:
+                        print(f"  UPOZORNĚNÍ: Hodnoty vypadají invertované - {ones_percentage:.2f}% jsou jedničky!")
+                        cleaned_binary = 1 - cleaned_binary
                     
-                    # Final binary lesion combines the soft values with the cleaned binary mask
-                    binary_lesion = soft_binary * cleaned_binary_tensor
+                    # Store cleaned binary
+                    generated_data['cleaned_binaries'].append(cleaned_binary)
                     
-                    # Get lesion volume and count
-                    lesion_volume = binary_lesion.sum().item()
-                    
-                    # Connected components analysis to count separate lesions
-                    # CPU computation for connected components
-                    binary_np = binary_lesion[0, 0].cpu().numpy()
-                    labeled_components, num_components = measure_label(binary_np, return_num=True)
-                    
-                    # Calculate atlas coverage
-                    total_atlas_area = atlas_binary.sum().item()
-                    lesion_area_in_atlas = (binary_lesion * atlas_binary[:1]).sum().item()
-                    atlas_coverage_percent = (lesion_area_in_atlas / total_atlas_area) * 100 if total_atlas_area > 0 else 0
-                    
-                    # Save statistics
-                    stats['lesion_volumes'].append(lesion_volume)
-                    stats['lesion_counts'].append(num_components)
-                    stats['atlas_coverage'].append(atlas_coverage_percent)
-                    
-                    # Write statistics to file
-                    f.write(f"Vzorek {i}:\n")
-                    f.write(f"  - Počet lézí: {stats['lesion_counts'][i]}\n")
-                    f.write(f"  - Objem lézí: {stats['lesion_volumes'][i]} voxelů\n")
-                    f.write(f"  - Pokrytí atlasu: {stats['atlas_coverage'][i]:.2f}%\n\n")
-                    
-                    # Visualization across planes
-                    fig, axes = plt.subplots(3, 3, figsize=(15, 15))
-                    
-                    # Define view planes
-                    planes = ['axial', 'coronal', 'sagittal']
-                    
-                    # Find best slices for each view
-                    for p_idx, plane in enumerate(planes):
-                        # Find slice with maximum lesion content
-                        if plane == 'axial':
-                            slices = [np.sum(binary_np[i, :, :]) for i in range(binary_np.shape[0])]
-                            if max(slices) > 0:
-                                slice_idx = np.argmax(slices)
-                            else:
-                                slice_idx = binary_np.shape[0] // 2
-                                
-                            binary_slice = binary_np[slice_idx, :, :]
-                            atlas_slice = atlas_binary[0, 0, slice_idx].cpu().numpy()
-                            brain_slice = brain_mask_binary[0, 0, slice_idx].cpu().numpy()
-                            
-                        elif plane == 'coronal':
-                            slices = [np.sum(binary_np[:, i, :]) for i in range(binary_np.shape[1])]
-                            if max(slices) > 0:
-                                slice_idx = np.argmax(slices)
-                            else:
-                                slice_idx = binary_np.shape[1] // 2
-                                
-                            binary_slice = binary_np[:, slice_idx, :]
-                            atlas_slice = atlas_binary[0, 0, :, slice_idx].cpu().numpy()
-                            brain_slice = brain_mask_binary[0, 0, :, slice_idx].cpu().numpy()
-                            
-                        else:  # sagittal
-                            slices = [np.sum(binary_np[:, :, i]) for i in range(binary_np.shape[2])]
-                            if max(slices) > 0:
-                                slice_idx = np.argmax(slices)
-                            else:
-                                slice_idx = binary_np.shape[2] // 2
-                                
-                            binary_slice = binary_np[:, :, slice_idx]
-                            atlas_slice = atlas_binary[0, 0, :, :, slice_idx].cpu().numpy()
-                            brain_slice = brain_mask_binary[0, 0, :, :, slice_idx].cpu().numpy()
+                    # Další zpracování a vizualizace pouze pokud nevrácíme data
+                    if not return_data:
+                        # Použijeme všechny řezy
+                        depth = cleaned_binary.shape[0]
                         
-                        # Plot lesion
-                        axes[p_idx, 0].imshow(binary_slice, cmap='binary', interpolation='none')
-                        axes[p_idx, 0].set_title(f'{plane.capitalize()} - Lesion')
-                        axes[p_idx, 0].axis('off')
+                        # Uspořádání: 4 řezy na řádek
+                        cols = 4
+                        rows = int(np.ceil(depth / cols))
+                        fig, axs = plt.subplots(rows, cols, figsize=(cols * 3, rows * 3))
+                        # Pokud je pouze jeden řádek, zajistíme konzistentní iteraci
+                        axs = np.array(axs).reshape(-1)
                         
-                        # Plot atlas
-                        axes[p_idx, 1].imshow(atlas_slice, cmap='hot', interpolation='none')
-                        axes[p_idx, 1].set_title(f'{plane.capitalize()} - Atlas')
-                        axes[p_idx, 1].axis('off')
+                        # Pro každý slice
+                        for i in range(depth):
+                            slice_img = cleaned_binary[i, :, :]
+                            nonzero_count = np.count_nonzero(slice_img > 0.5)
+                            
+                            # Nad každým slice zobrazíme číslo slice a počet nenulových pixelů
+                            axs[i].set_title(f"{i+1}/{depth}, nz: {nonzero_count}", fontsize=8)
+                            axs[i].imshow(slice_img, cmap='gray', vmin=0, vmax=1)
+                            axs[i].axis('off')
                         
-                        # Plot combined view (lesion + atlas)
-                        combined = np.zeros((binary_slice.shape[0], binary_slice.shape[1], 3))
-                        combined[:, :, 0] = binary_slice  # Red channel for lesion
-                        combined[:, :, 1] = atlas_slice * 0.5  # Green channel for atlas (dimmed)
-                        combined[:, :, 2] = brain_slice * 0.3  # Blue channel for brain mask (dimmed)
+                        # Skryjeme prázdné subplots (pokud nějaké zbydou)
+                        for j in range(depth, len(axs)):
+                            axs[j].axis('off')
                         
-                        axes[p_idx, 2].imshow(combined, interpolation='none')
-                        axes[p_idx, 2].set_title(f'{plane.capitalize()} - Combined')
-                        axes[p_idx, 2].axis('off')
-                    
-                    # Save visualization
-                    plt.tight_layout()
-                    plt.savefig(os.path.join(vis_dir, f'sample_{i}.png'), dpi=200)
-                    plt.close(fig)
-                    
-                    # Save NIfTI if requested
-                    if save_nifti:
-                        try:
-                            # Get reference file for affine and header
-                            first_file = self.dataloader.dataset.label_files[0]
-                            ref_nib = nib.load(first_file)
-                            
-                            # Create NIfTI from generated lesion
-                            binary_nii = nib.Nifti1Image(binary_np, ref_nib.affine, ref_nib.header)
-                            
-                            # Save NIfTI
-                            nib.save(binary_nii, os.path.join(output_dir, f'generated_lesion_{i}.nii.gz'))
-                            
-                        except Exception as e:
-                            print(f"Error saving NIfTI for sample {i}: {e}")
+                        plt.tight_layout()
+                        pdf.savefig(fig)
+                        plt.close(fig)
+                        
+                        # TODO: Calculate statistics and save
                 
-                # Write summary statistics
-                f.write("\nSouhrnné statistiky:\n")
-                f.write("=================\n")
-                f.write(f"Průměrný počet lézí: {np.mean(stats['lesion_counts']):.2f} (±{np.std(stats['lesion_counts']):.2f})\n")
-                f.write(f"Průměrný objem lézí: {np.mean(stats['lesion_volumes']):.2f} (±{np.std(stats['lesion_volumes']):.2f}) voxelů\n")
-                f.write(f"Průměrné pokrytí atlasu: {np.mean(stats['atlas_coverage']):.2f}% (±{np.std(stats['atlas_coverage']):.2f}%)\n")
+                # Write summary statistics if not returning data
+                if not return_data:
+                    f.write("\nSouhrnné statistiky:\n")
+                    f.write("=================\n")
+                    f.write(f"Průměrný počet lézí: {np.mean(stats['lesion_counts']):.2f} (±{np.std(stats['lesion_counts']):.2f})\n")
+                    f.write(f"Průměrný objem lézí: {np.mean(stats['lesion_volumes']):.2f} (±{np.std(stats['lesion_volumes']):.2f}) voxelů\n")
+                    f.write(f"Průměrné pokrytí atlasu: {np.mean(stats['atlas_coverage']):.2f}% (±{np.std(stats['atlas_coverage']):.2f}%)\n")
             
             # No need to continue looping through batches once we've processed one
             break
         
-        print(f"\nStatistiky byly uloženy do: {stats_path}")
-        print(f"Vizualizace byly uloženy do: {vis_dir}")
+        if not return_data:
+            print(f"\nStatistiky byly uloženy do: {stats_path}")
+            print(f"Vizualizace byly uloženy do: {viz_dir}")
         
         self.generator.train()
+        
+        # Return the generated data if requested
+        if return_data:
+            return generated_data
+        
+        return None
 
     def train_discriminator(self, real_lesions, atlas, brain_mask=None):
         batch_size = real_lesions.size(0)
@@ -2039,6 +2010,7 @@ class HIELesionGANTrainer:
         # Dice loss for better overlap, weighted by atlas probabilities
         weighted_dice_loss = self.atlas_weighted_dice(fake_lesions * valid_regions, real_lesions * valid_regions, atlas_resized)
         
+        
         # Atlas-guided focal loss - encourage generation in high probability atlas regions
         focal_loss_term = self.atlas_focal_loss(fake_lesions * brain_mask, real_lesions * brain_mask, atlas_resized)
         
@@ -2297,108 +2269,48 @@ class HIELesionGANTrainer:
         # Název výsledného PDF
         pdf_path = os.path.join(pdf_dir, f'lesion_slices_epoch_{epoch}.pdf')
         
-        # Přepneme model do eval režimu
-        self.generator.eval()
+        # Využijeme generate_samples k získání dat
+        samples_data = self.generate_samples(num_samples=num_samples, return_data=True)
         
-        # Získáme potřebné údaje z loaderu
-        for batch in self.dataloader:
-            atlas = batch['atlas'].to(self.device)
-            brain_mask = batch['brain_mask'].to(self.device)
-            
-            # Zajistíme batch rozměr
-            if atlas.dim() == 3:
-                atlas = atlas.unsqueeze(0)
-            if brain_mask.dim() == 3:
-                brain_mask = brain_mask.unsqueeze(0)
-            
-            # Binární masky
-            atlas_binary = (atlas > 0).float()
-            brain_mask_binary = (brain_mask > 0).float()
-            
-            from matplotlib.backends.backend_pdf import PdfPages
-            import matplotlib.pyplot as plt
-            
-            # Otevření PDF souboru (všechny vzorky na samostatných stránkách)
-            with PdfPages(pdf_path) as pdf:
-                # Pro každý vzorek vygenerujeme podobně jako v generate_samples
-                for sample_idx in range(num_samples):
-                    print(f"  Generuji vzorek {sample_idx+1}/{num_samples}...")
-                    
-                    # Vygenerování latentního vektoru
-                    z = torch.randn(1, self.z_dim, device=self.device)
-                    
-                    # Generování léze
-                    with torch.no_grad():
-                        fake_lesion = self.generator(z, atlas[:1], brain_mask[:1])
-                    
-                    # Aplikace atlasu a brain masky
-                    fake_lesion = fake_lesion * atlas_binary[:1] * brain_mask_binary[:1]
-                    
-                    # NOVÉ: Použití sofistikovaného přístupu s atlasem jako jemným vodítkem
-                    guidance_strength = 0.3  # Síla vlivu atlasu (0.3 = 30% vlivu atlasu)
-                    fake_lesion = self.apply_soft_atlas_guidance(
-                        fake_lesion, atlas[:1], brain_mask[:1], guidance_strength
-                    )
-                    
-                    # Aplikace teplotního škálování pro ostřejší přechody
-                    temperature = 8.0
-                    soft_binary = torch.sigmoid(temperature * (fake_lesion - 0.5))
-                    
-                    # Převod na numpy pro další zpracování
-                    binary_np = soft_binary[0, 0].cpu().numpy()
-                    
-                    # Odfiltrování malých komponent (podobně jako v generate_samples)
-                    binary_thresh = (binary_np > 0.55).astype(np.float32)  # Snížení prahu na 0.55 (původně 0.7)
-                    labeled_components, num_components = measure_label(binary_thresh, return_num=True)
-                    
-                    # Filtrování malých komponent
-                    component_sizes = np.bincount(labeled_components.flatten())[1:] if num_components > 0 else []
-                    min_component_size = 3  # Minimální velikost komponenty pro zachování
-                    
-                    cleaned_binary = np.zeros_like(binary_np)
-                    for comp_id in range(1, num_components + 1):
-                        if component_sizes[comp_id - 1] >= min_component_size:
-                            cleaned_binary[labeled_components == comp_id] = 1
-                    
-                    # Kontrola inverzních hodnot
-                    ones_percentage = np.mean(cleaned_binary == 1) * 100
-                    if ones_percentage > 90:
-                        print(f"  UPOZORNĚNÍ: Hodnoty vypadají invertované - {ones_percentage:.2f}% jsou jedničky!")
-                        cleaned_binary = 1 - cleaned_binary
-                    
-                    # Použijeme všechny řezy
-                    depth = cleaned_binary.shape[0]
-                    
-                    # Uspořádání: 4 řezy na řádek
-                    cols = 4
-                    rows = int(np.ceil(depth / cols))
-                    fig, axs = plt.subplots(rows, cols, figsize=(cols * 3, rows * 3))
-                    # Pokud je pouze jeden řádek, zajistíme konzistentní iteraci
-                    axs = np.array(axs).reshape(-1)
-                    
-                    # Pro každý slice
-                    for i in range(depth):
-                        slice_img = cleaned_binary[i, :, :]
-                        nonzero_count = np.count_nonzero(slice_img > 0.5)
-                        
-                        # Nad každým slice zobrazíme číslo slice a počet nenulových pixelů
-                        axs[i].set_title(f"{i+1}/{depth}, nz: {nonzero_count}", fontsize=8)
-                        axs[i].imshow(slice_img, cmap='gray', vmin=0, vmax=1)
-                        axs[i].axis('off')
-                    
-                    # Skryjeme prázdné subplots (pokud nějaké zbydou)
-                    for j in range(depth, len(axs)):
-                        axs[j].axis('off')
-                    
-                    plt.tight_layout()
-                    pdf.savefig(fig)
-                    plt.close(fig)
-            
-            # Použijeme pouze první batch
-            break
+        # Získání dat z výsledků
+        cleaned_binaries = samples_data['cleaned_binaries']
         
-        # Vrátíme model do tréninkového režimu
-        self.generator.train()
+        from matplotlib.backends.backend_pdf import PdfPages
+        import matplotlib.pyplot as plt
+        
+        # Otevření PDF souboru (všechny vzorky na samostatných stránkách)
+        with PdfPages(pdf_path) as pdf:
+            # Pro každý vzorek vygenerujeme vizualizaci
+            for sample_idx, cleaned_binary in enumerate(cleaned_binaries):
+                print(f"  Vizualizuji vzorek {sample_idx+1}/{num_samples}...")
+                
+                # Použijeme všechny řezy
+                depth = cleaned_binary.shape[0]
+                
+                # Uspořádání: 4 řezy na řádek
+                cols = 4
+                rows = int(np.ceil(depth / cols))
+                fig, axs = plt.subplots(rows, cols, figsize=(cols * 3, rows * 3))
+                # Pokud je pouze jeden řádek, zajistíme konzistentní iteraci
+                axs = np.array(axs).reshape(-1)
+                
+                # Pro každý slice
+                for i in range(depth):
+                    slice_img = cleaned_binary[i, :, :]
+                    nonzero_count = np.count_nonzero(slice_img > 0.5)
+                    
+                    # Nad každým slice zobrazíme číslo slice a počet nenulových pixelů
+                    axs[i].set_title(f"{i+1}/{depth}, nz: {nonzero_count}", fontsize=8)
+                    axs[i].imshow(slice_img, cmap='gray', vmin=0, vmax=1)
+                    axs[i].axis('off')
+                
+                # Skryjeme prázdné subplots (pokud nějaké zbydou)
+                for j in range(depth, len(axs)):
+                    axs[j].axis('off')
+                
+                plt.tight_layout()
+                pdf.savefig(fig)
+                plt.close(fig)
         
         print(f"PDF vizualizace uložena do: {pdf_path}")
     
@@ -2429,9 +2341,6 @@ class HIELesionGANTrainer:
         # Název výsledného PDF
         pdf_path = os.path.join(pdf_dir, f'lesion_overlay_epoch_{epoch}.pdf')
         
-        # Přepneme model do eval režimu
-        self.generator.eval()
-        
         # Načtení normativního atlasu, pokud existuje
         normative_atlas_np = None
         if has_normative_atlas:
@@ -2444,151 +2353,98 @@ class HIELesionGANTrainer:
                 print("Použiji místo toho atlas léze.")
                 has_normative_atlas = False
         
-        # Získáme potřebné údaje z loaderu
-        for batch in self.dataloader:
-            atlas = batch['atlas'].to(self.device)
-            brain_mask = batch['brain_mask'].to(self.device)
-            
-            # Zajistíme batch rozměr
-            if atlas.dim() == 3:
-                atlas = atlas.unsqueeze(0)
-            if brain_mask.dim() == 3:
-                brain_mask = brain_mask.unsqueeze(0)
-            
-            # Binární masky
-            atlas_binary = (atlas > 0).float()
-            brain_mask_binary = (brain_mask > 0).float()
-            
-            # Převod atlasu do numpy pro vizualizaci
-            if not has_normative_atlas:
-                # Použijeme atlas léze jako pozadí, pokud nemáme normativní atlas
-                atlas_np = atlas[0, 0].cpu().numpy()
-            else:
-                # Použijeme normativní atlas jako pozadí
-                atlas_np = normative_atlas_np
-            
-            from matplotlib.backends.backend_pdf import PdfPages
-            import matplotlib.pyplot as plt
-            from matplotlib.colors import LinearSegmentedColormap
-            
-            # Vytvoření vlastní barevné mapy pro překryv - šedá pro mozek, červená pro léze
-            # Vytvořím custom colormap pro zobrazení překryvu
-            colors = [(0.85, 0.85, 0.85), (0.85, 0.85, 0.85), (1, 0, 0)]  # šedá, šedá, červená
-            cmap_name = 'gray_red'
-            cm = LinearSegmentedColormap.from_list(cmap_name, colors, N=256)
-            
-            # Otevření PDF souboru (všechny vzorky na samostatných stránkách)
-            with PdfPages(pdf_path) as pdf:
-                # Pro každý vzorek vygenerujeme podobně jako v generate_samples
-                for sample_idx in range(num_samples):
-                    print(f"  Generuji vzorek {sample_idx+1}/{num_samples}...")
-                    
-                    # Vygenerování latentního vektoru
-                    z = torch.randn(1, self.z_dim, device=self.device)
-                    
-                    # Generování léze
-                    with torch.no_grad():
-                        fake_lesion = self.generator(z, atlas[:1], brain_mask[:1])
-                    
-                    # Aplikace atlasu a brain masky
-                    # NOVÉ: Použití sofistikovaného přístupu s atlasem jako jemným vodítkem
-                    guidance_strength = 0.3  # Síla vlivu atlasu (0.3 = 30% vlivu atlasu)
-                    fake_lesion = self.apply_soft_atlas_guidance(
-                        fake_lesion, atlas[:1], brain_mask[:1], guidance_strength
-                    )
-                    # Aplikace teplotního škálování pro ostřejší přechody
-                    temperature = 8.0
-                    soft_binary = torch.sigmoid(temperature * (fake_lesion - 0.5))
-                    
-                    # Převod na numpy pro další zpracování
-                    binary_np = soft_binary[0, 0].cpu().numpy()
-                    
-                    # Odfiltrování malých komponent (podobně jako v generate_samples)
-                    binary_thresh = (binary_np > 0.55).astype(np.float32)  # Snížení prahu na 0.55 (původně 0.7)
-                    labeled_components, num_components = measure_label(binary_thresh, return_num=True)
-                    
-                    # Filtrování malých komponent
-                    component_sizes = np.bincount(labeled_components.flatten())[1:] if num_components > 0 else []
-                    min_component_size = 3  # Minimální velikost komponenty pro zachování
-                    
-                    cleaned_binary = np.zeros_like(binary_np)
-                    for comp_id in range(1, num_components + 1):
-                        if component_sizes[comp_id - 1] >= min_component_size:
-                            cleaned_binary[labeled_components == comp_id] = 1
-                    
-                    # Kontrola inverzních hodnot
-                    ones_percentage = np.mean(cleaned_binary == 1) * 100
-                    if ones_percentage > 90:
-                        print(f"  UPOZORNĚNÍ: Hodnoty vypadají invertované - {ones_percentage:.2f}% jsou jedničky!")
-                        cleaned_binary = 1 - cleaned_binary
-                    
-                    # Použijeme všechny řezy
-                    depth = cleaned_binary.shape[0]
-                    
-                    # Uspořádání: 4 řezy na řádek
-                    cols = 4
-                    rows = int(np.ceil(depth / cols))
-                    fig, axs = plt.subplots(rows, cols, figsize=(cols * 3, rows * 3))
-                    # Pokud je pouze jeden řádek, zajistíme konzistentní iteraci
-                    axs = np.array(axs).reshape(-1)
-                    
-                    # Pro každý slice
-                    for i in range(depth):
-                        # Získáme řez normativního atlasu/mozku
-                        try:
-                            if has_normative_atlas:
-                                # Použití normativního atlasu
-                                atlas_slice = atlas_np[i, :, :]
-                            else:
-                                # Použití atlasu léze jako pozadí
-                                atlas_slice = atlas_np[i, :, :]
-                            
-                            # Získáme řez léze
-                            lesion_slice = cleaned_binary[i, :, :]
-                            nonzero_count = np.count_nonzero(lesion_slice > 0.5)
-                            
-                            # Vytvoříme překryv - normalizujeme atlas na hodnoty 0-0.5 (šedá)
-                            # a nastavíme léze na hodnotu 1 (červená)
-                            overlay = np.zeros_like(atlas_slice)
-                            
-                            # Normalizace atlasu na rozsah 0-0.5
-                            if atlas_slice.max() > 0:
-                                atlas_norm = atlas_slice / atlas_slice.max() * 0.5
-                                overlay = atlas_norm.copy()
-                            
-                            # Přidáme léze jako 1 (červená barva v custom colormapě)
-                            overlay[lesion_slice > 0.5] = 1.0
-                            
-                            # Nad každým slice zobrazíme číslo slice a počet nenulových pixelů léze
-                            axs[i].set_title(f"{i+1}/{depth}, léze: {nonzero_count} px", fontsize=8)
-                            axs[i].imshow(overlay, cmap=cm, vmin=0, vmax=1)
-                            axs[i].axis('off')
-                        except IndexError:
-                            print(f"  Varování: Řez {i} je mimo rozsah atlasu, přeskakuji.")
-                            axs[i].set_title(f"{i+1}/{depth}, mimo rozsah atlasu", fontsize=8)
-                            axs[i].axis('off')
-                    
-                    # Skryjeme prázdné subplots (pokud nějaké zbydou)
-                    for j in range(depth, len(axs)):
-                        axs[j].axis('off')
-                    
-                    # Přidáme legendu pro celou figuru
-                    fig.subplots_adjust(bottom=0.05)
-                    import matplotlib.patches as mpatches
-                    red_patch = mpatches.Patch(color='red', label='Léze')
-                    atlas_label = 'Normativní mozek' if has_normative_atlas else 'Atlas pravděpodobnosti lézí'
-                    gray_patch = mpatches.Patch(color='gray', label=atlas_label)
-                    fig.legend(handles=[gray_patch, red_patch], loc='lower center', ncol=2)
-                    
-                    plt.tight_layout(rect=[0, 0.05, 1, 1])  # Ponecháme místo pro legendu
-                    pdf.savefig(fig)
-                    plt.close(fig)
-            
-            # Použijeme pouze první batch
-            break
+        # Využijeme generate_samples k získání dat
+        samples_data = self.generate_samples(num_samples=num_samples, return_data=True)
         
-        # Vrátíme model do tréninkového režimu
-        self.generator.train()
+        # Získání dat z výsledků
+        cleaned_binaries = samples_data['cleaned_binaries']
+        atlas = samples_data['atlas']
+        
+        # Převod atlasu do numpy pro vizualizaci
+        if not has_normative_atlas:
+            # Použijeme atlas léze jako pozadí, pokud nemáme normativní atlas
+            atlas_np = atlas[0, 0].cpu().numpy()
+        else:
+            # Použijeme normativní atlas jako pozadí
+            atlas_np = normative_atlas_np
+        
+        from matplotlib.backends.backend_pdf import PdfPages
+        import matplotlib.pyplot as plt
+        from matplotlib.colors import LinearSegmentedColormap
+        
+        # Vytvoření vlastní barevné mapy pro překryv - šedá pro mozek, červená pro léze
+        # Vytvořím custom colormap pro zobrazení překryvu
+        colors = [(0.85, 0.85, 0.85), (0.85, 0.85, 0.85), (1, 0, 0)]  # šedá, šedá, červená
+        cmap_name = 'gray_red'
+        cm = LinearSegmentedColormap.from_list(cmap_name, colors, N=256)
+        
+        # Otevření PDF souboru (všechny vzorky na samostatných stránkách)
+        with PdfPages(pdf_path) as pdf:
+            # Pro každý vzorek vygenerujeme vizualizaci
+            for sample_idx, cleaned_binary in enumerate(cleaned_binaries):
+                print(f"  Vizualizuji vzorek {sample_idx+1}/{num_samples}...")
+                
+                # Použijeme všechny řezy
+                depth = cleaned_binary.shape[0]
+                
+                # Uspořádání: 4 řezy na řádek
+                cols = 4
+                rows = int(np.ceil(depth / cols))
+                fig, axs = plt.subplots(rows, cols, figsize=(cols * 3, rows * 3))
+                # Pokud je pouze jeden řádek, zajistíme konzistentní iteraci
+                axs = np.array(axs).reshape(-1)
+                
+                # Pro každý slice
+                for i in range(depth):
+                    # Získáme řez normativního atlasu/mozku
+                    try:
+                        if has_normative_atlas:
+                            # Použití normativního atlasu
+                            atlas_slice = atlas_np[i, :, :]
+                        else:
+                            # Použití atlasu léze jako pozadí
+                            atlas_slice = atlas_np[i, :, :]
+                        
+                        # Získáme řez léze
+                        lesion_slice = cleaned_binary[i, :, :]
+                        nonzero_count = np.count_nonzero(lesion_slice > 0.5)
+                        
+                        # Vytvoříme překryv - normalizujeme atlas na hodnoty 0-0.5 (šedá)
+                        # a nastavíme léze na hodnotu 1 (červená)
+                        overlay = np.zeros_like(atlas_slice)
+                        
+                        # Normalizace atlasu na rozsah 0-0.5
+                        if atlas_slice.max() > 0:
+                            atlas_norm = atlas_slice / atlas_slice.max() * 0.5
+                            overlay = atlas_norm.copy()
+                        
+                        # Přidáme léze jako 1 (červená barva v custom colormapě)
+                        overlay[lesion_slice > 0.5] = 1.0
+                        
+                        # Nad každým slice zobrazíme číslo slice a počet nenulových pixelů léze
+                        axs[i].set_title(f"{i+1}/{depth}, léze: {nonzero_count} px", fontsize=8)
+                        axs[i].imshow(overlay, cmap=cm, vmin=0, vmax=1)
+                        axs[i].axis('off')
+                    except IndexError:
+                        print(f"  Varování: Řez {i} je mimo rozsah atlasu, přeskakuji.")
+                        axs[i].set_title(f"{i+1}/{depth}, mimo rozsah atlasu", fontsize=8)
+                        axs[i].axis('off')
+                
+                # Skryjeme prázdné subplots (pokud nějaké zbydou)
+                for j in range(depth, len(axs)):
+                    axs[j].axis('off')
+                
+                # Přidáme legendu pro celou figuru
+                fig.subplots_adjust(bottom=0.05)
+                import matplotlib.patches as mpatches
+                red_patch = mpatches.Patch(color='red', label='Léze')
+                atlas_label = 'Normativní mozek' if has_normative_atlas else 'Atlas pravděpodobnosti lézí'
+                gray_patch = mpatches.Patch(color='gray', label=atlas_label)
+                fig.legend(handles=[gray_patch, red_patch], loc='lower center', ncol=2)
+                
+                plt.tight_layout(rect=[0, 0.05, 1, 1])  # Ponecháme místo pro legendu
+                pdf.savefig(fig)
+                plt.close(fig)
         
         atlas_type = "normativního mozku" if has_normative_atlas else "atlasu pravděpodobnosti lézí"
         print(f"PDF vizualizace s překryvem lézí na {atlas_type} uložena do: {pdf_path}")
@@ -2796,6 +2652,22 @@ class HIELesionGANTrainer:
             'd_lr_history': d_lr_history,
         }, final_checkpoint_path)
         print(f"Final model saved: {final_checkpoint_path}")
+
+    def debug_lesion_activation(self, fake_lesion, atlas_binary, brain_mask_binary, sample_idx):
+        """
+        Helper method to print debug information about lesion activation.
+        
+        Args:
+            fake_lesion: The generated lesion tensor
+            atlas_binary: Binary atlas mask
+            brain_mask_binary: Binary brain mask
+            sample_idx: Sample index for reporting
+        """
+        lesion_active_pixels = torch.sum(fake_lesion > 0.5).item()
+        valid_region_size = torch.sum(atlas_binary[:1] * brain_mask_binary[:1]).item()
+        percentage_active = (lesion_active_pixels / valid_region_size) * 100 if valid_region_size > 0 else 0
+        print(f"  Vzorek {sample_idx+1}: Aktivních pixelů: {lesion_active_pixels} ({percentage_active:.2f}% validní oblasti)")
+        return lesion_active_pixels, percentage_active
 
 def main():
     parser = argparse.ArgumentParser(description='GAN model for HIE lesion synthesis')
