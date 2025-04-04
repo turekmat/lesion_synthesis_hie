@@ -1036,9 +1036,87 @@ def generate_samples(model_path, lesion_atlas_path, output_dir, num_samples=10, 
     # Track distribution of generated samples
     generated_percentages = []
     
+    # Vytvoříme set pro sledování jedinečnosti generovaných vzorků (zabránění duplicitám)
+    generated_fingerprints = set()
+    
+    # Funkce pro generování rozmanitých typů šumu
+    def generate_diverse_noise(batch_size=1, z_dim=100, device=device):
+        # Základní gaussovský šum
+        noise = torch.randn(batch_size, z_dim, 1, 1, 1, device=device)
+        
+        # Přidat více rozmanitosti pomocí různých škál
+        scale = torch.rand(batch_size, 1, 1, 1, 1, device=device) * 2.0 + 0.5  # Škála mezi 0.5 a 2.5
+        noise = noise * scale
+        
+        # Náhodně přidat perturbace pro další rozmanitost
+        if random.random() > 0.3:
+            # Přidat lokalizovanou perturbaci na náhodných pozicích
+            num_perturbations = random.randint(1, 3)
+            for _ in range(num_perturbations):
+                pos = random.randint(0, z_dim-1)
+                length = random.randint(5, 15)
+                end_pos = min(pos + length, z_dim)
+                
+                # Vytvořit a aplikovat náhodnou perturbaci
+                perturbation = torch.randn(batch_size, end_pos - pos, 1, 1, 1, device=device) * random.uniform(0.5, 3.0)
+                noise[:, pos:end_pos] += perturbation
+        
+        # Občas přidat mixování s uniformním šumem
+        if random.random() > 0.7:
+            uniform_noise = (torch.rand(batch_size, z_dim, 1, 1, 1, device=device) * 2 - 1) * 2  # Uniformní šum v rozsahu [-2, 2]
+            mix_ratio = random.uniform(0.1, 0.3)
+            noise = noise * (1 - mix_ratio) + uniform_noise * mix_ratio
+            
+        # Občas přidat nenulovou střední hodnotu pro lepší podmínky
+        if random.random() > 0.6:
+            bias = (torch.rand(batch_size, 1, 1, 1, 1, device=device) - 0.5) * 0.4  # Bias v rozsahu [-0.2, 0.2]
+            noise += bias
+            
+        return noise
+    
+    # Funkce pro výpočet "otisku" generovaného vzorku (pro porovnávání jedinečnosti)
+    def compute_sample_fingerprint(sample, threshold):
+        # Převést na binární podle thresholdu
+        binary = (sample > threshold).astype(np.float32)
+        
+        # Najít a serializovat pozice lézí
+        labeled, num_components = ndimage.label(binary)
+        component_coords = []
+        
+        for i in range(1, num_components + 1):
+            # Získat souřadnice pixelů pro každou lézi
+            component_mask = (labeled == i)
+            coords = np.where(component_mask)
+            
+            # Použít centroid (střední bod) jako identifikátor pozice
+            if len(coords[0]) > 0:  # Ujistit se, že komponenta není prázdná
+                centroid = (
+                    np.mean(coords[0]), 
+                    np.mean(coords[1]), 
+                    np.mean(coords[2])
+                )
+                component_coords.append(centroid)
+        
+        # Setřídit podle pozice pro konzistentní porovnávání
+        component_coords.sort()
+        
+        # Vytvořit hash otisk
+        fingerprint = ""
+        for c in component_coords:
+            # Zaokrouhlit na jedno desetinné místo pro tolerování mírných odchylek
+            fingerprint += f"{c[0]:.1f},{c[1]:.1f},{c[2]:.1f}|"
+            
+        return fingerprint
+    
     # Generate samples with multiple threshold attempts if empty
     with torch.no_grad():
-        for i in range(num_samples):
+        i = 0
+        max_attempts = num_samples * 3  # Maximální počet pokusů pro případ, že budeme muset přeskočit duplicity
+        attempt_count = 0
+        
+        while i < num_samples and attempt_count < max_attempts:
+            attempt_count += 1
+            
             # Determine target percentage range for this sample if matching distribution
             target_min_pct = None
             target_max_pct = None
@@ -1081,15 +1159,32 @@ def generate_samples(model_path, lesion_atlas_path, output_dir, num_samples=10, 
             best_match = None
             best_match_diff = float('inf')
             best_noise_scale = 1.0
+            best_coverage = 0.0
+            best_fingerprint = None
             
             # Původní threshold pro začátek
             current_threshold = threshold
+            
+            # Nejprve se pokusíme dosáhnout cílového pokrytí
+            reached_target_coverage = False
+            
+            # Nejlepší pokus pro každou metriku
+            best_coverage_match = None
+            best_coverage_threshold = threshold
+            best_coverage_percentage = 0.0
+            best_coverage_components = 0
+            best_coverage_diff = float('inf')
+            
+            best_lesion_match = None
+            best_lesion_threshold = threshold
+            best_lesion_components = 0
+            best_lesion_percentage = 0.0
+            best_lesion_diff = float('inf')
 
-            # Zkusit více šumů a vybrat ten s nejlepším počtem lézí
-            for noise_attempt in range(20):  # Zvýšen počet pokusů
-                # Náhodný šum s vhodnou škálou pro tento pokus
-                noise_scale = 1.0 + (noise_attempt * 0.2)  # Zkusit různé škály
-                noise = torch.randn(1, 100, 1, 1, 1).to(device) * noise_scale
+            # Zkusit více šumů a vybrat ten s nejlepším pokrytím a počtem lézí
+            for noise_attempt in range(30):  # Zvýšen počet pokusů
+                # Používáme rozmanité šumy místo standardního Gaussovského šumu
+                noise = generate_diverse_noise(batch_size=1, z_dim=100, device=device)
                 
                 # Generovat lesion map
                 fake_label = generator(noise, atlas_tensor)
@@ -1105,36 +1200,132 @@ def generate_samples(model_path, lesion_atlas_path, output_dir, num_samples=10, 
                 if len(values_in_mask) > 0:
                     max_val = values_in_mask.max()
                     
-                    # Pokud je maximum příliš nízké, adaptivně snížíme threshold
+                    # Postupně snižujeme threshold, dokud nedosáhneme cílového pokrytí
+                    # Vytvoříme několik kandidátních thresholdů
+                    # Zkoušíme více různých úrovní thresholdu pro každý vygenerovaný vzorek
+                    thresholds_to_try = []
+                    
+                    # Adaptivní threshold založený na maximální hodnotě
                     if max_val < threshold and max_val > 0:
-                        # Nastavit threshold na 80% maximální hodnoty, ale ne méně než min_threshold
                         adaptive_threshold = max(min_threshold, max_val * 0.8)
-                        print(f"  Snižuji threshold z {threshold} na {adaptive_threshold:.4f} (max hodnota: {max_val:.4f})")
-                        current_threshold = adaptive_threshold
-                
-                # Threshold a počet lézí s adaptivním thresholdem
-                fake_np = (fake_np_raw > current_threshold).astype(np.float32)
-                labeled, num_components = ndimage.label(fake_np)
-                
-                # Vypočítat procento pokrytí lézemi
-                coverage_pct = (np.sum(fake_np) / np.sum(mask)) * 100
-                print(f"  Pokus {noise_attempt+1}: {num_components} lézí, {coverage_pct:.4f}% pokrytí (threshold: {current_threshold:.4f})")
-                
-                # Pokud je počet lézí v cílovém rozmezí nebo blízko, uložit
-                if target_min_count <= num_components <= target_max_count:
-                    best_match = fake_label
-                    best_noise_scale = noise_scale
+                        thresholds_to_try.append(adaptive_threshold)
+                    
+                    # Přidáme další kandidátní thresholdy - celá škála od min_threshold do max_val
+                    step = (max_val - min_threshold) / 10
+                    for t in range(10):
+                        candidate_threshold = min_threshold + t * step
+                        if candidate_threshold not in thresholds_to_try and candidate_threshold < max_val:
+                            thresholds_to_try.append(candidate_threshold)
+                    
+                    # Vždy přidáme velmi nízký threshold pro zajištění maximálního pokrytí
+                    thresholds_to_try.append(min_threshold)
+                    
+                    # Seřadíme thresholdy sestupně (začneme s vyššími hodnotami)
+                    thresholds_to_try.sort(reverse=True)
+                    
+                    # Vyzkoušíme různé thresholdy a najdeme nejlepší match
+                    for try_threshold in thresholds_to_try:
+                        # Threshold a počet lézí s tímto thresholdem
+                        fake_np = (fake_np_raw > try_threshold).astype(np.float32)
+                        labeled, num_components = ndimage.label(fake_np)
+                        
+                        # Vypočítat procento pokrytí lézemi
+                        coverage_pct = (np.sum(fake_np) / np.sum(mask)) * 100
+                        
+                        print(f"  Pokus {noise_attempt+1}, threshold {try_threshold:.4f}: {num_components} lézí, {coverage_pct:.4f}% pokrytí")
+                        
+                        # Vypočítat otisk pro kontrolu jedinečnosti
+                        current_fingerprint = compute_sample_fingerprint(fake_np_raw, try_threshold)
+                        
+                        # Přeskočit, pokud jsme generovali podobný vzorek dříve
+                        if current_fingerprint in generated_fingerprints:
+                            print(f"  ⚠️ Nalezena podobná léze, zkouším jiný šum...")
+                            continue
+                        
+                        # Kontrola, zda jsme dosáhli cílového pokrytí
+                        if target_min_pct is not None and target_max_pct is not None:
+                            coverage_in_range = target_min_pct <= coverage_pct <= target_max_pct
+                            # Vypočítat, jak daleko jsme od cílového rozmezí
+                            if coverage_pct < target_min_pct:
+                                coverage_diff = target_min_pct - coverage_pct
+                            elif coverage_pct > target_max_pct:
+                                coverage_diff = coverage_pct - target_max_pct
+                            else:
+                                coverage_diff = 0.0
+                                
+                            # Pokud je toto nejlepší pokrytí, které jsme našli
+                            if coverage_diff < best_coverage_diff:
+                                best_coverage_diff = coverage_diff
+                                best_coverage_match = fake_label
+                                best_coverage_threshold = try_threshold
+                                best_coverage_percentage = coverage_pct
+                                best_coverage_components = num_components
+                                best_fingerprint = current_fingerprint
+                                
+                            # Pokud jsme dosáhli cílového pokrytí, zkontrolujeme počet lézí
+                            if coverage_in_range:
+                                reached_target_coverage = True
+                                lesion_diff = min(abs(num_components - target_min_count), abs(num_components - target_max_count))
+                                
+                                # Pokud je toto nejlepší počet lézí v cílovém rozmezí pokrytí
+                                if lesion_diff < best_lesion_diff:
+                                    best_lesion_diff = lesion_diff
+                                    best_lesion_match = fake_label
+                                    best_lesion_threshold = try_threshold
+                                    best_lesion_components = num_components
+                                    best_lesion_percentage = coverage_pct
+                                    best_fingerprint = current_fingerprint
+                                    
+                                # Pokud jsme našli perfektní shodu (v rozmezí pokrytí i počtu lézí)
+                                if target_min_count <= num_components <= target_max_count:
+                                    best_match = fake_label
+                                    best_noise_scale = noise_scale
+                                    current_threshold = try_threshold
+                                    best_coverage = coverage_pct
+                                    best_fingerprint = current_fingerprint
+                                    print(f"  NALEZENA PERFEKTNÍ SHODA: {num_components} lézí, {coverage_pct:.4f}% pokrytí")
+                                    break
+                                    
+                        # Pokud nemáme cílové pokrytí, hodnotíme jen podle počtu lézí
+                        else:
+                            if target_min_count <= num_components <= target_max_count:
+                                best_match = fake_label
+                                best_noise_scale = noise_scale
+                                current_threshold = try_threshold
+                                best_coverage = coverage_pct
+                                best_fingerprint = current_fingerprint
+                                break
+                    
+                # Pokud jsme našli perfektní shodu, přerušíme cyklus pokusů        
+                if best_match is not None:
                     break
-                
-                # Jinak si pamatovat ten nejbližší
-                diff = min(abs(num_components - target_min_count), abs(num_components - target_max_count))
-                if diff < best_match_diff:
-                    best_match_diff = diff
-                    best_match = fake_label
-                    best_noise_scale = noise_scale
             
-            # Ještě jeden pokus s "nejlepším" šumem, ale agresivnějším snížením thresholdu, pokud stále nemáme žádné léze
-            if best_match is not None:
+            # Po vyzkoušení všech šumů a thresholdů, vybereme nejlepší dostupnou shodu
+            if best_match is None:
+                # Pokud jsme alespoň dosáhli cílového pokrytí, použijeme ten vzorek
+                if best_lesion_match is not None:
+                    best_match = best_lesion_match
+                    current_threshold = best_lesion_threshold
+                    best_fingerprint = best_fingerprint
+                    print(f"  Použijeme vzorek s nejlepším počtem lézí v cílovém rozmezí pokrytí: {best_lesion_components} lézí, {best_lesion_percentage:.4f}% pokrytí")
+                # Jinak použijeme vzorek s nejbližším pokrytím k cílovému rozmezí
+                elif best_coverage_match is not None:
+                    best_match = best_coverage_match
+                    current_threshold = best_coverage_threshold
+                    best_fingerprint = best_fingerprint
+                    print(f"  Použijeme vzorek s nejbližším pokrytím k cílovému rozmezí: {best_coverage_components} lézí, {best_coverage_percentage:.4f}% pokrytí")
+            
+            # Pokud nemáme žádnou shodu nebo je vzorek duplicitní, přeskočíme a zkusíme znovu
+            if best_match is None or best_fingerprint in generated_fingerprints:
+                print(f"  ⚠️ Nepodařilo se najít vhodný vzorek, zkouším znovu...")
+                continue
+                
+            # Přidáme otisk do set duplicit pro příští kontrolu
+            generated_fingerprints.add(best_fingerprint)
+            
+            # Ještě jeden pokus s "nejlepším" šumem, ale agresivnějším snížením thresholdu
+            # jen pokud jsme stále nedosáhli cílového pokrytí
+            if best_match is not None and target_min_pct is not None and best_coverage < target_min_pct:
                 fake_np_raw = best_match[0, 0].cpu().numpy()
                 mask = atlas_np > 0
                 values_in_mask = fake_np_raw[mask]
@@ -1142,28 +1333,36 @@ def generate_samples(model_path, lesion_atlas_path, output_dir, num_samples=10, 
                 if len(values_in_mask) > 0:
                     max_val = values_in_mask.max()
                     
-                    # Pokud je výsledek stále prázdný, zkusíme mnohem nižší threshold
-                    fake_np = (fake_np_raw > current_threshold).astype(np.float32)
-                    if np.sum(fake_np) == 0 and max_val > 0:
-                        # Velmi agresivní snížení - na 50% maximální hodnoty
-                        very_low_threshold = max(min_threshold, max_val * 0.5)
-                        print(f"  POSLEDNÍ POKUS: Snižuji threshold na {very_low_threshold:.4f} (max hodnota: {max_val:.4f})")
+                    # Velmi agresivní snížení, hledáme threshold který nám dá cílové pokrytí
+                    print(f"  POSLEDNÍ POKUS: Hledáme threshold pro dosažení cílového pokrytí {target_min_pct:.4f}%")
+                    
+                    # Zkusíme sérii thresholdů a najdeme ten, který dá požadované pokrytí
+                    percentile_values = np.percentile(values_in_mask, [1, 5, 10, 20, 30, 40, 50, 60, 70, 80, 90, 95, 99])
+                    
+                    for percentile_val in percentile_values:
+                        very_low_threshold = max(min_threshold, percentile_val)
+                        # Pouze pokud je nižší než současný threshold
+                        if very_low_threshold >= current_threshold:
+                            continue
+                            
+                        fake_np = (fake_np_raw > very_low_threshold).astype(np.float32)
+                        labeled, num_components = ndimage.label(fake_np)
+                        coverage_pct = (np.sum(fake_np) / np.sum(mask)) * 100
                         
-                        # Vygenerovat nový vzorek s nejlepším šumem
-                        noise = torch.randn(1, 100, 1, 1, 1).to(device) * best_noise_scale
-                        fake_label = generator(noise, atlas_tensor)
+                        print(f"  Zkoušíme threshold {very_low_threshold:.6f}: {num_components} lézí, {coverage_pct:.4f}% pokrytí")
                         
-                        # Použít velmi nízký threshold
-                        current_threshold = very_low_threshold
+                        # Pokud jsme dosáhli cílového pokrytí, použijeme tento threshold
+                        if coverage_pct >= target_min_pct:
+                            current_threshold = very_low_threshold
+                            print(f"  Našli jsme threshold {very_low_threshold:.6f} pro dosažení pokrytí {coverage_pct:.4f}%")
+                            break
             
-            # Použít nejlepší shodu
-            if best_match is not None:
-                fake_label = best_match
-            
-            # Store the percentage for this sample with adaptivním thresholdem
+            # Použít vybraný vzorek a threshold pro finální zpracování
+            fake_label = best_match
             fake_np_raw = fake_label[0, 0].cpu().numpy()
             fake_np = (fake_np_raw > current_threshold).astype(np.float32)
             mask = atlas_np > 0
+            
             if np.sum(mask) > 0:
                 coverage_percentage = (np.sum(fake_np[mask]) / np.sum(mask)) * 100
                 _, final_num_components = ndimage.label(fake_np)
@@ -1268,9 +1467,6 @@ Pokrytí: {coverage_percentage:.4f}%
                     print(f"  Min: {min_val:.6f}, Max: {max_val:.6f}, Mean: {mean_val:.6f}, Median: {median_val:.6f}")
                     print(f"  Above threshold ({current_threshold:.4f}): {np.sum(values_in_mask > current_threshold) / len(values_in_mask) * 100:.4f}%")
             
-            # Convert to binary using adaptivní threshold
-            fake_np = (fake_np_raw > current_threshold).astype(np.float32)
-            
             # Compute percentage of non-zero voxels
             non_zero_percentage = np.sum(fake_np) / np.sum(mask) if np.sum(mask) > 0 else 0
             print(f"Sample {i+1} non-zero voxels after thresholding: {non_zero_percentage * 100:.4f}%")
@@ -1309,10 +1505,20 @@ Pokrytí: {coverage_percentage:.4f}%
             plt.tight_layout()
             plt.savefig(os.path.join(output_dir, f'sample_{i+1}.png'))
             plt.close()
+            
+            # Pokračovat na další sample
+            i += 1
     
     print(f"Generated {num_samples} samples in {output_dir}")
     if show_raw_distribution:
         print(f"Raw distribution analysis saved in {distribution_dir}")
+        
+    # Zobrazit výsledný přehled jedinečnosti
+    print(f"\nUniqueness Report:")
+    print(f"  Total generated samples: {num_samples}")
+    print(f"  Total attempts needed: {attempt_count}")
+    print(f"  Ratio samples/attempts: {num_samples/attempt_count:.2f}")
+    print(f"  Unique sample patterns: {len(generated_fingerprints)}")
 
 # Main function
 def main(args):
