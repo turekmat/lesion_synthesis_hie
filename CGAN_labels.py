@@ -615,7 +615,7 @@ def evaluate(generator, dataloader, device):
     return np.mean(dice_scores)
 
 # Generation function to create new images from a trained model
-def generate_samples(model_path, lesion_atlas_path, output_dir, num_samples=10, threshold=0.5):
+def generate_samples(model_path, lesion_atlas_path, output_dir, num_samples=10, threshold=0.5, show_raw_distribution=True):
     """
     Generate new lesion samples using a trained generator model
     
@@ -625,9 +625,15 @@ def generate_samples(model_path, lesion_atlas_path, output_dir, num_samples=10, 
         output_dir: Directory to save the generated samples
         num_samples: Number of samples to generate
         threshold: Threshold for binarizing the output
+        show_raw_distribution: Whether to analyze and visualize raw distribution before thresholding
     """
     # Create output directory
     os.makedirs(output_dir, exist_ok=True)
+    
+    # Create a separate directory for distribution analysis
+    if show_raw_distribution:
+        distribution_dir = os.path.join(output_dir, 'raw_distribution')
+        os.makedirs(distribution_dir, exist_ok=True)
     
     # Set device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -667,24 +673,124 @@ def generate_samples(model_path, lesion_atlas_path, output_dir, num_samples=10, 
             # Check if we have a completely empty image
             if torch.sum(fake_label > 0.1) == 0:
                 # Try again with a lower threshold
-                threshold = 0.1
-                print(f"Sample {i+1} is empty, trying with lower threshold: {threshold}")
+                threshold_for_check = 0.1
+                print(f"Sample {i+1} is empty, trying with lower threshold: {threshold_for_check}")
                 
                 # If still empty, try a more aggressive noise
-                if torch.sum(fake_label > threshold) == 0:
+                if torch.sum(fake_label > threshold_for_check) == 0:
                     print(f"Sample {i+1} still empty, trying with more aggressive noise")
                     for _ in range(3):  # Try up to 3 times
                         noise = torch.randn(1, 100, 1, 1, 1).to(device) * 2.0  # More aggressive noise
                         fake_label = generator(noise, atlas_tensor)
-                        if torch.sum(fake_label > threshold) > 0:
+                        if torch.sum(fake_label > threshold_for_check) > 0:
                             break
             
-            # Convert to binary
+            # Convert to numpy for analysis (raw values before thresholding)
+            fake_np_raw = fake_label[0, 0].cpu().numpy()
+            
+            # Analyze distribution if requested
+            if show_raw_distribution:
+                # Get mask from atlas
+                atlas_np = atlas_tensor[0, 0].cpu().numpy()
+                mask = atlas_np > 0
+                
+                # Extract values where the mask is non-zero
+                values_in_mask = fake_np_raw[mask]
+                
+                # Calculate statistics
+                if len(values_in_mask) > 0:
+                    min_val = values_in_mask.min()
+                    max_val = values_in_mask.max()
+                    mean_val = values_in_mask.mean()
+                    median_val = np.median(values_in_mask)
+                    
+                    # Calculate percentiles
+                    percentiles = np.percentile(values_in_mask, [1, 5, 10, 25, 50, 75, 90, 95, 99])
+                    
+                    # Create plots
+                    plt.figure(figsize=(15, 10))
+                    
+                    # 1. Raw value visualization (middle slice)
+                    plt.subplot(2, 2, 1)
+                    mid_z = fake_np_raw.shape[2] // 2
+                    
+                    # Find slice with highest values if middle is empty
+                    if np.max(fake_np_raw[:, :, mid_z]) < 0.1:
+                        slice_max_vals = [np.max(fake_np_raw[:, :, z]) for z in range(fake_np_raw.shape[2])]
+                        if max(slice_max_vals) > 0.1:
+                            mid_z = np.argmax(slice_max_vals)
+                    
+                    plt.imshow(fake_np_raw[:, :, mid_z], cmap='hot', vmin=0, vmax=1)
+                    plt.colorbar()
+                    plt.title(f'Raw Values (Slice {mid_z})')
+                    plt.axis('off')
+                    
+                    # 2. Histogram of values
+                    plt.subplot(2, 2, 2)
+                    plt.hist(values_in_mask, bins=50, range=(0, 1), alpha=0.7)
+                    plt.axvline(x=threshold, color='r', linestyle='--', label=f'Threshold={threshold}')
+                    plt.legend()
+                    plt.title('Histogram of Raw Values (in Atlas Mask)')
+                    plt.xlabel('Value')
+                    plt.ylabel('Frequency')
+                    
+                    # 3. Percentile plot (as CDF)
+                    plt.subplot(2, 2, 3)
+                    values_sorted = np.sort(values_in_mask)
+                    p = 1. * np.arange(len(values_in_mask)) / (len(values_in_mask) - 1)
+                    plt.plot(values_sorted, p)
+                    plt.axvline(x=threshold, color='r', linestyle='--')
+                    plt.title('Cumulative Distribution Function')
+                    plt.xlabel('Value')
+                    plt.ylabel('Percentile')
+                    plt.grid(True)
+                    
+                    # 4. Display statistics
+                    plt.subplot(2, 2, 4)
+                    plt.axis('off')
+                    stats_text = f"""
+Statistics for Sample {i+1}:
+-------------------------
+Min: {min_val:.6f}
+Max: {max_val:.6f}
+Mean: {mean_val:.6f}
+Median: {median_val:.6f}
+
+Percentiles:
+  1%: {percentiles[0]:.6f}
+  5%: {percentiles[1]:.6f}
+ 10%: {percentiles[2]:.6f}
+ 25%: {percentiles[3]:.6f}
+ 50%: {percentiles[4]:.6f}
+ 75%: {percentiles[5]:.6f}
+ 90%: {percentiles[6]:.6f}
+ 95%: {percentiles[7]:.6f}
+ 99%: {percentiles[8]:.6f}
+
+Non-zero voxels (>0.001): {np.sum(values_in_mask > 0.001) / len(values_in_mask) * 100:.4f}%
+Voxels above threshold ({threshold}): {np.sum(values_in_mask > threshold) / len(values_in_mask) * 100:.4f}%
+                    """
+                    plt.text(0.01, 0.99, stats_text, fontsize=10, va='top', family='monospace')
+                    
+                    plt.tight_layout()
+                    plt.savefig(os.path.join(distribution_dir, f'sample_{i+1}_distribution.png'))
+                    plt.close()
+                    
+                    # Also save the raw values as a nifti for further analysis
+                    raw_nii = nib.Nifti1Image(fake_np_raw, affine)
+                    nib.save(raw_nii, os.path.join(distribution_dir, f'sample_{i+1}_raw.nii.gz'))
+                    
+                    # Print some statistics
+                    print(f"Sample {i+1} statistics in atlas mask:")
+                    print(f"  Min: {min_val:.6f}, Max: {max_val:.6f}, Mean: {mean_val:.6f}, Median: {median_val:.6f}")
+                    print(f"  Above threshold ({threshold}): {np.sum(values_in_mask > threshold) / len(values_in_mask) * 100:.4f}%")
+            
+            # Convert to binary using threshold
             fake_label_binary = (fake_label > threshold).float()
             
             # Compute percentage of non-zero voxels
             non_zero_percentage = torch.sum(fake_label_binary) / torch.numel(fake_label_binary)
-            print(f"Sample {i+1} non-zero voxels: {non_zero_percentage.item() * 100:.4f}%")
+            print(f"Sample {i+1} non-zero voxels after thresholding: {non_zero_percentage.item() * 100:.4f}%")
             
             # Convert to numpy
             fake_np = fake_label_binary[0, 0].cpu().numpy()
@@ -706,7 +812,7 @@ def generate_samples(model_path, lesion_atlas_path, output_dir, num_samples=10, 
             plt.figure(figsize=(10, 5))
             plt.subplot(1, 2, 1)
             plt.imshow(fake_np[:, :, mid_z], cmap='gray')
-            plt.title(f'Sample {i+1} - Axial')
+            plt.title(f'Sample {i+1} - Axial (Thresholded)')
             plt.axis('off')
             
             # Find the y-slice with the most lesions
@@ -717,7 +823,7 @@ def generate_samples(model_path, lesion_atlas_path, output_dir, num_samples=10, 
             
             plt.subplot(1, 2, 2)
             plt.imshow(fake_np[:, mid_y, :], cmap='gray')
-            plt.title(f'Sample {i+1} - Sagittal')
+            plt.title(f'Sample {i+1} - Sagittal (Thresholded)')
             plt.axis('off')
             
             plt.tight_layout()
@@ -725,6 +831,8 @@ def generate_samples(model_path, lesion_atlas_path, output_dir, num_samples=10, 
             plt.close()
     
     print(f"Generated {num_samples} samples in {output_dir}")
+    if show_raw_distribution:
+        print(f"Raw distribution analysis saved in {distribution_dir}")
 
 # Main function
 def main(args):
@@ -774,6 +882,8 @@ if __name__ == "__main__":
     parser.add_argument("--generate", action="store_true", help="Generate samples from a trained model")
     parser.add_argument("--model_path", type=str, help="Path to the trained model for generation")
     parser.add_argument("--num_samples", type=int, default=10, help="Number of samples to generate")
+    parser.add_argument("--threshold", type=float, default=0.5, help="Threshold for binarizing the output")
+    parser.add_argument("--no_distribution", action="store_true", help="Skip raw distribution analysis")
     
     args = parser.parse_args()
     
@@ -781,6 +891,7 @@ if __name__ == "__main__":
         if args.model_path is None:
             print("Error: --model_path must be specified when using --generate")
             exit(1)
-        generate_samples(args.model_path, args.lesion_atlas_path, args.output_dir, args.num_samples)
+        generate_samples(args.model_path, args.lesion_atlas_path, args.output_dir, 
+                         args.num_samples, args.threshold, not args.no_distribution)
     else:
         main(args)
