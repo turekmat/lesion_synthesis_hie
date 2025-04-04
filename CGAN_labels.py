@@ -973,7 +973,22 @@ def evaluate(generator, dataloader, device):
     return np.mean(dice_scores)
 
 # Funkce pro generování rozmanitých typů šumu
-def generate_diverse_noise(batch_size=1, z_dim=100, device=device):
+def generate_diverse_noise(batch_size=1, z_dim=100, device=None):
+    """
+    Generuje rozmanitý šum pro vstup generátoru.
+    
+    Args:
+        batch_size: Velikost dávky
+        z_dim: Dimenze latentního prostoru (délka vektoru šumu)
+        device: Zařízení, na kterém bude tensor vytvořen (cpu/cuda)
+    
+    Returns:
+        Tensor šumu s různými vlastnostmi pro lepší generování lézí
+    """
+    # Pokud není device specifikováno, použijeme cpu
+    if device is None:
+        device = torch.device("cpu")
+        
     # Základní gaussovský šum
     noise = torch.randn(batch_size, z_dim, 1, 1, 1, device=device)
     
