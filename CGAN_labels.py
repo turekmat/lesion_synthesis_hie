@@ -1158,7 +1158,7 @@ def generate_samples(model_path, lesion_atlas_path, output_dir, num_samples=10, 
             # Vygenerovat několik vzorků a vybrat ten nejbližší cílovému počtu
             best_match = None
             best_match_diff = float('inf')
-            best_noise_scale = 1.0
+            best_noise = None  # Změna: místo noise_scale si budeme pamatovat celý noise tensor
             best_coverage = 0.0
             best_fingerprint = None
             
@@ -1279,7 +1279,7 @@ def generate_samples(model_path, lesion_atlas_path, output_dir, num_samples=10, 
                                 # Pokud jsme našli perfektní shodu (v rozmezí pokrytí i počtu lézí)
                                 if target_min_count <= num_components <= target_max_count:
                                     best_match = fake_label
-                                    best_noise_scale = noise_scale
+                                    best_noise = noise  # Změna: uložíme celý noise tensor místo noise_scale
                                     current_threshold = try_threshold
                                     best_coverage = coverage_pct
                                     best_fingerprint = current_fingerprint
@@ -1290,7 +1290,7 @@ def generate_samples(model_path, lesion_atlas_path, output_dir, num_samples=10, 
                         else:
                             if target_min_count <= num_components <= target_max_count:
                                 best_match = fake_label
-                                best_noise_scale = noise_scale
+                                best_noise = noise  # Změna: uložíme celý noise tensor místo noise_scale
                                 current_threshold = try_threshold
                                 best_coverage = coverage_pct
                                 best_fingerprint = current_fingerprint
@@ -1356,6 +1356,11 @@ def generate_samples(model_path, lesion_atlas_path, output_dir, num_samples=10, 
                             current_threshold = very_low_threshold
                             print(f"  Našli jsme threshold {very_low_threshold:.6f} pro dosažení pokrytí {coverage_pct:.4f}%")
                             break
+                            
+                    # Pokud je potřeba, vygenerujeme znovu vzorek s použitím nejlepšího šumu a nového thresholdu
+                    if best_noise is not None and current_threshold != threshold:
+                        # Regenerovat lesion map s nejlepším šumem
+                        fake_label = generator(best_noise, atlas_tensor)
             
             # Použít vybraný vzorek a threshold pro finální zpracování
             fake_label = best_match
