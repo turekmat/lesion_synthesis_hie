@@ -10,6 +10,7 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 import random
 import argparse
+from scipy import ndimage
 
 # Set random seeds for reproducibility
 def set_seed(seed=42):
@@ -375,7 +376,6 @@ def compute_shape_consistency_loss(generated, real_labels, atlas):
         real_slice = real_labels[i, 0, :, :, mid_z].cpu().numpy()
         gen_slice = gen_binary[i, 0, :, :, mid_z].cpu().numpy()
         
-        from scipy import ndimage
         # Get connected components in real slice
         labeled_real, num_real = ndimage.label(real_slice)
         if num_real > 0:
@@ -393,6 +393,79 @@ def compute_shape_consistency_loss(generated, real_labels, atlas):
     
     # If we couldn't compute a meaningful shape loss
     return torch.tensor(0.0, device=generated.device)
+
+def analyze_lesion_distribution(dataset):
+    """
+    Analyze the distribution of lesion counts in the original dataset
+    
+    Args:
+        dataset: HIEDataset object containing the training data
+    
+    Returns:
+        counts: List of lesion counts for each sample
+        sizes: List of average lesion sizes for each sample
+        percentages: List of percentage of voxels that are lesions
+    """
+    counts = []
+    sizes = []
+    percentages = []
+    
+    print("Analyzing lesion distribution in the original dataset...")
+    for idx in tqdm(range(len(dataset))):
+        sample = dataset[idx]
+        label = sample['label'][0].numpy()  # Remove batch dimension
+        
+        # Calculate percentage of lesion voxels
+        total_voxels = label.size
+        lesion_voxels = np.sum(label > 0)
+        percentage = (lesion_voxels / total_voxels) * 100
+        percentages.append(percentage)
+        
+        # Find connected components
+        labeled, num_components = ndimage.label(label)
+        
+        # If there are components, calculate average size
+        if num_components > 0:
+            component_sizes = ndimage.sum(label, labeled, range(1, num_components+1))
+            avg_size = np.mean(component_sizes)
+            sizes.append(avg_size)
+        else:
+            sizes.append(0)
+        
+        counts.append(num_components)
+    
+    # Print statistics
+    print(f"Lesion Count Statistics:")
+    print(f"  Min: {min(counts)}, Max: {max(counts)}, Mean: {np.mean(counts):.2f}, Median: {np.median(counts)}")
+    print(f"Lesion Size Statistics (voxels):")
+    print(f"  Min: {min(sizes):.2f}, Max: {max(sizes):.2f}, Mean: {np.mean(sizes):.2f}, Median: {np.median(sizes):.2f}")
+    print(f"Lesion Percentage Statistics (% of volume):")
+    print(f"  Min: {min(percentages):.4f}%, Max: {max(percentages):.4f}%, Mean: {np.mean(percentages):.4f}%, Median: {np.median(percentages):.4f}%")
+    
+    # Create histograms
+    plt.figure(figsize=(15, 5))
+    
+    plt.subplot(1, 3, 1)
+    plt.hist(counts, bins=20)
+    plt.title('Distribution of Lesion Counts')
+    plt.xlabel('Number of Lesions')
+    plt.ylabel('Frequency')
+    
+    plt.subplot(1, 3, 2)
+    plt.hist(sizes, bins=20)
+    plt.title('Distribution of Average Lesion Sizes')
+    plt.xlabel('Average Size (voxels)')
+    plt.ylabel('Frequency')
+    
+    plt.subplot(1, 3, 3)
+    plt.hist(percentages, bins=20)
+    plt.title('Distribution of Lesion Percentages')
+    plt.xlabel('Percentage of Volume (%)')
+    plt.ylabel('Frequency')
+    
+    plt.tight_layout()
+    
+    return counts, sizes, percentages
 
 # Training function
 def train(generator, discriminator, dataloader, num_epochs, device, output_dir):
@@ -615,7 +688,7 @@ def evaluate(generator, dataloader, device):
     return np.mean(dice_scores)
 
 # Generation function to create new images from a trained model
-def generate_samples(model_path, lesion_atlas_path, output_dir, num_samples=10, threshold=0.5, show_raw_distribution=True):
+def generate_samples(model_path, lesion_atlas_path, output_dir, num_samples=10, threshold=0.5, show_raw_distribution=True, match_distribution=False, target_percentiles=None):
     """
     Generate new lesion samples using a trained generator model
     
@@ -626,6 +699,8 @@ def generate_samples(model_path, lesion_atlas_path, output_dir, num_samples=10, 
         num_samples: Number of samples to generate
         threshold: Threshold for binarizing the output
         show_raw_distribution: Whether to analyze and visualize raw distribution before thresholding
+        match_distribution: Whether to try to match the distribution of lesion counts from the original dataset
+        target_percentiles: List of target percentiles for lesion percentage (if None, defaults will be used)
     """
     # Create output directory
     os.makedirs(output_dir, exist_ok=True)
@@ -646,6 +721,17 @@ def generate_samples(model_path, lesion_atlas_path, output_dir, num_samples=10, 
     generator.load_state_dict(checkpoint['generator'])
     generator.eval()
     
+    # Define target distribution if matching is requested
+    if match_distribution and target_percentiles is None:
+        # These are example values - ideally should be calculated from the original dataset
+        # Format: [(percentile, min_percentage, max_percentage), ...]
+        target_percentiles = [
+            (0.2, 0.01, 0.1),    # 20% of samples should have 0.01-0.1% lesions
+            (0.4, 0.1, 0.5),     # 40% of samples should have 0.1-0.5% lesions
+            (0.3, 0.5, 1.0),     # 30% of samples should have 0.5-1.0% lesions
+            (0.1, 1.0, 2.5)      # 10% of samples should have 1.0-2.5% lesions
+        ]
+    
     # Load lesion atlas
     nifti_img = nib.load(lesion_atlas_path)
     lesion_atlas = nifti_img.get_fdata()
@@ -661,29 +747,86 @@ def generate_samples(model_path, lesion_atlas_path, output_dir, num_samples=10, 
     atlas_tensor = atlas_tensor / 0.34
     atlas_tensor = atlas_tensor.to(device)
     
+    # Track distribution of generated samples
+    generated_percentages = []
+    
     # Generate samples with multiple threshold attempts if empty
     with torch.no_grad():
         for i in range(num_samples):
-            # Generate random noise
-            noise = torch.randn(1, 100, 1, 1, 1).to(device)
-            
-            # Generate fake sample
-            fake_label = generator(noise, atlas_tensor)
-            
-            # Check if we have a completely empty image
-            if torch.sum(fake_label > 0.1) == 0:
-                # Try again with a lower threshold
-                threshold_for_check = 0.1
-                print(f"Sample {i+1} is empty, trying with lower threshold: {threshold_for_check}")
+            # Determine target percentage range for this sample if matching distribution
+            target_min_pct = None
+            target_max_pct = None
+            if match_distribution and target_percentiles:
+                # Randomly select a percentile range based on the distribution
+                rand_val = random.random()
+                cumulative_prob = 0
+                for prob, min_pct, max_pct in target_percentiles:
+                    cumulative_prob += prob
+                    if rand_val <= cumulative_prob:
+                        target_min_pct = min_pct
+                        target_max_pct = max_pct
+                        break
                 
-                # If still empty, try a more aggressive noise
-                if torch.sum(fake_label > threshold_for_check) == 0:
-                    print(f"Sample {i+1} still empty, trying with more aggressive noise")
-                    for _ in range(3):  # Try up to 3 times
-                        noise = torch.randn(1, 100, 1, 1, 1).to(device) * 2.0  # More aggressive noise
-                        fake_label = generator(noise, atlas_tensor)
-                        if torch.sum(fake_label > threshold_for_check) > 0:
-                            break
+                print(f"Sample {i+1}: Targeting {target_min_pct:.3f}% - {target_max_pct:.3f}% lesion coverage")
+            
+            # Try different noise scaling to achieve target percentage
+            max_attempts = 10
+            current_attempt = 0
+            best_fake_label = None
+            best_noise = None
+            best_percentage = 0
+            
+            while current_attempt < max_attempts:
+                # Adjust noise amplitude based on previous attempts
+                noise_scale = 1.0
+                if current_attempt > 0:
+                    if best_percentage < (target_min_pct / 100) if target_min_pct else 0.0001:
+                        # If percentage is too low, increase noise scale
+                        noise_scale = 1.0 + (current_attempt * 0.5)
+                    elif best_percentage > (target_max_pct / 100) if target_max_pct else 0.025:
+                        # If percentage is too high, decrease noise scale
+                        noise_scale = 1.0 / (1.0 + (current_attempt * 0.2))
+                
+                # Generate random noise with scaling
+                noise = torch.randn(1, 100, 1, 1, 1).to(device) * noise_scale
+                
+                # Generate fake sample
+                fake_label = generator(noise, atlas_tensor)
+                
+                # Check if we have a completely empty image
+                if torch.sum(fake_label > 0.1) == 0 and current_attempt < max_attempts - 1:
+                    # Try again with more aggressive noise
+                    current_attempt += 1
+                    continue
+                
+                # Calculate percentage of non-zero voxels (preliminary)
+                non_zero_percentage = torch.mean((fake_label > threshold).float()) * 100
+                
+                # Store the best result that meets our target
+                if best_fake_label is None or (
+                    (target_min_pct is None or non_zero_percentage >= target_min_pct) and
+                    (target_max_pct is None or non_zero_percentage <= target_max_pct) or
+                    (abs(non_zero_percentage - (target_min_pct + target_max_pct) / 2) < 
+                     abs(best_percentage * 100 - (target_min_pct + target_max_pct) / 2))
+                ):
+                    best_fake_label = fake_label
+                    best_noise = noise
+                    best_percentage = torch.mean((fake_label > threshold).float()).item()
+                
+                current_attempt += 1
+                
+                # If we've found a good match, stop trying
+                if (target_min_pct is None or non_zero_percentage >= target_min_pct) and \
+                   (target_max_pct is None or non_zero_percentage <= target_max_pct):
+                    break
+            
+            # Use the best result
+            if best_fake_label is not None:
+                fake_label = best_fake_label
+                noise = best_noise
+            
+            # Store the percentage for this sample
+            generated_percentages.append(best_percentage * 100)
             
             # Convert to numpy for analysis (raw values before thresholding)
             fake_np_raw = fake_label[0, 0].cpu().numpy()
@@ -845,6 +988,47 @@ def main(args):
     
     # Create dataset and dataloader
     dataset = HIEDataset(args.labels_dir, args.lesion_atlas_path)
+    
+    # Analyze lesion distribution if requested
+    if args.analyze_distribution:
+        counts, sizes, percentages = analyze_lesion_distribution(dataset)
+        
+        # Save results
+        distribution_dir = os.path.join(args.output_dir, 'original_distribution')
+        os.makedirs(distribution_dir, exist_ok=True)
+        
+        # Save the histogram
+        plt.savefig(os.path.join(distribution_dir, 'lesion_distribution.png'))
+        plt.close()
+        
+        # Save the raw data
+        np.savez(os.path.join(distribution_dir, 'lesion_distribution.npz'), 
+                 counts=counts, sizes=sizes, percentages=percentages)
+        
+        # If only analysis was requested, exit
+        if args.analyze_only:
+            return
+    
+    # Load target distribution if available and generation is requested
+    target_percentiles = None
+    if args.generate and args.match_distribution:
+        distribution_file = os.path.join(args.output_dir, 'original_distribution', 'lesion_distribution.npz')
+        if os.path.exists(distribution_file):
+            data = np.load(distribution_file)
+            percentages = data['percentages']
+            
+            # Create distribution percentiles from the data
+            p = np.percentile(percentages, [20, 60, 90])
+            target_percentiles = [
+                (0.2, 0, p[0]),
+                (0.4, p[0], p[1]),
+                (0.3, p[1], p[2]),
+                (0.1, p[2], max(percentages))
+            ]
+            print("Using target distribution from analysis:")
+            for prob, min_pct, max_pct in target_percentiles:
+                print(f"  {prob*100:.0f}% of samples: {min_pct:.4f}% - {max_pct:.4f}% lesion coverage")
+    
     dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=4)
     
     # Initialize models
@@ -884,6 +1068,9 @@ if __name__ == "__main__":
     parser.add_argument("--num_samples", type=int, default=10, help="Number of samples to generate")
     parser.add_argument("--threshold", type=float, default=0.5, help="Threshold for binarizing the output")
     parser.add_argument("--no_distribution", action="store_true", help="Skip raw distribution analysis")
+    parser.add_argument("--analyze_distribution", action="store_true", help="Analyze lesion distribution in the dataset")
+    parser.add_argument("--analyze_only", action="store_true", help="Only analyze distribution, don't train or generate")
+    parser.add_argument("--match_distribution", action="store_true", help="Try to match original lesion distribution")
     
     args = parser.parse_args()
     
@@ -892,6 +1079,7 @@ if __name__ == "__main__":
             print("Error: --model_path must be specified when using --generate")
             exit(1)
         generate_samples(args.model_path, args.lesion_atlas_path, args.output_dir, 
-                         args.num_samples, args.threshold, not args.no_distribution)
+                         args.num_samples, args.threshold, not args.no_distribution,
+                         args.match_distribution, None)
     else:
         main(args)
