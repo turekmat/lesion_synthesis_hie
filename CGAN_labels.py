@@ -394,21 +394,27 @@ def compute_shape_consistency_loss(generated, real_labels, atlas):
     # If we couldn't compute a meaningful shape loss
     return torch.tensor(0.0, device=generated.device)
 
-def analyze_lesion_distribution(dataset):
+def analyze_lesion_distribution(dataset, output_dir=None):
     """
     Analyze the distribution of lesion counts in the original dataset
     
     Args:
         dataset: HIEDataset object containing the training data
+        output_dir: Directory to save analysis results
     
     Returns:
         counts: List of lesion counts for each sample
         sizes: List of average lesion sizes for each sample
         percentages: List of percentage of voxels that are lesions
+        component_sizes_list: List of all component sizes across all samples
     """
     counts = []
     sizes = []
     percentages = []
+    component_sizes_list = []
+    component_sizes_by_sample = []
+    max_component_sizes = []
+    min_component_sizes = []
     
     print("Analyzing lesion distribution in the original dataset...")
     for idx in tqdm(range(len(dataset))):
@@ -423,49 +429,232 @@ def analyze_lesion_distribution(dataset):
         
         # Find connected components
         labeled, num_components = ndimage.label(label)
+        counts.append(num_components)
         
-        # If there are components, calculate average size
+        # If there are components, calculate sizes
         if num_components > 0:
             component_sizes = ndimage.sum(label, labeled, range(1, num_components+1))
             avg_size = np.mean(component_sizes)
             sizes.append(avg_size)
+            
+            # Store min and max component size for this sample
+            min_component_sizes.append(np.min(component_sizes) if len(component_sizes) > 0 else 0)
+            max_component_sizes.append(np.max(component_sizes) if len(component_sizes) > 0 else 0)
+            
+            # Store all component sizes for overall distribution
+            component_sizes_list.extend(component_sizes)
+            component_sizes_by_sample.append(component_sizes)
         else:
             sizes.append(0)
-        
-        counts.append(num_components)
+            min_component_sizes.append(0)
+            max_component_sizes.append(0)
+            component_sizes_by_sample.append([])
     
-    # Print statistics
-    print(f"Lesion Count Statistics:")
+    # Print detailed statistics
+    print("\n===== LESION DISTRIBUTION ANALYSIS =====")
+    print(f"\nLesion Count Statistics:")
     print(f"  Min: {min(counts)}, Max: {max(counts)}, Mean: {np.mean(counts):.2f}, Median: {np.median(counts)}")
-    print(f"Lesion Size Statistics (voxels):")
+    print(f"  Distribution of counts: {np.unique(counts, return_counts=True)}")
+    
+    print(f"\nLesion Size Statistics (voxels):")
     print(f"  Min: {min(sizes):.2f}, Max: {max(sizes):.2f}, Mean: {np.mean(sizes):.2f}, Median: {np.median(sizes):.2f}")
-    print(f"Lesion Percentage Statistics (% of volume):")
-    print(f"  Min: {min(percentages):.4f}%, Max: {max(percentages):.4f}%, Mean: {np.mean(percentages):.4f}%, Median: {np.median(percentages):.4f}%")
     
-    # Create histograms
-    plt.figure(figsize=(15, 5))
+    if len(component_sizes_list) > 0:
+        print(f"\nIndividual Lesion Component Size Statistics:")
+        print(f"  Min: {min(component_sizes_list):.2f}, Max: {max(component_sizes_list):.2f}")
+        print(f"  Mean: {np.mean(component_sizes_list):.2f}, Median: {np.median(component_sizes_list):.2f}")
+        
+        # Calculate percentiles
+        percentiles = [5, 10, 25, 50, 75, 90, 95]
+        percentile_values = np.percentile(component_sizes_list, percentiles)
+        print(f"\nLesion Component Size Percentiles (voxels):")
+        for p, val in zip(percentiles, percentile_values):
+            print(f"  {p}%: {val:.2f}")
     
-    plt.subplot(1, 3, 1)
-    plt.hist(counts, bins=20)
-    plt.title('Distribution of Lesion Counts')
-    plt.xlabel('Number of Lesions')
-    plt.ylabel('Frequency')
+    print(f"\nLesion Percentage Statistics (% of volume):")
+    print(f"  Min: {min(percentages):.4f}%, Max: {max(percentages):.4f}%")
+    print(f"  Mean: {np.mean(percentages):.4f}%, Median: {np.median(percentages):.4f}%")
     
-    plt.subplot(1, 3, 2)
-    plt.hist(sizes, bins=20)
-    plt.title('Distribution of Average Lesion Sizes')
-    plt.xlabel('Average Size (voxels)')
-    plt.ylabel('Frequency')
+    # Calculate ratio of largest component to total lesion volume
+    max_component_ratio = []
+    for i, components in enumerate(component_sizes_by_sample):
+        if len(components) > 0 and np.sum(components) > 0:
+            max_component_ratio.append(np.max(components) / np.sum(components))
     
-    plt.subplot(1, 3, 3)
-    plt.hist(percentages, bins=20)
-    plt.title('Distribution of Lesion Percentages')
-    plt.xlabel('Percentage of Volume (%)')
-    plt.ylabel('Frequency')
+    if len(max_component_ratio) > 0:
+        print(f"\nRatio of largest component to total lesion volume:")
+        print(f"  Min: {min(max_component_ratio):.4f}, Max: {max(max_component_ratio):.4f}")
+        print(f"  Mean: {np.mean(max_component_ratio):.4f}, Median: {np.median(max_component_ratio):.4f}")
     
-    plt.tight_layout()
+    # Save analysis results and create visualizations if output_dir is provided
+    if output_dir:
+        # Create distribution directory
+        distribution_dir = os.path.join(output_dir, 'original_distribution')
+        os.makedirs(distribution_dir, exist_ok=True)
+        
+        # Create histograms
+        plt.figure(figsize=(15, 10))
+        
+        # 1. Distribution of lesion counts
+        plt.subplot(2, 2, 1)
+        # Calculate frequency of each count
+        unique_counts, count_freq = np.unique(counts, return_counts=True)
+        bars = plt.bar(unique_counts, count_freq)
+        plt.title('Distribution of Lesion Counts')
+        plt.xlabel('Number of Lesions per Sample')
+        plt.ylabel('Frequency')
+        plt.xticks(unique_counts)
+        
+        # Add frequency labels on top of bars
+        for bar, freq in zip(bars, count_freq):
+            plt.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.1, 
+                    str(freq), ha='center', va='bottom')
+        
+        # 2. Distribution of average lesion sizes
+        plt.subplot(2, 2, 2)
+        plt.hist(sizes, bins=20)
+        plt.title('Distribution of Average Lesion Sizes')
+        plt.xlabel('Average Size (voxels)')
+        plt.ylabel('Frequency')
+        
+        # 3. Distribution of individual component sizes
+        plt.subplot(2, 2, 3)
+        if len(component_sizes_list) > 0:
+            plt.hist(component_sizes_list, bins=20)
+            plt.title('Distribution of Individual Lesion Sizes')
+            plt.xlabel('Component Size (voxels)')
+            plt.ylabel('Frequency')
+            plt.xscale('log')  # Log scale for better visualization
+        
+        # 4. Distribution of lesion percentages
+        plt.subplot(2, 2, 4)
+        plt.hist(percentages, bins=20)
+        plt.title('Distribution of Lesion Percentages')
+        plt.xlabel('Percentage of Volume (%)')
+        plt.ylabel('Frequency')
+        
+        plt.tight_layout()
+        plt.savefig(os.path.join(distribution_dir, 'lesion_distribution.png'))
+        
+        # Create a more detailed visualization of component size distributions
+        plt.figure(figsize=(15, 10))
+        
+        # 1. Box plot of component sizes by number of components
+        plt.subplot(2, 2, 1)
+        data_for_boxplot = []
+        labels_for_boxplot = []
+        
+        # Group samples by number of components (up to 10)
+        for count in range(1, min(11, max(counts) + 1)):
+            sizes_for_count = [component_sizes_by_sample[i] for i in range(len(counts)) if counts[i] == count]
+            if sizes_for_count:
+                # Flatten the list
+                flat_sizes = [size for sublist in sizes_for_count for size in sublist]
+                if flat_sizes:
+                    data_for_boxplot.append(flat_sizes)
+                    labels_for_boxplot.append(str(count))
+        
+        if data_for_boxplot:
+            plt.boxplot(data_for_boxplot, labels=labels_for_boxplot)
+            plt.title('Distribution of Component Sizes by Number of Components')
+            plt.xlabel('Number of Components')
+            plt.ylabel('Component Size (voxels)')
+            plt.yscale('log')  # Log scale for better visualization
+        
+        # 2. Scatter plot of number of components vs average size
+        plt.subplot(2, 2, 2)
+        plt.scatter(counts, sizes)
+        plt.title('Number of Components vs Average Size')
+        plt.xlabel('Number of Components')
+        plt.ylabel('Average Component Size (voxels)')
+        
+        # 3. Ratio of largest component to total lesion volume
+        plt.subplot(2, 2, 3)
+        if max_component_ratio:
+            plt.hist(max_component_ratio, bins=20)
+            plt.title('Ratio of Largest Component to Total Volume')
+            plt.xlabel('Ratio')
+            plt.ylabel('Frequency')
+        
+        # 4. Component size percentiles
+        plt.subplot(2, 2, 4)
+        if len(component_sizes_list) > 0:
+            component_percentiles = list(range(0, 101, 5))
+            percentile_values = np.percentile(component_sizes_list, component_percentiles)
+            plt.plot(component_percentiles, percentile_values, marker='o')
+            plt.title('Component Size Percentiles')
+            plt.xlabel('Percentile')
+            plt.ylabel('Component Size (voxels)')
+            plt.grid(True)
+        
+        plt.tight_layout()
+        plt.savefig(os.path.join(distribution_dir, 'component_size_distribution.png'))
+        
+        # Create a separate histogram just for lesion counts (larger, more detailed)
+        plt.figure(figsize=(12, 8))
+        bars = plt.bar(unique_counts, count_freq, width=0.7)
+        plt.title('Distribution of Lesion Counts per Sample', fontsize=16)
+        plt.xlabel('Number of Lesions', fontsize=14)
+        plt.ylabel('Number of Samples', fontsize=14)
+        plt.xticks(unique_counts, fontsize=12)
+        plt.yticks(fontsize=12)
+        
+        # Add count and percentage labels on top of bars
+        for bar, count, freq in zip(bars, unique_counts, count_freq):
+            percentage = (freq / len(counts)) * 100
+            plt.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.1, 
+                    f"{freq}\n({percentage:.1f}%)", ha='center', va='bottom', fontsize=11)
+        
+        plt.tight_layout()
+        plt.savefig(os.path.join(distribution_dir, 'lesion_count_histogram.png'))
+        plt.close()
+        
+        # Save the raw data
+        np.savez(os.path.join(distribution_dir, 'lesion_distribution.npz'), 
+                 counts=counts, 
+                 sizes=sizes, 
+                 percentages=percentages,
+                 component_sizes=component_sizes_list,
+                 min_component_sizes=min_component_sizes,
+                 max_component_sizes=max_component_sizes,
+                 max_component_ratio=max_component_ratio if max_component_ratio else [])
+        
+        # Save a text summary
+        with open(os.path.join(distribution_dir, 'summary.txt'), 'w') as f:
+            f.write("===== LESION DISTRIBUTION ANALYSIS =====\n\n")
+            
+            f.write("Lesion Count Statistics:\n")
+            f.write(f"  Min: {min(counts)}, Max: {max(counts)}, Mean: {np.mean(counts):.2f}, Median: {np.median(counts)}\n")
+            
+            f.write("\nCount Distribution:\n")
+            for count, freq in zip(unique_counts, count_freq):
+                percentage = (freq / len(counts)) * 100
+                f.write(f"  {count} lesions: {freq} samples ({percentage:.1f}%)\n")
+            
+            f.write("\nLesion Size Statistics (voxels):\n")
+            f.write(f"  Min: {min(sizes):.2f}, Max: {max(sizes):.2f}, Mean: {np.mean(sizes):.2f}, Median: {np.median(sizes):.2f}\n")
+            
+            if len(component_sizes_list) > 0:
+                f.write("\nIndividual Lesion Component Size Statistics:\n")
+                f.write(f"  Min: {min(component_sizes_list):.2f}, Max: {max(component_sizes_list):.2f}\n")
+                f.write(f"  Mean: {np.mean(component_sizes_list):.2f}, Median: {np.median(component_sizes_list):.2f}\n")
+                
+                f.write("\nLesion Component Size Percentiles (voxels):\n")
+                for p, val in zip(percentiles, percentile_values):
+                    f.write(f"  {p}%: {val:.2f}\n")
+            
+            f.write("\nLesion Percentage Statistics (% of volume):\n")
+            f.write(f"  Min: {min(percentages):.4f}%, Max: {max(percentages):.4f}%\n")
+            f.write(f"  Mean: {np.mean(percentages):.4f}%, Median: {np.median(percentages):.4f}%\n")
+            
+            if len(max_component_ratio) > 0:
+                f.write("\nRatio of largest component to total lesion volume:\n")
+                f.write(f"  Min: {min(max_component_ratio):.4f}, Max: {max(max_component_ratio):.4f}\n")
+                f.write(f"  Mean: {np.mean(max_component_ratio):.4f}, Median: {np.median(max_component_ratio):.4f}\n")
+        
+        print(f"\nDetailed analysis saved to {distribution_dir}")
     
-    return counts, sizes, percentages
+    return counts, sizes, percentages, component_sizes_list
 
 # Training function
 def train(generator, discriminator, dataloader, num_epochs, device, output_dir):
@@ -991,7 +1180,7 @@ def main(args):
     
     # Analyze lesion distribution if requested
     if args.analyze_distribution:
-        counts, sizes, percentages = analyze_lesion_distribution(dataset)
+        counts, sizes, percentages, component_sizes_list = analyze_lesion_distribution(dataset, args.output_dir)
         
         # Save results
         distribution_dir = os.path.join(args.output_dir, 'original_distribution')
@@ -1003,7 +1192,8 @@ def main(args):
         
         # Save the raw data
         np.savez(os.path.join(distribution_dir, 'lesion_distribution.npz'), 
-                 counts=counts, sizes=sizes, percentages=percentages)
+                 counts=counts, sizes=sizes, percentages=percentages,
+                 component_sizes=component_sizes_list)
         
         # If only analysis was requested, exit
         if args.analyze_only:
