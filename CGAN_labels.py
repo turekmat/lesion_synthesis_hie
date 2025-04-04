@@ -335,6 +335,65 @@ def compute_sparsity_loss(generated, atlas):
     """L1 norm of the output weighted by atlas values"""
     return torch.mean(torch.abs(generated) * atlas)
 
+def compute_empty_penalty(generated, atlas):
+    """Penalize empty generations (all zeros)"""
+    # Calculate percentage of non-zero voxels in the atlas-masked area
+    mask = atlas > 0
+    if not torch.any(mask):
+        return torch.tensor(0.0, device=generated.device)
+    
+    # Get non-zero percentage in masked area
+    non_zero_percentage = torch.mean((generated[mask] > 0.1).float())
+    
+    # Penalize if percentage is too low (empty image)
+    # Target a minimum of 0.5% non-zero voxels (can adjust based on data)
+    target_percentage = 0.005
+    empty_penalty = torch.relu(target_percentage - non_zero_percentage) * 100.0
+    
+    return empty_penalty
+
+def compute_shape_consistency_loss(generated, real_labels, atlas):
+    """Encourage the generator to create lesions with similar morphology to real ones"""
+    # Skip if no real lesions
+    if torch.sum(real_labels) < 1:
+        return torch.tensor(0.0, device=generated.device)
+    
+    # Binarize generated lesions for shape comparison
+    gen_binary = (generated > 0.5).float()
+    
+    # Calculate average lesion size in real data
+    real_component_sizes = []
+    batch_size = real_labels.size(0)
+    for i in range(batch_size):
+        # Skip empty real samples
+        if torch.sum(real_labels[i]) < 1:
+            continue
+        
+        # Get average connected component size (approximation using 2D slices for simplicity)
+        # We'll use middle slices as representative
+        mid_z = real_labels.size(4) // 2
+        real_slice = real_labels[i, 0, :, :, mid_z].cpu().numpy()
+        gen_slice = gen_binary[i, 0, :, :, mid_z].cpu().numpy()
+        
+        from scipy import ndimage
+        # Get connected components in real slice
+        labeled_real, num_real = ndimage.label(real_slice)
+        if num_real > 0:
+            real_sizes = ndimage.sum(real_slice, labeled_real, range(1, num_real+1))
+            real_component_sizes.extend(real_sizes)
+        
+        # Get connected components in generated slice
+        labeled_gen, num_gen = ndimage.label(gen_slice)
+        
+        # Penalize if number of components is too different
+        if num_real > 0 and num_gen > 0:
+            # Convert back to tensor for gradient flow
+            comp_diff = torch.abs(torch.tensor(num_real - num_gen, device=generated.device).float()) / max(num_real, 1)
+            return comp_diff * 0.1  # Scale factor to balance with other losses
+    
+    # If we couldn't compute a meaningful shape loss
+    return torch.tensor(0.0, device=generated.device)
+
 # Training function
 def train(generator, discriminator, dataloader, num_epochs, device, output_dir):
     # Optimizers
@@ -342,8 +401,8 @@ def train(generator, discriminator, dataloader, num_epochs, device, output_dir):
     optimizer_D = optim.Adam(discriminator.parameters(), lr=2e-4, betas=(0.5, 0.999))
     
     # Learning rate schedulers
-    scheduler_G = optim.lr_scheduler.ExponentialLR(optimizer_G, gamma=0.95)
-    scheduler_D = optim.lr_scheduler.ExponentialLR(optimizer_D, gamma=0.95)
+    scheduler_G = optim.lr_scheduler.ExponentialLR(optimizer_G, gamma=0.98)
+    scheduler_D = optim.lr_scheduler.ExponentialLR(optimizer_D, gamma=0.98)
     
     # Track losses
     g_losses = []
@@ -364,8 +423,8 @@ def train(generator, discriminator, dataloader, num_epochs, device, output_dir):
             # ---------------------
             # Train Discriminator
             # ---------------------
-            # Train discriminator 3 times for each generator update
-            for _ in range(3):
+            # Train discriminator 1 time for each generator update
+            for _ in range(1):  # Reduced from 3 to balance training
                 optimizer_D.zero_grad()
                 
                 # Generate fake samples
@@ -405,11 +464,25 @@ def train(generator, discriminator, dataloader, num_epochs, device, output_dir):
             # Frequency regularization loss
             freq_loss = compute_frequency_loss(fake_labels, atlas)
             
-            # Sparsity loss
+            # Sparsity loss (reduced weight to prevent overemphasis on sparsity)
             sparse_loss = compute_sparsity_loss(fake_labels, atlas)
             
-            # Total generator loss (no topology loss for now due to complexity)
-            g_loss = 0.5 * g_adv_loss + 10 * freq_loss + 0.1 * sparse_loss
+            # Empty image penalty (new)
+            empty_penalty = compute_empty_penalty(fake_labels, atlas)
+            
+            # Shape consistency loss (new)
+            try:
+                shape_loss = compute_shape_consistency_loss(fake_labels, real_labels, atlas)
+            except Exception as e:
+                print(f"Error computing shape loss: {e}")
+                shape_loss = torch.tensor(0.0, device=device)
+            
+            # Total generator loss with adjusted weights
+            g_loss = (0.5 * g_adv_loss + 
+                     15.0 * freq_loss +  # Increased weight
+                     0.05 * sparse_loss +  # Reduced weight
+                     20.0 * empty_penalty +  # Strong penalty for empty images
+                     5.0 * shape_loss)  # Shape consistency
             
             g_loss.backward()
             optimizer_G.step()
@@ -417,6 +490,13 @@ def train(generator, discriminator, dataloader, num_epochs, device, output_dir):
             # Track losses
             epoch_g_loss += g_loss.item()
             epoch_d_loss += d_loss.item()
+            
+            # Print detailed losses occasionally
+            if batch_size % 10 == 0:
+                non_zero_percent = torch.mean((fake_labels > 0.1).float()) * 100
+                print(f"  G_adv: {g_adv_loss.item():.4f}, Freq: {freq_loss.item():.4f}, "
+                      f"Sparse: {sparse_loss.item():.4f}, Empty: {empty_penalty.item():.4f}, "
+                      f"Shape: {shape_loss.item():.4f}, Non-zero: {non_zero_percent.item():.2f}%")
         
         # Update learning rates
         scheduler_G.step()
@@ -575,7 +655,7 @@ def generate_samples(model_path, lesion_atlas_path, output_dir, num_samples=10, 
     atlas_tensor = atlas_tensor / 0.34
     atlas_tensor = atlas_tensor.to(device)
     
-    # Generate samples
+    # Generate samples with multiple threshold attempts if empty
     with torch.no_grad():
         for i in range(num_samples):
             # Generate random noise
@@ -584,11 +664,27 @@ def generate_samples(model_path, lesion_atlas_path, output_dir, num_samples=10, 
             # Generate fake sample
             fake_label = generator(noise, atlas_tensor)
             
-            # Convert to binary if requested
-            if threshold is not None:
-                fake_label_binary = (fake_label > threshold).float()
-            else:
-                fake_label_binary = fake_label
+            # Check if we have a completely empty image
+            if torch.sum(fake_label > 0.1) == 0:
+                # Try again with a lower threshold
+                threshold = 0.1
+                print(f"Sample {i+1} is empty, trying with lower threshold: {threshold}")
+                
+                # If still empty, try a more aggressive noise
+                if torch.sum(fake_label > threshold) == 0:
+                    print(f"Sample {i+1} still empty, trying with more aggressive noise")
+                    for _ in range(3):  # Try up to 3 times
+                        noise = torch.randn(1, 100, 1, 1, 1).to(device) * 2.0  # More aggressive noise
+                        fake_label = generator(noise, atlas_tensor)
+                        if torch.sum(fake_label > threshold) > 0:
+                            break
+            
+            # Convert to binary
+            fake_label_binary = (fake_label > threshold).float()
+            
+            # Compute percentage of non-zero voxels
+            non_zero_percentage = torch.sum(fake_label_binary) / torch.numel(fake_label_binary)
+            print(f"Sample {i+1} non-zero voxels: {non_zero_percentage.item() * 100:.4f}%")
             
             # Convert to numpy
             fake_np = fake_label_binary[0, 0].cpu().numpy()
@@ -600,14 +696,27 @@ def generate_samples(model_path, lesion_atlas_path, output_dir, num_samples=10, 
             # Also save middle slice as image for quick preview
             mid_z = fake_np.shape[2] // 2
             
+            # Find the z-slice with the most lesions if middle slice is empty
+            if np.sum(fake_np[:, :, mid_z]) == 0:
+                lesion_sums = [np.sum(fake_np[:, :, z]) for z in range(fake_np.shape[2])]
+                if max(lesion_sums) > 0:
+                    mid_z = np.argmax(lesion_sums)
+                    print(f"Middle slice empty, using slice {mid_z} with most lesions")
+            
             plt.figure(figsize=(10, 5))
             plt.subplot(1, 2, 1)
             plt.imshow(fake_np[:, :, mid_z], cmap='gray')
             plt.title(f'Sample {i+1} - Axial')
             plt.axis('off')
             
+            # Find the y-slice with the most lesions
+            lesion_sums_y = [np.sum(fake_np[:, y, :]) for y in range(fake_np.shape[1])]
+            mid_y = fake_np.shape[1] // 2
+            if max(lesion_sums_y) > 0:
+                mid_y = np.argmax(lesion_sums_y)
+            
             plt.subplot(1, 2, 2)
-            plt.imshow(fake_np[:, mid_z, :], cmap='gray')
+            plt.imshow(fake_np[:, mid_y, :], cmap='gray')
             plt.title(f'Sample {i+1} - Sagittal')
             plt.axis('off')
             
