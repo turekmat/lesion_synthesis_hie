@@ -187,6 +187,14 @@ class Generator(nn.Module):
             nn.ReLU(inplace=True)
         )
         
+        # Finální konvoluce pro zpracování vzorů lézí - nová vrstva namísto self.final
+        self.pattern_to_lesion = nn.Sequential(
+            nn.Conv3d(1, 16, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv3d(16, 1, kernel_size=3, padding=1),
+            nn.Sigmoid()
+        )
+        
     def forward(self, noise, atlas):
         # Resize noise to match spatial dimensions
         batch_size = noise.size(0)
@@ -234,18 +242,23 @@ class Generator(nn.Module):
         d4 = self.up4(d3)
         d4 = self.gate4(d4, F.interpolate(atlas, size=d4.shape[2:]))
         
-        # V metodě forward před final vrstvou
-        lesion_patterns = self.lesion_pattern_decoder(d4)
-        outputs = []
+        # Použijeme původní metodu pro základní případ
+        base_output = self.final(d4)
         
-        # Generujeme několik dílčích map lézí (podporuje generování různě velkých a různě umístěných lézí)
+        # Použijeme multi-pattern přístup pro generování vícečetných lézí
+        lesion_patterns = self.lesion_pattern_decoder(d4)
+        outputs = [base_output]  # Začneme se základním výstupem
+        
+        # Generujeme několik dílčích map lézí
         for i in range(8):
-            sub_output = self.final(lesion_patterns[:, i:i+1])
+            pattern = lesion_patterns[:, i:i+1]
+            # Použít novou vrstvu pro zpracování jednotlivých vzorů
+            sub_output = self.pattern_to_lesion(pattern)
             outputs.append(sub_output)
         
-        # Kombinujeme dílčí mapy pomocí max operace (nikoliv součtem, aby hodnoty nezůstaly příliš vysoké)
+        # Kombinujeme všechny mapy pomocí max operace
         output = outputs[0]
-        for i in range(1, 8):
+        for i in range(1, len(outputs)):
             output = torch.max(output, outputs[i])
         
         # Masking s atlasem
