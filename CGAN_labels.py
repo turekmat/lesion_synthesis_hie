@@ -689,6 +689,65 @@ def analyze_lesion_distribution(dataset, output_dir=None):
     
     return counts, sizes, percentages, component_sizes_list
 
+def compute_lesion_distribution_loss(generated, real_labels, atlas):
+    """Podporuje realistickou distribuci počtu a velikosti lézí"""
+    # Práh pro binární léze
+    gen_binary = (generated > 0.5).float()
+    loss = 0.0
+    batch_size = generated.size(0)
+    
+    for i in range(batch_size):
+        # Analýza reálného a generovaného vzorku
+        real_np = real_labels[i, 0].cpu().numpy()
+        gen_np = gen_binary[i, 0].cpu().numpy()
+        
+        # Počet komponent
+        real_labeled, real_count = ndimage.label(real_np)
+        gen_labeled, gen_count = ndimage.label(gen_np)
+        
+        if real_count == 0:  # Přeskočit prázdné vzorky
+            continue
+            
+        # 1. Penalizace za špatný počet lézí
+        # Použijeme log pro zmírnění vlivu vysokých počtů
+        count_ratio = abs(np.log1p(real_count) - np.log1p(gen_count)) / np.log1p(max(real_count, 1))
+        count_loss = torch.tensor(count_ratio, device=generated.device)
+        
+        # 2. Penalizace za nesprávnou distribuci velikostí
+        if gen_count > 0 and real_count > 0:
+            # Velikosti komponent
+            real_sizes = ndimage.sum(real_np, real_labeled, range(1, real_count+1))
+            gen_sizes = ndimage.sum(gen_np, gen_labeled, range(1, gen_count+1))
+            
+            # Poměr největší léze k celkovému objemu
+            real_ratio = np.max(real_sizes) / np.sum(real_sizes) if np.sum(real_sizes) > 0 else 0
+            gen_ratio = np.max(gen_sizes) / np.sum(gen_sizes) if np.sum(gen_sizes) > 0 else 0
+            
+            # Penalizace za rozdíl v dominanci
+            dominance_loss = abs(real_ratio - gen_ratio)
+            
+            # Porovnání histogramů velikostí (zjednodušeně)
+            # Normalizujeme velikosti do 10 binů
+            real_hist = np.histogram(real_sizes, bins=10, range=(0, np.max(real_sizes)*1.1))[0]
+            real_hist = real_hist / (np.sum(real_hist) + 1e-8)
+            
+            gen_hist = np.histogram(gen_sizes, bins=10, range=(0, np.max(real_sizes)*1.1))[0]
+            gen_hist = gen_hist / (np.sum(gen_hist) + 1e-8)
+            
+            # KL divergence
+            hist_loss = 0.0
+            for j in range(10):
+                if real_hist[j] > 0 and gen_hist[j] > 0:
+                    hist_loss += real_hist[j] * np.log(real_hist[j] / (gen_hist[j] + 1e-8))
+            
+            size_loss = torch.tensor(dominance_loss + hist_loss, device=generated.device)
+        else:
+            size_loss = torch.tensor(1.0, device=generated.device)  # Vysoká penalizace při chybějících lézích
+        
+        loss += 0.7 * count_loss + 0.3 * size_loss
+    
+    return loss / batch_size if batch_size > 0 else torch.tensor(0.0, device=generated.device)
+
 # Training function
 def train(generator, discriminator, dataloader, num_epochs, device, output_dir):
     # Optimizers
@@ -1308,62 +1367,3 @@ if __name__ == "__main__":
                          args.match_distribution, None)
     else:
         main(args)
-
-def compute_lesion_distribution_loss(generated, real_labels, atlas):
-    """Podporuje realistickou distribuci počtu a velikosti lézí"""
-    # Práh pro binární léze
-    gen_binary = (generated > 0.5).float()
-    loss = 0.0
-    batch_size = generated.size(0)
-    
-    for i in range(batch_size):
-        # Analýza reálného a generovaného vzorku
-        real_np = real_labels[i, 0].cpu().numpy()
-        gen_np = gen_binary[i, 0].cpu().numpy()
-        
-        # Počet komponent
-        real_labeled, real_count = ndimage.label(real_np)
-        gen_labeled, gen_count = ndimage.label(gen_np)
-        
-        if real_count == 0:  # Přeskočit prázdné vzorky
-            continue
-            
-        # 1. Penalizace za špatný počet lézí
-        # Použijeme log pro zmírnění vlivu vysokých počtů
-        count_ratio = abs(np.log1p(real_count) - np.log1p(gen_count)) / np.log1p(max(real_count, 1))
-        count_loss = torch.tensor(count_ratio, device=generated.device)
-        
-        # 2. Penalizace za nesprávnou distribuci velikostí
-        if gen_count > 0 and real_count > 0:
-            # Velikosti komponent
-            real_sizes = ndimage.sum(real_np, real_labeled, range(1, real_count+1))
-            gen_sizes = ndimage.sum(gen_np, gen_labeled, range(1, gen_count+1))
-            
-            # Poměr největší léze k celkovému objemu
-            real_ratio = np.max(real_sizes) / np.sum(real_sizes) if np.sum(real_sizes) > 0 else 0
-            gen_ratio = np.max(gen_sizes) / np.sum(gen_sizes) if np.sum(gen_sizes) > 0 else 0
-            
-            # Penalizace za rozdíl v dominanci
-            dominance_loss = abs(real_ratio - gen_ratio)
-            
-            # Porovnání histogramů velikostí (zjednodušeně)
-            # Normalizujeme velikosti do 10 binů
-            real_hist = np.histogram(real_sizes, bins=10, range=(0, np.max(real_sizes)*1.1))[0]
-            real_hist = real_hist / (np.sum(real_hist) + 1e-8)
-            
-            gen_hist = np.histogram(gen_sizes, bins=10, range=(0, np.max(real_sizes)*1.1))[0]
-            gen_hist = gen_hist / (np.sum(gen_hist) + 1e-8)
-            
-            # KL divergence
-            hist_loss = 0.0
-            for j in range(10):
-                if real_hist[j] > 0 and gen_hist[j] > 0:
-                    hist_loss += real_hist[j] * np.log(real_hist[j] / (gen_hist[j] + 1e-8))
-            
-            size_loss = torch.tensor(dominance_loss + hist_loss, device=generated.device)
-        else:
-            size_loss = torch.tensor(1.0, device=generated.device)  # Vysoká penalizace při chybějících lézích
-        
-        loss += 0.7 * count_loss + 0.3 * size_loss
-    
-    return loss / batch_size if batch_size > 0 else torch.tensor(0.0, device=generated.device)
