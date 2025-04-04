@@ -1219,16 +1219,19 @@ def generate_samples(model_path, lesion_atlas_path, output_dir, num_samples=10, 
                         
                         # Najít percentily vygenerovaných hodnot pro odhad thresholdů
                         if len(values_in_mask) > 10:
-                            # Vytvoříme percentilní thresholdy pro jemnější kontrolu - ZAMĚŘIT SE NA VYŠŠÍ PERCENTILY
-                            percentiles = np.linspace(95, 50, 15)  # Od p95 do p50 s jemnějším krokem
+                            # Vytvoříme percentilní thresholdy pro jemnější kontrolu - ZAMĚŘIT SE NA EXTRÉMNĚ VYSOKÉ PERCENTILY
+                            percentiles = np.linspace(99.9, 90, 15)  # Mnohem vyšší thresholdy: od p99.9 do p90 s jemnějším krokem
                             thresholds = np.percentile(values_in_mask, percentiles)
                             
-                            # Nechceme hodnoty pod min_threshold
-                            thresholds = np.clip(thresholds, min_threshold, None)
+                            # Nechceme hodnoty pod min_threshold - VÝRAZNÉ ZVÝŠENÍ MINIMÁLNÍHO THRESHOLDU
+                            # Implementace silnější preference vysokých thresholdů - pro každý vzorek určíme minimální threshold
+                            # ze základního min_threshold a percentilu p80 vygenerovaných hodnot
+                            strong_min_threshold = max(min_threshold, np.percentile(values_in_mask, 80))
+                            thresholds = np.clip(thresholds, strong_min_threshold, None)
                             
                             # Přidáme velmi nízký threshold pro extrémní případy - pouze pokud opravdu potřebujeme
-                            if min_threshold not in thresholds and np.max(values_in_mask) > min_threshold * 5:
-                                thresholds = np.append(thresholds, min_threshold)
+                            if strong_min_threshold not in thresholds and np.max(values_in_mask) > strong_min_threshold * 5:
+                                thresholds = np.append(thresholds, strong_min_threshold)
                                 
                             # Vzestupné pořadí pro binární vyhledávání
                             thresholds = np.sort(thresholds)
@@ -1444,10 +1447,21 @@ def generate_samples(model_path, lesion_atlas_path, output_dir, num_samples=10, 
             atlas_np = atlas_tensor[0, 0].cpu().numpy()
             mask = atlas_np > 0
             
+            # NOVÝ KROK: Sloučení blízkých lézí pro drastické snížení jejich počtu
+            labeled, num_components = ndimage.label(fake_np)
+            print(f"Před sloučením: {num_components} lézí")
+            
+            # Aplikujeme sloučení blízkých lézí
+            merged_labeled, merged_components = merge_close_lesions(labeled, min_distance=3)  # Použít větší vzdálenost (3 voxely) pro agresivnější sloučení
+            print(f"Po sloučení: {merged_components} lézí")
+            
+            # Aktualizujeme binární data a počet komponent
+            fake_np = (merged_labeled > 0).astype(np.float32)
+            labeled, final_num_components = ndimage.label(fake_np)
+            
             # Vypočítat finální statistiky
             if np.sum(mask) > 0:
                 coverage_percentage = (np.sum(fake_np[mask]) / np.sum(mask)) * 100
-                labeled, final_num_components = ndimage.label(fake_np)
                 print(f"Finální výsledek: {final_num_components} lézí, {coverage_percentage:.4f}% pokrytí (threshold: {best_threshold:.6f})")
                 
                 # Analýza velikosti lézí - NOVÁ ČÁST PRO PREFERENCI VĚTŠÍCH LÉZÍ
@@ -1666,6 +1680,31 @@ Cílové pokrytí: {target_min_pct:.4f}% - {target_max_pct:.4f}%
         plt.savefig(os.path.join(output_dir, 'coverage_distribution.png'))
         plt.close()
 
+def merge_close_lesions(labeled_data, min_distance=2):
+    """
+    Slučuje blízké léze pomocí morfologických operací.
+    
+    Args:
+        labeled_data: Data s označenými komponentami
+        min_distance: Minimální vzdálenost mezi lézemi (počet voxelů)
+    
+    Returns:
+        Nová data s označenými komponentami po sloučení
+    """
+    # Vytvoříme binární obraz
+    binary_data = labeled_data > 0
+    
+    # Dilatace (rozšíření) a poté eroze (zúžení) - operace uzavření
+    # Tím se propojí blízké komponenty
+    structure = ndimage.generate_binary_structure(3, 2)  # 3D konektivita
+    dilated = ndimage.binary_dilation(binary_data, structure=structure, iterations=min_distance)
+    closed = ndimage.binary_erosion(dilated, structure=structure, iterations=min_distance)
+    
+    # Znovu označíme komponenty
+    new_labeled, new_num_components = ndimage.label(closed)
+    
+    return new_labeled, new_num_components
+
 # Main function
 def main(args):
     # Set device
@@ -1757,7 +1796,7 @@ if __name__ == "__main__":
     parser.add_argument("--model_path", type=str, help="Path to the trained model for generation")
     parser.add_argument("--num_samples", type=int, default=10, help="Number of samples to generate")
     parser.add_argument("--threshold", type=float, default=0.5, help="Threshold for binarizing the output")
-    parser.add_argument("--min_threshold", type=float, default=0.01, help="Minimum threshold to try if standard threshold gives empty results")
+    parser.add_argument("--min_threshold", type=float, default=0.05, help="Minimum threshold to try if standard threshold gives empty results")
     parser.add_argument("--no_distribution", action="store_true", help="Skip raw distribution analysis")
     parser.add_argument("--analyze_distribution", action="store_true", help="Analyze lesion distribution in the dataset")
     parser.add_argument("--analyze_only", action="store_true", help="Only analyze distribution, don't train or generate")
