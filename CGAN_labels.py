@@ -973,7 +973,7 @@ def evaluate(generator, dataloader, device):
     return np.mean(dice_scores)
 
 # Generation function to create new images from a trained model
-def generate_samples(model_path, lesion_atlas_path, output_dir, num_samples=10, threshold=0.5, show_raw_distribution=True, match_distribution=False, target_percentiles=None):
+def generate_samples(model_path, lesion_atlas_path, output_dir, num_samples=10, threshold=0.5, show_raw_distribution=True, match_distribution=False, target_percentiles=None, min_threshold=0.01):
     """
     Generate new lesion samples using a trained generator model
     
@@ -982,10 +982,11 @@ def generate_samples(model_path, lesion_atlas_path, output_dir, num_samples=10, 
         lesion_atlas_path: Path to the lesion atlas .nii file
         output_dir: Directory to save the generated samples
         num_samples: Number of samples to generate
-        threshold: Threshold for binarizing the output
+        threshold: Threshold for binarizing the output (starting value)
         show_raw_distribution: Whether to analyze and visualize raw distribution before thresholding
         match_distribution: Whether to try to match the distribution of lesion counts from the original dataset
         target_percentiles: List of target percentiles for lesion percentage (if None, defaults will be used)
+        min_threshold: Minimum threshold to try if standard threshold gives empty results
     """
     # Create output directory
     os.makedirs(output_dir, exist_ok=True)
@@ -1079,9 +1080,13 @@ def generate_samples(model_path, lesion_atlas_path, output_dir, num_samples=10, 
             # Vygenerovat několik vzorků a vybrat ten nejbližší cílovému počtu
             best_match = None
             best_match_diff = float('inf')
+            best_noise_scale = 1.0
+            
+            # Původní threshold pro začátek
+            current_threshold = threshold
 
             # Zkusit více šumů a vybrat ten s nejlepším počtem lézí
-            for noise_attempt in range(10):
+            for noise_attempt in range(20):  # Zvýšen počet pokusů
                 # Náhodný šum s vhodnou škálou pro tento pokus
                 noise_scale = 1.0 + (noise_attempt * 0.2)  # Zkusit různé škály
                 noise = torch.randn(1, 100, 1, 1, 1).to(device) * noise_scale
@@ -1089,13 +1094,36 @@ def generate_samples(model_path, lesion_atlas_path, output_dir, num_samples=10, 
                 # Generovat lesion map
                 fake_label = generator(noise, atlas_tensor)
                 
-                # Threshold a počet lézí
-                fake_np = (fake_label[0, 0].cpu().numpy() > threshold).astype(np.float32)
-                _, num_components = ndimage.label(fake_np)
+                # Získat raw data pro analýzu
+                fake_np_raw = fake_label[0, 0].cpu().numpy()
+                
+                # Zkontrolujeme maximum hodnoty - pokud je nízké, snížíme threshold
+                atlas_np = atlas_tensor[0, 0].cpu().numpy()
+                mask = atlas_np > 0
+                values_in_mask = fake_np_raw[mask]
+                
+                if len(values_in_mask) > 0:
+                    max_val = values_in_mask.max()
+                    
+                    # Pokud je maximum příliš nízké, adaptivně snížíme threshold
+                    if max_val < threshold and max_val > 0:
+                        # Nastavit threshold na 80% maximální hodnoty, ale ne méně než min_threshold
+                        adaptive_threshold = max(min_threshold, max_val * 0.8)
+                        print(f"  Snižuji threshold z {threshold} na {adaptive_threshold:.4f} (max hodnota: {max_val:.4f})")
+                        current_threshold = adaptive_threshold
+                
+                # Threshold a počet lézí s adaptivním thresholdem
+                fake_np = (fake_np_raw > current_threshold).astype(np.float32)
+                labeled, num_components = ndimage.label(fake_np)
+                
+                # Vypočítat procento pokrytí lézemi
+                coverage_pct = (np.sum(fake_np) / np.sum(mask)) * 100
+                print(f"  Pokus {noise_attempt+1}: {num_components} lézí, {coverage_pct:.4f}% pokrytí (threshold: {current_threshold:.4f})")
                 
                 # Pokud je počet lézí v cílovém rozmezí nebo blízko, uložit
                 if target_min_count <= num_components <= target_max_count:
                     best_match = fake_label
+                    best_noise_scale = noise_scale
                     break
                 
                 # Jinak si pamatovat ten nejbližší
@@ -1103,23 +1131,49 @@ def generate_samples(model_path, lesion_atlas_path, output_dir, num_samples=10, 
                 if diff < best_match_diff:
                     best_match_diff = diff
                     best_match = fake_label
-
+                    best_noise_scale = noise_scale
+            
+            # Ještě jeden pokus s "nejlepším" šumem, ale agresivnějším snížením thresholdu, pokud stále nemáme žádné léze
+            if best_match is not None:
+                fake_np_raw = best_match[0, 0].cpu().numpy()
+                mask = atlas_np > 0
+                values_in_mask = fake_np_raw[mask]
+                
+                if len(values_in_mask) > 0:
+                    max_val = values_in_mask.max()
+                    
+                    # Pokud je výsledek stále prázdný, zkusíme mnohem nižší threshold
+                    fake_np = (fake_np_raw > current_threshold).astype(np.float32)
+                    if np.sum(fake_np) == 0 and max_val > 0:
+                        # Velmi agresivní snížení - na 50% maximální hodnoty
+                        very_low_threshold = max(min_threshold, max_val * 0.5)
+                        print(f"  POSLEDNÍ POKUS: Snižuji threshold na {very_low_threshold:.4f} (max hodnota: {max_val:.4f})")
+                        
+                        # Vygenerovat nový vzorek s nejlepším šumem
+                        noise = torch.randn(1, 100, 1, 1, 1).to(device) * best_noise_scale
+                        fake_label = generator(noise, atlas_tensor)
+                        
+                        # Použít velmi nízký threshold
+                        current_threshold = very_low_threshold
+            
             # Použít nejlepší shodu
             if best_match is not None:
                 fake_label = best_match
             
-            # Store the percentage for this sample
-            generated_percentages.append(torch.mean((fake_label > threshold).float()).item() * 100)
-            
-            # Convert to numpy for analysis (raw values before thresholding)
+            # Store the percentage for this sample with adaptivním thresholdem
             fake_np_raw = fake_label[0, 0].cpu().numpy()
+            fake_np = (fake_np_raw > current_threshold).astype(np.float32)
+            mask = atlas_np > 0
+            if np.sum(mask) > 0:
+                coverage_percentage = (np.sum(fake_np[mask]) / np.sum(mask)) * 100
+                _, final_num_components = ndimage.label(fake_np)
+                print(f"Finální výsledek: {final_num_components} lézí, {coverage_percentage:.4f}% pokrytí (threshold: {current_threshold:.4f})")
+                generated_percentages.append(coverage_percentage)
+            else:
+                generated_percentages.append(0)
             
             # Analyze distribution if requested
             if show_raw_distribution:
-                # Get mask from atlas
-                atlas_np = atlas_tensor[0, 0].cpu().numpy()
-                mask = atlas_np > 0
-                
                 # Extract values where the mask is non-zero
                 values_in_mask = fake_np_raw[mask]
                 
@@ -1141,20 +1195,20 @@ def generate_samples(model_path, lesion_atlas_path, output_dir, num_samples=10, 
                     mid_z = fake_np_raw.shape[2] // 2
                     
                     # Find slice with highest values if middle is empty
-                    if np.max(fake_np_raw[:, :, mid_z]) < 0.1:
+                    if np.max(fake_np_raw[:, :, mid_z]) < current_threshold * 0.5:
                         slice_max_vals = [np.max(fake_np_raw[:, :, z]) for z in range(fake_np_raw.shape[2])]
-                        if max(slice_max_vals) > 0.1:
+                        if max(slice_max_vals) > current_threshold * 0.5:
                             mid_z = np.argmax(slice_max_vals)
                     
-                    plt.imshow(fake_np_raw[:, :, mid_z], cmap='hot', vmin=0, vmax=1)
+                    plt.imshow(fake_np_raw[:, :, mid_z], cmap='hot', vmin=0, vmax=max(max_val, 0.1))
                     plt.colorbar()
                     plt.title(f'Raw Values (Slice {mid_z})')
                     plt.axis('off')
                     
                     # 2. Histogram of values
                     plt.subplot(2, 2, 2)
-                    plt.hist(values_in_mask, bins=50, range=(0, 1), alpha=0.7)
-                    plt.axvline(x=threshold, color='r', linestyle='--', label=f'Threshold={threshold}')
+                    plt.hist(values_in_mask, bins=50, range=(0, max(max_val*1.1, 0.1)), alpha=0.7)
+                    plt.axvline(x=current_threshold, color='r', linestyle='--', label=f'Threshold={current_threshold:.4f}')
                     plt.legend()
                     plt.title('Histogram of Raw Values (in Atlas Mask)')
                     plt.xlabel('Value')
@@ -1165,7 +1219,7 @@ def generate_samples(model_path, lesion_atlas_path, output_dir, num_samples=10, 
                     values_sorted = np.sort(values_in_mask)
                     p = 1. * np.arange(len(values_in_mask)) / (len(values_in_mask) - 1)
                     plt.plot(values_sorted, p)
-                    plt.axvline(x=threshold, color='r', linestyle='--')
+                    plt.axvline(x=current_threshold, color='r', linestyle='--')
                     plt.title('Cumulative Distribution Function')
                     plt.xlabel('Value')
                     plt.ylabel('Percentile')
@@ -1194,7 +1248,10 @@ Percentiles:
  99%: {percentiles[8]:.6f}
 
 Non-zero voxels (>0.001): {np.sum(values_in_mask > 0.001) / len(values_in_mask) * 100:.4f}%
-Voxels above threshold ({threshold}): {np.sum(values_in_mask > threshold) / len(values_in_mask) * 100:.4f}%
+Voxels above threshold ({current_threshold:.4f}): {np.sum(values_in_mask > current_threshold) / len(values_in_mask) * 100:.4f}%
+
+Počet lézí: {final_num_components}
+Pokrytí: {coverage_percentage:.4f}%
                     """
                     plt.text(0.01, 0.99, stats_text, fontsize=10, va='top', family='monospace')
                     
@@ -1209,17 +1266,14 @@ Voxels above threshold ({threshold}): {np.sum(values_in_mask > threshold) / len(
                     # Print some statistics
                     print(f"Sample {i+1} statistics in atlas mask:")
                     print(f"  Min: {min_val:.6f}, Max: {max_val:.6f}, Mean: {mean_val:.6f}, Median: {median_val:.6f}")
-                    print(f"  Above threshold ({threshold}): {np.sum(values_in_mask > threshold) / len(values_in_mask) * 100:.4f}%")
+                    print(f"  Above threshold ({current_threshold:.4f}): {np.sum(values_in_mask > current_threshold) / len(values_in_mask) * 100:.4f}%")
             
-            # Convert to binary using threshold
-            fake_label_binary = (fake_label > threshold).float()
+            # Convert to binary using adaptivní threshold
+            fake_np = (fake_np_raw > current_threshold).astype(np.float32)
             
             # Compute percentage of non-zero voxels
-            non_zero_percentage = torch.sum(fake_label_binary) / torch.numel(fake_label_binary)
-            print(f"Sample {i+1} non-zero voxels after thresholding: {non_zero_percentage.item() * 100:.4f}%")
-            
-            # Convert to numpy
-            fake_np = fake_label_binary[0, 0].cpu().numpy()
+            non_zero_percentage = np.sum(fake_np) / np.sum(mask) if np.sum(mask) > 0 else 0
+            print(f"Sample {i+1} non-zero voxels after thresholding: {non_zero_percentage * 100:.4f}%")
             
             # Save as .nii file
             fake_nii = nib.Nifti1Image(fake_np, affine)
@@ -1238,7 +1292,7 @@ Voxels above threshold ({threshold}): {np.sum(values_in_mask > threshold) / len(
             plt.figure(figsize=(10, 5))
             plt.subplot(1, 2, 1)
             plt.imshow(fake_np[:, :, mid_z], cmap='gray')
-            plt.title(f'Sample {i+1} - Axial (Thresholded)')
+            plt.title(f'Sample {i+1} - Axial (Threshold: {current_threshold:.4f})')
             plt.axis('off')
             
             # Find the y-slice with the most lesions
@@ -1249,7 +1303,7 @@ Voxels above threshold ({threshold}): {np.sum(values_in_mask > threshold) / len(
             
             plt.subplot(1, 2, 2)
             plt.imshow(fake_np[:, mid_y, :], cmap='gray')
-            plt.title(f'Sample {i+1} - Sagittal (Thresholded)')
+            plt.title(f'Sample {i+1} - Sagittal (Threshold: {current_threshold:.4f})')
             plt.axis('off')
             
             plt.tight_layout()
@@ -1351,6 +1405,7 @@ if __name__ == "__main__":
     parser.add_argument("--model_path", type=str, help="Path to the trained model for generation")
     parser.add_argument("--num_samples", type=int, default=10, help="Number of samples to generate")
     parser.add_argument("--threshold", type=float, default=0.5, help="Threshold for binarizing the output")
+    parser.add_argument("--min_threshold", type=float, default=0.01, help="Minimum threshold to try if standard threshold gives empty results")
     parser.add_argument("--no_distribution", action="store_true", help="Skip raw distribution analysis")
     parser.add_argument("--analyze_distribution", action="store_true", help="Analyze lesion distribution in the dataset")
     parser.add_argument("--analyze_only", action="store_true", help="Only analyze distribution, don't train or generate")
@@ -1363,7 +1418,7 @@ if __name__ == "__main__":
             print("Error: --model_path must be specified when using --generate")
             exit(1)
         generate_samples(args.model_path, args.lesion_atlas_path, args.output_dir, 
-                         args.num_samples, args.threshold, not args.no_distribution,
-                         args.match_distribution, None)
+                        args.num_samples, args.threshold, not args.no_distribution,
+                        args.match_distribution, None, args.min_threshold)
     else:
         main(args)
