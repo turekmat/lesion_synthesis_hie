@@ -992,32 +992,32 @@ def generate_diverse_noise(batch_size=1, z_dim=100, device=None):
     # Základní gaussovský šum
     noise = torch.randn(batch_size, z_dim, 1, 1, 1, device=device)
     
-    # Přidat více rozmanitosti pomocí různých škál
-    scale = torch.rand(batch_size, 1, 1, 1, 1, device=device) * 2.0 + 0.5  # Škála mezi 0.5 a 2.5
+    # Přidat více rozmanitosti pomocí různých škál - MÍRNĚJŠÍ ŠKÁLOVÁNÍ
+    scale = torch.rand(batch_size, 1, 1, 1, 1, device=device) * 1.5 + 0.75  # Škála mezi 0.75 a 2.25 (zúžený rozsah)
     noise = noise * scale
     
-    # Náhodně přidat perturbace pro další rozmanitost
-    if random.random() > 0.3:
+    # Náhodně přidat perturbace pro další rozmanitost - SNÍŽENÁ PRAVDĚPODOBNOST PERTURBACÍ
+    if random.random() > 0.5:  # Zvýšit práh z 0.3 na 0.5
         # Přidat lokalizovanou perturbaci na náhodných pozicích
-        num_perturbations = random.randint(1, 3)
+        num_perturbations = random.randint(1, 2)  # Snížený max počet perturbací z 3 na 2
         for _ in range(num_perturbations):
             pos = random.randint(0, z_dim-1)
             length = random.randint(5, 15)
             end_pos = min(pos + length, z_dim)
             
-            # Vytvořit a aplikovat náhodnou perturbaci
-            perturbation = torch.randn(batch_size, end_pos - pos, 1, 1, 1, device=device) * random.uniform(0.5, 3.0)
+            # Vytvořit a aplikovat náhodnou perturbaci - SNÍŽENÁ INTENZITA
+            perturbation = torch.randn(batch_size, end_pos - pos, 1, 1, 1, device=device) * random.uniform(0.5, 2.0)  # Snížit horní mez z 3.0
             noise[:, pos:end_pos] += perturbation
     
-    # Občas přidat mixování s uniformním šumem
-    if random.random() > 0.7:
-        uniform_noise = (torch.rand(batch_size, z_dim, 1, 1, 1, device=device) * 2 - 1) * 2  # Uniformní šum v rozsahu [-2, 2]
-        mix_ratio = random.uniform(0.1, 0.3)
+    # Občas přidat mixování s uniformním šumem - OMEZENÉ MIXOVÁNÍ
+    if random.random() > 0.8:  # Zvýšit práh z 0.7 na 0.8
+        uniform_noise = (torch.rand(batch_size, z_dim, 1, 1, 1, device=device) * 2 - 1) * 1.5  # Snížit rozsah z [-2, 2] na [-1.5, 1.5]
+        mix_ratio = random.uniform(0.1, 0.2)  # Snížit horní mez z 0.3 na 0.2
         noise = noise * (1 - mix_ratio) + uniform_noise * mix_ratio
         
-    # Občas přidat nenulovou střední hodnotu pro lepší podmínky
-    if random.random() > 0.6:
-        bias = (torch.rand(batch_size, 1, 1, 1, 1, device=device) - 0.5) * 0.4  # Bias v rozsahu [-0.2, 0.2]
+    # Občas přidat nenulovou střední hodnotu pro lepší podmínky - SNÍŽENÁ BIAS HODNOTA
+    if random.random() > 0.7:  # Mírně snížit práh z 0.6 na 0.7
+        bias = (torch.rand(batch_size, 1, 1, 1, 1, device=device) - 0.5) * 0.3  # Snížit rozsah z [-0.2, 0.2] na [-0.15, 0.15]
         noise += bias
         
     return noise
@@ -1180,7 +1180,7 @@ def generate_samples(model_path, lesion_atlas_path, output_dir, num_samples=10, 
             noise_candidates = []
             
             # Generujeme více kandidátních šumů
-            for noise_attempt in range(40):  # Zvýšený počet pokusů
+            for noise_attempt in range(30):  # Střední počet pokusů mezi 20 a 40
                 # Generujeme rozmanitý šum
                 noise = generate_diverse_noise(batch_size=1, z_dim=100, device=device)
                 
@@ -1203,15 +1203,15 @@ def generate_samples(model_path, lesion_atlas_path, output_dir, num_samples=10, 
                         
                         # Najít percentily vygenerovaných hodnot pro odhad thresholdů
                         if len(values_in_mask) > 10:
-                            # Vytvoříme percentilní thresholdy pro jemnější kontrolu
-                            percentiles = np.linspace(99, 20, 20)  # Od p99 do p20
+                            # Vytvoříme percentilní thresholdy pro jemnější kontrolu - ZAMĚŘIT SE NA VYŠŠÍ PERCENTILY
+                            percentiles = np.linspace(95, 50, 15)  # Od p95 do p50 s jemnějším krokem
                             thresholds = np.percentile(values_in_mask, percentiles)
                             
                             # Nechceme hodnoty pod min_threshold
                             thresholds = np.clip(thresholds, min_threshold, None)
                             
-                            # Přidáme velmi nízký threshold pro extrémní případy
-                            if min_threshold not in thresholds:
+                            # Přidáme velmi nízký threshold pro extrémní případy - pouze pokud opravdu potřebujeme
+                            if min_threshold not in thresholds and np.max(values_in_mask) > min_threshold * 5:
                                 thresholds = np.append(thresholds, min_threshold)
                                 
                             # Vzestupné pořadí pro binární vyhledávání
@@ -1222,7 +1222,7 @@ def generate_samples(model_path, lesion_atlas_path, output_dir, num_samples=10, 
                             components_by_threshold = []
                             
                             # Testujeme všechny thresholdy a sledujeme pokrytí a počet komponent
-                            print(f"Analyzuji šum {noise_attempt+1}/{40}...")
+                            print(f"Analyzuji šum {noise_attempt+1}/{30}...")
                             for test_threshold in thresholds:
                                 fake_np = (fake_np_raw > test_threshold).astype(np.float32)
                                 labeled, num_components = ndimage.label(fake_np)
@@ -1280,6 +1280,9 @@ def generate_samples(model_path, lesion_atlas_path, output_dir, num_samples=10, 
                 for candidate_idx, candidate in enumerate(noise_candidates):
                     # Iterujeme přes všechny thresholdy
                     for t_idx, (coverage, components) in enumerate(zip(candidate['coverage'], candidate['components'])):
+                        # Maximální přijatelný počet lézí
+                        max_acceptable_components = 150  # Omezení maximálního počtu lézí
+                        
                         # Jak daleko jsme od cílového rozmezí pokrytí?
                         if coverage < target_min_pct:
                             coverage_diff = target_min_pct - coverage
@@ -1296,8 +1299,13 @@ def generate_samples(model_path, lesion_atlas_path, output_dir, num_samples=10, 
                         else:
                             component_diff = 0
                             
-                        # Kombinovaná metrika se zaměřením hlavně na pokrytí
-                        combined_diff = coverage_diff * 0.8 + component_diff * 0.2
+                        # Penalizovat příliš vysoký počet lézí
+                        component_penalty = 0
+                        if components > max_acceptable_components:
+                            component_penalty = (components - max_acceptable_components) / max_acceptable_components
+                            
+                        # Kombinovaná metrika se VYVÁŽENÝM zaměřením na pokrytí a počet lézí
+                        combined_diff = coverage_diff * 0.5 + component_diff * 0.5 + component_penalty * 0.8
                         
                         if combined_diff < best_match_diff:
                             best_match_diff = combined_diff
@@ -1415,6 +1423,42 @@ def generate_samples(model_path, lesion_atlas_path, output_dir, num_samples=10, 
                 coverage_percentage = (np.sum(fake_np[mask]) / np.sum(mask)) * 100
                 labeled, final_num_components = ndimage.label(fake_np)
                 print(f"Finální výsledek: {final_num_components} lézí, {coverage_percentage:.4f}% pokrytí (threshold: {best_threshold:.6f})")
+                
+                # Analýza velikosti lézí - NOVÁ ČÁST PRO PREFERENCI VĚTŠÍCH LÉZÍ
+                target_min_lesion_size = 10  # Minimální cílová velikost léze (počet voxelů)
+                
+                if final_num_components > 0:
+                    # Výpočet velikostí jednotlivých lézí
+                    lesion_sizes = ndimage.sum(fake_np, labeled, range(1, final_num_components+1))
+                    avg_lesion_size = np.mean(lesion_sizes) if len(lesion_sizes) > 0 else 0
+                    
+                    print(f"Průměrná velikost léze: {avg_lesion_size:.2f} voxelů")
+                    
+                    # Pokud jsou léze příliš malé a máme jich mnoho, zvážíme použití vyššího thresholdu
+                    if avg_lesion_size < target_min_lesion_size and final_num_components > 30:
+                        # Zkusíme vyšší threshold, pokud nejsme už blízko maximální hodnoty
+                        if best_threshold < best_candidate['max_val'] * 0.7:
+                            new_threshold = min(best_threshold * 1.2, best_candidate['max_val'] * 0.7)
+                            print(f"Léze jsou příliš malé, zkusím vyšší threshold: {new_threshold:.6f}")
+                            
+                            # Aplikovat nový threshold
+                            fake_np = (fake_np_raw > new_threshold).astype(np.float32)
+                            labeled, adjusted_num_components = ndimage.label(fake_np)
+                            adjusted_coverage = (np.sum(fake_np[mask]) / np.sum(mask)) * 100
+                            
+                            # Zkontrolovat, zda je nový výsledek lepší
+                            if adjusted_num_components > 0:
+                                adjusted_sizes = ndimage.sum(fake_np, labeled, range(1, adjusted_num_components+1))
+                                adjusted_avg_size = np.mean(adjusted_sizes) if len(adjusted_sizes) > 0 else 0
+                                
+                                # Pokud je průměrná velikost léze větší a stále máme rozumné pokrytí
+                                if adjusted_avg_size > avg_lesion_size and adjusted_coverage >= target_min_pct * 0.7:
+                                    print(f"Použiji upravený threshold pro větší léze: {adjusted_num_components} lézí, "
+                                          f"{adjusted_coverage:.4f}% pokrytí, prům. velikost: {adjusted_avg_size:.2f}")
+                                    final_num_components = adjusted_num_components
+                                    coverage_percentage = adjusted_coverage
+                                    best_threshold = new_threshold
+                
                 generated_percentages.append(coverage_percentage)
             else:
                 generated_percentages.append(0)
