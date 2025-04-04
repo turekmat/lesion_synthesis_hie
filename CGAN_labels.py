@@ -690,7 +690,7 @@ def analyze_lesion_distribution(dataset, output_dir=None):
     return counts, sizes, percentages, component_sizes_list
 
 def compute_lesion_distribution_loss(generated, real_labels, atlas):
-    """Podporuje realistickou distribuci počtu a velikosti lézí"""
+    """Podporuje realistickou distribuci počtu a velikosti lézí s výraznou tolerancí k menšímu počtu lézí"""
     # Práh pro binární léze
     gen_binary = (generated > 0.5).float()
     loss = 0.0
@@ -708,45 +708,61 @@ def compute_lesion_distribution_loss(generated, real_labels, atlas):
         if real_count == 0:  # Přeskočit prázdné vzorky
             continue
             
-        # 1. Penalizace za špatný počet lézí
-        # Použijeme log pro zmírnění vlivu vysokých počtů
-        count_ratio = abs(np.log1p(real_count) - np.log1p(gen_count)) / np.log1p(max(real_count, 1))
-        count_loss = torch.tensor(count_ratio, device=generated.device)
+        # Získání velikostí komponent
+        real_sizes = ndimage.sum_labels(real_np, real_labeled, range(1, real_count + 1))
         
-        # 2. Penalizace za nesprávnou distribuci velikostí
-        if gen_count > 0 and real_count > 0:
-            # Velikosti komponent
-            real_sizes = ndimage.sum(real_np, real_labeled, range(1, real_count+1))
-            gen_sizes = ndimage.sum(gen_np, gen_labeled, range(1, gen_count+1))
+        if gen_count > 0:
+            gen_sizes = ndimage.sum_labels(gen_np, gen_labeled, range(1, gen_count + 1))
             
-            # Poměr největší léze k celkovému objemu
-            real_ratio = np.max(real_sizes) / np.sum(real_sizes) if np.sum(real_sizes) > 0 else 0
-            gen_ratio = np.max(gen_sizes) / np.sum(gen_sizes) if np.sum(gen_sizes) > 0 else 0
+            # Výpočet střední velikosti léze
+            real_mean_size = real_sizes.mean()
+            gen_mean_size = gen_sizes.mean()
             
-            # Penalizace za rozdíl v dominanci
-            dominance_loss = abs(real_ratio - gen_ratio)
+            # VÝRAZNÁ TOLERANCE: Mnohem mírnější penalizace pro rozdíl v počtu lézí
+            # Rozdíl v počtu komponent - toleruje až 60% rozdíl bez významné penalizace
+            count_ratio = gen_count / real_count
+            tolerance = 0.6  # 60% tolerance
             
-            # Porovnání histogramů velikostí (zjednodušeně)
-            # Normalizujeme velikosti do 10 binů
-            real_hist = np.histogram(real_sizes, bins=10, range=(0, np.max(real_sizes)*1.1))[0]
-            real_hist = real_hist / (np.sum(real_hist) + 1e-8)
+            # Asymetrická tolerance - mnohem méně penalizuje příliš malý počet lézí
+            if count_ratio < 1:  # Příliš málo lézí
+                # Mnohem mírnější penalizace pro malý počet lézí
+                count_diff = max(0, 1 - count_ratio - tolerance) 
+                count_loss = count_diff * 0.5  # Ještě snížená penalizace pro malý počet
+            else:  # Příliš mnoho lézí
+                count_diff = max(0, count_ratio - (1 + tolerance))
+                count_loss = count_diff  # Standardní penalizace pro vysoký počet
             
-            gen_hist = np.histogram(gen_sizes, bins=10, range=(0, np.max(real_sizes)*1.1))[0]
-            gen_hist = gen_hist / (np.sum(gen_hist) + 1e-8)
+            # Rozdíl ve velikosti lézí
+            size_ratio = real_mean_size / gen_mean_size if gen_mean_size > 0 else 100
             
-            # KL divergence
-            hist_loss = 0.0
-            for j in range(10):
-                if real_hist[j] > 0 and gen_hist[j] > 0:
-                    hist_loss += real_hist[j] * np.log(real_hist[j] / (gen_hist[j] + 1e-8))
+            # Asymetrická penalizace pro velikost - přísnější pokud jsou léze příliš malé
+            if size_ratio > 1:  # Generované léze jsou příliš malé
+                size_loss = torch.tensor(size_ratio - 1).to(generated.device)
+            else:  # Generované léze jsou příliš velké
+                # Menší penalizace pro příliš velké léze
+                size_loss = torch.tensor(max(0, (1 - size_ratio) * 0.3)).to(generated.device)
             
-            size_loss = torch.tensor(dominance_loss + hist_loss, device=generated.device)
+            # Dominance největší léze: poměr největší léze k celkové velikosti
+            real_dominance = real_sizes.max() / real_sizes.sum()
+            gen_dominance = gen_sizes.max() / gen_sizes.sum() if gen_sizes.sum() > 0 else 0
+            
+            # Tolerance pro dominanci - preferujeme větší dominanci (větší léze)
+            dominance_ratio = real_dominance / gen_dominance if gen_dominance > 0 else 100
+            if dominance_ratio > 1:  # Gen dominance je příliš nízká (preferujeme větší dominanci)
+                dominance_loss = torch.tensor(dominance_ratio - 1).to(generated.device)
+            else:
+                # Téměř žádná penalizace pro příliš vysokou dominanci (žádoucí)
+                dominance_loss = torch.tensor(max(0, (1 - dominance_ratio) * 0.1)).to(generated.device)
+            
+            # Váhy jednotlivých složek - VÝRAZNÉ SNÍŽENÍ váhy count_loss
+            total_loss = 0.1 * count_loss + 0.9 * size_loss + 0.2 * dominance_loss
+            loss += total_loss
         else:
-            size_loss = torch.tensor(1.0, device=generated.device)  # Vysoká penalizace při chybějících lézích
-        
-        loss += 0.7 * count_loss + 0.3 * size_loss
+            # Pokud nejsou generovány žádné léze, ale měly by být
+            empty_penalty = torch.tensor(5.0).to(generated.device)  # Snížená penalizace za prázdný výstup
+            loss += empty_penalty
     
-    return loss / batch_size if batch_size > 0 else torch.tensor(0.0, device=generated.device)
+    return loss / batch_size if batch_size > 0 else torch.tensor(0.0).to(generated.device)
 
 # Training function
 def train(generator, discriminator, dataloader, num_epochs, device, output_dir):
@@ -834,13 +850,13 @@ def train(generator, discriminator, dataloader, num_epochs, device, output_dir):
             # Přidat do výpočtu generator loss
             lesion_dist_loss = compute_lesion_distribution_loss(fake_labels, real_labels, atlas)
             
-            # Upravit váhy v celkové loss funkci
+            # Upravit váhy v celkové loss funkci - SNÍŽENA VÁHA DISTRIBUCE LÉZÍ
             g_loss = (0.5 * g_adv_loss + 
                      15.0 * freq_loss +
                      0.05 * sparse_loss +
                      20.0 * empty_penalty +
                      5.0 * shape_loss +
-                     10.0 * lesion_dist_loss)  # Vysoká váha pro loss distribuci lézí
+                     3.0 * lesion_dist_loss)  # Výrazně snížena váha z 7.0 na 3.0 pro minimální penalizaci distribuce lézí
             
             g_loss.backward()
             optimizer_G.step()
@@ -1299,13 +1315,23 @@ def generate_samples(model_path, lesion_atlas_path, output_dir, num_samples=10, 
                         else:
                             component_diff = 0
                             
+                        # Přidat bonus pro větší léze
+                        large_lesion_bonus = 0.0
+                        if components > 0:
+                            # Odhad průměrné velikosti léze (pokrytí / počet lézí)
+                            avg_lesion_size = coverage / components
+                            if avg_lesion_size > 0.003:  # Snížený práh pro získání bonusu
+                                large_lesion_bonus = 0.8  # Výrazně zvýšený bonus pro léze s větší průměrnou velikostí
+                            
                         # Penalizovat příliš vysoký počet lézí
                         component_penalty = 0
-                        if components > max_acceptable_components:
-                            component_penalty = (components - max_acceptable_components) / max_acceptable_components
-                            
-                        # Kombinovaná metrika se VYVÁŽENÝM zaměřením na pokrytí a počet lézí
-                        combined_diff = coverage_diff * 0.5 + component_diff * 0.5 + component_penalty * 0.8
+                        if components > target_max_count:
+                            # Výrazně zvýšená penalizace za příliš mnoho lézí
+                            component_penalty = (components - target_max_count) / target_max_count * 3.0
+                        
+                        # Kombinovaná metrika s VÝRAZNÝM zaměřením na pokrytí a MINIMÁLNÍM na počet lézí
+                        # Mnohem větší důraz na pokrytí (0.9), minimální na počet lézí (0.1)
+                        combined_diff = coverage_diff * 0.9 + component_diff * 0.1 + component_penalty - large_lesion_bonus
                         
                         if combined_diff < best_match_diff:
                             best_match_diff = combined_diff
@@ -1425,7 +1451,7 @@ def generate_samples(model_path, lesion_atlas_path, output_dir, num_samples=10, 
                 print(f"Finální výsledek: {final_num_components} lézí, {coverage_percentage:.4f}% pokrytí (threshold: {best_threshold:.6f})")
                 
                 # Analýza velikosti lézí - NOVÁ ČÁST PRO PREFERENCI VĚTŠÍCH LÉZÍ
-                target_min_lesion_size = 10  # Minimální cílová velikost léze (počet voxelů)
+                target_min_lesion_size = 15  # Zvýšení z 10 na 15 voxelů - preferujeme větší léze
                 
                 if final_num_components > 0:
                     # Výpočet velikostí jednotlivých lézí
@@ -1435,10 +1461,10 @@ def generate_samples(model_path, lesion_atlas_path, output_dir, num_samples=10, 
                     print(f"Průměrná velikost léze: {avg_lesion_size:.2f} voxelů")
                     
                     # Pokud jsou léze příliš malé a máme jich mnoho, zvážíme použití vyššího thresholdu
-                    if avg_lesion_size < target_min_lesion_size and final_num_components > 30:
+                    if avg_lesion_size < target_min_lesion_size and final_num_components > 20:  # Sníženo z 30 na 20
                         # Zkusíme vyšší threshold, pokud nejsme už blízko maximální hodnoty
                         if best_threshold < best_candidate['max_val'] * 0.7:
-                            new_threshold = min(best_threshold * 1.2, best_candidate['max_val'] * 0.7)
+                            new_threshold = min(best_threshold * 1.25, best_candidate['max_val'] * 0.7)  # Agresivnější zvýšení (1.25 místo 1.2)
                             print(f"Léze jsou příliš malé, zkusím vyšší threshold: {new_threshold:.6f}")
                             
                             # Aplikovat nový threshold
@@ -1452,7 +1478,8 @@ def generate_samples(model_path, lesion_atlas_path, output_dir, num_samples=10, 
                                 adjusted_avg_size = np.mean(adjusted_sizes) if len(adjusted_sizes) > 0 else 0
                                 
                                 # Pokud je průměrná velikost léze větší a stále máme rozumné pokrytí
-                                if adjusted_avg_size > avg_lesion_size and adjusted_coverage >= target_min_pct * 0.7:
+                                # Mírnější požadavek na pokrytí (0.6 místo 0.7)
+                                if adjusted_avg_size > avg_lesion_size and adjusted_coverage >= target_min_pct * 0.6:
                                     print(f"Použiji upravený threshold pro větší léze: {adjusted_num_components} lézí, "
                                           f"{adjusted_coverage:.4f}% pokrytí, prům. velikost: {adjusted_avg_size:.2f}")
                                     final_num_components = adjusted_num_components
