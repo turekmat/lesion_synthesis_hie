@@ -178,6 +178,15 @@ class Generator(nn.Module):
             nn.Sigmoid()
         )
         
+        # Nová vrstva pro podporu multi-lesion patterns
+        self.lesion_pattern_decoder = nn.Sequential(
+            nn.Conv3d(64, 32, kernel_size=3, padding=1),
+            nn.InstanceNorm3d(32),
+            nn.ReLU(inplace=True),
+            nn.Conv3d(32, 8, kernel_size=1),
+            nn.ReLU(inplace=True)
+        )
+        
     def forward(self, noise, atlas):
         # Resize noise to match spatial dimensions
         batch_size = noise.size(0)
@@ -225,10 +234,21 @@ class Generator(nn.Module):
         d4 = self.up4(d3)
         d4 = self.gate4(d4, F.interpolate(atlas, size=d4.shape[2:]))
         
-        # Final output
-        output = self.final(d4)
+        # V metodě forward před final vrstvou
+        lesion_patterns = self.lesion_pattern_decoder(d4)
+        outputs = []
         
-        # Mask the output with atlas (lesions only where atlas > 0)
+        # Generujeme několik dílčích map lézí (podporuje generování různě velkých a různě umístěných lézí)
+        for i in range(8):
+            sub_output = self.final(lesion_patterns[:, i:i+1])
+            outputs.append(sub_output)
+        
+        # Kombinujeme dílčí mapy pomocí max operace (nikoliv součtem, aby hodnoty nezůstaly příliš vysoké)
+        output = outputs[0]
+        for i in range(1, 8):
+            output = torch.max(output, outputs[i])
+        
+        # Masking s atlasem
         masked_output = output * (atlas > 0).float()
         
         return masked_output
@@ -739,12 +759,16 @@ def train(generator, discriminator, dataloader, num_epochs, device, output_dir):
                 print(f"Error computing shape loss: {e}")
                 shape_loss = torch.tensor(0.0, device=device)
             
-            # Total generator loss with adjusted weights
+            # Přidat do výpočtu generator loss
+            lesion_dist_loss = compute_lesion_distribution_loss(fake_labels, real_labels, atlas)
+            
+            # Upravit váhy v celkové loss funkci
             g_loss = (0.5 * g_adv_loss + 
-                     15.0 * freq_loss +  # Increased weight
-                     0.05 * sparse_loss +  # Reduced weight
-                     20.0 * empty_penalty +  # Strong penalty for empty images
-                     5.0 * shape_loss)  # Shape consistency
+                     15.0 * freq_loss +
+                     0.05 * sparse_loss +
+                     20.0 * empty_penalty +
+                     5.0 * shape_loss +
+                     10.0 * lesion_dist_loss)  # Vysoká váha pro loss distribuci lézí
             
             g_loss.backward()
             optimizer_G.step()
@@ -958,64 +982,62 @@ def generate_samples(model_path, lesion_atlas_path, output_dir, num_samples=10, 
                 
                 print(f"Sample {i+1}: Targeting {target_min_pct:.3f}% - {target_max_pct:.3f}% lesion coverage")
             
-            # Try different noise scaling to achieve target percentage
-            max_attempts = 10
-            current_attempt = 0
-            best_fake_label = None
-            best_noise = None
-            best_percentage = 0
-            
-            while current_attempt < max_attempts:
-                # Adjust noise amplitude based on previous attempts
-                noise_scale = 1.0
-                if current_attempt > 0:
-                    if best_percentage < (target_min_pct / 100) if target_min_pct else 0.0001:
-                        # If percentage is too low, increase noise scale
-                        noise_scale = 1.0 + (current_attempt * 0.5)
-                    elif best_percentage > (target_max_pct / 100) if target_max_pct else 0.025:
-                        # If percentage is too high, decrease noise scale
-                        noise_scale = 1.0 / (1.0 + (current_attempt * 0.2))
-                
-                # Generate random noise with scaling
+            # Cílové distribuce počtu lézí
+            lesion_count_targets = [
+                (0.30, 1, 10),      # 30% vzorků: 1-10 lézí
+                (0.40, 10, 30),     # 40% vzorků: 10-30 lézí
+                (0.20, 30, 80),     # 20% vzorků: 30-80 lézí
+                (0.10, 80, 200)     # 10% vzorků: 80-200 lézí
+            ]
+
+            # Vybrat cílový počet lézí
+            rand_val = random.random()
+            cumulative_prob = 0
+            target_min_count = None
+            target_max_count = None
+            for prob, min_count, max_count in lesion_count_targets:
+                cumulative_prob += prob
+                if rand_val <= cumulative_prob:
+                    target_min_count = min_count
+                    target_max_count = max_count
+                    break
+
+            print(f"Targeting {target_min_count}-{target_max_count} lesions")
+
+            # Vygenerovat několik vzorků a vybrat ten nejbližší cílovému počtu
+            best_match = None
+            best_match_diff = float('inf')
+
+            # Zkusit více šumů a vybrat ten s nejlepším počtem lézí
+            for noise_attempt in range(10):
+                # Náhodný šum s vhodnou škálou pro tento pokus
+                noise_scale = 1.0 + (noise_attempt * 0.2)  # Zkusit různé škály
                 noise = torch.randn(1, 100, 1, 1, 1).to(device) * noise_scale
                 
-                # Generate fake sample
+                # Generovat lesion map
                 fake_label = generator(noise, atlas_tensor)
                 
-                # Check if we have a completely empty image
-                if torch.sum(fake_label > 0.1) == 0 and current_attempt < max_attempts - 1:
-                    # Try again with more aggressive noise
-                    current_attempt += 1
-                    continue
+                # Threshold a počet lézí
+                fake_np = (fake_label[0, 0].cpu().numpy() > threshold).astype(np.float32)
+                _, num_components = ndimage.label(fake_np)
                 
-                # Calculate percentage of non-zero voxels (preliminary)
-                non_zero_percentage = torch.mean((fake_label > threshold).float()) * 100
-                
-                # Store the best result that meets our target
-                if best_fake_label is None or (
-                    (target_min_pct is None or non_zero_percentage >= target_min_pct) and
-                    (target_max_pct is None or non_zero_percentage <= target_max_pct) or
-                    (abs(non_zero_percentage - (target_min_pct + target_max_pct) / 2) < 
-                     abs(best_percentage * 100 - (target_min_pct + target_max_pct) / 2))
-                ):
-                    best_fake_label = fake_label
-                    best_noise = noise
-                    best_percentage = torch.mean((fake_label > threshold).float()).item()
-                
-                current_attempt += 1
-                
-                # If we've found a good match, stop trying
-                if (target_min_pct is None or non_zero_percentage >= target_min_pct) and \
-                   (target_max_pct is None or non_zero_percentage <= target_max_pct):
+                # Pokud je počet lézí v cílovém rozmezí nebo blízko, uložit
+                if target_min_count <= num_components <= target_max_count:
+                    best_match = fake_label
                     break
-            
-            # Use the best result
-            if best_fake_label is not None:
-                fake_label = best_fake_label
-                noise = best_noise
+                
+                # Jinak si pamatovat ten nejbližší
+                diff = min(abs(num_components - target_min_count), abs(num_components - target_max_count))
+                if diff < best_match_diff:
+                    best_match_diff = diff
+                    best_match = fake_label
+
+            # Použít nejlepší shodu
+            if best_match is not None:
+                fake_label = best_match
             
             # Store the percentage for this sample
-            generated_percentages.append(best_percentage * 100)
+            generated_percentages.append(torch.mean((fake_label > threshold).float()).item() * 100)
             
             # Convert to numpy for analysis (raw values before thresholding)
             fake_np_raw = fake_label[0, 0].cpu().numpy()
@@ -1273,3 +1295,62 @@ if __name__ == "__main__":
                          args.match_distribution, None)
     else:
         main(args)
+
+def compute_lesion_distribution_loss(generated, real_labels, atlas):
+    """Podporuje realistickou distribuci počtu a velikosti lézí"""
+    # Práh pro binární léze
+    gen_binary = (generated > 0.5).float()
+    loss = 0.0
+    batch_size = generated.size(0)
+    
+    for i in range(batch_size):
+        # Analýza reálného a generovaného vzorku
+        real_np = real_labels[i, 0].cpu().numpy()
+        gen_np = gen_binary[i, 0].cpu().numpy()
+        
+        # Počet komponent
+        real_labeled, real_count = ndimage.label(real_np)
+        gen_labeled, gen_count = ndimage.label(gen_np)
+        
+        if real_count == 0:  # Přeskočit prázdné vzorky
+            continue
+            
+        # 1. Penalizace za špatný počet lézí
+        # Použijeme log pro zmírnění vlivu vysokých počtů
+        count_ratio = abs(np.log1p(real_count) - np.log1p(gen_count)) / np.log1p(max(real_count, 1))
+        count_loss = torch.tensor(count_ratio, device=generated.device)
+        
+        # 2. Penalizace za nesprávnou distribuci velikostí
+        if gen_count > 0 and real_count > 0:
+            # Velikosti komponent
+            real_sizes = ndimage.sum(real_np, real_labeled, range(1, real_count+1))
+            gen_sizes = ndimage.sum(gen_np, gen_labeled, range(1, gen_count+1))
+            
+            # Poměr největší léze k celkovému objemu
+            real_ratio = np.max(real_sizes) / np.sum(real_sizes) if np.sum(real_sizes) > 0 else 0
+            gen_ratio = np.max(gen_sizes) / np.sum(gen_sizes) if np.sum(gen_sizes) > 0 else 0
+            
+            # Penalizace za rozdíl v dominanci
+            dominance_loss = abs(real_ratio - gen_ratio)
+            
+            # Porovnání histogramů velikostí (zjednodušeně)
+            # Normalizujeme velikosti do 10 binů
+            real_hist = np.histogram(real_sizes, bins=10, range=(0, np.max(real_sizes)*1.1))[0]
+            real_hist = real_hist / (np.sum(real_hist) + 1e-8)
+            
+            gen_hist = np.histogram(gen_sizes, bins=10, range=(0, np.max(real_sizes)*1.1))[0]
+            gen_hist = gen_hist / (np.sum(gen_hist) + 1e-8)
+            
+            # KL divergence
+            hist_loss = 0.0
+            for j in range(10):
+                if real_hist[j] > 0 and gen_hist[j] > 0:
+                    hist_loss += real_hist[j] * np.log(real_hist[j] / (gen_hist[j] + 1e-8))
+            
+            size_loss = torch.tensor(dominance_loss + hist_loss, device=generated.device)
+        else:
+            size_loss = torch.tensor(1.0, device=generated.device)  # Vysoká penalizace při chybějících lézích
+        
+        loss += 0.7 * count_loss + 0.3 * size_loss
+    
+    return loss / batch_size if batch_size > 0 else torch.tensor(0.0, device=generated.device)
