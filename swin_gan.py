@@ -9,7 +9,7 @@ from monai.networks.nets import SwinUNETR
 from monai.losses import FocalLoss
 import glob
 from collections import defaultdict
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 import argparse
 
 
@@ -19,7 +19,7 @@ class HieLesionDataset(Dataset):
                  lesion_atlas_path, 
                  transform=None, 
                  filter_empty=True,
-                 min_non_zero_percentage=0.001):
+                 min_non_zero_percentage=0.00001):
         """
         Dataset for HIE lesion synthesis
         
@@ -123,7 +123,6 @@ class Generator(nn.Module):
         
         # Additional layers to get binary output
         self.final_conv = nn.Conv3d(feature_size, out_channels, kernel_size=1)
-        self.sigmoid = nn.Sigmoid()
     
     def forward(self, x):
         # SwinUNETR features
@@ -131,7 +130,6 @@ class Generator(nn.Module):
         
         # Final layers
         x = self.final_conv(features)
-        x = self.sigmoid(x)
         
         return x
 
@@ -166,8 +164,7 @@ class Discriminator(nn.Module):
         
         # Final layers
         layers += [
-            nn.Conv3d(current_feature_size, 1, kernel_size=4, stride=1, padding=1, bias=False),
-            nn.Sigmoid()
+            nn.Conv3d(current_feature_size, 1, kernel_size=4, stride=1, padding=1, bias=False)
         ]
         
         self.model = nn.Sequential(*layers)
@@ -208,7 +205,7 @@ class SwinGAN(nn.Module):
         
         # Loss functions
         self.focal_loss = FocalLoss(alpha=focal_alpha, gamma=focal_gamma)
-        self.bce_loss = nn.BCELoss()
+        self.bce_loss = nn.BCEWithLogitsLoss()
         self.l1_loss = nn.L1Loss()
         
         # Loss weights
@@ -225,18 +222,21 @@ class SwinGAN(nn.Module):
             atlas: Lesion atlas (frequency map)
             fake_pred: Discriminator prediction on fake lesion
         """
-        # Adversarial loss
+        # Adversarial loss (BCEWithLogitsLoss automatically applies sigmoid)
         adv_loss = self.bce_loss(fake_pred, torch.ones_like(fake_pred))
+        
+        # Apply sigmoid to fake_lesion for other losses since we removed it from generator
+        fake_lesion_sigmoid = torch.sigmoid(fake_lesion)
         
         # Focal loss for sparse lesion segmentation
         focal_loss = self.focal_loss(fake_lesion, real_lesion)
         
         # L1 loss (can help with spatial consistency)
-        l1_loss = self.l1_loss(fake_lesion, real_lesion)
+        l1_loss = self.l1_loss(fake_lesion_sigmoid, real_lesion)
         
         # Constraint loss: ensure lesions only appear in regions with non-zero atlas values
         constraint_mask = (atlas > 0).float()
-        lesion_outside_mask = fake_lesion * (1 - constraint_mask)
+        lesion_outside_mask = fake_lesion_sigmoid * (1 - constraint_mask)
         constraint_loss = torch.mean(lesion_outside_mask) * 100.0  # Heavy penalty
         
         # Total generator loss
@@ -258,7 +258,7 @@ class SwinGAN(nn.Module):
             real_pred: Discriminator prediction on real lesion
             fake_pred: Discriminator prediction on fake lesion
         """
-        # Loss on real samples
+        # Loss on real samples (BCEWithLogitsLoss automatically applies sigmoid)
         real_loss = self.bce_loss(real_pred, torch.ones_like(real_pred))
         
         # Loss on fake samples
@@ -319,8 +319,8 @@ class SwinGANTrainer:
         
         # For mixed precision training
         if self.use_amp:
-            self.scaler_g = GradScaler()
-            self.scaler_d = GradScaler()
+            self.scaler_g = GradScaler('cuda' if device == 'cuda' else 'cpu')
+            self.scaler_d = GradScaler('cuda' if device == 'cuda' else 'cpu')
         
         # Create output directory if it doesn't exist
         os.makedirs(self.output_dir, exist_ok=True)
@@ -353,7 +353,7 @@ class SwinGANTrainer:
                 # Train discriminator
                 self.optimizer_d.zero_grad()
                 
-                with autocast(enabled=self.use_amp):
+                with autocast(device_type='cuda' if self.device == 'cuda' else 'cpu', enabled=self.use_amp):
                     # Generate fake lesions
                     fake_lesion = self.model.generator(atlas)
                     
@@ -376,7 +376,7 @@ class SwinGANTrainer:
                 # Train generator
                 self.optimizer_g.zero_grad()
                 
-                with autocast(enabled=self.use_amp):
+                with autocast(device_type='cuda' if self.device == 'cuda' else 'cpu', enabled=self.use_amp):
                     # Generate fake lesions again (since gradients were detached)
                     fake_lesion = self.model.generator(atlas)
                     
@@ -459,18 +459,20 @@ class SwinGANTrainer:
                 atlas = batch['atlas'].to(self.device)
                 real_lesion = batch['lesion'].to(self.device)
                 
-                # Generate fake lesions
-                fake_lesion = self.model.generator(atlas)
-                
-                # Compute discriminator predictions
-                real_pred = self.model.discriminator(atlas, real_lesion)
-                fake_pred = self.model.discriminator(atlas, fake_lesion)
-                
-                # Compute losses
-                g_loss, g_losses_dict = self.model.generator_loss(
-                    fake_lesion, real_lesion, atlas, fake_pred
-                )
-                d_loss, d_losses_dict = self.model.discriminator_loss(real_pred, fake_pred)
+                # Use autocast for validation as well for consistency
+                with autocast(device_type='cuda' if self.device == 'cuda' else 'cpu', enabled=self.use_amp):
+                    # Generate fake lesions
+                    fake_lesion = self.model.generator(atlas)
+                    
+                    # Compute discriminator predictions
+                    real_pred = self.model.discriminator(atlas, real_lesion)
+                    fake_pred = self.model.discriminator(atlas, fake_lesion)
+                    
+                    # Compute losses
+                    g_loss, g_losses_dict = self.model.generator_loss(
+                        fake_lesion, real_lesion, atlas, fake_pred
+                    )
+                    d_loss, d_losses_dict = self.model.discriminator_loss(real_pred, fake_pred)
                 
                 # Update validation losses
                 for k, v in d_losses_dict.items():
@@ -635,7 +637,11 @@ def generate_lesions(args):
     
     # Generate lesions
     with torch.no_grad():
-        fake_lesion = model.generator(atlas_tensor)
+        # Get raw outputs from generator
+        logits = model.generator(atlas_tensor)
+        
+        # Apply sigmoid to get probability map
+        fake_lesion = torch.sigmoid(logits)
         
         # Binarize the output
         binary_lesion = (fake_lesion > args.threshold).float()
@@ -705,7 +711,7 @@ def main():
                              help='Alpha parameter for focal loss')
     train_parser.add_argument('--focal_gamma', type=float, default=2.0, 
                              help='Gamma parameter for focal loss')
-    train_parser.add_argument('--min_non_zero', type=float, default=0.001, 
+    train_parser.add_argument('--min_non_zero', type=float, default=0.000001, 
                              help='Minimum percentage of non-zero voxels to include sample')
     train_parser.add_argument('--save_interval', type=int, default=5, 
                              help='Interval for saving full model checkpoints')
