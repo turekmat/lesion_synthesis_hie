@@ -1446,7 +1446,7 @@ def generate_lesions(
                 time_component = int(time.time() * 1000) % 10000
                 perlin_seed = (perlin_seed + time_component) % 1000000
                 
-                # Create different initialization noise patterns for each sample
+                # Vytvoření zcela nového generátoru Perlin šumu pro každý vzorek
                 perlin_gen = PerlinNoiseGenerator(
                     octaves=sample_octaves,
                     persistence=sample_persistence,
@@ -1454,7 +1454,7 @@ def generate_lesions(
                     seed=perlin_seed
                 )
                 
-                # Generate Perlin noise for this sample
+                # Generování základního šumu
                 noise = perlin_gen.generate_batch_noise(
                     batch_size=1, 
                     shape=(atlas_data.shape[0], atlas_data.shape[1], atlas_data.shape[2]),
@@ -1463,38 +1463,105 @@ def generate_lesions(
                     device=device
                 )
                 
-                # Add additional spatial variation by slightly rotating or offsetting the noise pattern
-                # This can be accomplished in the forward pass of the model, but we can enhance 
-                # the noise representation here as well
-                if i % 3 == 0:  # For every third sample, apply a different noise transformation
-                    # Create a "secondary" noise component to blend with the primary
-                    secondary_perlin_seed = (perlin_seed + 83443) % 1000000  # Use a large prime offset
-                    secondary_perlin_gen = PerlinNoiseGenerator(
-                        octaves=sample_octaves,
-                        persistence=sample_persistence,
-                        lacunarity=sample_lacunarity,
-                        seed=secondary_perlin_seed
+                # AGRESIVNÍ TRANSFORMACE ŠUMU - aplikujeme vždy
+                # Vytvoříme vícenásobné vrstvy šumu a zkombinujeme je pro větší komplexitu
+                
+                # Generování několika různých šumových komponent
+                noise_layers = []
+                num_layers = np.random.randint(2, 5)  # 2-4 vrstvy šumu
+                
+                for layer in range(num_layers):
+                    # Různý seed pro každou vrstvu
+                    layer_seed = np.random.randint(0, 1000000)
+                    layer_octaves = np.random.randint(2, 6)
+                    layer_persistence = np.random.uniform(0.3, 0.7)
+                    layer_lacunarity = np.random.uniform(1.5, 2.5)
+                    layer_scale = np.random.uniform(0.05, 0.15)
+                    
+                    # Vytvoření nového generátoru pro tuto vrstvu
+                    layer_gen = PerlinNoiseGenerator(
+                        octaves=layer_octaves,
+                        persistence=layer_persistence,
+                        lacunarity=layer_lacunarity,
+                        seed=layer_seed
                     )
                     
-                    # Generate secondary noise and blend with primary
-                    secondary_noise = secondary_perlin_gen.generate_batch_noise(
+                    # Generování šumu pro tuto vrstvu
+                    layer_noise = layer_gen.generate_batch_noise(
                         batch_size=1,
                         shape=(atlas_data.shape[0], atlas_data.shape[1], atlas_data.shape[2]),
                         noise_dim=model.noise_dim,
-                        scale=sample_scale * 1.2,  # Slightly different scale
+                        scale=layer_scale,
                         device=device
                     )
                     
-                    # Blend the noise vectors (simple weighted average)
-                    blend_factor = 0.4 + np.random.uniform(0, 0.2)  # Random between 0.4-0.6
-                    noise = noise * blend_factor + secondary_noise * (1 - blend_factor)
-                    
-                    print(f"  Applied noise blending with factor {blend_factor:.2f} for additional variation")
+                    noise_layers.append(layer_noise)
+                
+                # Kombinace všech vrstev šumu s různou váhou
+                combined_noise = noise.clone()  # Začínáme základním šumem
+                for layer_idx, layer_noise in enumerate(noise_layers):
+                    weight = np.random.uniform(0.2, 0.8)
+                    # Různé způsoby kombinace šumu pro různé typy interakcí
+                    if layer_idx % 3 == 0:
+                        # Aditivní kombinace
+                        combined_noise = combined_noise * (1 - weight) + layer_noise * weight
+                    elif layer_idx % 3 == 1:
+                        # Multiplikativní kombinace
+                        combined_noise = combined_noise * (layer_noise * weight + (1 - weight))
+                    else:
+                        # Max/min kombinace
+                        if np.random.random() > 0.5:
+                            combined_noise = torch.max(combined_noise * (1 - weight), layer_noise * weight)
+                        else:
+                            combined_noise = torch.min(combined_noise * (1 + weight), layer_noise * (1 + weight))
+                
+                noise = combined_noise
+                print(f"  Applied {num_layers} noise layers with complex blending for extreme variation")
             else:
                 noise = None
             
+            # Aplikujeme náhodnou transformaci vstupního atlasu pro každý vzorek
+            # To způsobí, že model bude generovat léze v mírně odlišných lokalitách
+            if np.random.random() > 0.3:  # Pro 70% vzorků
+                # Vyrobíme kopii atlasu pro manipulaci
+                transformed_atlas = atlas_tensor.clone()
+                
+                # Náhodné posunutí atlasu o několik voxelů
+                shift_x = np.random.randint(-5, 6)  # Posunutí o -5 až +5 voxelů
+                shift_y = np.random.randint(-5, 6)
+                shift_z = np.random.randint(-3, 4)  # Méně v ose Z
+                
+                if shift_x != 0 or shift_y != 0 or shift_z != 0:
+                    # Použití torch.roll pro cyklické posunutí atlasu
+                    transformed_atlas = torch.roll(transformed_atlas, shifts=(shift_z, shift_x, shift_y), dims=(2, 3, 4))
+                    print(f"  Applied spatial shift to atlas: ({shift_x}, {shift_y}, {shift_z})")
+                
+                # Náhodná lokální úprava intenzity atlasu
+                if np.random.random() > 0.5:
+                    # Vytvoříme náhodnou masku pro lokální zesílení/zeslabení atlasu
+                    intensity_factor = np.random.uniform(0.8, 1.2)
+                    mask_size = np.random.randint(10, 30)
+                    
+                    # Vytvoříme náhodnou lokální masku
+                    mask_center_x = np.random.randint(mask_size, transformed_atlas.shape[3] - mask_size)
+                    mask_center_y = np.random.randint(mask_size, transformed_atlas.shape[4] - mask_size)
+                    mask_center_z = np.random.randint(mask_size//2, transformed_atlas.shape[2] - mask_size//2)
+                    
+                    # Aplikujeme změnu intenzity v dané oblasti
+                    transformed_atlas[0, 0, 
+                                      max(0, mask_center_z - mask_size//2):min(transformed_atlas.shape[2], mask_center_z + mask_size//2),
+                                      max(0, mask_center_x - mask_size):min(transformed_atlas.shape[3], mask_center_x + mask_size),
+                                      max(0, mask_center_y - mask_size):min(transformed_atlas.shape[4], mask_center_y + mask_size)] *= intensity_factor
+                    
+                    print(f"  Applied local intensity modification with factor {intensity_factor:.2f}")
+                
+                # Použití transformovaného atlasu pro generování
+                atlas_input = transformed_atlas
+            else:
+                atlas_input = atlas_tensor
+            
             # Generate the lesion
-            fake_lesion_logits = model(atlas_tensor, noise)
+            fake_lesion_logits = model(atlas_input, noise)
             
             # Apply sigmoid to get probability map
             fake_lesion = torch.sigmoid(fake_lesion_logits)
@@ -1502,24 +1569,92 @@ def generate_lesions(
             # Convert to numpy array
             fake_lesion_np = fake_lesion.squeeze().cpu().numpy()
             
-            # Add additional spatial variation to the probability map
-            # This helps ensure that even with similar network outputs, the final patterns differ
-            # Add subtle random spatial perturbations to the probability map
-            if i % 2 == 0:  # For half the samples
-                # Create a small random perturbation field
-                perturbation = np.random.normal(0, 0.02, fake_lesion_np.shape)  # Low stddev for subtle effect
-                # Apply the perturbation
-                fake_lesion_np = fake_lesion_np + perturbation
-                # Clip to valid probability range
-                fake_lesion_np = np.clip(fake_lesion_np, 0.0, 1.0)
-                print(f"  Applied random spatial perturbation for additional diversity")
+            # AGRESIVNÍ MANIPULACE S PRAVDĚPODOBNOSTNÍ MAPOU
+            # Aplikujeme různé transformace na vygenerovanou pravděpodobnostní mapu
+            
+            # 1. Aplikace náhodné prostorové perturbace - vždy, ne jen pro polovinu vzorků
+            # Vytvoříme výraznější perturbace pro větší diverzitu
+            perturbation_strength = np.random.uniform(0.02, 0.1)  # Silnější perturbace (0.02-0.1 místo pevné 0.02)
+            perturbation = np.random.normal(0, perturbation_strength, fake_lesion_np.shape)
+            fake_lesion_np = fake_lesion_np + perturbation
+            
+            # 2. Aplikace nelineárních transformací pro změnu charakteru mapy
+            transformation_type = np.random.randint(0, 5)  # 5 různých transformací
+            
+            if transformation_type == 0:
+                # Exponenciální transformace - zvýrazní vyšší hodnoty
+                power = np.random.uniform(0.5, 2.0)
+                fake_lesion_np = np.power(fake_lesion_np, power)
+                print(f"  Applied exponential transformation with power {power:.2f}")
+            elif transformation_type == 1:
+                # Sigmoidní transformace - zvýrazní kontrast mezi nízkou a vysokou pravděpodobností
+                alpha = np.random.uniform(5, 15)
+                beta = np.random.uniform(0.3, 0.7)
+                fake_lesion_np = 1 / (1 + np.exp(-alpha * (fake_lesion_np - beta)))
+                print(f"  Applied sigmoid transformation with alpha={alpha:.2f}, beta={beta:.2f}")
+            elif transformation_type == 2:
+                # Logaritmická transformace - zvýrazní nižší hodnoty
+                epsilon = 1e-5  # Malá hodnota pro zabránění log(0)
+                fake_lesion_np = np.log(fake_lesion_np + epsilon) / np.log(1 + epsilon)
+                print(f"  Applied logarithmic transformation")
+            elif transformation_type == 3:
+                # Inverzní transformace v určitých regionech - lokální inverze hodnot
+                if np.random.random() > 0.5:
+                    inv_mask = np.random.uniform(0, 1, fake_lesion_np.shape) > 0.8  # 20% voxelů
+                    fake_lesion_np[inv_mask] = 1 - fake_lesion_np[inv_mask]
+                    print(f"  Applied local intensity inversion")
+            elif transformation_type == 4:
+                # Prahování s více úrovněmi - vytvoří více různých stupňů
+                thresholds = np.sort(np.random.uniform(0.2, 0.8, np.random.randint(2, 5)))
+                levels = np.linspace(0.2, 1.0, len(thresholds) + 1)
+                
+                result = np.zeros_like(fake_lesion_np)
+                mask = fake_lesion_np > thresholds[0]
+                result[mask] = levels[0]
+                
+                for i in range(1, len(thresholds)):
+                    mask = fake_lesion_np > thresholds[i]
+                    result[mask] = levels[i]
+                
+                mask = fake_lesion_np > thresholds[-1]
+                result[mask] = levels[-1]
+                
+                fake_lesion_np = result
+                print(f"  Applied multi-level thresholding with {len(thresholds)} levels")
+            
+            # Zajistíme, že hodnoty zůstanou v platném rozsahu [0, 1]
+            fake_lesion_np = np.clip(fake_lesion_np, 0.0, 1.0)
             
             # Apply Gaussian smoothing to reduce noise and small fragments
             if smooth_sigma > 0:
-                # Vary smoothing slightly for each sample
-                sample_smooth_sigma = smooth_sigma * (0.8 + np.random.uniform(0, 0.4))  # 0.8-1.2x the original
-                fake_lesion_np = gaussian_filter(fake_lesion_np, sigma=sample_smooth_sigma)
-                print(f"  Using sample-specific smoothing sigma: {sample_smooth_sigma:.3f}")
+                # Náhodný výběr typu vyhlazení
+                smoothing_type = np.random.randint(0, 3)
+                
+                if smoothing_type == 0:
+                    # Standardní Gaussovské vyhlazení s náhodnou sigmou
+                    sample_smooth_sigma = np.random.uniform(0.2, 1.0)  # Širší rozsah (0.2-1.0)
+                    fake_lesion_np = gaussian_filter(fake_lesion_np, sigma=sample_smooth_sigma)
+                    print(f"  Using Gaussian smoothing with sigma: {sample_smooth_sigma:.3f}")
+                elif smoothing_type == 1:
+                    # Anisotropické vyhlazení - různé sigmy pro různé směry
+                    sigma_x = np.random.uniform(0.3, 1.2)
+                    sigma_y = np.random.uniform(0.3, 1.2)
+                    sigma_z = np.random.uniform(0.3, 1.2)
+                    fake_lesion_np = gaussian_filter(fake_lesion_np, sigma=(sigma_z, sigma_x, sigma_y))
+                    print(f"  Using anisotropic smoothing with sigma: ({sigma_x:.2f}, {sigma_y:.2f}, {sigma_z:.2f})")
+                elif smoothing_type == 2:
+                    # Selektivní vyhlazení - vyhlazení pouze určitých oblastí
+                    baseline_sigma = np.random.uniform(0.3, 0.8)
+                    # Vytvoříme masku pro selektivní vyhlazení
+                    smooth_threshold = np.random.uniform(0.3, 0.7)
+                    areas_to_smooth = fake_lesion_np > smooth_threshold
+                    
+                    # Aplikujeme vyhlazení pouze na vybrané oblasti
+                    temp_result = fake_lesion_np.copy()
+                    temp_smooth = gaussian_filter(fake_lesion_np, sigma=baseline_sigma)
+                    temp_result[areas_to_smooth] = temp_smooth[areas_to_smooth]
+                    fake_lesion_np = temp_result
+                    print(f"  Using selective smoothing with threshold {smooth_threshold:.2f} and sigma {baseline_sigma:.2f}")
             
             # Apply adaptive threshold if requested
             if use_adaptive_threshold and current_target_coverage is not None:
