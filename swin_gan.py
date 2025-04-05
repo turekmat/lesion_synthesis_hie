@@ -241,10 +241,12 @@ class SwinGAN(nn.Module):
                  dropout_rate=0.0,
                  lambda_focal=10.0,
                  lambda_l1=5.0,
+                 lambda_fragmentation=50.0,
                  focal_alpha=0.75,
                  focal_gamma=2.0,
                  use_noise=True,
-                 noise_dim=16):
+                 noise_dim=16,
+                 fragmentation_kernel_size=5):
         """
         SwinGAN for lesion synthesis
         
@@ -255,10 +257,12 @@ class SwinGAN(nn.Module):
             dropout_rate (float): Dropout rate for generator
             lambda_focal (float): Weight for focal loss
             lambda_l1 (float): Weight for L1 loss
+            lambda_fragmentation (float): Weight for fragmentation loss - higher values promote more coherent lesions
             focal_alpha (float): Alpha parameter for focal loss
             focal_gamma (float): Gamma parameter for focal loss
             use_noise (bool): Whether to use noise injection for diversity
             noise_dim (int): Dimension of the noise vector to inject
+            fragmentation_kernel_size (int): Size of kernel used for fragmentation loss
         """
         super(SwinGAN, self).__init__()
         
@@ -280,10 +284,14 @@ class SwinGAN(nn.Module):
         # Loss weights
         self.lambda_focal = lambda_focal
         self.lambda_l1 = lambda_l1
+        self.lambda_fragmentation = lambda_fragmentation
         
         # For generating diverse samples
         self.use_noise = use_noise
         self.noise_dim = noise_dim
+        
+        # For fragmentation loss
+        self.fragmentation_kernel_size = fragmentation_kernel_size
     
     def generator_loss(self, fake_lesion, real_lesion, atlas, fake_pred):
         """
@@ -312,14 +320,54 @@ class SwinGAN(nn.Module):
         lesion_outside_mask = fake_lesion_sigmoid * (1 - constraint_mask)
         constraint_loss = torch.mean(lesion_outside_mask) * 100.0  # Heavy penalty
         
-        # Total generator loss
-        total_loss = adv_loss + self.lambda_focal * focal_loss + self.lambda_l1 * l1_loss + constraint_loss
+        # Nová komponenta ztráty pro podporu celistvosti lézí
+        # Použijeme 3D konvoluci s gaussovským kernelem pro vyhlazení lézí
+        # Toto penalizuje fragmentaci a podporuje generování souvislých lézí
+        batch_size = fake_lesion_sigmoid.size(0)
+        
+        # Vytvoření 3D gaussovského kernelu pro vyhlazení
+        kernel_size = self.fragmentation_kernel_size
+        sigma = 1.0
+        
+        # Středový bod kernelu
+        center = kernel_size // 2
+        
+        # Vytvoříme 3D kernel
+        kernel = torch.zeros((1, 1, kernel_size, kernel_size, kernel_size), device=fake_lesion.device)
+        
+        # Naplníme kernel gaussovskými hodnotami
+        for x in range(kernel_size):
+            for y in range(kernel_size):
+                for z in range(kernel_size):
+                    # 3D Gaussovská funkce
+                    kernel[0, 0, x, y, z] = torch.exp(
+                        -((x - center) ** 2 + (y - center) ** 2 + (z - center) ** 2) / (2 * sigma ** 2)
+                    )
+        
+        # Normalizace kernelu
+        kernel = kernel / kernel.sum()
+        
+        # Aplikace kernelu na fake_lesion pro získání vyhlazeného obrazu
+        # padding=center zajistí, že výstup bude mít stejnou velikost jako vstup
+        smoothed_lesion = F.conv3d(
+            fake_lesion_sigmoid, kernel, padding=center
+        )
+        
+        # Ztráta fragmentace - chceme, aby model preferoval podobné hodnoty sousedních voxelů
+        # Tím podporujeme vytváření celistvých struktur
+        fragmentation_loss = torch.mean(
+            torch.abs(fake_lesion_sigmoid - smoothed_lesion)
+        ) * self.lambda_fragmentation  # Použijeme parametr lambda_fragmentation
+        
+        # Total generator loss včetně nové komponenty
+        total_loss = adv_loss + self.lambda_focal * focal_loss + self.lambda_l1 * l1_loss + constraint_loss + fragmentation_loss
         
         return total_loss, {
             'adv_loss': adv_loss.item(),
             'focal_loss': focal_loss.item(),
             'l1_loss': l1_loss.item(),
             'constraint_loss': constraint_loss.item(),
+            'fragmentation_loss': fragmentation_loss.item(),  # Přidání nové ztráty do statistik
             'total_g_loss': total_loss.item()
         }
     
@@ -590,6 +638,10 @@ def train_model(args):
     print(f"Non-zero threshold: {args.min_non_zero}")
     print(f"Device: {args.device}")
     print(f"Generator save interval: {args.generator_save_interval}")
+    print(f"Fragmentation loss weight: {args.lambda_fragmentation}")
+    print(f"Fragmentation kernel size: {args.fragmentation_kernel_size}")
+    print(f"Using noise for generation diversity: True")
+    print(f"Noise dimension: 16")
     
     # Create the output directory if it doesn't exist
     if not os.path.exists(args.output_dir):
@@ -639,10 +691,12 @@ def train_model(args):
         dropout_rate=args.dropout_rate,
         lambda_focal=args.lambda_focal,
         lambda_l1=args.lambda_l1,
+        lambda_fragmentation=args.lambda_fragmentation,
         focal_alpha=args.focal_alpha,
         focal_gamma=args.focal_gamma,
         use_noise=True,
-        noise_dim=16
+        noise_dim=16,
+        fragmentation_kernel_size=args.fragmentation_kernel_size
     )
     
     # Create the optimizer
@@ -827,14 +881,29 @@ def generate_lesions(
             # Print some statistics
             # measure.label vrací tuple (labeled_array, num_features)
             labeled_array, num_lesions = measure.label(binary_lesion)
-            lesion_volume = binary_lesion.sum() * np.prod(atlas_img.header.get_zooms()) / 1000.0  # in ml
+            
+            # Výpočet objemu v procentech celkového objemu mozku
+            total_brain_volume = np.count_nonzero(atlas_data > 0)  # Počet voxelů, kde je atlas nenulový
+            lesion_volume_voxels = binary_lesion.sum()
+            lesion_volume_percentage = (lesion_volume_voxels / total_brain_volume) * 100.0
+            
+            # Také vypočítáme objem v ml pro úplnost
+            lesion_volume_ml = lesion_volume_voxels * np.prod(atlas_img.header.get_zooms()) / 1000.0  # in ml
             
             if num_samples > 1:
                 print(f"Sample {i+1}: Generated {num_lesions} distinct lesions")
-                print(f"Sample {i+1}: Total lesion volume: {lesion_volume:.2f} ml")
+                print(f"Sample {i+1}: Total lesion volume: {lesion_volume_percentage:.2f}% of brain volume ({lesion_volume_ml:.2f} ml)")
+                
+                # Varování pokud počet lézí je mimo očekávaný rozsah podle trénovací množiny
+                if num_lesions > 75:
+                    print(f"WARNING: Sample {i+1} has {num_lesions} lesions, which is much higher than expected (1-75 based on training set)")
             else:
                 print(f"Generated {num_lesions} distinct lesions")
-                print(f"Total lesion volume: {lesion_volume:.2f} ml")
+                print(f"Total lesion volume: {lesion_volume_percentage:.2f}% of brain volume ({lesion_volume_ml:.2f} ml)")
+                
+                # Varování pokud počet lézí je mimo očekávaný rozsah podle trénovací množiny
+                if num_lesions > 75:
+                    print(f"WARNING: Generated {num_lesions} lesions, which is much higher than expected (1-75 based on training set)")
     
     # If multiple samples were generated, also save a mean probability map
     if num_samples > 1:
@@ -888,6 +957,10 @@ def main():
                              help='Weight for focal loss')
     train_parser.add_argument('--lambda_l1', type=float, default=5.0, 
                              help='Weight for L1 loss')
+    train_parser.add_argument('--lambda_fragmentation', type=float, default=50.0, 
+                             help='Weight for fragmentation loss - higher values promote more coherent lesions')
+    train_parser.add_argument('--fragmentation_kernel_size', type=int, default=5, 
+                             help='Size of kernel used for fragmentation loss - larger values promote larger coherent structures')
     train_parser.add_argument('--focal_alpha', type=float, default=0.75, 
                              help='Alpha parameter for focal loss')
     train_parser.add_argument('--focal_gamma', type=float, default=2.0, 
