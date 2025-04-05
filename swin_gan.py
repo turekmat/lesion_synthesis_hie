@@ -339,10 +339,9 @@ class SwinGAN(nn.Module):
         for x in range(kernel_size):
             for y in range(kernel_size):
                 for z in range(kernel_size):
-                    # 3D Gaussovská funkce
-                    kernel[0, 0, x, y, z] = torch.exp(
-                        -((x - center) ** 2 + (y - center) ** 2 + (z - center) ** 2) / (2 * sigma ** 2)
-                    )
+                    # 3D Gaussovská funkce - převedeme výpočet na tensor
+                    exponent = -((x - center) ** 2 + (y - center) ** 2 + (z - center) ** 2) / (2 * sigma ** 2)
+                    kernel[0, 0, x, y, z] = torch.exp(torch.tensor(exponent, device=fake_lesion.device))
         
         # Normalizace kernelu
         kernel = kernel / kernel.sum()
