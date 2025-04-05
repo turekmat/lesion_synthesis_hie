@@ -825,7 +825,8 @@ def generate_lesions(
             nib.save(lesion_img, sample_output_file)
             
             # Print some statistics
-            num_lesions = measure.label(binary_lesion).max()
+            # measure.label vrací tuple (labeled_array, num_features)
+            labeled_array, num_lesions = measure.label(binary_lesion)
             lesion_volume = binary_lesion.sum() * np.prod(atlas_img.header.get_zooms()) / 1000.0  # in ml
             
             if num_samples > 1:
