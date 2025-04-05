@@ -469,6 +469,7 @@ def train(generator, discriminator, dataloader, num_epochs, device, output_dir):
     os.makedirs(output_dir, exist_ok=True)
     os.makedirs(os.path.join(output_dir, 'samples'), exist_ok=True)
     os.makedirs(os.path.join(output_dir, 'checkpoints'), exist_ok=True)
+    os.makedirs(os.path.join(output_dir, 'generator_models'), exist_ok=True)  # Nový adresář pro modely generátoru
     
     # Vytvoření logovacího souboru pro sledování pokrytí lézí
     coverage_log_path = os.path.join(output_dir, 'lesion_coverage_log.csv')
@@ -598,6 +599,21 @@ def train(generator, discriminator, dataloader, num_epochs, device, output_dir):
                 'optimizer_D_state_dict': optimizer_D.state_dict(),
                 'epoch': epoch
             }, os.path.join(output_dir, 'checkpoints', f'checkpoint_epoch_{epoch+1}.pt'))
+        
+        # NOVĚ: Ukládání generátoru každé 4 epochy ve formátu vhodném pro generování
+        if (epoch + 1) % 4 == 0 or epoch == num_epochs - 1:
+            generator_model_path = os.path.join(output_dir, 'generator_models', f'generator_epoch_{epoch+1}.pt')
+            torch.save(generator.state_dict(), generator_model_path)
+            print(f"Uložen model generátoru pro epoch {epoch+1} do {generator_model_path}")
+            
+            # Vytvoříme log soubor s parametry modelu
+            with open(os.path.join(output_dir, 'generator_models', f'generator_epoch_{epoch+1}_info.txt'), 'w') as f:
+                f.write(f"Epoch: {epoch+1}\n")
+                f.write(f"Generator Loss: {avg_g_loss:.6f}\n")
+                f.write(f"Average Coverage: {avg_coverage:.4f}%\n")
+                f.write(f"Atlas Guidance Score: {avg_atlas_guidance_loss:.6f}\n")
+                f.write(f"\nPokud chcete použít tento model pro generování vzorků, použijte příkaz:\n")
+                f.write(f"python SwinUNETR_lesion_GAN.py --generate --model_path={generator_model_path} --lesion_atlas_path=<cesta_k_atlasu> --output_dir=<vystupni_adresar> --num_samples=<pocet_vzorku>")
         
         # Generování vzorků pro vizualizaci
         if (epoch + 1) % 5 == 0 or epoch == num_epochs - 1:
