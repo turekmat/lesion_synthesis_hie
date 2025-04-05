@@ -308,7 +308,7 @@ class SwinUNETRGenerator(nn.Module):
             img_size: Velikost vstupního obrazu
             feature_size: Velikost rysů v první vrstvě
             patch_size: Velikost patchů pro Swin Transformer
-            in_channels: Počet vstupních kanálů
+            in_channels: Počet vstupních kanálů pro šum (mělo by být 100 pro kompatibilitu s generate_diverse_noise)
             out_channels: Počet výstupních kanálů
             depths: Hloubka pro každý stupeň (počet bloků)
             num_heads: Počet attention heads pro každý stupeň
@@ -327,7 +327,7 @@ class SwinUNETRGenerator(nn.Module):
         self.connectivity_radius = connectivity_radius
         self.training_mode = True  # Příznak pro určení, zda jsme v tréninkovém režimu
 
-        # Prvotní blok pro vstupní šum
+        # Prvotní blok pro vstupní šum - příjímá in_channels (100) pro šum
         self.noise_encoder = nn.Sequential(
             nn.Conv3d(in_channels, feature_size, kernel_size=3, padding=1),
             nn.PReLU(),
@@ -335,9 +335,9 @@ class SwinUNETRGenerator(nn.Module):
             nn.PReLU()
         )
         
-        # Atlas encoder
+        # Atlas encoder - vždy očekává 1 kanál pro atlas
         self.atlas_encoder = nn.Sequential(
-            nn.Conv3d(in_channels, feature_size, kernel_size=3, padding=1),
+            nn.Conv3d(1, feature_size, kernel_size=3, padding=1),
             nn.PReLU(),
             nn.Conv3d(feature_size, feature_size, kernel_size=3, padding=1),
             nn.PReLU()
@@ -1216,7 +1216,8 @@ def generate_samples(model_path, lesion_atlas_path, output_dir, num_samples=10, 
     # Načtení modelu
     img_size = atlas_data.shape
     print(f"Inicializuji generátor s feature_size={feature_size}")
-    generator = SwinUNETRGenerator(img_size=img_size, feature_size=feature_size)
+    # Nastavení in_channels=100, aby odpovídalo dimensi šumu v generate_diverse_noise
+    generator = SwinUNETRGenerator(img_size=img_size, feature_size=feature_size, in_channels=100)
     generator.load_state_dict(torch.load(model_path, map_location=device))
     generator.to(device)
     generator.eval()  # Přepnutí do evaluačního režimu (aktivuje postprocessing)
@@ -1446,7 +1447,8 @@ def main(args):
                 img_size = tuple(sample_data['atlas'].shape[2:])
                 print(f"Velikost dat: {img_size}")
                 
-                generator = SwinUNETRGenerator(img_size=img_size, feature_size=args.feature_size)
+                # Zde změníme in_channels na 100, aby odpovídal z_dim v generate_diverse_noise
+                generator = SwinUNETRGenerator(img_size=img_size, feature_size=args.feature_size, in_channels=100)
                 discriminator = LesionDiscriminator()
                 
                 generator.to(device)
@@ -1488,7 +1490,7 @@ def main(args):
             print(f"Načítám atlas lézí z: {atlas_path}")
             print(f"Používám feature_size: {args.feature_size}")
             
-            # Generování vzorků z natrénovaného modelu
+            # Generování vzorků z natrénovaného modelu - také zde změníme in_channels na 100
             generate_samples(
                 model_path=args.model_path,
                 lesion_atlas_path=atlas_path,  # Použití ověřené cesty
