@@ -52,9 +52,15 @@ class LesionDataset(Dataset):
         if not all_files:
             raise ValueError(f"Adresář {labels_dir} neobsahuje žádné .nii nebo .nii.gz soubory")
         
+        print(f"\n--- Inicializace datasetu ---")
+        print(f"Adresář: {labels_dir}")
+        print(f"Počet nalezených souborů: {len(all_files)} (.nii: {len(nii_files)}, .nii.gz: {len(nii_gz_files)})")
+        
         # Filtrování souborů, které neobsahují žádné léze
         self.labels_files = []
         skipped_count = 0
+        empty_count = 0
+        error_count = 0
         
         for file_path in sorted(all_files):
             try:
@@ -65,15 +71,28 @@ class LesionDataset(Dataset):
                 if np.any(data > 0):
                     self.labels_files.append(file_path)
                 else:
+                    empty_count += 1
                     skipped_count += 1
             except Exception as e:
                 print(f"Chyba při kontrole souboru {file_path}: {str(e)}")
+                error_count += 1
                 skipped_count += 1
         
         # Výpis statistik o načtených souborech
-        print(f"Celkový počet .nii/.nii.gz souborů: {len(all_files)}")
+        print(f"\n--- Výsledky zpracování souborů ---")
         print(f"Počet souborů s lézemi: {len(self.labels_files)}")
-        print(f"Počet přeskočených souborů (prázdné/chybné): {skipped_count}")
+        print(f"Počet souborů bez lézí (prázdné): {empty_count}")
+        print(f"Počet souborů s chybou při načtení: {error_count}")
+        print(f"Celkem přeskočeno: {skipped_count}")
+        
+        if self.labels_files:
+            # Ukázkový soubor pro informace o rozměrech
+            sample_img = nib.load(self.labels_files[0])
+            sample_data = sample_img.get_fdata()
+            print(f"\n--- Ukázkový soubor ---")
+            print(f"Rozměry: {sample_data.shape}")
+            print(f"Datový typ: {sample_data.dtype}")
+            print(f"Rozsah hodnot: {np.min(sample_data)} - {np.max(sample_data)}")
         
         if not self.labels_files:
             raise ValueError(f"Žádný z nalezených souborů neobsahuje léze. Dataset je prázdný.")
@@ -87,11 +106,19 @@ class LesionDataset(Dataset):
         atlas_data = atlas_nii.get_fdata()
         self.atlas_affine = atlas_nii.affine
         
+        # Informace o atlasu lézí
+        print(f"\n--- Atlas lézí ---")
+        print(f"Cesta: {lesion_atlas_path}")
+        print(f"Rozměry: {atlas_data.shape}")
+        print(f"Rozsah hodnot: {np.min(atlas_data)} - {np.max(atlas_data)}")
+        
         # Normalizace atlasu
         if np.max(atlas_data) > 0:
             atlas_data = atlas_data / np.max(atlas_data)
         
         self.atlas_data = atlas_data
+        print(f"\nDataset úspěšně inicializován s {len(self.labels_files)} vzorky.")
+        print("-" * 50)
     
     def __len__(self):
         return len(self.labels_files)
@@ -101,12 +128,7 @@ class LesionDataset(Dataset):
             nii_img = nib.load(path)
             data = nii_img.get_fdata()
             
-            # Výpis informací o souboru pro diagnostiku
-            print(f"Načten soubor: {path}")
-            print(f"  Rozměry: {data.shape}")
-            print(f"  Datový typ: {data.dtype}")
-            print(f"  Min hodnota: {np.min(data)}, Max hodnota: {np.max(data)}")
-            print(f"  Obsahuje nenulové hodnoty: {np.any(data > 0)}")
+            # Odstraněny podrobné výpisy pro každý soubor
             
             # Převedení na binární masku
             data = (data > 0).astype(np.float32)
@@ -507,7 +529,8 @@ def compute_atlas_guidance_loss(generated, atlas):
                 correction = 0.2 * (0.5 - relative_score) + 0.1 * ((0.5 - relative_score) ** 2)
                 loss += correction
     
-    return loss / batch_size
+    # Vrátíme jako PyTorch tensor místo float hodnoty
+    return torch.tensor(loss / batch_size, device=generated.device)
 
 # Trénovací funkce
 def train(generator, discriminator, dataloader, num_epochs, device, output_dir):
