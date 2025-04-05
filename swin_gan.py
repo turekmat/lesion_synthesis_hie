@@ -1814,6 +1814,8 @@ def main():
                              help='Batch size for training')
     train_parser.add_argument('--epochs', type=int, default=100, 
                              help='Number of epochs to train')
+    train_parser.add_argument('--num_workers', type=int, default=4, 
+                             help='Number of worker processes for data loading')
     train_parser.add_argument('--lr_g', type=float, default=1e-4, 
                              help='Learning rate for generator')
     train_parser.add_argument('--lr_d', type=float, default=4e-4, 
