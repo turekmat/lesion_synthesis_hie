@@ -1225,7 +1225,9 @@ def generate_lesions(
                 sample_output_file = os.path.join(output_dir, filename)
             
             # Create a new NIfTI image and save it
-            lesion_img = nib.Nifti1Image(binary_lesion, atlas_img.affine)
+            # Ensure data is of supported type (not bool)
+            binary_lesion_for_saving = binary_lesion.astype(np.int16)  # Convert to int16, which is supported by NIfTI
+            lesion_img = nib.Nifti1Image(binary_lesion_for_saving, atlas_img.affine)
             nib.save(lesion_img, sample_output_file)
             
             # Print some statistics
@@ -1272,6 +1274,8 @@ def generate_lesions(
         mean_filename = f"{name}_mean{ext}"
         mean_output_file = os.path.join(output_dir, mean_filename)
         
+        # Ensure mean_lesion is of a supported data type
+        mean_lesion = mean_lesion.astype(np.float32)  # Use float32 for probability map
         mean_img = nib.Nifti1Image(mean_lesion, atlas_img.affine)
         nib.save(mean_img, mean_output_file)
         print(f"Saved mean probability map to {mean_output_file}")
