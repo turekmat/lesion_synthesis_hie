@@ -934,7 +934,65 @@ def connected_components_3d(binary_tensor):
     
     return output
 
-# Trénovací funkce
+# Přidání Focal Loss pro lépe vyvážené generování lézí
+def compute_focal_loss(generated, atlas, gamma=2.0, alpha=0.75, min_prob=0.01):
+    """
+    Implementace Focal Loss pro lépe vyvážené generování lézí.
+    Focal Loss se zaměřuje na obtížnější případy (méně zastoupené třídy) tím, že 
+    zvyšuje jejich váhu při trénování.
+    
+    Args:
+        generated: Generovaný výstup modelu [batch, 1, D, H, W]
+        atlas: Atlas pravděpodobnosti lézí [batch, 1, D, H, W]
+        gamma: Faktor modulace pro Focal Loss (vyšší hodnota = větší důraz na obtížné případy)
+        alpha: Vyvažovací faktor pro pozitivní třídu (léze)
+        min_prob: Minimální pravděpodobnost v atlasu pro relevantní oblasti
+        
+    Returns:
+        Hodnota Focal Loss
+    """
+    import torch
+    
+    # Zajistíme, že vstupní hodnoty jsou v rozsahu [0, 1]
+    generated = torch.clamp(generated, 0.0, 1.0)
+    
+    # Maska mozku - oblasti kde atlas má nenulovou pravděpodobnost
+    brain_mask = (atlas > min_prob).float()
+    
+    # Aplikace masky mozku na generované hodnoty
+    relevant_output = generated * brain_mask
+    
+    # Počet relevantních voxelů v masce mozku
+    num_voxels = torch.sum(brain_mask) + 1e-8
+    
+    # Binary Cross Entropy komponenty
+    p_t = relevant_output
+    # Přidáme malou konstantu pro numerickou stabilitu
+    p_t = torch.clamp(p_t, 1e-7, 1.0 - 1e-7)
+    
+    # Modulační faktor pro Focal Loss
+    modulating_factor = (1.0 - p_t)**gamma
+    
+    # Výpočet vážené BCE loss pro pozitivní voxely (kde by měly být léze podle atlasu)
+    # Vyšší pravděpodobnost v atlasu = vyšší váha při trénování
+    weights = brain_mask * atlas * alpha
+    
+    # Normalizace vah
+    weights = weights / (torch.mean(weights) + 1e-8)
+    
+    # Focal Loss - povzbuzuje generování lézí v relevantních oblastech
+    focal_loss = -weights * modulating_factor * torch.log(p_t)
+    focal_loss = torch.sum(focal_loss) / num_voxels
+    
+    # Přidáme komponentu, která penalizuje generování lézí mimo relevantní oblasti
+    outside_loss = torch.sum(generated * (1.0 - brain_mask)) / (torch.sum(1.0 - brain_mask) + 1e-8)
+    
+    # Kombinovaná ztráta
+    loss = focal_loss + 5.0 * outside_loss
+    
+    return loss
+
+# Upravení trénovací funkce pro použití Focal Loss
 def train(generator, discriminator, dataloader, num_epochs, device, output_dir):
     # Vytvoření výstupního adresáře
     os.makedirs(output_dir, exist_ok=True)
@@ -954,24 +1012,23 @@ def train(generator, discriminator, dataloader, num_epochs, device, output_dir):
     # Kritéria ztráty
     bce_loss = nn.BCELoss()
     
-    # Koeficienty pro vážení ztrát - upravené hodnoty pro nové ztrátové funkce
+    # Koeficienty pro vážení ztrát - ZJEDNODUŠENO
     lambda_gp = 10.0
-    lambda_size = 6.0  # Zvýšeno z 2.0 na 6.0 pro silnější penalizaci počtu a velikosti lézí
-    lambda_anatomical = 5.0
-    lambda_coverage = 2.0  # Sníženo z 6.0 na 2.0, aby nebyla příliš silná penalizace pokrytí
-    lambda_atlas_guidance = 4.0  # Sníženo z 8.0 na 4.0 pro lepší vyvážení ztrátových funkcí
+    lambda_focal = 5.0
+    lambda_size = 2.0  # Sníženo pro menší vliv
+    lambda_anatomical = 3.0  # Sníženo pro menší vliv
     
     # Statistiky pro vykreslení
     g_losses = []
     d_losses = []
     coverage_stats = []  # Pro sledování pokrytí lézí
-    atlas_guidance_losses = []  # Pro sledování efektivity navádění atlasem
+    focal_losses = []  # Pro sledování Focal Loss
     
     for epoch in range(num_epochs):
         epoch_g_loss = 0.0
         epoch_d_loss = 0.0
         epoch_coverage_sum = 0.0
-        epoch_atlas_guidance_loss = 0.0
+        epoch_focal_loss = 0.0
         epoch_samples = 0
         
         for batch_idx, batch in enumerate(tqdm(dataloader, desc=f"Epoch {epoch+1}/{num_epochs}")):
@@ -1018,22 +1075,18 @@ def train(generator, discriminator, dataloader, num_epochs, device, output_dir):
             # Adversarial loss - chceme, aby diskriminátor označil generované vzorky jako reálné
             g_adv_loss = -torch.mean(fake_validity)
             
-            # Velikost lézí loss
+            # NOVĚ: Focal Loss pro léze
+            focal_loss = compute_focal_loss(fake_labels, atlas, gamma=2.0, alpha=0.75)
+            epoch_focal_loss += focal_loss.item()
+            
+            # Velikost lézí loss - zachováno pro kontrolu velikosti, ale s menším vlivem
             size_loss = compute_lesion_size_loss(fake_labels, atlas)
             
-            # Anatomická konzistence
+            # Anatomická konzistence - zachováno pro kontrolu umístění
             anatomical_loss = compute_anatomical_consistency_loss(fake_labels, atlas)
             
-            # Pokrytí lézí v požadovaném rozsahu
-            coverage_loss = compute_coverage_loss(fake_labels, atlas)
-            
-            # NOVĚ: Atlas-guided loss pro jemné navádění k pravděpodobnějším oblastem
-            atlas_guidance_loss = compute_atlas_guidance_loss(fake_labels, atlas)
-            epoch_atlas_guidance_loss += atlas_guidance_loss.item()
-            
-            # Celková ztráta generátoru
-            g_loss = g_adv_loss + lambda_size * size_loss + lambda_anatomical * anatomical_loss + \
-                     lambda_coverage * coverage_loss + lambda_atlas_guidance * atlas_guidance_loss
+            # Celková ztráta generátoru - ZJEDNODUŠENO
+            g_loss = g_adv_loss + lambda_focal * focal_loss + lambda_size * size_loss + lambda_anatomical * anatomical_loss
             
             g_loss.backward()
             optimizer_G.step()
@@ -1054,14 +1107,14 @@ def train(generator, discriminator, dataloader, num_epochs, device, output_dir):
         avg_g_loss = epoch_g_loss / len(dataloader)
         avg_d_loss = epoch_d_loss / max(1, len(dataloader) // 3)  # Upraveno pro méně časté trénování diskriminátoru
         avg_coverage = epoch_coverage_sum / max(1, epoch_samples)
-        avg_atlas_guidance_loss = epoch_atlas_guidance_loss / len(dataloader)
+        avg_focal_loss = epoch_focal_loss / len(dataloader)
         
         g_losses.append(avg_g_loss)
         d_losses.append(avg_d_loss)
         coverage_stats.append(avg_coverage)
-        atlas_guidance_losses.append(avg_atlas_guidance_loss)
+        focal_losses.append(avg_focal_loss)
         
-        print(f"Epoch {epoch+1}/{num_epochs} - D Loss: {avg_d_loss:.4f}, G Loss: {avg_g_loss:.4f}, Avg Coverage: {avg_coverage:.4f}%, Atlas Guidance: {avg_atlas_guidance_loss:.4f}")
+        print(f"Epoch {epoch+1}/{num_epochs} - D Loss: {avg_d_loss:.4f}, G Loss: {avg_g_loss:.4f}, Avg Coverage: {avg_coverage:.4f}%, Focal Loss: {avg_focal_loss:.4f}")
         
         # Uložení checkpointu
         if (epoch + 1) % 5 == 0 or epoch == num_epochs - 1:
@@ -1084,7 +1137,7 @@ def train(generator, discriminator, dataloader, num_epochs, device, output_dir):
                 f.write(f"Epoch: {epoch+1}\n")
                 f.write(f"Generator Loss: {avg_g_loss:.6f}\n")
                 f.write(f"Average Coverage: {avg_coverage:.4f}%\n")
-                f.write(f"Atlas Guidance Score: {avg_atlas_guidance_loss:.6f}\n")
+                f.write(f"Focal Loss: {avg_focal_loss:.6f}\n")
                 f.write(f"\nPokud chcete použít tento model pro generování vzorků, použijte příkaz:\n")
                 f.write(f"python SwinUNETR_lesion_GAN.py --generate --model_path={generator_model_path} --lesion_atlas_path=<cesta_k_atlasu> --output_dir=<vystupni_adresar> --num_samples=<pocet_vzorku>")
         
@@ -1114,13 +1167,13 @@ def train(generator, discriminator, dataloader, num_epochs, device, output_dir):
     plt.legend()
     plt.title('Average Lesion Coverage (within Brain Mask)')
     
-    # Plot 3: Atlas Guidance Loss
+    # Plot 3: Focal Loss
     plt.subplot(2, 2, 3)
-    plt.plot(atlas_guidance_losses, label='Atlas Guidance Loss', color='purple')
+    plt.plot(focal_losses, label='Focal Loss', color='purple')
     plt.xlabel('Epoch')
     plt.ylabel('Loss')
     plt.legend()
-    plt.title('Atlas Guidance Loss (Lower is Better)')
+    plt.title('Focal Loss (Lower is Better)')
     
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, 'training_stats.png'))
@@ -1148,21 +1201,13 @@ def save_samples(generator, dataloader, device, epoch, output_dir):
         # Analýza pokrytí lézí
         coverage_info = calculate_lesion_coverage(fake_labels, atlas)
         
+        # Výpočet Focal Loss pro vizualizaci
+        focal_loss = compute_focal_loss(fake_labels, atlas, gamma=2.0, alpha=0.75)
+        
         # Výběr jednoho vzorku pro vizualizaci
         real_np = real_labels[0, 0].cpu().numpy()
         fake_np = fake_labels[0, 0].cpu().numpy()
         atlas_np = atlas[0, 0].cpu().numpy()
-        
-        # Výpočet skóre atlas guidance pro vizualizaci
-        binary = (fake_labels > 0.5).float()
-        lesion_areas = binary[0]
-        
-        atlas_guidance_score = 0.0
-        if torch.sum(lesion_areas) > 0:
-            avg_atlas_prob = torch.sum(atlas[0] * lesion_areas) / torch.sum(lesion_areas)
-            atlas_mask = (atlas[0] > 0.01).float()
-            avg_atlas_overall = torch.sum(atlas[0] * atlas_mask) / (torch.sum(atlas_mask) + 1e-8)
-            atlas_guidance_score = (avg_atlas_prob / (avg_atlas_overall + 1e-8)).item()
         
         # Najdeme střední řez nebo řez s největším obsahem léze
         mid_z = fake_np.shape[2] // 2
@@ -1179,7 +1224,7 @@ def save_samples(generator, dataloader, device, epoch, output_dir):
         axes[0].imshow(atlas_np[:, :, mid_z], cmap='viridis', alpha=0.7)
         binary_np = (fake_np > 0.5).astype(float)
         axes[0].imshow(binary_np[:, :, mid_z], cmap='gray', alpha=0.5)
-        axes[0].set_title(f'Atlas s lézemi\nAtlas Guidance Score: {atlas_guidance_score:.2f}')
+        axes[0].set_title(f'Atlas s generovanými lézemi\nFocal Loss: {focal_loss.item():.4f}')
         axes[0].axis('off')
         
         axes[1].imshow(real_np[:, :, mid_z], cmap='gray')
@@ -1205,7 +1250,7 @@ def save_samples(generator, dataloader, device, epoch, output_dir):
                 f.write(f"  Coverage: {info['coverage_percentage']:.4f}% ({'v požadovaném rozmezí' if is_in_range else 'mimo požadované rozmezí'})\n")
                 f.write(f"  Number of lesions: {info['num_components']}\n")
                 f.write(f"  Average lesion size: {info['avg_lesion_size']:.4f} voxels\n")
-                f.write(f"  Atlas Guidance Score: {atlas_guidance_score:.4f} (>1.0 znamená léze v pravděpodobnějších oblastech)\n\n")
+                f.write(f"  Focal Loss: {focal_loss.item():.4f} (nižší hodnota = lepší)\n\n")
     
     generator.train()
 
@@ -1242,11 +1287,11 @@ def generate_samples(model_path, lesion_atlas_path, output_dir, num_samples=10, 
     # Vytvoření souboru pro sledování statistik
     stats_file = os.path.join(output_dir, 'lesion_statistics.csv')
     with open(stats_file, 'w') as f:
-        f.write("sample,coverage_percentage,num_components,avg_lesion_size,is_in_target_range,atlas_guidance_score\n")
+        f.write("sample,coverage_percentage,num_components,avg_lesion_size,is_in_target_range,focal_loss\n")
     
     # Generování vzorků
     all_coverages = []
-    all_atlas_scores = []
+    all_focal_losses = []
     all_component_counts = []  # Pro sledování počtu lézí
     
     # Parametry postprocessing - pro generování vzorků s různými velikostmi lézí
@@ -1267,6 +1312,10 @@ def generate_samples(model_path, lesion_atlas_path, output_dir, num_samples=10, 
             
             # Generování vzorku
             fake_label = generator(noise, atlas_tensor)
+            
+            # Výpočet Focal Loss
+            focal_loss = compute_focal_loss(fake_label, atlas_tensor, gamma=2.0, alpha=0.75).item()
+            all_focal_losses.append(focal_loss)
             
             # Převod na numpy
             fake_np_raw = fake_label[0, 0].cpu().numpy()
@@ -1290,27 +1339,14 @@ def generate_samples(model_path, lesion_atlas_path, output_dir, num_samples=10, 
             is_in_range = 0.01 <= coverage_percentage <= 65.5
             all_coverages.append(coverage_percentage)
             
-            # Výpočet skóre atlas guidance pro statistiku
-            binary = (fake_tensor > 0.5).float()
-            lesion_areas = binary[0]
-            
-            atlas_guidance_score = 0.0
-            if torch.sum(lesion_areas) > 0:
-                avg_atlas_prob = torch.sum(atlas_tensor[0] * lesion_areas) / torch.sum(lesion_areas)
-                atlas_mask = (atlas_tensor[0] > 0.01).float()
-                avg_atlas_overall = torch.sum(atlas_tensor[0] * atlas_mask) / (torch.sum(atlas_mask) + 1e-8)
-                atlas_guidance_score = (avg_atlas_prob / (avg_atlas_overall + 1e-8)).item()
-            
-            all_atlas_scores.append(atlas_guidance_score)
-            
             # Zápis do statistického souboru
             with open(stats_file, 'a') as f:
-                f.write(f"{i+1},{coverage_percentage:.4f},{num_components},{avg_size:.4f},{is_in_range},{atlas_guidance_score:.4f}\n")
+                f.write(f"{i+1},{coverage_percentage:.4f},{num_components},{avg_size:.4f},{is_in_range},{focal_loss:.4f}\n")
             
             # Výpis informací o vzorku - upravený popisek
             print(f"Vzorek {i+1}: {num_components} lézí, průměrná velikost: {avg_size:.2f}, pokrytí: {coverage_percentage:.4f}%")
             print(f"  Pokrytí v cílovém rozsahu (0.01% - 65.5% v rámci mozku): {'Ano' if is_in_range else 'Ne'}")
-            print(f"  Atlas Guidance Score: {atlas_guidance_score:.4f} (>1.0 znamená léze v pravděpodobnějších oblastech)")
+            print(f"  Focal Loss: {focal_loss:.4f} (nižší hodnota = lepší)")
             
             # Uložení jako NIfTI
             fake_nii = nib.Nifti1Image(fake_np, atlas_affine)
@@ -1339,7 +1375,7 @@ def generate_samples(model_path, lesion_atlas_path, output_dir, num_samples=10, 
             atlas_slice = atlas_data[:, :, mid_z]
             plt.imshow(atlas_slice, cmap='viridis', alpha=0.7)
             plt.imshow(fake_np[:, :, mid_z], cmap='gray', alpha=0.5)
-            plt.title(f'Atlas s lézemi\nAtlas Guidance Score: {atlas_guidance_score:.2f}')
+            plt.title(f'Atlas s generovanými lézemi\nFocal Loss: {focal_loss:.4f}')
             plt.axis('off')
             
             # Plot 3: Sagitální řez
@@ -1355,7 +1391,7 @@ def generate_samples(model_path, lesion_atlas_path, output_dir, num_samples=10, 
     
     # Souhrnné statistiky - upravení rozsahu
     in_range_count = sum(1 for c in all_coverages if 0.01 <= c <= 65.5)
-    avg_atlas_score = sum(all_atlas_scores) / len(all_atlas_scores) if all_atlas_scores else 0
+    avg_focal_loss = sum(all_focal_losses) / len(all_focal_losses) if all_focal_losses else 0
     avg_component_count = sum(all_component_counts) / len(all_component_counts) if all_component_counts else 0
     
     # Vytvoření histogramů
@@ -1372,14 +1408,12 @@ def generate_samples(model_path, lesion_atlas_path, output_dir, num_samples=10, 
     plt.legend()
     plt.grid(True, alpha=0.3)
     
-    # Plot 2: Histogram atlas guidance skóre
+    # Plot 2: Histogram Focal Loss
     plt.subplot(3, 1, 2)
-    plt.hist(all_atlas_scores, bins=20, color='lightgreen', edgecolor='black')
-    plt.axvline(x=1.0, color='r', linestyle='--', label='Neutral (1.0)')
-    plt.xlabel('Atlas Guidance Score')
+    plt.hist(all_focal_losses, bins=20, color='lightgreen', edgecolor='black')
+    plt.xlabel('Focal Loss')
     plt.ylabel('Number of Samples')
-    plt.title(f'Atlas Guidance Score Distribution\nAverage Score: {avg_atlas_score:.4f} (>1.0 znamená léze v pravděpodobnějších oblastech)')
-    plt.legend()
+    plt.title(f'Focal Loss Distribution\nAverage: {avg_focal_loss:.4f} (nižší hodnoty = lepší)')
     plt.grid(True, alpha=0.3)
     
     # Plot 3: Histogram počtu lézí
@@ -1396,7 +1430,7 @@ def generate_samples(model_path, lesion_atlas_path, output_dir, num_samples=10, 
     
     print(f"Vygenerováno {num_samples} vzorků v adresáři {output_dir}")
     print(f"Vzorky v cílovém rozsahu pokrytí (0.01% - 65.5% v rámci mozku): {in_range_count}/{num_samples} ({in_range_count/num_samples*100:.1f}%)")
-    print(f"Průměrné Atlas Guidance Score: {avg_atlas_score:.4f} (>1.0 znamená léze v pravděpodobnějších oblastech)")
+    print(f"Průměrná hodnota Focal Loss: {avg_focal_loss:.4f} (nižší hodnoty = lepší)")
     print(f"Průměrný počet lézí na vzorek: {avg_component_count:.1f}")
     print(f"Použity hodnoty min_size: {min_sizes}, connectivity_radius: {connectivity_radii} pro postprocessing")
 
