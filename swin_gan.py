@@ -1019,17 +1019,23 @@ def compute_lesion_coverage(binary_lesion, atlas_mask=None):
     return coverage_percentage
 
 
-def compute_target_coverage_from_training(lesion_dir, sample_count=10):
+def compute_target_coverage_from_training(lesion_dir, sample_count=10, return_list=False, random_seed=None):
     """
-    Compute the average lesion coverage percentage from training data
+    Compute the average lesion coverage percentage from training data or return list of individual coverages
 
     Args:
         lesion_dir (str): Directory containing lesion files
         sample_count (int): Number of samples to consider
+        return_list (bool): If True, returns a list of individual coverage values instead of average
+        random_seed (int): Random seed for reproducibility
 
     Returns:
-        float: Average coverage percentage
+        float or list: Average coverage percentage or list of individual coverage values
     """
+    # Set random seed if provided
+    if random_seed is not None:
+        np.random.seed(random_seed)
+    
     # List all lesion files
     lesion_files = sorted(glob.glob(os.path.join(lesion_dir, "*lesion.nii*")))
     
@@ -1045,7 +1051,7 @@ def compute_target_coverage_from_training(lesion_dir, sample_count=10):
     # If no non-empty files found, return a default value
     if not non_empty_files:
         print("Warning: No non-empty lesion files found, using default coverage of 1%")
-        return 1.0
+        return [1.0] if return_list else 1.0
     
     # Select random samples or use all if fewer than requested
     if len(non_empty_files) > sample_count:
@@ -1053,7 +1059,7 @@ def compute_target_coverage_from_training(lesion_dir, sample_count=10):
     else:
         selected_files = non_empty_files
     
-    # Compute average coverage
+    # Compute coverage for each file
     coverage_values = []
     for lesion_file in selected_files:
         lesion = nib.load(lesion_file).get_fdata()
@@ -1061,11 +1067,29 @@ def compute_target_coverage_from_training(lesion_dir, sample_count=10):
         coverage_values.append(coverage)
         print(f"File {os.path.basename(lesion_file)}: {coverage:.4f}% coverage")
     
-    # Calculate average coverage
-    avg_coverage = np.mean(coverage_values)
-    print(f"Average coverage from training data: {avg_coverage:.4f}%")
-    
-    return avg_coverage
+    # Return list of individual values or average
+    if return_list:
+        return coverage_values
+    else:
+        # Calculate average coverage
+        avg_coverage = np.mean(coverage_values)
+        print(f"Average coverage from training data: {avg_coverage:.4f}%")
+        return avg_coverage
+
+
+def get_single_lesion_coverage(lesion_file):
+    """
+    Compute coverage percentage for a single lesion file
+
+    Args:
+        lesion_file (str): Path to the lesion file
+
+    Returns:
+        float: Coverage percentage
+    """
+    lesion = nib.load(lesion_file).get_fdata()
+    coverage = compute_lesion_coverage(lesion > 0)
+    return coverage
 
 
 def find_adaptive_threshold(probability_map, target_coverage, atlas_mask=None, 
@@ -1195,7 +1219,8 @@ def generate_lesions(
     target_coverage=None,          # Cílové pokrytí lézemi v procentech
     min_adaptive_threshold=0.00001,  # Minimální hodnota pro adaptivní threshold
     max_adaptive_threshold=0.999,    # Maximální hodnota pro adaptivní threshold
-    adaptive_threshold_iterations=50  # Maximální počet iterací pro hledání adaptivního thresholdu
+    adaptive_threshold_iterations=50,  # Maximální počet iterací pro hledání adaptivního thresholdu
+    use_different_target_for_each_sample=False  # Použít jiný cílový coverage pro každý vzorek
 ):
     """
     Generate synthetic lesions using a trained GAN model
@@ -1222,6 +1247,7 @@ def generate_lesions(
         min_adaptive_threshold (float): Minimální hodnota thresholdu pro adaptivní prahování
         max_adaptive_threshold (float): Maximální hodnota thresholdu pro adaptivní prahování
         adaptive_threshold_iterations (int): Maximální počet iterací pro hledání adaptivního thresholdu
+        use_different_target_for_each_sample (bool): Použít jiný cílový coverage pro každý vzorek
     """
     # Validate input parameters
     if num_samples > 1 and output_dir is None:
@@ -1230,6 +1256,8 @@ def generate_lesions(
         raise ValueError("Either output_file or output_dir must be specified")
     if use_adaptive_threshold and training_lesion_dir is None and target_coverage is None:
         raise ValueError("For adaptive threshold, either training_lesion_dir or target_coverage must be specified")
+    if use_different_target_for_each_sample and training_lesion_dir is None:
+        raise ValueError("For using different target for each sample, training_lesion_dir must be specified")
     
     print(f"Generating lesions with the following parameters:")
     print(f"Model checkpoint: {model_checkpoint}")
@@ -1256,6 +1284,8 @@ def generate_lesions(
             print(f"Target coverage: {target_coverage}%")
         print(f"Adaptive threshold range: [{min_adaptive_threshold}, {max_adaptive_threshold}]")
         print(f"Adaptive threshold max iterations: {adaptive_threshold_iterations}")
+        if use_different_target_for_each_sample:
+            print(f"Using different target coverage for each sample")
     
     # Load the lesion atlas
     atlas_img = nib.load(lesion_atlas)
@@ -1270,8 +1300,43 @@ def generate_lesions(
     # Create atlas mask for region of interest
     atlas_mask = atlas_data > 0
     
-    # If using adaptive threshold, compute target coverage from training data if not specified
-    if use_adaptive_threshold and target_coverage is None and training_lesion_dir is not None:
+    # If using adaptive threshold with different targets for each sample, prepare list of target coverages
+    target_coverages = None
+    if use_adaptive_threshold and use_different_target_for_each_sample and training_lesion_dir is not None:
+        # List all lesion files
+        lesion_files = sorted(glob.glob(os.path.join(training_lesion_dir, "*lesion.nii*")))
+        
+        # Filter out empty lesion files
+        non_empty_files = []
+        for lesion_file in lesion_files:
+            lesion = nib.load(lesion_file).get_fdata()
+            if np.count_nonzero(lesion) > 0:
+                non_empty_files.append(lesion_file)
+        
+        if not non_empty_files:
+            print("Warning: No non-empty lesion files found in training directory")
+            if target_coverage is not None:
+                # Use specified target_coverage for all samples
+                target_coverages = [target_coverage] * num_samples
+            else:
+                # Use default coverage of 1%
+                target_coverages = [1.0] * num_samples
+        else:
+            # If there are fewer files than samples, allow reusing files
+            if len(non_empty_files) < num_samples:
+                selected_files = np.random.choice(non_empty_files, size=num_samples, replace=True)
+            else:
+                selected_files = np.random.choice(non_empty_files, size=num_samples, replace=False)
+            
+            # Compute coverage for each selected file
+            target_coverages = []
+            for i, lesion_file in enumerate(selected_files):
+                coverage = get_single_lesion_coverage(lesion_file)
+                target_coverages.append(coverage)
+                print(f"Sample {i+1} will use target coverage from {os.path.basename(lesion_file)}: {coverage:.4f}%")
+    # If not using different targets for each sample but using adaptive threshold
+    elif use_adaptive_threshold and target_coverage is None and training_lesion_dir is not None:
+        # Compute single target coverage from all training data
         target_coverage = compute_target_coverage_from_training(training_lesion_dir)
     
     # Convert to tensor
@@ -1352,6 +1417,9 @@ def generate_lesions(
             
             print(f"\nGenerating sample {i+1} with seed {sample_seed}")
             
+            # Get the target coverage for this specific sample if using different targets
+            current_target_coverage = target_coverages[i] if target_coverages else target_coverage
+            
             # Create a random noise vector for this sample
             if model.use_noise:
                 # Initialize Perlin noise generator using parameters from checkpoint if available
@@ -1405,11 +1473,11 @@ def generate_lesions(
                 fake_lesion_np = gaussian_filter(fake_lesion_np, sigma=smooth_sigma)
             
             # Apply adaptive threshold if requested
-            if use_adaptive_threshold and target_coverage is not None:
-                print(f"Finding adaptive threshold for sample {i+1} to match coverage of {target_coverage:.4f}%")
+            if use_adaptive_threshold and current_target_coverage is not None:
+                print(f"Finding adaptive threshold for sample {i+1} to match coverage of {current_target_coverage:.4f}%")
                 found_threshold, actual_coverage, binary_lesion = find_adaptive_threshold(
                     fake_lesion_np, 
-                    target_coverage, 
+                    current_target_coverage, 
                     atlas_mask,
                     initial_threshold=threshold,
                     min_threshold=min_adaptive_threshold,
@@ -1633,6 +1701,8 @@ def main():
                            help='Maximum threshold value for adaptive thresholding')
     gen_parser.add_argument('--adaptive_threshold_iterations', type=int, default=50,
                            help='Maximum iterations for adaptive threshold search')
+    gen_parser.add_argument('--use_different_target_for_each_sample', action='store_true',
+                           help='Use a different target coverage for each sample (requires training_lesion_dir)')
     
     args = parser.parse_args()
     
@@ -1660,7 +1730,8 @@ def main():
             target_coverage=args.target_coverage,
             min_adaptive_threshold=args.min_adaptive_threshold,
             max_adaptive_threshold=args.max_adaptive_threshold,
-            adaptive_threshold_iterations=args.adaptive_threshold_iterations
+            adaptive_threshold_iterations=args.adaptive_threshold_iterations,
+            use_different_target_for_each_sample=args.use_different_target_for_each_sample
         )
     else:
         parser.print_help()
