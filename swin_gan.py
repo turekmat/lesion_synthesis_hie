@@ -163,10 +163,22 @@ class Generator(nn.Module):
             
             # Generate random noise if not provided
             if noise is None:
-                noise = torch.randn(batch_size, 1, D, H, W, device=x.device)
+                # Generujeme šum jako 1D vektor
+                noise = torch.randn(batch_size, self.noise_dim, device=x.device)
+                
+            # Reshape noise to 5D tensor [batch_size, 1, D, H, W]
+            # Nejprve rozšíříme šum na správnou délku
+            if noise.dim() == 2:  # Pokud má noise tvar [batch_size, noise_dim]
+                # Rozšíříme noise_dim na D*H*W
+                expanded_noise = noise.view(batch_size, self.noise_dim, 1, 1, 1).expand(batch_size, self.noise_dim, D, H, W)
+                # Vezmeme pouze jednu dimenzi (kanál) pro noise_processor
+                noise_3d = expanded_noise[:, 0:1, :, :, :]  # [batch_size, 1, D, H, W]
+            else:
+                # Předpokládáme, že noise už má správný tvar
+                noise_3d = noise
             
             # Process noise through a small network to make it more structured
-            processed_noise = self.noise_processor(noise)
+            processed_noise = self.noise_processor(noise_3d)
             
             # Concatenate processed noise with input along channel dimension
             x = torch.cat([x, processed_noise], dim=1)
