@@ -13,6 +13,120 @@ from torch.amp import GradScaler, autocast
 import argparse
 from scipy import ndimage as measure
 from torchvision import transforms
+import noise  # Import the noise library for Perlin noise
+
+
+class PerlinNoiseGenerator:
+    def __init__(self, octaves=4, persistence=0.5, lacunarity=2.0, repeat=1024, seed=None):
+        """
+        Generate 3D Perlin noise tailored for lesion generation
+        
+        Args:
+            octaves (int): Number of octaves for the noise (higher = more detail)
+            persistence (float): How much each octave contributes to the overall shape (0-1)
+            lacunarity (float): How much detail is added at each octave
+            repeat (int): Period after which the noise pattern repeats
+            seed (int): Random seed for reproducibility
+        """
+        self.octaves = octaves
+        self.persistence = persistence
+        self.lacunarity = lacunarity
+        self.repeat = repeat
+        self.seed = seed if seed is not None else np.random.randint(0, 10000)
+    
+    def generate_3d_perlin(self, shape, scale=0.1, device='cuda'):
+        """
+        Generate 3D Perlin noise
+        
+        Args:
+            shape (tuple): Shape of the noise volume (D, H, W)
+            scale (float): Scale of the noise (smaller = smoother)
+            device (str): Device to place the tensor on
+            
+        Returns:
+            torch.Tensor: 3D Perlin noise tensor
+        """
+        D, H, W = shape
+        result = np.zeros((D, H, W), dtype=np.float32)
+        
+        # Generate 3D Perlin noise
+        for z in range(D):
+            for y in range(H):
+                for x in range(W):
+                    # The noise.pnoise3 function generates smoother 3D noise than snoise3
+                    # Scale coordinates to make the noise pattern appropriate for the volume
+                    result[z, y, x] = noise.pnoise3(
+                        x * scale, 
+                        y * scale, 
+                        z * scale,
+                        octaves=self.octaves,
+                        persistence=self.persistence,
+                        lacunarity=self.lacunarity,
+                        repeatx=self.repeat,
+                        repeaty=self.repeat,
+                        repeatz=self.repeat,
+                        base=self.seed
+                    )
+        
+        # Rescale to [0, 1] range
+        result = (result - result.min()) / (result.max() - result.min() + 1e-8)
+        
+        # Convert to tensor and move to specified device
+        noise_tensor = torch.from_numpy(result).to(device)
+        
+        return noise_tensor
+    
+    def generate_batch_noise(self, batch_size, shape, noise_dim=16, scale=0.1, device='cuda'):
+        """
+        Generate a batch of 3D Perlin noise vectors
+        
+        Args:
+            batch_size (int): Batch size
+            shape (tuple): Shape of each noise volume (D, H, W)
+            noise_dim (int): Noise dimension for vector representation
+            scale (float): Scale of the noise
+            device (str): Device to place the tensor on
+            
+        Returns:
+            torch.Tensor: Batch of noise vectors [batch_size, noise_dim]
+        """
+        # Generate a base 3D Perlin noise
+        base_noise = self.generate_3d_perlin(shape, scale, device)
+        
+        # Create batch by sampling different regions or adding small variations
+        batch_noise = []
+        for i in range(batch_size):
+            # Create a variant by adding a small random offset to the seed
+            self.seed = self.seed + i if self.seed is not None else np.random.randint(0, 10000)
+            noise_sample = self.generate_3d_perlin(shape, scale, device)
+            
+            # Flatten and reduce to noise_dim dimensions (simple dimensionality reduction)
+            # We'll use average pooling to reduce dimensions
+            pool_size = int(np.cbrt(np.prod(shape) / noise_dim))
+            if pool_size < 1:
+                pool_size = 1
+            
+            # Reshape for 3D average pooling
+            noise_for_pooling = noise_sample.unsqueeze(0).unsqueeze(0)  # [1, 1, D, H, W]
+            
+            # Apply 3D average pooling
+            pooled = F.avg_pool3d(noise_for_pooling, pool_size)
+            
+            # Extract noise_dim values from the pooled tensor
+            flat_pooled = pooled.view(-1)
+            if len(flat_pooled) >= noise_dim:
+                noise_vector = flat_pooled[:noise_dim]
+            else:
+                # If we couldn't extract enough values, repeat and truncate
+                repeats = int(np.ceil(noise_dim / len(flat_pooled)))
+                noise_vector = flat_pooled.repeat(repeats)[:noise_dim]
+            
+            batch_noise.append(noise_vector)
+        
+        # Stack into a batch tensor
+        batch_noise_tensor = torch.stack(batch_noise, dim=0)
+        
+        return batch_noise_tensor
 
 
 class HieLesionDataset(Dataset):
@@ -101,7 +215,8 @@ class HieLesionDataset(Dataset):
 
 
 class Generator(nn.Module):
-    def __init__(self, in_channels=1, out_channels=1, feature_size=24, dropout_rate=0.0, use_noise=True, noise_dim=16):
+    def __init__(self, in_channels=1, out_channels=1, feature_size=24, dropout_rate=0.0, use_noise=True, noise_dim=16,
+                 perlin_octaves=4, perlin_persistence=0.5, perlin_lacunarity=2.0, perlin_scale=0.1):
         """
         Generator based on SwinUNETR for lesion synthesis
         
@@ -112,6 +227,10 @@ class Generator(nn.Module):
             dropout_rate (float): Dropout rate
             use_noise (bool): Whether to use noise injection for diversity
             noise_dim (int): Dimension of the noise vector to inject
+            perlin_octaves (int): Number of octaves for Perlin noise
+            perlin_persistence (float): Persistence parameter for Perlin noise
+            perlin_lacunarity (float): Lacunarity parameter for Perlin noise
+            perlin_scale (float): Scale parameter for Perlin noise
         """
         super(Generator, self).__init__()
         
@@ -119,6 +238,16 @@ class Generator(nn.Module):
         self.noise_dim = noise_dim
         self.feature_size = feature_size  # Uložíme hodnotu i jako atribut
         self.dropout_rate = dropout_rate  # Uložíme hodnotu i jako atribut
+        
+        # Initialize Perlin noise generator if using noise
+        if use_noise:
+            self.perlin_generator = PerlinNoiseGenerator(
+                octaves=perlin_octaves,
+                persistence=perlin_persistence,
+                lacunarity=perlin_lacunarity,
+                seed=np.random.randint(0, 10000)
+            )
+            self.perlin_scale = perlin_scale
         
         # Adjust input channels if using noise
         actual_in_channels = in_channels
@@ -152,7 +281,7 @@ class Generator(nn.Module):
         
         Args:
             x: Input tensor (lesion atlas)
-            noise: Optional noise tensor. If None and use_noise is True, random noise will be generated
+            noise: Optional noise tensor. If None and use_noise is True, Perlin noise will be generated
         
         Returns:
             Generated lesion mask
@@ -161,10 +290,16 @@ class Generator(nn.Module):
         if self.use_noise:
             batch_size, _, D, H, W = x.shape
             
-            # Generate random noise if not provided
+            # Generate Perlin noise if not provided
             if noise is None:
-                # Generujeme šum jako 1D vektor
-                noise = torch.randn(batch_size, self.noise_dim, device=x.device)
+                # Generate Perlin noise vectors for the batch
+                noise = self.perlin_generator.generate_batch_noise(
+                    batch_size=batch_size,
+                    shape=(D, H, W),
+                    noise_dim=self.noise_dim,
+                    scale=self.perlin_scale,
+                    device=x.device
+                )
                 
             # Reshape noise to 5D tensor [batch_size, 1, D, H, W]
             # Nejprve rozšíříme šum na správnou délku
@@ -246,7 +381,11 @@ class SwinGAN(nn.Module):
                  focal_gamma=2.0,
                  use_noise=True,
                  noise_dim=16,
-                 fragmentation_kernel_size=5):
+                 fragmentation_kernel_size=5,
+                 perlin_octaves=4,
+                 perlin_persistence=0.5,
+                 perlin_lacunarity=2.0,
+                 perlin_scale=0.1):
         """
         SwinGAN for lesion synthesis
         
@@ -263,6 +402,10 @@ class SwinGAN(nn.Module):
             use_noise (bool): Whether to use noise injection for diversity
             noise_dim (int): Dimension of the noise vector to inject
             fragmentation_kernel_size (int): Size of kernel used for fragmentation loss
+            perlin_octaves (int): Number of octaves for Perlin noise
+            perlin_persistence (float): Persistence parameter for Perlin noise
+            perlin_lacunarity (float): Lacunarity parameter for Perlin noise
+            perlin_scale (float): Scale parameter controlling smoothness of Perlin noise
         """
         super(SwinGAN, self).__init__()
         
@@ -272,7 +415,11 @@ class SwinGAN(nn.Module):
             feature_size=feature_size, 
             dropout_rate=dropout_rate,
             use_noise=use_noise,
-            noise_dim=noise_dim
+            noise_dim=noise_dim,
+            perlin_octaves=perlin_octaves,
+            perlin_persistence=perlin_persistence,
+            perlin_lacunarity=perlin_lacunarity,
+            perlin_scale=perlin_scale
         )
         self.discriminator = Discriminator(in_channels + out_channels, feature_size)
         
@@ -292,6 +439,12 @@ class SwinGAN(nn.Module):
         
         # For fragmentation loss
         self.fragmentation_kernel_size = fragmentation_kernel_size
+        
+        # Store Perlin noise parameters for checkpoints
+        self.perlin_octaves = perlin_octaves
+        self.perlin_persistence = perlin_persistence
+        self.perlin_lacunarity = perlin_lacunarity
+        self.perlin_scale = perlin_scale
     
     def generator_loss(self, fake_lesion, real_lesion, atlas, fake_pred):
         """
@@ -562,10 +715,14 @@ class SwinGANTrainer:
                     'use_noise': self.model.use_noise,
                     'noise_dim': self.model.noise_dim,
                     'feature_size': self.model.generator.feature_size,
-                    'dropout_rate': self.model.generator.dropout_rate
+                    'dropout_rate': self.model.generator.dropout_rate,
+                    'perlin_octaves': self.model.perlin_octaves,
+                    'perlin_persistence': self.model.perlin_persistence,
+                    'perlin_lacunarity': self.model.perlin_lacunarity,
+                    'perlin_scale': self.model.perlin_scale
                 }, generator_path)
                 print(f"Saved generator-only checkpoint to {generator_path}")
-                print(f"Checkpoint includes configuration for use_noise={self.model.use_noise}, noise_dim={self.model.noise_dim}")
+                print(f"Checkpoint includes configuration for use_noise={self.model.use_noise}, noise_dim={self.model.noise_dim}, perlin params: octaves={self.model.perlin_octaves}, persistence={self.model.perlin_persistence}, scale={self.model.perlin_scale}")
             
             # Validation
             if val_dataloader is not None and (epoch + 1) % 1 == 0:
@@ -641,6 +798,10 @@ def train_model(args):
     print(f"Fragmentation kernel size: {args.fragmentation_kernel_size}")
     print(f"Using noise for generation diversity: True")
     print(f"Noise dimension: 16")
+    print(f"Perlin noise octaves: {args.perlin_octaves}")
+    print(f"Perlin noise persistence: {args.perlin_persistence}")
+    print(f"Perlin noise lacunarity: {args.perlin_lacunarity}")
+    print(f"Perlin noise scale: {args.perlin_scale}")
     
     # Create the output directory if it doesn't exist
     if not os.path.exists(args.output_dir):
@@ -695,7 +856,11 @@ def train_model(args):
         focal_gamma=args.focal_gamma,
         use_noise=True,
         noise_dim=16,
-        fragmentation_kernel_size=args.fragmentation_kernel_size
+        fragmentation_kernel_size=args.fragmentation_kernel_size,
+        perlin_octaves=args.perlin_octaves,
+        perlin_persistence=args.perlin_persistence,
+        perlin_lacunarity=args.perlin_lacunarity,
+        perlin_scale=args.perlin_scale
     )
     
     # Create the optimizer
@@ -727,7 +892,11 @@ def generate_lesions(
     output_dir=None,
     threshold=0.5,
     device='cuda',
-    num_samples=1
+    num_samples=1,
+    perlin_octaves=4,
+    perlin_persistence=0.5,
+    perlin_lacunarity=2.0,
+    perlin_scale=0.1
 ):
     """
     Generate synthetic lesions using a trained GAN model
@@ -740,6 +909,10 @@ def generate_lesions(
         threshold (float): Threshold for binarizing the generated lesion probability map
         device (str): Device to use for inference ('cuda' or 'cpu')
         num_samples (int): Number of samples to generate with different noise vectors
+        perlin_octaves (int): Number of octaves for Perlin noise
+        perlin_persistence (float): Persistence parameter for Perlin noise
+        perlin_lacunarity (float): Lacunarity parameter for Perlin noise
+        perlin_scale (float): Scale parameter for Perlin noise
     """
     # Validate input parameters
     if num_samples > 1 and output_dir is None:
@@ -757,6 +930,10 @@ def generate_lesions(
     print(f"Threshold: {threshold}")
     print(f"Device: {device}")
     print(f"Number of samples: {num_samples}")
+    print(f"Perlin noise octaves: {perlin_octaves}")
+    print(f"Perlin noise persistence: {perlin_persistence}")
+    print(f"Perlin noise lacunarity: {perlin_lacunarity}")
+    print(f"Perlin noise scale: {perlin_scale}")
     
     # Load the lesion atlas
     atlas_img = nib.load(lesion_atlas)
@@ -790,7 +967,15 @@ def generate_lesions(
         feature_size = checkpoint.get('feature_size', 24)
         dropout_rate = checkpoint.get('dropout_rate', 0.0)
         
+        # Load Perlin noise parameters from checkpoint if available
+        loaded_perlin_octaves = checkpoint.get('perlin_octaves', perlin_octaves)
+        loaded_perlin_persistence = checkpoint.get('perlin_persistence', perlin_persistence)
+        loaded_perlin_lacunarity = checkpoint.get('perlin_lacunarity', perlin_lacunarity)
+        loaded_perlin_scale = checkpoint.get('perlin_scale', perlin_scale)
+        
         print(f"Checkpoint configuration: use_noise={use_noise}, noise_dim={noise_dim}, feature_size={feature_size}")
+        print(f"Perlin noise parameters: octaves={loaded_perlin_octaves}, persistence={loaded_perlin_persistence}, "
+              f"lacunarity={loaded_perlin_lacunarity}, scale={loaded_perlin_scale}")
         
         # Vytvoření nového modelu s načtenými parametry
         model = SwinGAN(
@@ -799,7 +984,11 @@ def generate_lesions(
             feature_size=feature_size,
             dropout_rate=dropout_rate,
             use_noise=use_noise,
-            noise_dim=noise_dim
+            noise_dim=noise_dim,
+            perlin_octaves=loaded_perlin_octaves,
+            perlin_persistence=loaded_perlin_persistence,
+            perlin_lacunarity=loaded_perlin_lacunarity,
+            perlin_scale=loaded_perlin_scale
         )
         
         # Načtení vah generátoru
@@ -825,7 +1014,30 @@ def generate_lesions(
         for i in range(num_samples):
             # Create a random noise vector for this sample
             if model.use_noise:
-                noise = torch.randn(1, model.noise_dim, device=device)
+                # Initialize Perlin noise generator using parameters from checkpoint if available
+                perlin_octaves_model = getattr(model, 'perlin_octaves', perlin_octaves)
+                perlin_persistence_model = getattr(model, 'perlin_persistence', perlin_persistence)
+                perlin_lacunarity_model = getattr(model, 'perlin_lacunarity', perlin_lacunarity)
+                perlin_scale_model = getattr(model, 'perlin_scale', perlin_scale)
+                
+                # Create a new seed for each sample for variation
+                seed = np.random.randint(0, 10000) + i
+                
+                perlin_gen = PerlinNoiseGenerator(
+                    octaves=perlin_octaves_model,
+                    persistence=perlin_persistence_model,
+                    lacunarity=perlin_lacunarity_model,
+                    seed=seed
+                )
+                
+                # Generate Perlin noise for this sample
+                noise = perlin_gen.generate_batch_noise(
+                    batch_size=1, 
+                    shape=(atlas_data.shape[0], atlas_data.shape[1], atlas_data.shape[2]),
+                    noise_dim=model.noise_dim,
+                    scale=perlin_scale_model,
+                    device=device
+                )
             else:
                 noise = None
             
@@ -976,6 +1188,14 @@ def main():
                              help='Disable automatic mixed precision training')
     train_parser.add_argument('--save_interval', type=int, default=5, 
                              help='Interval for saving full model checkpoints')
+    train_parser.add_argument('--perlin_octaves', type=int, default=4, 
+                             help='Number of octaves for Perlin noise (higher = more detail)')
+    train_parser.add_argument('--perlin_persistence', type=float, default=0.5, 
+                             help='Persistence parameter for Perlin noise (0-1)')
+    train_parser.add_argument('--perlin_lacunarity', type=float, default=2.0, 
+                             help='Lacunarity parameter for Perlin noise (how quickly detail increases)')
+    train_parser.add_argument('--perlin_scale', type=float, default=0.1, 
+                             help='Scale parameter for Perlin noise (smaller = smoother)')
     
     # Generation subparser
     gen_parser = subparsers.add_parser('generate', help='Generate synthetic lesions')
@@ -995,6 +1215,14 @@ def main():
                            help='Device to use (cuda or cpu)')
     gen_parser.add_argument('--num_samples', type=int, default=1, 
                            help='Number of samples to generate with different noise vectors')
+    gen_parser.add_argument('--perlin_octaves', type=int, default=4, 
+                           help='Number of octaves for Perlin noise (higher = more detail)')
+    gen_parser.add_argument('--perlin_persistence', type=float, default=0.5, 
+                           help='Persistence parameter for Perlin noise (0-1)')
+    gen_parser.add_argument('--perlin_lacunarity', type=float, default=2.0, 
+                           help='Lacunarity parameter for Perlin noise (how quickly detail increases)')
+    gen_parser.add_argument('--perlin_scale', type=float, default=0.1, 
+                           help='Scale parameter for Perlin noise (smaller = smoother)')
     
     args = parser.parse_args()
     
@@ -1009,7 +1237,11 @@ def main():
             output_dir=args.output_dir,
             threshold=args.threshold,
             device=args.device,
-            num_samples=args.num_samples
+            num_samples=args.num_samples,
+            perlin_octaves=args.perlin_octaves,
+            perlin_persistence=args.perlin_persistence,
+            perlin_lacunarity=args.perlin_lacunarity,
+            perlin_scale=args.perlin_scale
         )
     else:
         parser.print_help()
