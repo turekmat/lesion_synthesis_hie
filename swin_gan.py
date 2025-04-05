@@ -1439,8 +1439,14 @@ def generate_lesions(
                       f"persistence={sample_persistence:.3f}, lacunarity={sample_lacunarity:.3f}, scale={sample_scale:.3f}")
                 
                 # Create a new seed for Perlin that's different for each sample
-                perlin_seed = sample_seed ^ 0x55AA55AA  # XOR with a constant for more variation
+                # Use a more complex seed derivation with better randomization
+                perlin_seed = (sample_seed ^ 0x55AA55AA) + (i * 7919)  # XOR with a constant and add prime offset
                 
+                # Further mix the seed with a time component to ensure uniqueness even with same master seed
+                time_component = int(time.time() * 1000) % 10000
+                perlin_seed = (perlin_seed + time_component) % 1000000
+                
+                # Create different initialization noise patterns for each sample
                 perlin_gen = PerlinNoiseGenerator(
                     octaves=sample_octaves,
                     persistence=sample_persistence,
@@ -1456,6 +1462,34 @@ def generate_lesions(
                     scale=sample_scale,
                     device=device
                 )
+                
+                # Add additional spatial variation by slightly rotating or offsetting the noise pattern
+                # This can be accomplished in the forward pass of the model, but we can enhance 
+                # the noise representation here as well
+                if i % 3 == 0:  # For every third sample, apply a different noise transformation
+                    # Create a "secondary" noise component to blend with the primary
+                    secondary_perlin_seed = (perlin_seed + 83443) % 1000000  # Use a large prime offset
+                    secondary_perlin_gen = PerlinNoiseGenerator(
+                        octaves=sample_octaves,
+                        persistence=sample_persistence,
+                        lacunarity=sample_lacunarity,
+                        seed=secondary_perlin_seed
+                    )
+                    
+                    # Generate secondary noise and blend with primary
+                    secondary_noise = secondary_perlin_gen.generate_batch_noise(
+                        batch_size=1,
+                        shape=(atlas_data.shape[0], atlas_data.shape[1], atlas_data.shape[2]),
+                        noise_dim=model.noise_dim,
+                        scale=sample_scale * 1.2,  # Slightly different scale
+                        device=device
+                    )
+                    
+                    # Blend the noise vectors (simple weighted average)
+                    blend_factor = 0.4 + np.random.uniform(0, 0.2)  # Random between 0.4-0.6
+                    noise = noise * blend_factor + secondary_noise * (1 - blend_factor)
+                    
+                    print(f"  Applied noise blending with factor {blend_factor:.2f} for additional variation")
             else:
                 noise = None
             
@@ -1468,9 +1502,24 @@ def generate_lesions(
             # Convert to numpy array
             fake_lesion_np = fake_lesion.squeeze().cpu().numpy()
             
+            # Add additional spatial variation to the probability map
+            # This helps ensure that even with similar network outputs, the final patterns differ
+            # Add subtle random spatial perturbations to the probability map
+            if i % 2 == 0:  # For half the samples
+                # Create a small random perturbation field
+                perturbation = np.random.normal(0, 0.02, fake_lesion_np.shape)  # Low stddev for subtle effect
+                # Apply the perturbation
+                fake_lesion_np = fake_lesion_np + perturbation
+                # Clip to valid probability range
+                fake_lesion_np = np.clip(fake_lesion_np, 0.0, 1.0)
+                print(f"  Applied random spatial perturbation for additional diversity")
+            
             # Apply Gaussian smoothing to reduce noise and small fragments
             if smooth_sigma > 0:
-                fake_lesion_np = gaussian_filter(fake_lesion_np, sigma=smooth_sigma)
+                # Vary smoothing slightly for each sample
+                sample_smooth_sigma = smooth_sigma * (0.8 + np.random.uniform(0, 0.4))  # 0.8-1.2x the original
+                fake_lesion_np = gaussian_filter(fake_lesion_np, sigma=sample_smooth_sigma)
+                print(f"  Using sample-specific smoothing sigma: {sample_smooth_sigma:.3f}")
             
             # Apply adaptive threshold if requested
             if use_adaptive_threshold and current_target_coverage is not None:
@@ -1493,22 +1542,34 @@ def generate_lesions(
             
             # Apply morphological operations to remove small isolated regions and fill holes
             if morph_close_size > 0:
+                # Vary morphological operation parameters for each sample
+                sample_morph_size = morph_close_size + np.random.randint(-1, 2)  # -1, 0, or +1
+                sample_morph_size = max(1, sample_morph_size)  # Ensure at least 1
+                
                 struct = generate_binary_structure(3, 1)  # 6-connectivity
-                for _ in range(morph_close_size - 1):
+                for _ in range(sample_morph_size - 1):
                     struct = binary_dilation(struct)
+                
+                print(f"  Using sample-specific morphological closing size: {sample_morph_size}")
                 
                 # Close holes in the lesions
                 binary_lesion = binary_closing(binary_lesion, structure=struct)
             
             # Remove small isolated lesions
             if min_lesion_size > 0:
+                # Vary minimum lesion size slightly for each sample
+                sample_min_size = int(min_lesion_size * (0.9 + np.random.uniform(0, 0.2)))  # 0.9-1.1x the original
+                sample_min_size = max(1, sample_min_size)  # Ensure at least 1
+                
+                print(f"  Using sample-specific minimum lesion size: {sample_min_size}")
+                
                 labeled_array, num_features = measure.label(binary_lesion)
                 component_sizes = np.bincount(labeled_array.ravel())
                 # Set background (index 0) size to 0
                 if len(component_sizes) > 0:
                     component_sizes[0] = 0
                 # Filter by size
-                too_small = component_sizes < min_lesion_size
+                too_small = component_sizes < sample_min_size
                 too_small_mask = too_small[labeled_array]
                 binary_lesion[too_small_mask] = 0
             
