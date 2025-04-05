@@ -38,7 +38,42 @@ def set_seed(seed=42):
 class LesionDataset(Dataset):
     def __init__(self, labels_dir, lesion_atlas_path, transform=None, image_size=(96, 96, 96)):
         self.labels_dir = labels_dir
-        self.labels_files = sorted([os.path.join(labels_dir, f) for f in os.listdir(labels_dir) if f.endswith('.nii.gz')])
+        
+        # Kontrola, zda adresář existuje
+        if not os.path.exists(labels_dir):
+            raise FileNotFoundError(f"Adresář s daty neexistuje: {labels_dir}")
+        
+        # Načtení všech souborů .nii.gz
+        all_files = [os.path.join(labels_dir, f) for f in os.listdir(labels_dir) if f.endswith('.nii.gz')]
+        if not all_files:
+            raise ValueError(f"Adresář {labels_dir} neobsahuje žádné .nii.gz soubory")
+        
+        # Filtrování souborů, které neobsahují žádné léze
+        self.labels_files = []
+        skipped_count = 0
+        
+        for file_path in sorted(all_files):
+            try:
+                nii_img = nib.load(file_path)
+                data = nii_img.get_fdata()
+                
+                # Kontrola, zda soubor obsahuje nějaké léze (nenulové hodnoty)
+                if np.any(data > 0):
+                    self.labels_files.append(file_path)
+                else:
+                    skipped_count += 1
+            except Exception as e:
+                print(f"Chyba při kontrole souboru {file_path}: {str(e)}")
+                skipped_count += 1
+        
+        # Výpis statistik o načtených souborech
+        print(f"Celkový počet .nii.gz souborů: {len(all_files)}")
+        print(f"Počet souborů s lézemi: {len(self.labels_files)}")
+        print(f"Počet přeskočených souborů (prázdné/chybné): {skipped_count}")
+        
+        if not self.labels_files:
+            raise ValueError(f"Žádný z nalezených souborů neobsahuje léze. Dataset je prázdný.")
+        
         self.lesion_atlas_path = lesion_atlas_path
         self.transform = transform
         self.image_size = image_size
@@ -898,63 +933,110 @@ def generate_samples(model_path, lesion_atlas_path, output_dir, num_samples=10, 
 
 # Hlavní funkce
 def main(args):
-    # Nastavení reprodukovatelnosti
-    set_seed(args.seed)
+    try:
+        # Nastavení reprodukovatelnosti
+        set_seed(args.seed)
+        
+        # Nastavení zařízení
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"Používám zařízení: {device}")
+        
+        if args.train:
+            # Kontrola vstupních argumentů
+            if not args.data_dir:
+                raise ValueError("Pro trénink je nutné zadat --data_dir")
+            if not args.lesion_atlas_path:
+                raise ValueError("Pro trénink je nutné zadat --lesion_atlas_path")
+            
+            # Kontrola existence souborů
+            if not os.path.exists(args.data_dir):
+                raise FileNotFoundError(f"Adresář s trénovacími daty neexistuje: {args.data_dir}")
+            if not os.path.exists(args.lesion_atlas_path):
+                raise FileNotFoundError(f"Soubor s atlasem lézí neexistuje: {args.lesion_atlas_path}")
+            
+            print(f"Načítám trénovací data z adresáře: {args.data_dir}")
+            print(f"Načítám atlas lézí z: {args.lesion_atlas_path}")
+            
+            try:
+                # Vytvoření datasetu a datového loaderu
+                dataset = LesionDataset(
+                    labels_dir=args.data_dir,
+                    lesion_atlas_path=args.lesion_atlas_path,
+                    image_size=(96, 96, 96)  # Nastavte podle velikosti vašich dat
+                )
+                
+                if len(dataset) == 0:
+                    raise ValueError("Dataset je prázdný. Ujistěte se, že adresář obsahuje validní .nii.gz soubory s lézemi.")
+                
+                dataloader = DataLoader(
+                    dataset,
+                    batch_size=min(args.batch_size, len(dataset)),  # Zajištění, že batch_size není větší než velikost datasetu
+                    shuffle=True,
+                    num_workers=4,
+                    drop_last=True
+                )
+                
+                print(f"Načteno {len(dataset)} vzorků pro trénink.")
+                
+                # Vytvoření generátoru a diskriminátoru
+                sample_data = next(iter(dataloader))
+                img_size = tuple(sample_data['atlas'].shape[2:])
+                print(f"Velikost dat: {img_size}")
+                
+                generator = SwinUNETRGenerator(img_size=img_size, feature_size=args.feature_size)
+                discriminator = LesionDiscriminator()
+                
+                generator.to(device)
+                discriminator.to(device)
+                
+                # Trénování modelu
+                train(
+                    generator=generator,
+                    discriminator=discriminator,
+                    dataloader=dataloader,
+                    num_epochs=args.epochs,
+                    device=device,
+                    output_dir=args.output_dir
+                )
+            except Exception as e:
+                print(f"Chyba při inicializaci datasetu nebo tréninku: {str(e)}")
+                raise
+        
+        elif args.generate:
+            # Kontrola vstupních argumentů pro generování
+            if not args.model_path:
+                raise ValueError("Pro generování vzorků je nutné zadat --model_path")
+            if not args.lesion_atlas_path:
+                raise ValueError("Pro generování vzorků je nutné zadat --lesion_atlas_path")
+            if not os.path.exists(args.model_path):
+                raise FileNotFoundError(f"Soubor s modelem neexistuje: {args.model_path}")
+            if not os.path.exists(args.lesion_atlas_path):
+                raise FileNotFoundError(f"Soubor s atlasem lézí neexistuje: {args.lesion_atlas_path}")
+            
+            # Generování vzorků z natrénovaného modelu
+            generate_samples(
+                model_path=args.model_path,
+                lesion_atlas_path=args.lesion_atlas_path,
+                output_dir=args.output_dir,
+                num_samples=args.num_samples,
+                min_threshold=args.min_threshold
+            )
+        
+        else:
+            print("Musíte zadat buď --train nebo --generate")
     
-    # Nastavení zařízení
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Používám zařízení: {device}")
+    except Exception as e:
+        print(f"\nKritická chyba: {type(e).__name__}: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        print("\nTipy pro řešení problémů:")
+        print("1. Zkontrolujte, že adresář s daty existuje a obsahuje soubory .nii.gz")
+        print("2. Ujistěte se, že soubory obsahují nějaké léze (nenulové hodnoty)")
+        print("3. Zkontrolujte formát a integritu souborů")
+        print("4. Vyzkoušejte menší batch_size, pokud máte problémy s pamětí")
+        return 1
     
-    if args.train:
-        # Vytvoření datasetu a datového loaderu
-        dataset = LesionDataset(
-            labels_dir=args.data_dir,
-            lesion_atlas_path=args.lesion_atlas_path,
-            image_size=(96, 96, 96)  # Nastavte podle velikosti vašich dat
-        )
-        
-        dataloader = DataLoader(
-            dataset,
-            batch_size=args.batch_size,
-            shuffle=True,
-            num_workers=4,
-            drop_last=True
-        )
-        
-        print(f"Načteno {len(dataset)} vzorků pro trénink.")
-        
-        # Vytvoření generátoru a diskriminátoru
-        sample_data = next(iter(dataloader))
-        img_size = tuple(sample_data['atlas'].shape[2:])
-        
-        generator = SwinUNETRGenerator(img_size=img_size, feature_size=args.feature_size)
-        discriminator = LesionDiscriminator()
-        
-        generator.to(device)
-        discriminator.to(device)
-        
-        # Trénování modelu
-        train(
-            generator=generator,
-            discriminator=discriminator,
-            dataloader=dataloader,
-            num_epochs=args.epochs,
-            device=device,
-            output_dir=args.output_dir
-        )
-    
-    elif args.generate:
-        # Generování vzorků z natrénovaného modelu
-        generate_samples(
-            model_path=args.model_path,
-            lesion_atlas_path=args.lesion_atlas_path,
-            output_dir=args.output_dir,
-            num_samples=args.num_samples,
-            min_threshold=args.min_threshold
-        )
-    
-    else:
-        print("Musíte zadat buď --train nebo --generate")
+    return 0
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="SwinUNETR Lesion GAN")
@@ -972,4 +1054,6 @@ if __name__ == "__main__":
     parser.add_argument("--feature_size", type=int, default=24, help="Základní velikost příznakových map v SwinUNETR")
     
     args = parser.parse_args()
-    main(args) 
+    exit_code = main(args)
+    import sys
+    sys.exit(exit_code) 
