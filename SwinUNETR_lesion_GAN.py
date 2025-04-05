@@ -43,10 +43,14 @@ class LesionDataset(Dataset):
         if not os.path.exists(labels_dir):
             raise FileNotFoundError(f"Adresář s daty neexistuje: {labels_dir}")
         
-        # Načtení všech souborů .nii.gz
-        all_files = [os.path.join(labels_dir, f) for f in os.listdir(labels_dir) if f.endswith('.nii.gz')]
+        # Načtení všech souborů .nii a .nii.gz
+        all_files = []
+        nii_files = [os.path.join(labels_dir, f) for f in os.listdir(labels_dir) if f.endswith('.nii')]
+        nii_gz_files = [os.path.join(labels_dir, f) for f in os.listdir(labels_dir) if f.endswith('.nii.gz')]
+        all_files = nii_files + nii_gz_files
+        
         if not all_files:
-            raise ValueError(f"Adresář {labels_dir} neobsahuje žádné .nii.gz soubory")
+            raise ValueError(f"Adresář {labels_dir} neobsahuje žádné .nii nebo .nii.gz soubory")
         
         # Filtrování souborů, které neobsahují žádné léze
         self.labels_files = []
@@ -67,7 +71,7 @@ class LesionDataset(Dataset):
                 skipped_count += 1
         
         # Výpis statistik o načtených souborech
-        print(f"Celkový počet .nii.gz souborů: {len(all_files)}")
+        print(f"Celkový počet .nii/.nii.gz souborů: {len(all_files)}")
         print(f"Počet souborů s lézemi: {len(self.labels_files)}")
         print(f"Počet přeskočených souborů (prázdné/chybné): {skipped_count}")
         
@@ -96,6 +100,13 @@ class LesionDataset(Dataset):
         try:
             nii_img = nib.load(path)
             data = nii_img.get_fdata()
+            
+            # Výpis informací o souboru pro diagnostiku
+            print(f"Načten soubor: {path}")
+            print(f"  Rozměry: {data.shape}")
+            print(f"  Datový typ: {data.dtype}")
+            print(f"  Min hodnota: {np.min(data)}, Max hodnota: {np.max(data)}")
+            print(f"  Obsahuje nenulové hodnoty: {np.any(data > 0)}")
             
             # Převedení na binární masku
             data = (data > 0).astype(np.float32)
@@ -951,22 +962,31 @@ def main(args):
             # Kontrola existence souborů
             if not os.path.exists(args.data_dir):
                 raise FileNotFoundError(f"Adresář s trénovacími daty neexistuje: {args.data_dir}")
-            if not os.path.exists(args.lesion_atlas_path):
-                raise FileNotFoundError(f"Soubor s atlasem lézí neexistuje: {args.lesion_atlas_path}")
+            
+            # Kontrola existence atlasu lézí (bez ohledu na příponu)
+            atlas_path = args.lesion_atlas_path
+            if not os.path.exists(atlas_path):
+                # Zkusíme alternativní přípony, pokud soubor neexistuje
+                if atlas_path.endswith('.nii') and os.path.exists(atlas_path + '.gz'):
+                    atlas_path = atlas_path + '.gz'
+                elif atlas_path.endswith('.nii.gz') and os.path.exists(atlas_path[:-3]):
+                    atlas_path = atlas_path[:-3]
+                else:
+                    raise FileNotFoundError(f"Soubor s atlasem lézí neexistuje: {args.lesion_atlas_path}")
             
             print(f"Načítám trénovací data z adresáře: {args.data_dir}")
-            print(f"Načítám atlas lézí z: {args.lesion_atlas_path}")
+            print(f"Načítám atlas lézí z: {atlas_path}")
             
             try:
                 # Vytvoření datasetu a datového loaderu
                 dataset = LesionDataset(
                     labels_dir=args.data_dir,
-                    lesion_atlas_path=args.lesion_atlas_path,
+                    lesion_atlas_path=atlas_path,  # Použití ověřené cesty
                     image_size=(96, 96, 96)  # Nastavte podle velikosti vašich dat
                 )
                 
                 if len(dataset) == 0:
-                    raise ValueError("Dataset je prázdný. Ujistěte se, že adresář obsahuje validní .nii.gz soubory s lézemi.")
+                    raise ValueError("Dataset je prázdný. Ujistěte se, že adresář obsahuje validní .nii/.nii.gz soubory s lézemi.")
                 
                 dataloader = DataLoader(
                     dataset,
@@ -1010,13 +1030,24 @@ def main(args):
                 raise ValueError("Pro generování vzorků je nutné zadat --lesion_atlas_path")
             if not os.path.exists(args.model_path):
                 raise FileNotFoundError(f"Soubor s modelem neexistuje: {args.model_path}")
-            if not os.path.exists(args.lesion_atlas_path):
-                raise FileNotFoundError(f"Soubor s atlasem lézí neexistuje: {args.lesion_atlas_path}")
+            
+            # Kontrola existence atlasu lézí (bez ohledu na příponu)
+            atlas_path = args.lesion_atlas_path
+            if not os.path.exists(atlas_path):
+                # Zkusíme alternativní přípony, pokud soubor neexistuje
+                if atlas_path.endswith('.nii') and os.path.exists(atlas_path + '.gz'):
+                    atlas_path = atlas_path + '.gz'
+                elif atlas_path.endswith('.nii.gz') and os.path.exists(atlas_path[:-3]):
+                    atlas_path = atlas_path[:-3]
+                else:
+                    raise FileNotFoundError(f"Soubor s atlasem lézí neexistuje: {args.lesion_atlas_path}")
+            
+            print(f"Načítám atlas lézí z: {atlas_path}")
             
             # Generování vzorků z natrénovaného modelu
             generate_samples(
                 model_path=args.model_path,
-                lesion_atlas_path=args.lesion_atlas_path,
+                lesion_atlas_path=atlas_path,  # Použití ověřené cesty
                 output_dir=args.output_dir,
                 num_samples=args.num_samples,
                 min_threshold=args.min_threshold
@@ -1030,7 +1061,7 @@ def main(args):
         import traceback
         traceback.print_exc()
         print("\nTipy pro řešení problémů:")
-        print("1. Zkontrolujte, že adresář s daty existuje a obsahuje soubory .nii.gz")
+        print("1. Zkontrolujte, že adresář s daty existuje a obsahuje soubory .nii nebo .nii.gz")
         print("2. Ujistěte se, že soubory obsahují nějaké léze (nenulové hodnoty)")
         print("3. Zkontrolujte formát a integritu souborů")
         print("4. Vyzkoušejte menší batch_size, pokud máte problémy s pamětí")
@@ -1042,8 +1073,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="SwinUNETR Lesion GAN")
     parser.add_argument("--train", action="store_true", help="Trénování modelu")
     parser.add_argument("--generate", action="store_true", help="Generování vzorků")
-    parser.add_argument("--data_dir", type=str, help="Adresář s trénovacími daty")
-    parser.add_argument("--lesion_atlas_path", type=str, help="Cesta k atlasu lézí")
+    parser.add_argument("--data_dir", type=str, help="Adresář s trénovacími daty (.nii nebo .nii.gz soubory)")
+    parser.add_argument("--lesion_atlas_path", type=str, help="Cesta k atlasu lézí (.nii nebo .nii.gz)")
     parser.add_argument("--output_dir", type=str, default="output", help="Výstupní adresář")
     parser.add_argument("--model_path", type=str, help="Cesta k uloženému modelu (pro generování)")
     parser.add_argument("--epochs", type=int, default=100, help="Počet trénovacích epoch")
