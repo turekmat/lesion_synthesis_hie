@@ -392,7 +392,7 @@ class SwinGANTrainer:
         # Move model to device
         self.model.to(self.device)
     
-    def train(self, dataloader, epochs, val_dataloader=None):
+    def train(self, dataloader, epochs, val_dataloader=None, save_interval=5):
         """
         Train the SwinGAN model
         
@@ -400,6 +400,7 @@ class SwinGANTrainer:
             dataloader: Training data loader
             epochs: Number of epochs to train
             val_dataloader: Validation data loader
+            save_interval: Interval for saving full model checkpoints
         """
         for epoch in range(epochs):
             self.model.train()
@@ -477,14 +478,15 @@ class SwinGANTrainer:
                   f"G Loss: {epoch_losses['total_g_loss']:.4f} | "
                   f"D Loss: {epoch_losses['total_d_loss']:.4f}")
             
-            # Save full model checkpoint
-            torch.save({
-                'epoch': epoch + 1,
-                'model_state_dict': self.model.state_dict(),
-                'optimizer_g_state_dict': self.optimizer_g.state_dict(),
-                'optimizer_d_state_dict': self.optimizer_d.state_dict(),
-                'losses': epoch_losses
-            }, os.path.join(self.output_dir, f'swin_gan_epoch_{epoch+1}.pt'))
+            # Save full model checkpoint at save_interval
+            if (epoch + 1) % save_interval == 0:
+                torch.save({
+                    'epoch': epoch + 1,
+                    'model_state_dict': self.model.state_dict(),
+                    'optimizer_g_state_dict': self.optimizer_g.state_dict(),
+                    'optimizer_d_state_dict': self.optimizer_d.state_dict(),
+                    'losses': epoch_losses
+                }, os.path.join(self.output_dir, f'swin_gan_epoch_{epoch+1}.pt'))
             
             # Save generator-only checkpoint every generator_save_interval epochs
             if (epoch + 1) % self.generator_save_interval == 0:
@@ -559,38 +561,58 @@ def train_model(args):
     """
     print("=== Training SwinGAN model ===")
     print(f"Lesion directory: {args.lesion_dir}")
-    print(f"Atlas file: {args.atlas_file}")
+    print(f"Atlas file: {args.lesion_atlas}")
     print(f"Output directory: {args.output_dir}")
     print(f"Batch size: {args.batch_size}")
-    print(f"Num epochs: {args.num_epochs}")
-    print(f"Learning rate: {args.learning_rate}")
+    print(f"Num epochs: {args.epochs}")
+    print(f"Learning rate (generator): {args.lr_g}")
+    print(f"Learning rate (discriminator): {args.lr_d}")
     print(f"Feature size: {args.feature_size}")
+    print(f"Non-zero threshold: {args.min_non_zero}")
     print(f"Device: {args.device}")
+    print(f"Generator save interval: {args.generator_save_interval}")
     
     # Create the output directory if it doesn't exist
     if not os.path.exists(args.output_dir):
         os.makedirs(args.output_dir)
     
-    # Create the dataset
-    dataset = HieLesionDataset(
+    # Create dataset
+    train_dataset = HieLesionDataset(
         lesion_dir=args.lesion_dir,
-        lesion_atlas_path=args.atlas_file,
-        transform=transforms.Compose([
-            transforms.ToTensor(),
-            transforms.RandomAffine(degrees=10, translate=(0.1, 0.1)),
-            transforms.RandomRotation(10),
-        ])
+        lesion_atlas_path=args.lesion_atlas,
+        filter_empty=True,
+        min_non_zero_percentage=args.min_non_zero
     )
+    
+    # Create validation dataset if provided
+    val_loader = None
+    if args.val_lesion_dir:
+        print(f"Validation lesion directory: {args.val_lesion_dir}")
+        val_dataset = HieLesionDataset(
+            lesion_dir=args.val_lesion_dir,
+            lesion_atlas_path=args.lesion_atlas,
+            filter_empty=True,
+            min_non_zero_percentage=args.min_non_zero
+        )
+        
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=True
+        )
     
     # Create data loader
-    dataloader = DataLoader(
-        dataset,
+    train_loader = DataLoader(
+        train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=args.num_workers
+        num_workers=args.num_workers,
+        pin_memory=True
     )
     
-    # Create the model
+    # Create model
     model = SwinGAN(
         in_channels=1,
         out_channels=1,
@@ -604,12 +626,9 @@ def train_model(args):
         noise_dim=16
     )
     
-    # Move model to device
-    model = model.to(args.device)
-    
     # Create the optimizer
-    optimizer_g = torch.optim.Adam(model.generator.parameters(), lr=args.learning_rate)
-    optimizer_d = torch.optim.Adam(model.discriminator.parameters(), lr=args.learning_rate)
+    optimizer_g = torch.optim.Adam(model.generator.parameters(), lr=args.lr_g)
+    optimizer_d = torch.optim.Adam(model.discriminator.parameters(), lr=args.lr_d)
     
     # Create the trainer
     trainer = SwinGANTrainer(
@@ -623,7 +642,10 @@ def train_model(args):
     )
     
     # Train the model
-    trainer.train(dataloader, args.num_epochs, val_dataloader=None)
+    trainer.train(train_loader, args.epochs, val_dataloader=val_loader, save_interval=args.save_interval)
+    
+    print(f"Training completed. Model saved to {args.output_dir}")
+    print(f"Generator checkpoints saved to {trainer.generator_dir}")
 
 
 def generate_lesions(
@@ -757,126 +779,84 @@ def generate_lesions(
         print(f"Saved mean probability map to {mean_output_file}")
 
 
-def add_train_command(subparsers):
+def main():
+    parser = argparse.ArgumentParser(description='SwinGAN for HIE Lesion Synthesis')
+    subparsers = parser.add_subparsers(dest='mode', help='Mode of operation')
+    
+    # Training subparser
     train_parser = subparsers.add_parser('train', help='Train the SwinGAN model')
     train_parser.add_argument('--lesion_dir', type=str, required=True, 
-                           help='Directory containing lesion .nii files for training')
-    train_parser.add_argument('--atlas_file', type=str, required=True, 
-                           help='Path to the lesion frequency atlas .nii file')
+                             help='Directory containing lesion .nii files for training')
+    train_parser.add_argument('--lesion_atlas', type=str, required=True, 
+                             help='Path to the lesion frequency atlas .nii file')
     train_parser.add_argument('--output_dir', type=str, default='./swin_gan_output', 
-                           help='Output directory for saving model checkpoints')
+                             help='Output directory for saving model checkpoints')
+    train_parser.add_argument('--val_lesion_dir', type=str, default=None, 
+                             help='Directory containing lesion .nii files for validation')
     train_parser.add_argument('--batch_size', type=int, default=2, 
-                           help='Batch size for training')
-    train_parser.add_argument('--num_epochs', type=int, default=100, 
-                           help='Number of epochs to train')
-    train_parser.add_argument('--learning_rate', type=float, default=0.0002, 
-                          help='Learning rate for training')
+                             help='Batch size for training')
+    train_parser.add_argument('--epochs', type=int, default=100, 
+                             help='Number of epochs to train')
+    train_parser.add_argument('--lr_g', type=float, default=0.0002, 
+                             help='Learning rate for generator')
+    train_parser.add_argument('--lr_d', type=float, default=0.0001, 
+                             help='Learning rate for discriminator')
     train_parser.add_argument('--feature_size', type=int, default=24, 
-                           help='Feature size for SwinUNETR')
+                             help='Feature size for SwinUNETR')
     train_parser.add_argument('--dropout_rate', type=float, default=0.0, 
-                           help='Dropout rate for SwinUNETR')
-    train_parser.add_argument('--num_workers', type=int, default=4, 
-                           help='Number of data loading workers')
-    train_parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu', 
-                           help='Device to use (cuda or cpu)')
+                             help='Dropout rate for generator')
     train_parser.add_argument('--lambda_focal', type=float, default=10.0, 
-                           help='Weight for focal loss')
+                             help='Weight for focal loss')
     train_parser.add_argument('--lambda_l1', type=float, default=5.0, 
-                           help='Weight for L1 loss')
+                             help='Weight for L1 loss')
     train_parser.add_argument('--focal_alpha', type=float, default=0.75, 
-                           help='Alpha parameter for focal loss')
+                             help='Alpha parameter for focal loss')
     train_parser.add_argument('--focal_gamma', type=float, default=2.0, 
-                           help='Gamma parameter for focal loss')
+                             help='Gamma parameter for focal loss')
+    train_parser.add_argument('--min_non_zero', type=float, default=0.000001, 
+                             help='Minimum percentage of non-zero voxels to include sample')
     train_parser.add_argument('--generator_save_interval', type=int, default=4, 
-                           help='Interval for saving generator-only checkpoints')
+                             help='Interval for saving generator-only checkpoints')
+    train_parser.add_argument('--num_workers', type=int, default=4, 
+                             help='Number of workers for data loading')
+    train_parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu', 
+                             help='Device to use (cuda or cpu)')
     train_parser.add_argument('--disable_amp', action='store_true', 
-                           help='Disable automatic mixed precision training')
+                             help='Disable automatic mixed precision training')
+    train_parser.add_argument('--save_interval', type=int, default=5, 
+                             help='Interval for saving full model checkpoints')
     
-    train_parser.set_defaults(func=handle_train_command)
-
-
-def add_generate_command(subparsers):
-    generate_parser = subparsers.add_parser(
-        'generate', help='Generate synthetic lesions using a trained model'
-    )
-    
-    generate_parser.add_argument(
-        '--model_checkpoint', 
-        type=str, 
-        required=True,
-        help='Path to the model checkpoint'
-    )
-    
-    generate_parser.add_argument(
-        '--lesion_atlas', 
-        type=str, 
-        required=True,
-        help='Path to the lesion atlas (frequency map)'
-    )
-    
-    generate_parser.add_argument(
-        '--output_file', 
-        type=str, 
-        required=True,
-        help='Path to save the generated lesion'
-    )
-    
-    generate_parser.add_argument(
-        '--threshold', 
-        type=float, 
-        default=0.5,
-        help='Threshold for binarizing the generated lesion probability map'
-    )
-    
-    generate_parser.add_argument(
-        '--device', 
-        type=str, 
-        default='cuda',
-        help='Device to use for inference'
-    )
-    
-    generate_parser.add_argument(
-        '--num_samples', 
-        type=int, 
-        default=1,
-        help='Number of samples to generate with different noise vectors'
-    )
-    
-    generate_parser.set_defaults(func=handle_generate_command)
-
-
-def handle_generate_command(args):
-    """Handler for the generate command"""
-    generate_lesions(
-        model_checkpoint=args.model_checkpoint,
-        lesion_atlas=args.lesion_atlas,
-        output_file=args.output_file,
-        threshold=args.threshold,
-        device=args.device,
-        num_samples=args.num_samples
-    )
-
-
-def handle_train_command(args):
-    """Handler for the train command"""
-    train_model(args)
-
-
-def main():
-    """Main entry point for the CLI"""
-    parser = argparse.ArgumentParser(description='SwinGAN for HIE lesion synthesis')
-    subparsers = parser.add_subparsers(dest='command', help='Command to run')
-    
-    # Add train command
-    add_train_command(subparsers)
-    
-    # Add generate command
-    add_generate_command(subparsers)
+    # Generation subparser
+    gen_parser = subparsers.add_parser('generate', help='Generate synthetic lesions')
+    gen_parser.add_argument('--model_checkpoint', type=str, required=True, 
+                           help='Path to the trained model checkpoint')
+    gen_parser.add_argument('--lesion_atlas', type=str, required=True, 
+                           help='Path to the lesion frequency atlas .nii file')
+    gen_parser.add_argument('--output_file', type=str, required=True, 
+                           help='Path to save the generated lesion .nii file')
+    gen_parser.add_argument('--threshold', type=float, default=0.5, 
+                           help='Threshold for binarizing the generated lesions')
+    gen_parser.add_argument('--feature_size', type=int, default=24, 
+                           help='Feature size for SwinUNETR (must match training)')
+    gen_parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu', 
+                           help='Device to use (cuda or cpu)')
+    gen_parser.add_argument('--num_samples', type=int, default=1, 
+                           help='Number of samples to generate with different noise vectors')
     
     args = parser.parse_args()
     
-    if hasattr(args, 'func'):
-        args.func(args)
+    # Run the appropriate mode
+    if args.mode == 'train':
+        train_model(args)
+    elif args.mode == 'generate':
+        generate_lesions(
+            model_checkpoint=args.model_checkpoint,
+            lesion_atlas=args.lesion_atlas,
+            output_file=args.output_file,
+            threshold=args.threshold,
+            device=args.device,
+            num_samples=args.num_samples
+        )
     else:
         parser.print_help()
 
