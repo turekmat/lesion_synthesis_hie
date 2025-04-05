@@ -497,9 +497,14 @@ class SwinGANTrainer:
                     'focal_loss_weight': self.model.lambda_focal,
                     'l1_loss_weight': self.model.lambda_l1,
                     'focal_alpha': self.model.focal_loss.alpha,
-                    'focal_gamma': self.model.focal_loss.gamma
+                    'focal_gamma': self.model.focal_loss.gamma,
+                    'use_noise': self.model.use_noise,
+                    'noise_dim': self.model.noise_dim,
+                    'feature_size': self.model.generator.swin_unetr.feature_size,
+                    'dropout_rate': self.model.generator.swin_unetr.drop_rate
                 }, generator_path)
                 print(f"Saved generator-only checkpoint to {generator_path}")
+                print(f"Checkpoint includes configuration for use_noise={self.model.use_noise}, noise_dim={self.model.noise_dim}")
             
             # Validation
             if val_dataloader is not None and (epoch + 1) % 1 == 0:
@@ -709,12 +714,35 @@ def generate_lesions(
     # Check if checkpoint contains the full model or just generator
     if 'model_state_dict' in checkpoint:
         model.load_state_dict(checkpoint['model_state_dict'])
+    elif 'generator_state_dict' in checkpoint:
+        print("Loading generator from checkpoint with configuration...")
+        
+        # Získání konfiguračních parametrů z checkpointu
+        use_noise = checkpoint.get('use_noise', True)  # defaultně True pro zpětnou kompatibilitu
+        noise_dim = checkpoint.get('noise_dim', 16)
+        feature_size = checkpoint.get('feature_size', 24)
+        dropout_rate = checkpoint.get('dropout_rate', 0.0)
+        
+        print(f"Checkpoint configuration: use_noise={use_noise}, noise_dim={noise_dim}, feature_size={feature_size}")
+        
+        # Vytvoření nového modelu s načtenými parametry
+        model = SwinGAN(
+            in_channels=1, 
+            out_channels=1,
+            feature_size=feature_size,
+            dropout_rate=dropout_rate,
+            use_noise=use_noise,
+            noise_dim=noise_dim
+        )
+        
+        # Načtení vah generátoru
+        model.generator.load_state_dict(checkpoint['generator_state_dict'])
+        model = model.to(device)
     elif 'generator' in checkpoint:
         model.generator.load_state_dict(checkpoint['generator'])
     else:
         model.load_state_dict(checkpoint)
     
-    model = model.to(device)
     model.eval()
     
     # Create output directory if it doesn't exist
