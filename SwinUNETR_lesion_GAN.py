@@ -34,6 +34,7 @@ from tqdm import tqdm  # type: ignore
 import argparse
 from monai.networks.nets import SwinUNETR  # type: ignore
 from monai.transforms import Compose, LoadImage, Resize, ToTensor  # type: ignore
+from monai.losses import FocalLoss  # type: ignore
 
 # Nastavení seed pro reprodukovatelnost
 def set_seed(seed=42):
@@ -937,70 +938,51 @@ def connected_components_3d(binary_tensor):
 # Přidání Focal Loss pro lépe vyvážené generování lézí
 def compute_focal_loss(generated, atlas, gamma=2.0, alpha=0.8, min_prob=0.01):
     """
-    Implementace Focal Loss pro lépe vyvážené generování lézí.
-    Focal Loss se zaměřuje na obtížnější případy (méně zastoupené třídy) tím, že 
-    zvyšuje jejich váhu při trénování.
+    Vysoce optimalizovaná implementace Focal Loss využívající MONAI knihovnu.
     
     Args:
         generated: Generovaný výstup modelu [batch, 1, D, H, W]
         atlas: Atlas pravděpodobnosti lézí [batch, 1, D, H, W]
-        gamma: Faktor modulace pro Focal Loss (vyšší hodnota = větší důraz na obtížné případy)
+        gamma: Faktor modulace pro Focal Loss
         alpha: Vyvažovací faktor pro pozitivní třídu (léze)
         min_prob: Minimální pravděpodobnost v atlasu pro relevantní oblasti
-        
+    
     Returns:
         Hodnota Focal Loss
     """
-    import torch
-    
     # Zajistíme, že vstupní hodnoty jsou v rozsahu [0, 1]
     generated = torch.clamp(generated, 0.0, 1.0)
     
     # Maska mozku - oblasti kde atlas má nenulovou pravděpodobnost
     brain_mask = (atlas > min_prob).float()
     
-    # V generativním kontextu nepoužíváme atlas jako ground truth, ale jako vodítko
-    # Vytvoříme binární "cíl" na základě atlasu - oblasti s vyšší pravděpodobností
-    # jsou prioritizované pro generování lézí
-    target_prob = (atlas > 0.3).float()  # Binární cíl založený na pravděpodobnosti atlasu
+    # Vytvoření "pseudo-target" z atlasu - používáme atlas jako vodítko pro generování
+    # Prahování atlasu pro vytvoření binárního cíle pro Focal Loss
+    target = (atlas > 0.3).float()
     
-    # Pro stabilitu výpočtu - vyhnutí se log(0) a dalším numerickým problémům
-    eps = 1e-7
+    # Inicializace MONAI FocalLoss s našimi parametry
+    # - 'none' redukce nám umožní aplikovat vlastní masku mozku
+    # - není nutné aplikovat sigmoid/softmax, protože naše data jsou již v [0,1]
+    focal_loss_fn = FocalLoss(
+        gamma=gamma,
+        alpha=alpha, 
+        reduction='none',  # žádná redukce, abychom mohli aplikovat masku mozku
+        include_background=True,  # zahrnout pozadí (v našem případě všechno)
+        to_onehot_y=False  # cíl již je v požadovaném formátu
+    )
     
-    # Pravděpodobnosti predikce
-    p = generated
-    p = torch.clamp(p, eps, 1.0 - eps)
-    
-    # Pravděpodobnosti pro správnou třídu podle standardní definice Focal Loss
-    # p_t = p pro y=1 (pozitivní třída) a 1-p pro y=0 (negativní třída)
-    p_t = p * target_prob + (1 - p) * (1 - target_prob)
-    
-    # Alpha faktor - vyvážení kladných a záporných případů
-    # Pro generativní kontext používáme upravený alpha přístup, který zohledňuje atlas
-    alpha_t = alpha * target_prob + (1 - alpha) * (1 - target_prob)
-    
-    # Focal váhování - zaměření na obtížné případy
-    focal_weight = (1 - p_t) ** gamma
-    
-    # Standardní Binary Cross Entropy
-    bce = -target_prob * torch.log(p) - (1 - target_prob) * torch.log(1 - p)
-    
-    # Focal Loss vzorec s alpha vyvážením
-    focal_loss = alpha_t * focal_weight * bce
+    # Výpočet Focal Loss pomocí MONAI implementace
+    focal_loss_values = focal_loss_fn(generated, target)
     
     # Aplikace masky mozku - počítáme loss pouze uvnitř mozku
-    masked_loss = focal_loss * brain_mask
+    masked_loss = focal_loss_values * brain_mask
     
-    # Průměrování přes všechny voxely mozku pro stabilnější hodnoty
-    batch_size = generated.size(0)
-    brain_voxels = torch.sum(brain_mask) + eps
-    
-    # Konečná hodnota Focal Loss
+    # Průměrování přes všechny voxely mozku
+    brain_voxels = torch.sum(brain_mask) + 1e-7
     loss = torch.sum(masked_loss) / brain_voxels
     
-    # Přidáme jemnou penalizaci za léze mimo mozek (mnohem menší váha)
-    outside_brain = generated * (1.0 - brain_mask)
-    outside_penalty = 0.1 * torch.sum(outside_brain) / (torch.sum(1.0 - brain_mask) + eps)
+    # Lehká penalizace za aktivace mimo mozek (velmi nízká váha, aby nezpomalovala trénink)
+    outside_penalty = 0.05 * torch.mean(generated * (1.0 - brain_mask))
     
     return loss + outside_penalty
 
