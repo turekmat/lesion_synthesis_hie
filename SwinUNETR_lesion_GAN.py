@@ -361,15 +361,16 @@ def compute_anatomical_consistency_loss(generated, atlas):
     
     return loss
 
-def compute_coverage_loss(generated, atlas, min_coverage=0.01, max_coverage=3.0):
+def compute_coverage_loss(generated, atlas, min_coverage=0.01, max_coverage=65.5):
     """
-    Penalizuje léze s celkovým pokrytím mimo požadovaný rozsah (0.01% - 3%)
+    Penalizuje léze s celkovým pokrytím mimo požadovaný rozsah (0.01% - 65.5%)
     
     Args:
         generated: Generovaný výstup modelu
         atlas: Atlas definující povolené oblasti pro léze (funguje jako maska mozku)
         min_coverage: Minimální akceptované pokrytí (0.01%)
-        max_coverage: Maximální akceptované pokrytí (3%)
+        max_coverage: Maximální akceptované pokrytí (65.5% v rámci masky mozku)
+                     (Pro celý objem by to odpovídalo přibližně 3.5%)
     
     Returns:
         Penalizační loss pro pokrytí mimo požadovaný rozsah
@@ -704,11 +705,11 @@ def train(generator, discriminator, dataloader, num_epochs, device, output_dir):
     plt.subplot(2, 2, 2)
     plt.plot(coverage_stats, label='Average Lesion Coverage (%)', color='green')
     plt.axhline(y=0.01, color='r', linestyle='--', label='Min Target (0.01%)')
-    plt.axhline(y=3.0, color='r', linestyle='--', label='Max Target (3.0%)')
+    plt.axhline(y=65.5, color='r', linestyle='--', label='Max Target (65.5%)')
     plt.xlabel('Epoch')
-    plt.ylabel('Lesion Coverage (%)')
+    plt.ylabel('Lesion Coverage (% of Brain Volume)')
     plt.legend()
-    plt.title('Average Lesion Coverage')
+    plt.title('Average Lesion Coverage (within Brain Mask)')
     
     # Plot 3: Atlas Guidance Loss
     plt.subplot(2, 2, 3)
@@ -784,7 +785,7 @@ def save_samples(generator, dataloader, device, epoch, output_dir):
         
         axes[2].imshow(fake_np[:, :, mid_z], cmap='gray')
         sample_info = coverage_info[0]
-        is_in_range = 0.01 <= sample_info["coverage_percentage"] <= 3.0
+        is_in_range = 0.01 <= sample_info["coverage_percentage"] <= 65.5
         range_status = "✓" if is_in_range else "✗"
         axes[2].set_title(f'Generated Label\nCoverage: {sample_info["coverage_percentage"]:.2f}% {range_status}, Lesions: {sample_info["num_components"]}')
         axes[2].axis('off')
@@ -796,7 +797,7 @@ def save_samples(generator, dataloader, device, epoch, output_dir):
         # Vytvoření log souboru s detaily
         with open(os.path.join(output_dir, f'sample_epoch_{epoch+1}_details.txt'), 'w') as f:
             for i, info in enumerate(coverage_info):
-                is_in_range = 0.01 <= info["coverage_percentage"] <= 3.0
+                is_in_range = 0.01 <= info["coverage_percentage"] <= 65.5
                 f.write(f"Sample {i+1}:\n")
                 f.write(f"  Coverage: {info['coverage_percentage']:.4f}% ({'v požadovaném rozmezí' if is_in_range else 'mimo požadované rozmezí'})\n")
                 f.write(f"  Number of lesions: {info['num_components']}\n")
@@ -806,7 +807,7 @@ def save_samples(generator, dataloader, device, epoch, output_dir):
     generator.train()
 
 # Funkce pro generování vzorků z natrénovaného modelu
-def generate_samples(model_path, lesion_atlas_path, output_dir, num_samples=10, min_threshold=0.3):
+def generate_samples(model_path, lesion_atlas_path, output_dir, num_samples=10, min_threshold=0.3, feature_size=24):
     # Nastavení
     set_seed(42)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -825,7 +826,8 @@ def generate_samples(model_path, lesion_atlas_path, output_dir, num_samples=10, 
     
     # Načtení modelu
     img_size = atlas_data.shape
-    generator = SwinUNETRGenerator(img_size=img_size)
+    print(f"Inicializuji generátor s feature_size={feature_size}")
+    generator = SwinUNETRGenerator(img_size=img_size, feature_size=feature_size)
     generator.load_state_dict(torch.load(model_path, map_location=device))
     generator.to(device)
     generator.eval()
@@ -857,7 +859,7 @@ def generate_samples(model_path, lesion_atlas_path, output_dir, num_samples=10, 
             avg_size = coverage_info['avg_lesion_size']
             
             # Je pokrytí v cílovém rozsahu?
-            is_in_range = 0.01 <= coverage_percentage <= 3.0
+            is_in_range = 0.01 <= coverage_percentage <= 65.5
             all_coverages.append(coverage_percentage)
             
             # Výpočet skóre atlas guidance pro statistiku
@@ -883,9 +885,9 @@ def generate_samples(model_path, lesion_atlas_path, output_dir, num_samples=10, 
             # Aplikace thresholdu pro získání binární masky
             fake_np = (fake_np_raw > min_threshold).astype(np.float32)
             
-            # Výpis informací o vzorku
+            # Výpis informací o vzorku - upravený popisek
             print(f"Vzorek {i+1}: {num_components} lézí, průměrná velikost: {avg_size:.2f}, pokrytí: {coverage_percentage:.4f}%")
-            print(f"  Pokrytí v cílovém rozsahu (0.01% - 3.0%): {'Ano' if is_in_range else 'Ne'}")
+            print(f"  Pokrytí v cílovém rozsahu (0.01% - 65.5% v rámci mozku): {'Ano' if is_in_range else 'Ne'}")
             print(f"  Atlas Guidance Score: {atlas_guidance_score:.4f} (>1.0 znamená léze v pravděpodobnějších oblastech)")
             
             # Uložení jako NIfTI
@@ -929,8 +931,8 @@ def generate_samples(model_path, lesion_atlas_path, output_dir, num_samples=10, 
             plt.savefig(os.path.join(output_dir, f'sample_{i+1}.png'))
             plt.close()
     
-    # Souhrnné statistiky
-    in_range_count = sum(1 for c in all_coverages if 0.01 <= c <= 3.0)
+    # Souhrnné statistiky - upravení rozsahu
+    in_range_count = sum(1 for c in all_coverages if 0.01 <= c <= 65.5)
     avg_atlas_score = sum(all_atlas_scores) / len(all_atlas_scores) if all_atlas_scores else 0
     
     # Vytvoření histogramu pokrytí
@@ -940,10 +942,10 @@ def generate_samples(model_path, lesion_atlas_path, output_dir, num_samples=10, 
     plt.subplot(2, 1, 1)
     plt.hist(all_coverages, bins=20, color='skyblue', edgecolor='black')
     plt.axvline(x=0.01, color='r', linestyle='--', label='Min Target (0.01%)')
-    plt.axvline(x=3.0, color='r', linestyle='--', label='Max Target (3.0%)')
+    plt.axvline(x=65.5, color='r', linestyle='--', label='Max Target (65.5%)')
     plt.xlabel('Lesion Coverage (% of Brain Volume)')
     plt.ylabel('Number of Samples')
-    plt.title(f'Lesion Coverage Distribution\n{in_range_count}/{num_samples} samples in target range (0.01% - 3.0%)')
+    plt.title(f'Lesion Coverage Distribution\n{in_range_count}/{num_samples} samples in target range (0.01% - 65.5%)')
     plt.legend()
     plt.grid(True, alpha=0.3)
     
@@ -962,7 +964,7 @@ def generate_samples(model_path, lesion_atlas_path, output_dir, num_samples=10, 
     plt.close()
     
     print(f"Vygenerováno {num_samples} vzorků v adresáři {output_dir}")
-    print(f"Vzorky v cílovém rozsahu pokrytí (0.01% - 3.0%): {in_range_count}/{num_samples} ({in_range_count/num_samples*100:.1f}%)")
+    print(f"Vzorky v cílovém rozsahu pokrytí (0.01% - 65.5% v rámci mozku): {in_range_count}/{num_samples} ({in_range_count/num_samples*100:.1f}%)")
     print(f"Průměrné Atlas Guidance Score: {avg_atlas_score:.4f} (>1.0 znamená léze v pravděpodobnějších oblastech)")
 
 # Hlavní funkce
@@ -1066,6 +1068,7 @@ def main(args):
                     raise FileNotFoundError(f"Soubor s atlasem lézí neexistuje: {args.lesion_atlas_path}")
             
             print(f"Načítám atlas lézí z: {atlas_path}")
+            print(f"Používám feature_size: {args.feature_size}")
             
             # Generování vzorků z natrénovaného modelu
             generate_samples(
@@ -1073,7 +1076,8 @@ def main(args):
                 lesion_atlas_path=atlas_path,  # Použití ověřené cesty
                 output_dir=args.output_dir,
                 num_samples=args.num_samples,
-                min_threshold=args.min_threshold
+                min_threshold=args.min_threshold,
+                feature_size=args.feature_size  # Předání hodnoty z argumentů
             )
         
         else:
