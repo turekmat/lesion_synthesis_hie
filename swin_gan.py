@@ -651,7 +651,8 @@ def train_model(args):
 def generate_lesions(
     model_checkpoint,
     lesion_atlas,
-    output_file,
+    output_file=None,
+    output_dir=None,
     threshold=0.5,
     device='cuda',
     num_samples=1
@@ -662,15 +663,25 @@ def generate_lesions(
     Args:
         model_checkpoint (str): Path to the model checkpoint
         lesion_atlas (str): Path to the lesion atlas (frequency map)
-        output_file (str): Path to save the generated lesion
+        output_file (str, optional): Path to save the generated lesion (for single sample)
+        output_dir (str, optional): Directory to save multiple generated samples
         threshold (float): Threshold for binarizing the generated lesion probability map
         device (str): Device to use for inference ('cuda' or 'cpu')
         num_samples (int): Number of samples to generate with different noise vectors
     """
+    # Validate input parameters
+    if num_samples > 1 and output_dir is None:
+        raise ValueError("output_dir must be specified when generating multiple samples")
+    if num_samples == 1 and output_file is None and output_dir is None:
+        raise ValueError("Either output_file or output_dir must be specified")
+    
     print(f"Generating lesions with the following parameters:")
     print(f"Model checkpoint: {model_checkpoint}")
     print(f"Lesion atlas: {lesion_atlas}")
-    print(f"Output file: {output_file}")
+    if output_file:
+        print(f"Output file: {output_file}")
+    if output_dir:
+        print(f"Output directory: {output_dir}")
     print(f"Threshold: {threshold}")
     print(f"Device: {device}")
     print(f"Number of samples: {num_samples}")
@@ -707,9 +718,10 @@ def generate_lesions(
     model.eval()
     
     # Create output directory if it doesn't exist
-    output_dir = os.path.dirname(output_file)
-    if output_dir and not os.path.exists(output_dir):
-        os.makedirs(output_dir)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+    elif output_file:
+        os.makedirs(os.path.dirname(os.path.abspath(output_file)), exist_ok=True)
     
     # Generate samples with different noise vectors
     all_samples = []
@@ -740,40 +752,64 @@ def generate_lesions(
             
             all_samples.append(binary_lesion)
             
-            # If only one sample is requested, save it directly
-            if num_samples == 1:
-                # Create a new NIfTI image
-                lesion_img = nib.Nifti1Image(binary_lesion, atlas_img.affine)
-                nib.save(lesion_img, output_file)
-                
-                # Print some statistics
-                num_lesions = measure.label(binary_lesion).max()
-                lesion_volume = binary_lesion.sum() * np.prod(atlas_img.header.get_zooms()) / 1000.0  # in ml
-                print(f"Generated {num_lesions} distinct lesions")
-                print(f"Total lesion volume: {lesion_volume:.2f} ml")
+            # Determine output path for this sample
+            if num_samples == 1 and output_file:
+                # Single sample with specified output file
+                sample_output_file = output_file
             else:
-                # For multiple samples, create a unique filename for each
-                base_name, ext = os.path.splitext(output_file)
-                if ext == '.gz' and os.path.splitext(base_name)[1] == '.nii':
-                    base_name = os.path.splitext(base_name)[0]
-                    ext = '.nii.gz'
+                # Multiple samples or output_dir was specified
+                if output_file:
+                    # Derive filename from output_file but save in output_dir
+                    base_name = os.path.basename(output_file)
+                    name, ext = os.path.splitext(base_name)
+                    if ext == '.gz' and os.path.splitext(name)[1] == '.nii':
+                        name = os.path.splitext(name)[0]
+                        ext = '.nii.gz'
+                else:
+                    # Create a generic filename
+                    name = "lesion"
+                    ext = ".nii.gz"
                 
-                sample_output_file = f"{base_name}_sample{i+1}{ext}"
+                if num_samples > 1:
+                    # Add sample number for multiple samples
+                    filename = f"{name}_sample{i+1}{ext}"
+                else:
+                    filename = f"{name}{ext}"
                 
-                # Create a new NIfTI image
-                lesion_img = nib.Nifti1Image(binary_lesion, atlas_img.affine)
-                nib.save(lesion_img, sample_output_file)
-                
-                # Print some statistics
-                num_lesions = measure.label(binary_lesion).max()
-                lesion_volume = binary_lesion.sum() * np.prod(atlas_img.header.get_zooms()) / 1000.0  # in ml
+                sample_output_file = os.path.join(output_dir, filename)
+            
+            # Create a new NIfTI image and save it
+            lesion_img = nib.Nifti1Image(binary_lesion, atlas_img.affine)
+            nib.save(lesion_img, sample_output_file)
+            
+            # Print some statistics
+            num_lesions = measure.label(binary_lesion).max()
+            lesion_volume = binary_lesion.sum() * np.prod(atlas_img.header.get_zooms()) / 1000.0  # in ml
+            
+            if num_samples > 1:
                 print(f"Sample {i+1}: Generated {num_lesions} distinct lesions")
                 print(f"Sample {i+1}: Total lesion volume: {lesion_volume:.2f} ml")
+            else:
+                print(f"Generated {num_lesions} distinct lesions")
+                print(f"Total lesion volume: {lesion_volume:.2f} ml")
     
     # If multiple samples were generated, also save a mean probability map
     if num_samples > 1:
         mean_lesion = np.mean(all_samples, axis=0)
-        mean_output_file = f"{base_name}_mean{ext}"
+        
+        if output_file:
+            base_name = os.path.basename(output_file)
+            name, ext = os.path.splitext(base_name)
+            if ext == '.gz' and os.path.splitext(name)[1] == '.nii':
+                name = os.path.splitext(name)[0]
+                ext = '.nii.gz'
+        else:
+            name = "lesion"
+            ext = ".nii.gz"
+        
+        mean_filename = f"{name}_mean{ext}"
+        mean_output_file = os.path.join(output_dir, mean_filename)
+        
         mean_img = nib.Nifti1Image(mean_lesion, atlas_img.affine)
         nib.save(mean_img, mean_output_file)
         print(f"Saved mean probability map to {mean_output_file}")
@@ -832,8 +868,10 @@ def main():
                            help='Path to the trained model checkpoint')
     gen_parser.add_argument('--lesion_atlas', type=str, required=True, 
                            help='Path to the lesion frequency atlas .nii file')
-    gen_parser.add_argument('--output_file', type=str, required=True, 
-                           help='Path to save the generated lesion .nii file')
+    gen_parser.add_argument('--output_file', type=str, default=None,
+                           help='Path to save the generated lesion .nii file (for single sample)')
+    gen_parser.add_argument('--output_dir', type=str, default=None,
+                           help='Directory to save multiple generated samples')
     gen_parser.add_argument('--threshold', type=float, default=0.5, 
                            help='Threshold for binarizing the generated lesions')
     gen_parser.add_argument('--feature_size', type=int, default=24, 
@@ -853,6 +891,7 @@ def main():
             model_checkpoint=args.model_checkpoint,
             lesion_atlas=args.lesion_atlas,
             output_file=args.output_file,
+            output_dir=args.output_dir,
             threshold=args.threshold,
             device=args.device,
             num_samples=args.num_samples
