@@ -560,8 +560,8 @@ def train(generator, discriminator, dataloader, num_epochs, device, output_dir):
     lambda_gp = 10.0
     lambda_size = 2.0
     lambda_anatomical = 5.0
-    lambda_coverage = 3.0  # Snížit z 5.0
-    lambda_atlas_guidance = 6.0  # Zvýšit z 1.0
+    lambda_coverage = 4.0  # Snížit z 5.0
+    lambda_atlas_guidance = 8.0  # Zvýšit z 1.0
     
     # Statistiky pro vykreslení
     g_losses = []
