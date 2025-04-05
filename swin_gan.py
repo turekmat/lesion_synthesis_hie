@@ -117,6 +117,8 @@ class Generator(nn.Module):
         
         self.use_noise = use_noise
         self.noise_dim = noise_dim
+        self.feature_size = feature_size  # Uložíme hodnotu i jako atribut
+        self.dropout_rate = dropout_rate  # Uložíme hodnotu i jako atribut
         
         # Adjust input channels if using noise
         actual_in_channels = in_channels
@@ -500,8 +502,8 @@ class SwinGANTrainer:
                     'focal_gamma': self.model.focal_loss.gamma,
                     'use_noise': self.model.use_noise,
                     'noise_dim': self.model.noise_dim,
-                    'feature_size': self.model.generator.swin_unetr.feature_size,
-                    'dropout_rate': self.model.generator.swin_unetr.drop_rate
+                    'feature_size': self.model.generator.feature_size,
+                    'dropout_rate': self.model.generator.dropout_rate
                 }, generator_path)
                 print(f"Saved generator-only checkpoint to {generator_path}")
                 print(f"Checkpoint includes configuration for use_noise={self.model.use_noise}, noise_dim={self.model.noise_dim}")
