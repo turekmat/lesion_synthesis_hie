@@ -1840,6 +1840,8 @@ def main():
                              help='Device to use (cuda or cpu)')
     train_parser.add_argument('--disable_amp', action='store_true', 
                              help='Disable automatic mixed precision')
+    train_parser.add_argument('--min_non_zero', type=float, default=0.00001,
+                             help='Minimum percentage of non-zero voxels to include a sample')
     train_parser.add_argument('--fragmentation_kernel_size', type=int, default=3, 
                              help='Kernel size for fragmentation loss')
     train_parser.add_argument('--perlin_octaves', type=int, default=4, 
