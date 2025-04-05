@@ -410,17 +410,25 @@ class SwinUNETRGenerator(nn.Module):
         Forward pass generátoru.
         
         Args:
-            noise: Vstupní šum [batch, 1, D, H, W]
+            noise: Vstupní šum [batch, in_channels, 1, 1, 1]
             atlas: Pravděpodobnostní atlas lézí [batch, 1, D, H, W]
             
         Returns:
             Generované binární masky lézí [batch, 1, D, H, W]
         """
-        # Zakódování šumu a atlasu
-        noise_features = self.noise_encoder(noise)
-        atlas_features = self.atlas_encoder(atlas)
+        # Zjištění cílových rozměrů z atlasu
+        batch_size, _, depth, height, width = atlas.shape
         
-        # Spojení rysů
+        # Zakódování šumu
+        noise_features = self.noise_encoder(noise)  # [batch, feature_size, 1, 1, 1]
+        
+        # Rozšíření noise_features na stejný prostorový rozměr jako atlas
+        noise_features = noise_features.expand(-1, -1, depth, height, width)
+        
+        # Zakódování atlasu
+        atlas_features = self.atlas_encoder(atlas)  # [batch, feature_size, D, H, W]
+        
+        # Nyní mají oba tensory stejný tvar a lze je spojit
         combined_features = torch.cat([noise_features, atlas_features], dim=1)
         
         # Zpracování jádrem generátoru
