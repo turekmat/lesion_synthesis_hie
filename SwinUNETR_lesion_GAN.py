@@ -660,7 +660,7 @@ def compute_coverage_loss(generated, atlas, min_coverage=0.01, max_coverage=65.5
     # Toto pomůže generovat rozmanitější distribuce pokrytí
     prefer_low = torch.rand(1).item() < 0.7  # 70% preference pro nižší pokrytí (odpovídá trénovacím datům)
     
-    # Upravené rozsahy pro náhodné preference
+    # Upravené rozsahy pro náhodné preference - zmírněné hodnoty
     optimal_min = 0.01
     optimal_max = 5.0 if prefer_low else 20.0
     
@@ -672,24 +672,30 @@ def compute_coverage_loss(generated, atlas, min_coverage=0.01, max_coverage=65.5
         if total_brain_voxels > 0:
             coverage_ratio = (lesion_voxels / total_brain_voxels) * 100  # Převedeno na procenta
             
+            # SPECIÁLNÍ PŘÍPAD: Žádné léze
+            # Silná penalizace pokud není vygenerována žádná léze (hlavní změna)
+            if coverage_ratio == 0:
+                loss += 30.0  # Vysoká konstanta, která pobízí generátor k vytvoření alespoň nějakých lézí
+                continue
+                
             # Optimální rozsah má nulovou penalizaci
             if optimal_min <= coverage_ratio <= optimal_max:
                 # Žádná penalizace pro optimální rozsah
                 continue
-            # Penalizace pokud je pokrytí pod minimálním limitem
-            elif coverage_ratio < min_coverage:
-                # Kvadratická penalizace pro příliš malé pokrytí
-                loss += 15.0 * (min_coverage - coverage_ratio) ** 2
+            # Penalizace pokud je pokrytí pod minimálním limitem (ale nenulové)
+            elif 0 < coverage_ratio < min_coverage:
+                # Mírnější lineární penalizace pro velmi malé pokrytí (ale nenulové)
+                # Zmírnění oproti předchozí kvadratické penalizaci
+                loss += 5.0 * (min_coverage - coverage_ratio)
             # Penalizace pro hodnoty mezi optimálním maximem a absolutním maximem
             elif optimal_max < coverage_ratio <= max_coverage:
                 # Mírnější lineární penalizace pro hodnoty nad optimálním, ale stále v povoleném rozsahu
-                # Toto umožňuje občasné generování i větších pokrytí (jak vidíme v trénovacích datech)
-                severity = 1.0 if prefer_low else 0.2  # Méně přísné, když preferujeme větší pokrytí
+                severity = 0.5 if prefer_low else 0.1  # Snížené hodnoty oproti původním
                 loss += severity * (coverage_ratio - optimal_max) / (max_coverage - optimal_max)
             # Penalizace pro hodnoty nad maximálním limitem
             elif coverage_ratio > max_coverage:
-                # Přísnější kvadratická penalizace pro příliš velké pokrytí
-                loss += 20.0 * (coverage_ratio - max_coverage) ** 2
+                # Kvadratická penalizace pro příliš velké pokrytí (zachováno)
+                loss += 10.0 * (coverage_ratio - max_coverage) ** 2
     
     return loss / batch_size
 
@@ -806,13 +812,13 @@ def compute_atlas_guidance_loss(fake_labels, atlas):
         # Celkový počet voxelů v lézích
         lesion_voxels = torch.sum(lesion_mask) + 1e-8  # Přidáme malou hodnotu pro stabilitu
         
-        # Pokud nejsou žádné léze, použijeme alternativní přístup
+        # Pokud nejsou žádné léze, použijeme silnější postih
         if lesion_voxels < 10:  # Pokud je velmi málo voxelů lézí
             # Vypočítáme průměrnou pravděpodobnost v celém mozku
             avg_atlas_prob = torch.sum(atlas_probs * mask) / (torch.sum(mask) + 1e-8)
             
-            # Ztráta, která povzbuzuje tvorbu alespoň nějakých lézí
-            loss = torch.tensor(1.0, device=device, requires_grad=True) - avg_atlas_prob
+            # Silnější ztráta, která výrazně povzbuzuje tvorbu lézí - zvýšeno z 1.0 na 3.0
+            loss = torch.tensor(3.0, device=device, requires_grad=True) - avg_atlas_prob
         else:
             # Průměrná pravděpodobnost v generovaných oblastech lézí
             avg_lesion_prob = torch.sum(atlas_probs * lesion_mask) / lesion_voxels
@@ -824,12 +830,12 @@ def compute_atlas_guidance_loss(fake_labels, atlas):
             # Pokud je poměr > 1, generátor vybírá oblasti s nadprůměrnou pravděpodobností
             ratio = avg_lesion_prob / (avg_atlas_prob + 1e-8)
             
-            # Transformace na ztrátu (chceme minimalizovat)
-            loss = torch.exp(-ratio)
+            # Transformace na ztrátu (chceme minimalizovat) - mírnější pokles
+            loss = torch.exp(-ratio * 0.5)  # Zmírnění vlivu poměru na ztrátu
             
-            # Zvýšení vlivu významných odchylek - více penalizujeme velkou odchylku
-            if ratio < 0.5:  # Generátor výrazně ignoruje atlas
-                loss = loss * 2.0
+            # Zvýšení vlivu významných odchylek - zmírněno
+            if ratio < 0.3:  # Zmírněno z 0.5 na 0.3 - tolerujeme více různorodosti
+                loss = loss * 1.5  # Sníženo z 2.0 na 1.5 - mírnější navýšení
         
         total_loss = total_loss + loss
     
@@ -952,8 +958,8 @@ def train(generator, discriminator, dataloader, num_epochs, device, output_dir):
     lambda_gp = 10.0
     lambda_size = 6.0  # Zvýšeno z 2.0 na 6.0 pro silnější penalizaci počtu a velikosti lézí
     lambda_anatomical = 5.0
-    lambda_coverage = 6.0  # Zvýšeno z 4.0 na 6.0 pro silnější kontrolu pokrytí
-    lambda_atlas_guidance = 8.0
+    lambda_coverage = 2.0  # Sníženo z 6.0 na 2.0, aby nebyla příliš silná penalizace pokrytí
+    lambda_atlas_guidance = 4.0  # Sníženo z 8.0 na 4.0 pro lepší vyvážení ztrátových funkcí
     
     # Statistiky pro vykreslení
     g_losses = []
