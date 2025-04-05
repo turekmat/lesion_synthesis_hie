@@ -990,6 +990,145 @@ def train_model(args):
     print(f"Generator checkpoints saved to {trainer.generator_dir}")
 
 
+def compute_lesion_coverage(binary_lesion, atlas_mask=None):
+    """
+    Compute the percentage of voxels covered by lesions
+
+    Args:
+        binary_lesion (numpy.ndarray): Binary lesion mask
+        atlas_mask (numpy.ndarray, optional): Atlas mask to define the region of interest
+    
+    Returns:
+        float: Percentage of coverage (0.0-100.0)
+    """
+    if atlas_mask is not None:
+        # Count only voxels within the atlas mask
+        total_voxels = np.count_nonzero(atlas_mask)
+        lesion_voxels = np.count_nonzero(binary_lesion * atlas_mask)
+    else:
+        # Count all voxels in the volume
+        total_voxels = binary_lesion.size
+        lesion_voxels = np.count_nonzero(binary_lesion)
+    
+    # Calculate percentage
+    if total_voxels > 0:
+        coverage_percentage = (lesion_voxels / total_voxels) * 100.0
+    else:
+        coverage_percentage = 0.0
+    
+    return coverage_percentage
+
+
+def compute_target_coverage_from_training(lesion_dir, sample_count=10):
+    """
+    Compute the average lesion coverage percentage from training data
+
+    Args:
+        lesion_dir (str): Directory containing lesion files
+        sample_count (int): Number of samples to consider
+
+    Returns:
+        float: Average coverage percentage
+    """
+    # List all lesion files
+    lesion_files = sorted(glob.glob(os.path.join(lesion_dir, "*lesion.nii*")))
+    
+    # Filter out empty lesion files
+    non_empty_files = []
+    for lesion_file in lesion_files:
+        lesion = nib.load(lesion_file).get_fdata()
+        if np.count_nonzero(lesion) > 0:
+            non_empty_files.append(lesion_file)
+    
+    print(f"Found {len(non_empty_files)} non-empty lesion files in training data")
+    
+    # If no non-empty files found, return a default value
+    if not non_empty_files:
+        print("Warning: No non-empty lesion files found, using default coverage of 1%")
+        return 1.0
+    
+    # Select random samples or use all if fewer than requested
+    if len(non_empty_files) > sample_count:
+        selected_files = np.random.choice(non_empty_files, size=sample_count, replace=False)
+    else:
+        selected_files = non_empty_files
+    
+    # Compute average coverage
+    coverage_values = []
+    for lesion_file in selected_files:
+        lesion = nib.load(lesion_file).get_fdata()
+        coverage = compute_lesion_coverage(lesion > 0)
+        coverage_values.append(coverage)
+        print(f"File {os.path.basename(lesion_file)}: {coverage:.4f}% coverage")
+    
+    # Calculate average coverage
+    avg_coverage = np.mean(coverage_values)
+    print(f"Average coverage from training data: {avg_coverage:.4f}%")
+    
+    return avg_coverage
+
+
+def find_adaptive_threshold(probability_map, target_coverage, atlas_mask=None, 
+                            initial_threshold=0.5, min_threshold=0.1, max_threshold=0.9, 
+                            max_iterations=20, tolerance=0.1):
+    """
+    Find the threshold value that produces lesions with coverage close to the target
+    
+    Args:
+        probability_map (numpy.ndarray): Probability map from the generator
+        target_coverage (float): Target coverage percentage to achieve
+        atlas_mask (numpy.ndarray, optional): Atlas mask to define the region of interest
+        initial_threshold (float): Starting threshold value
+        min_threshold (float): Minimum threshold value
+        max_threshold (float): Maximum threshold value
+        max_iterations (int): Maximum number of iterations
+        tolerance (float): Acceptable difference between actual and target coverage
+        
+    Returns:
+        tuple: (found_threshold, actual_coverage, binary_lesion)
+    """
+    threshold = initial_threshold
+    threshold_min = min_threshold
+    threshold_max = max_threshold
+    
+    for iteration in range(max_iterations):
+        # Binarize the probability map with current threshold
+        binary_lesion = (probability_map > threshold).astype(np.float32)
+        
+        # Apply atlas mask if provided
+        if atlas_mask is not None:
+            binary_lesion = binary_lesion * atlas_mask
+        
+        # Compute current coverage
+        current_coverage = compute_lesion_coverage(binary_lesion, atlas_mask)
+        
+        # Check if we're close enough to the target
+        if abs(current_coverage - target_coverage) <= tolerance:
+            print(f"Found threshold {threshold:.4f} with coverage {current_coverage:.4f}% (target: {target_coverage:.4f}%)")
+            return threshold, current_coverage, binary_lesion
+        
+        # Adjust threshold using binary search
+        if current_coverage > target_coverage:
+            # Too much coverage, increase threshold
+            threshold_min = threshold
+            threshold = (threshold + threshold_max) / 2
+        else:
+            # Too little coverage, decrease threshold
+            threshold_max = threshold
+            threshold = (threshold + threshold_min) / 2
+        
+        print(f"Iteration {iteration+1}: threshold={threshold:.4f}, coverage={current_coverage:.4f}%, target={target_coverage:.4f}%")
+    
+    # If we exit the loop, use the last threshold
+    binary_lesion = (probability_map > threshold).astype(np.float32)
+    if atlas_mask is not None:
+        binary_lesion = binary_lesion * atlas_mask
+    current_coverage = compute_lesion_coverage(binary_lesion, atlas_mask)
+    
+    print(f"Warning: Reached maximum iterations. Using threshold {threshold:.4f} with coverage {current_coverage:.4f}% (target: {target_coverage:.4f}%)")
+    return threshold, current_coverage, binary_lesion
+
+
 def generate_lesions(
     model_checkpoint,
     lesion_atlas,
@@ -1002,9 +1141,12 @@ def generate_lesions(
     perlin_persistence=0.5,
     perlin_lacunarity=2.0,
     perlin_scale=0.1,
-    min_lesion_size=10,  # Minimální velikost léze (v počtu voxelů)
-    smooth_sigma=0.5,    # Hodnota sigma pro vyhlazení lézí
-    morph_close_size=2   # Velikost strukturního elementu pro morfologickou operaci uzavření
+    min_lesion_size=10,     # Minimální velikost léze (v počtu voxelů)
+    smooth_sigma=0.5,       # Hodnota sigma pro vyhlazení lézí
+    morph_close_size=2,     # Velikost strukturního elementu pro morfologickou operaci uzavření
+    use_adaptive_threshold=False,  # Použít adaptivní threshold
+    training_lesion_dir=None,      # Adresář s trénovacími lézemi
+    target_coverage=None          # Cílové pokrytí lézemi v procentech
 ):
     """
     Generate synthetic lesions using a trained GAN model
@@ -1024,12 +1166,18 @@ def generate_lesions(
         min_lesion_size (int): Minimální velikost léze v počtu voxelů (menší léze budou odstraněny)
         smooth_sigma (float): Hodnota sigma pro vyhlazení lézí pomocí Gaussovského filtru
         morph_close_size (int): Velikost strukturního elementu pro morfologickou operaci uzavření
+        use_adaptive_threshold (bool): Použít adaptivní threshold pro dosažení podobného pokrytí jako v trénovacích datech
+        training_lesion_dir (str): Adresář s trénovacími lézemi, používá se pro výpočet cílového pokrytí
+        target_coverage (float): Cílové pokrytí lézemi v procentech, pokud není zadáno a use_adaptive_threshold=True, 
+                                 použije se průměrné pokrytí z training_lesion_dir
     """
     # Validate input parameters
     if num_samples > 1 and output_dir is None:
         raise ValueError("output_dir must be specified when generating multiple samples")
     if num_samples == 1 and output_file is None and output_dir is None:
         raise ValueError("Either output_file or output_dir must be specified")
+    if use_adaptive_threshold and training_lesion_dir is None and target_coverage is None:
+        raise ValueError("For adaptive threshold, either training_lesion_dir or target_coverage must be specified")
     
     print(f"Generating lesions with the following parameters:")
     print(f"Model checkpoint: {model_checkpoint}")
@@ -1038,7 +1186,7 @@ def generate_lesions(
         print(f"Output file: {output_file}")
     if output_dir:
         print(f"Output directory: {output_dir}")
-    print(f"Threshold: {threshold}")
+    print(f"Threshold: {threshold if not use_adaptive_threshold else 'adaptive'}")
     print(f"Device: {device}")
     print(f"Number of samples: {num_samples}")
     print(f"Perlin noise octaves: {perlin_octaves}")
@@ -1048,6 +1196,12 @@ def generate_lesions(
     print(f"Minimum lesion size: {min_lesion_size}")
     print(f"Smoothing sigma: {smooth_sigma}")
     print(f"Morphological closing size: {morph_close_size}")
+    if use_adaptive_threshold:
+        print(f"Using adaptive threshold to match training data coverage")
+        if training_lesion_dir:
+            print(f"Training lesion directory: {training_lesion_dir}")
+        if target_coverage is not None:
+            print(f"Target coverage: {target_coverage}%")
     
     # Load the lesion atlas
     atlas_img = nib.load(lesion_atlas)
@@ -1058,6 +1212,13 @@ def generate_lesions(
     
     # Normalize the atlas
     atlas_data = (atlas_data - atlas_data.min()) / (atlas_data.max() - atlas_data.min() + 1e-8)
+    
+    # Create atlas mask for region of interest
+    atlas_mask = atlas_data > 0
+    
+    # If using adaptive threshold, compute target coverage from training data if not specified
+    if use_adaptive_threshold and target_coverage is None and training_lesion_dir is not None:
+        target_coverage = compute_target_coverage_from_training(training_lesion_dir)
     
     # Convert to tensor
     atlas_tensor = torch.from_numpy(atlas_data).float().unsqueeze(0).unsqueeze(0)
@@ -1168,12 +1329,21 @@ def generate_lesions(
             if smooth_sigma > 0:
                 fake_lesion_np = gaussian_filter(fake_lesion_np, sigma=smooth_sigma)
             
-            # Binarize the lesion with threshold
-            binary_lesion = (fake_lesion_np > threshold).astype(np.float32)
-            
-            # Ensure lesions only appear in regions with non-zero atlas values
-            atlas_mask = atlas_data > 0
-            binary_lesion = binary_lesion * atlas_mask
+            # Apply adaptive threshold if requested
+            if use_adaptive_threshold and target_coverage is not None:
+                print(f"Finding adaptive threshold for sample {i+1} to match coverage of {target_coverage:.4f}%")
+                found_threshold, actual_coverage, binary_lesion = find_adaptive_threshold(
+                    fake_lesion_np, 
+                    target_coverage, 
+                    atlas_mask,
+                    initial_threshold=threshold
+                )
+                print(f"Sample {i+1}: Using threshold {found_threshold:.4f} with coverage {actual_coverage:.4f}%")
+            else:
+                # Use fixed threshold
+                binary_lesion = (fake_lesion_np > threshold).astype(np.float32)
+                # Ensure lesions only appear in regions with non-zero atlas values
+                binary_lesion = binary_lesion * atlas_mask
             
             # Apply morphological operations to remove small isolated regions and fill holes
             if morph_close_size > 0:
@@ -1244,14 +1414,14 @@ def generate_lesions(
             
             if num_samples > 1:
                 print(f"Sample {i+1}: Generated {num_lesions} distinct lesions")
-                print(f"Sample {i+1}: Total lesion volume: {lesion_volume_percentage:.2f}% of brain volume ({lesion_volume_ml:.2f} ml)")
+                print(f"Sample {i+1}: Total lesion volume: {lesion_volume_percentage:.4f}% of brain volume ({lesion_volume_ml:.2f} ml)")
                 
                 # Varování pokud počet lézí je mimo očekávaný rozsah podle trénovací množiny
                 if num_lesions > 75:
                     print(f"WARNING: Sample {i+1} has {num_lesions} lesions, which is much higher than expected (1-75 based on training set)")
             else:
                 print(f"Generated {num_lesions} distinct lesions")
-                print(f"Total lesion volume: {lesion_volume_percentage:.2f}% of brain volume ({lesion_volume_ml:.2f} ml)")
+                print(f"Total lesion volume: {lesion_volume_percentage:.4f}% of brain volume ({lesion_volume_ml:.2f} ml)")
                 
                 # Varování pokud počet lézí je mimo očekávaný rozsah podle trénovací množiny
                 if num_lesions > 75:
@@ -1366,6 +1536,18 @@ def main():
                            help='Lacunarity parameter for Perlin noise (how quickly detail increases)')
     gen_parser.add_argument('--perlin_scale', type=float, default=0.1, 
                            help='Scale parameter for Perlin noise (smaller = smoother)')
+    gen_parser.add_argument('--min_lesion_size', type=int, default=10,
+                           help='Minimum size of lesions in voxels (smaller will be removed)')
+    gen_parser.add_argument('--smooth_sigma', type=float, default=0.5,
+                           help='Sigma value for Gaussian smoothing of lesion probability map')
+    gen_parser.add_argument('--morph_close_size', type=int, default=2,
+                           help='Size of structuring element for morphological closing operation')
+    gen_parser.add_argument('--use_adaptive_threshold', action='store_true',
+                           help='Use adaptive thresholding to match training data coverage')
+    gen_parser.add_argument('--training_lesion_dir', type=str, default=None,
+                           help='Directory with training lesions to compute target coverage')
+    gen_parser.add_argument('--target_coverage', type=float, default=None,
+                           help='Target lesion coverage percentage (if not specified, computed from training data)')
     
     args = parser.parse_args()
     
@@ -1384,7 +1566,13 @@ def main():
             perlin_octaves=args.perlin_octaves,
             perlin_persistence=args.perlin_persistence,
             perlin_lacunarity=args.perlin_lacunarity,
-            perlin_scale=args.perlin_scale
+            perlin_scale=args.perlin_scale,
+            min_lesion_size=args.min_lesion_size,
+            smooth_sigma=args.smooth_sigma,
+            morph_close_size=args.morph_close_size,
+            use_adaptive_threshold=args.use_adaptive_threshold,
+            training_lesion_dir=args.training_lesion_dir,
+            target_coverage=args.target_coverage
         )
     else:
         parser.print_help()
