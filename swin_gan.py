@@ -12,6 +12,7 @@ from collections import defaultdict
 from torch.amp import GradScaler, autocast
 import argparse
 from scipy import ndimage as measure
+from scipy.ndimage import binary_closing, binary_opening, binary_dilation, generate_binary_structure, gaussian_filter
 from torchvision import transforms
 import time  # Import time for performance measurement
 
@@ -56,7 +57,7 @@ class PerlinNoiseGenerator:
         D, H, W = shape
         
         # Print the volume size being generated
-        print(f"Generating noise for volume size: {D}x{H}x{W}")
+        # print(f"Generating noise for volume size: {D}x{H}x{W}")
         
         # Set random seed for reproducibility for this specific call
         torch.manual_seed(self.seed)
@@ -83,6 +84,10 @@ class PerlinNoiseGenerator:
         
         z_grid, y_grid, x_grid = torch.meshgrid(z, y, x, indexing='ij')
         
+        # Generate a random phase offset tensor for this specific noise generation
+        # This is crucial for making different seeds produce different patterns
+        random_tensor = torch.rand(3, 3, device=device)
+        
         # Generate noise by adding different frequency components
         for octave in range(self.octaves):
             # Calculate frequency and amplitude for this octave
@@ -94,28 +99,39 @@ class PerlinNoiseGenerator:
             phase_y = y_grid * freq
             phase_z = z_grid * freq
             
-            # Generate random gradient vectors for this octave
-            # We'll generate a set of random normalized gradients
-            # This is a simplified approach to generate Perlin-like noise using harmonic functions
+            # Use the random tensor to create truly random phase offsets based on the seed
+            phase_offset_x = random_tensor[0, 0] * 6.28 + octave * 0.5
+            phase_offset_y = random_tensor[0, 1] * 6.28 + octave * 1.2
+            phase_offset_z = random_tensor[0, 2] * 6.28 + octave * 0.8
             
-            # Add a phase offset for each octave to create variation
-            phase_offset = torch.tensor([octave * 0.5, octave * 1.2, octave * 0.8], device=device)
+            # We'll also randomize the frequency multipliers to get more varied patterns
+            freq_multiplier_x = 1.0 + random_tensor[1, 0] * 0.5
+            freq_multiplier_y = 1.0 + random_tensor[1, 1] * 0.5
+            freq_multiplier_z = 1.0 + random_tensor[1, 2] * 0.5
             
-            # Generate 3D noise using sine waves with different phases
-            noise_x = torch.sin(2 * np.pi * phase_x + phase_offset[0])
-            noise_y = torch.sin(2 * np.pi * phase_y + phase_offset[1])
-            noise_z = torch.sin(2 * np.pi * phase_z + phase_offset[2])
+            # Generate 3D noise using sine waves with randomized phases
+            noise_x = torch.sin(2 * np.pi * phase_x * freq_multiplier_x + phase_offset_x)
+            noise_y = torch.sin(2 * np.pi * phase_y * freq_multiplier_y + phase_offset_y)
+            noise_z = torch.sin(2 * np.pi * phase_z * freq_multiplier_z + phase_offset_z)
             
-            # Combine the noise patterns
-            noise = (noise_x + noise_y + noise_z) / 3.0
+            # Combine the noise patterns (with random weights)
+            weight_x = 0.3 + random_tensor[2, 0] * 0.4
+            weight_y = 0.3 + random_tensor[2, 1] * 0.4
+            weight_z = 0.3 + random_tensor[2, 2] * 0.4
+            weight_sum = weight_x + weight_y + weight_z
+            
+            noise = (noise_x * weight_x + noise_y * weight_y + noise_z * weight_z) / weight_sum
             
             # Add turbulence/distortion for more natural patterns
             if octave > 0:
-                distortion_x = torch.sin(2 * np.pi * phase_x * 1.7 + phase_offset[0])
-                distortion_y = torch.sin(2 * np.pi * phase_y * 1.7 + phase_offset[1])
-                distortion_z = torch.sin(2 * np.pi * phase_z * 1.7 + phase_offset[2])
+                turb_freq = 1.7 + random_tensor[1, 0] * 0.6  # Randomize turbulence frequency
+                distortion_x = torch.sin(2 * np.pi * phase_x * turb_freq + phase_offset_x)
+                distortion_y = torch.sin(2 * np.pi * phase_y * turb_freq + phase_offset_y)
+                distortion_z = torch.sin(2 * np.pi * phase_z * turb_freq + phase_offset_z)
                 
-                noise = noise + (distortion_x * distortion_y * distortion_z) * 0.3
+                # Make distortion smoother with higher octaves to reduce small isolated areas
+                distortion_factor = 0.3 * (1.0 / (octave + 1))
+                noise = noise + (distortion_x * distortion_y * distortion_z) * distortion_factor
             
             # Add weighted noise to the total
             result += noise * amplitude
@@ -123,7 +139,42 @@ class PerlinNoiseGenerator:
         # Normalize to [0, 1] range
         result = result / max_amplitude
         result = (result - result.min()) / (result.max() - result.min() + 1e-8)
-    
+        
+        # Apply gaussian smoothing to reduce small isolated regions
+        # This is a key step to reduce the number of small disconnected lesions
+        # We'll use 3D gaussian blur
+        kernel_size = 5
+        sigma = 1.0
+        
+        # Create a 3D Gaussian kernel
+        kernel_size = int(kernel_size)
+        # Ensure kernel_size is odd
+        if kernel_size % 2 == 0:
+            kernel_size = kernel_size + 1
+            
+        # Create a 1D Gaussian kernel
+        x = torch.arange(kernel_size, device=device) - (kernel_size - 1) / 2
+        kernel_1d = torch.exp(-0.5 * (x / sigma)**2)
+        kernel_1d = kernel_1d / kernel_1d.sum()
+        
+        # Expand to 3D
+        kernel_x = kernel_1d.view(1, 1, kernel_size, 1, 1).expand(1, 1, kernel_size, 1, 1)
+        kernel_y = kernel_1d.view(1, 1, 1, kernel_size, 1).expand(1, 1, 1, kernel_size, 1)
+        kernel_z = kernel_1d.view(1, 1, 1, 1, kernel_size).expand(1, 1, 1, 1, kernel_size)
+        
+        # Apply separable convolution for efficiency
+        result_temp = result.unsqueeze(0).unsqueeze(0)  # Add batch and channel dims [1,1,D,H,W]
+        result_temp = F.conv3d(result_temp, kernel_x, padding=(kernel_size//2, 0, 0))
+        result_temp = F.conv3d(result_temp, kernel_y, padding=(0, kernel_size//2, 0))
+        result_temp = F.conv3d(result_temp, kernel_z, padding=(0, 0, kernel_size//2))
+        
+        # Remove batch and channel dimensions
+        result = result_temp.squeeze(0).squeeze(0)
+        
+        # End timing and print the time taken
+        end_time = time.time()
+        elapsed_time = end_time - start_time
+        # print(f"Noise generation completed in {elapsed_time:.4f} seconds")
         
         return result
     
@@ -950,7 +1001,10 @@ def generate_lesions(
     perlin_octaves=4,
     perlin_persistence=0.5,
     perlin_lacunarity=2.0,
-    perlin_scale=0.1
+    perlin_scale=0.1,
+    min_lesion_size=10,  # Minimální velikost léze (v počtu voxelů)
+    smooth_sigma=0.5,    # Hodnota sigma pro vyhlazení lézí
+    morph_close_size=2   # Velikost strukturního elementu pro morfologickou operaci uzavření
 ):
     """
     Generate synthetic lesions using a trained GAN model
@@ -967,6 +1021,9 @@ def generate_lesions(
         perlin_persistence (float): Persistence parameter for Perlin noise
         perlin_lacunarity (float): Lacunarity parameter for Perlin noise
         perlin_scale (float): Scale parameter for Perlin noise
+        min_lesion_size (int): Minimální velikost léze v počtu voxelů (menší léze budou odstraněny)
+        smooth_sigma (float): Hodnota sigma pro vyhlazení lézí pomocí Gaussovského filtru
+        morph_close_size (int): Velikost strukturního elementu pro morfologickou operaci uzavření
     """
     # Validate input parameters
     if num_samples > 1 and output_dir is None:
@@ -988,6 +1045,9 @@ def generate_lesions(
     print(f"Perlin noise persistence: {perlin_persistence}")
     print(f"Perlin noise lacunarity: {perlin_lacunarity}")
     print(f"Perlin noise scale: {perlin_scale}")
+    print(f"Minimum lesion size: {min_lesion_size}")
+    print(f"Smoothing sigma: {smooth_sigma}")
+    print(f"Morphological closing size: {morph_close_size}")
     
     # Load the lesion atlas
     atlas_img = nib.load(lesion_atlas)
@@ -1075,7 +1135,7 @@ def generate_lesions(
                 perlin_scale_model = getattr(model, 'perlin_scale', perlin_scale)
                 
                 # Create a new seed for each sample for variation
-                seed = np.random.randint(0, 10000) + i
+                seed = np.random.randint(0, 10000) + i * 1013  # Použití většího offsetu pro větší variaci
                 
                 perlin_gen = PerlinNoiseGenerator(
                     octaves=perlin_octaves_model,
@@ -1104,12 +1164,37 @@ def generate_lesions(
             # Convert to numpy array
             fake_lesion_np = fake_lesion.squeeze().cpu().numpy()
             
-            # Binarize the lesion
+            # Apply Gaussian smoothing to reduce noise and small fragments
+            if smooth_sigma > 0:
+                fake_lesion_np = gaussian_filter(fake_lesion_np, sigma=smooth_sigma)
+            
+            # Binarize the lesion with threshold
             binary_lesion = (fake_lesion_np > threshold).astype(np.float32)
             
             # Ensure lesions only appear in regions with non-zero atlas values
             atlas_mask = atlas_data > 0
             binary_lesion = binary_lesion * atlas_mask
+            
+            # Apply morphological operations to remove small isolated regions and fill holes
+            if morph_close_size > 0:
+                struct = generate_binary_structure(3, 1)  # 6-connectivity
+                for _ in range(morph_close_size - 1):
+                    struct = binary_dilation(struct)
+                
+                # Close holes in the lesions
+                binary_lesion = binary_closing(binary_lesion, structure=struct)
+            
+            # Remove small isolated lesions
+            if min_lesion_size > 0:
+                labeled_array, num_features = measure.label(binary_lesion)
+                component_sizes = np.bincount(labeled_array.ravel())
+                # Set background (index 0) size to 0
+                if len(component_sizes) > 0:
+                    component_sizes[0] = 0
+                # Filter by size
+                too_small = component_sizes < min_lesion_size
+                too_small_mask = too_small[labeled_array]
+                binary_lesion[too_small_mask] = 0
             
             all_samples.append(binary_lesion)
             
