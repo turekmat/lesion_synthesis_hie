@@ -1069,8 +1069,8 @@ def compute_target_coverage_from_training(lesion_dir, sample_count=10):
 
 
 def find_adaptive_threshold(probability_map, target_coverage, atlas_mask=None, 
-                            initial_threshold=0.5, min_threshold=0.1, max_threshold=0.9, 
-                            max_iterations=20, tolerance=0.1):
+                            initial_threshold=0.5, min_threshold=0.00001, max_threshold=0.999, 
+                            max_iterations=50, tolerance=0.1):
     """
     Find the threshold value that produces lesions with coverage close to the target
     
@@ -1087,9 +1087,48 @@ def find_adaptive_threshold(probability_map, target_coverage, atlas_mask=None,
     Returns:
         tuple: (found_threshold, actual_coverage, binary_lesion)
     """
-    threshold = initial_threshold
+    # First, check if we need a very low threshold by testing the extremes
+    binary_high = (probability_map > max_threshold).astype(np.float32)
+    if atlas_mask is not None:
+        binary_high = binary_high * atlas_mask
+    coverage_high = compute_lesion_coverage(binary_high, atlas_mask)
+    
+    binary_low = (probability_map > min_threshold).astype(np.float32)
+    if atlas_mask is not None:
+        binary_low = binary_low * atlas_mask
+    coverage_low = compute_lesion_coverage(binary_low, atlas_mask)
+    
+    print(f"Coverage range: [{coverage_low:.4f}% at threshold {min_threshold}] - [{coverage_high:.4f}% at threshold {max_threshold}]")
+    
+    # Verify that the target is within the achievable range
+    if target_coverage > coverage_low:
+        print(f"Warning: Target coverage {target_coverage:.4f}% is higher than maximum possible coverage {coverage_low:.4f}%")
+        print(f"Using minimum threshold {min_threshold} to achieve maximum coverage")
+        return min_threshold, coverage_low, binary_low
+    
+    if target_coverage < coverage_high:
+        print(f"Warning: Target coverage {target_coverage:.4f}% is lower than minimum possible coverage {coverage_high:.4f}%")
+        print(f"Using maximum threshold {max_threshold} to achieve minimum coverage")
+        return max_threshold, coverage_high, binary_high
+    
+    # Initialize the binary search with a better initial guess
+    if coverage_low != coverage_high:
+        # Interpolate to get a better initial threshold based on linear mapping
+        # This helps to start closer to the target
+        ratio = (target_coverage - coverage_high) / (coverage_low - coverage_high)
+        threshold = min_threshold + ratio * (max_threshold - min_threshold)
+        threshold = max(min_threshold, min(max_threshold, threshold))  # Clamp
+    else:
+        threshold = initial_threshold
+    
+    print(f"Starting search with initial threshold {threshold:.6f}")
+    
     threshold_min = min_threshold
     threshold_max = max_threshold
+    
+    best_threshold = threshold
+    best_diff = float('inf')
+    best_binary = None
     
     for iteration in range(max_iterations):
         # Binarize the probability map with current threshold
@@ -1102,9 +1141,16 @@ def find_adaptive_threshold(probability_map, target_coverage, atlas_mask=None,
         # Compute current coverage
         current_coverage = compute_lesion_coverage(binary_lesion, atlas_mask)
         
+        # Track the best result so far
+        diff = abs(current_coverage - target_coverage)
+        if diff < best_diff:
+            best_diff = diff
+            best_threshold = threshold
+            best_binary = binary_lesion.copy()
+        
         # Check if we're close enough to the target
-        if abs(current_coverage - target_coverage) <= tolerance:
-            print(f"Found threshold {threshold:.4f} with coverage {current_coverage:.4f}% (target: {target_coverage:.4f}%)")
+        if diff <= tolerance:
+            print(f"Found threshold {threshold:.6f} with coverage {current_coverage:.4f}% (target: {target_coverage:.4f}%)")
             return threshold, current_coverage, binary_lesion
         
         # Adjust threshold using binary search
@@ -1117,16 +1163,16 @@ def find_adaptive_threshold(probability_map, target_coverage, atlas_mask=None,
             threshold_max = threshold
             threshold = (threshold + threshold_min) / 2
         
-        print(f"Iteration {iteration+1}: threshold={threshold:.4f}, coverage={current_coverage:.4f}%, target={target_coverage:.4f}%")
+        print(f"Iteration {iteration+1}: threshold={threshold:.6f}, coverage={current_coverage:.4f}%, target={target_coverage:.4f}%")
     
-    # If we exit the loop, use the last threshold
-    binary_lesion = (probability_map > threshold).astype(np.float32)
+    # If we exit the loop, use the best threshold found
+    binary_lesion = (probability_map > best_threshold).astype(np.float32)
     if atlas_mask is not None:
         binary_lesion = binary_lesion * atlas_mask
     current_coverage = compute_lesion_coverage(binary_lesion, atlas_mask)
     
-    print(f"Warning: Reached maximum iterations. Using threshold {threshold:.4f} with coverage {current_coverage:.4f}% (target: {target_coverage:.4f}%)")
-    return threshold, current_coverage, binary_lesion
+    print(f"Warning: Reached maximum iterations. Using best threshold {best_threshold:.6f} with coverage {current_coverage:.4f}% (target: {target_coverage:.4f}%)")
+    return best_threshold, current_coverage, binary_lesion
 
 
 def generate_lesions(
@@ -1146,7 +1192,10 @@ def generate_lesions(
     morph_close_size=2,     # Velikost strukturního elementu pro morfologickou operaci uzavření
     use_adaptive_threshold=False,  # Použít adaptivní threshold
     training_lesion_dir=None,      # Adresář s trénovacími lézemi
-    target_coverage=None          # Cílové pokrytí lézemi v procentech
+    target_coverage=None,          # Cílové pokrytí lézemi v procentech
+    min_adaptive_threshold=0.00001,  # Minimální hodnota pro adaptivní threshold
+    max_adaptive_threshold=0.999,    # Maximální hodnota pro adaptivní threshold
+    adaptive_threshold_iterations=50  # Maximální počet iterací pro hledání adaptivního thresholdu
 ):
     """
     Generate synthetic lesions using a trained GAN model
@@ -1170,6 +1219,9 @@ def generate_lesions(
         training_lesion_dir (str): Adresář s trénovacími lézemi, používá se pro výpočet cílového pokrytí
         target_coverage (float): Cílové pokrytí lézemi v procentech, pokud není zadáno a use_adaptive_threshold=True, 
                                  použije se průměrné pokrytí z training_lesion_dir
+        min_adaptive_threshold (float): Minimální hodnota thresholdu pro adaptivní prahování
+        max_adaptive_threshold (float): Maximální hodnota thresholdu pro adaptivní prahování
+        adaptive_threshold_iterations (int): Maximální počet iterací pro hledání adaptivního thresholdu
     """
     # Validate input parameters
     if num_samples > 1 and output_dir is None:
@@ -1202,6 +1254,8 @@ def generate_lesions(
             print(f"Training lesion directory: {training_lesion_dir}")
         if target_coverage is not None:
             print(f"Target coverage: {target_coverage}%")
+        print(f"Adaptive threshold range: [{min_adaptive_threshold}, {max_adaptive_threshold}]")
+        print(f"Adaptive threshold max iterations: {adaptive_threshold_iterations}")
     
     # Load the lesion atlas
     atlas_img = nib.load(lesion_atlas)
@@ -1285,8 +1339,19 @@ def generate_lesions(
     # Generate samples with different noise vectors
     all_samples = []
     
+    # Set master seed for the overall generation process
+    master_seed = np.random.randint(0, 1000000)
+    print(f"Using master seed: {master_seed} for overall generation process")
+    
     with torch.no_grad():
         for i in range(num_samples):
+            # Derive a unique seed for this sample using the master seed
+            sample_seed = (master_seed + i * 2053) % 1000000  # Use a large prime number (2053) for offset
+            np.random.seed(sample_seed)
+            torch.manual_seed(sample_seed)
+            
+            print(f"\nGenerating sample {i+1} with seed {sample_seed}")
+            
             # Create a random noise vector for this sample
             if model.use_noise:
                 # Initialize Perlin noise generator using parameters from checkpoint if available
@@ -1295,14 +1360,24 @@ def generate_lesions(
                 perlin_lacunarity_model = getattr(model, 'perlin_lacunarity', perlin_lacunarity)
                 perlin_scale_model = getattr(model, 'perlin_scale', perlin_scale)
                 
-                # Create a new seed for each sample for variation
-                seed = np.random.randint(0, 10000) + i * 1013  # Použití většího offsetu pro větší variaci
+                # Add more variation by slightly perturbing the noise parameters for each sample
+                # This helps create more diverse samples
+                sample_octaves = max(1, perlin_octaves_model + np.random.randint(-1, 2))  # +/- 1
+                sample_persistence = max(0.1, min(0.9, perlin_persistence_model + np.random.uniform(-0.1, 0.1)))
+                sample_lacunarity = max(1.0, min(3.0, perlin_lacunarity_model + np.random.uniform(-0.2, 0.2)))
+                sample_scale = max(0.05, min(0.3, perlin_scale_model + np.random.uniform(-0.03, 0.03)))
+                
+                print(f"  Sample-specific noise parameters: octaves={sample_octaves}, "
+                      f"persistence={sample_persistence:.3f}, lacunarity={sample_lacunarity:.3f}, scale={sample_scale:.3f}")
+                
+                # Create a new seed for Perlin that's different for each sample
+                perlin_seed = sample_seed ^ 0x55AA55AA  # XOR with a constant for more variation
                 
                 perlin_gen = PerlinNoiseGenerator(
-                    octaves=perlin_octaves_model,
-                    persistence=perlin_persistence_model,
-                    lacunarity=perlin_lacunarity_model,
-                    seed=seed
+                    octaves=sample_octaves,
+                    persistence=sample_persistence,
+                    lacunarity=sample_lacunarity,
+                    seed=perlin_seed
                 )
                 
                 # Generate Perlin noise for this sample
@@ -1310,7 +1385,7 @@ def generate_lesions(
                     batch_size=1, 
                     shape=(atlas_data.shape[0], atlas_data.shape[1], atlas_data.shape[2]),
                     noise_dim=model.noise_dim,
-                    scale=perlin_scale_model,
+                    scale=sample_scale,
                     device=device
                 )
             else:
@@ -1336,9 +1411,12 @@ def generate_lesions(
                     fake_lesion_np, 
                     target_coverage, 
                     atlas_mask,
-                    initial_threshold=threshold
+                    initial_threshold=threshold,
+                    min_threshold=min_adaptive_threshold,
+                    max_threshold=max_adaptive_threshold,
+                    max_iterations=adaptive_threshold_iterations
                 )
-                print(f"Sample {i+1}: Using threshold {found_threshold:.4f} with coverage {actual_coverage:.4f}%")
+                print(f"Sample {i+1}: Using threshold {found_threshold:.6f} with coverage {actual_coverage:.4f}%")
             else:
                 # Use fixed threshold
                 binary_lesion = (fake_lesion_np > threshold).astype(np.float32)
@@ -1452,55 +1530,54 @@ def generate_lesions(
 
 
 def main():
-    parser = argparse.ArgumentParser(description='SwinGAN for HIE Lesion Synthesis')
+    # Create argument parser
+    parser = argparse.ArgumentParser(description='SwinGAN - Synthetic Lesion Generator')
     subparsers = parser.add_subparsers(dest='mode', help='Mode of operation')
     
-    # Training subparser
-    train_parser = subparsers.add_parser('train', help='Train the SwinGAN model')
+    # Train mode
+    train_parser = subparsers.add_parser('train', help='Train a model')
+    
+    # Training arguments
     train_parser.add_argument('--lesion_dir', type=str, required=True, 
-                             help='Directory containing lesion .nii files for training')
+                             help='Directory containing lesion NIfTI files')
     train_parser.add_argument('--lesion_atlas', type=str, required=True, 
-                             help='Path to the lesion frequency atlas .nii file')
-    train_parser.add_argument('--output_dir', type=str, default='./swin_gan_output', 
-                             help='Output directory for saving model checkpoints')
-    train_parser.add_argument('--val_lesion_dir', type=str, default=None, 
-                             help='Directory containing lesion .nii files for validation')
-    train_parser.add_argument('--batch_size', type=int, default=2, 
+                             help='Path to lesion atlas (frequency map)')
+    train_parser.add_argument('--output_dir', type=str, required=True, 
+                             help='Directory to save model checkpoints and logs')
+    train_parser.add_argument('--batch_size', type=int, default=4, 
                              help='Batch size for training')
     train_parser.add_argument('--epochs', type=int, default=100, 
                              help='Number of epochs to train')
-    train_parser.add_argument('--lr_g', type=float, default=0.0002, 
+    train_parser.add_argument('--lr_g', type=float, default=1e-4, 
                              help='Learning rate for generator')
-    train_parser.add_argument('--lr_d', type=float, default=0.0001, 
+    train_parser.add_argument('--lr_d', type=float, default=4e-4, 
                              help='Learning rate for discriminator')
     train_parser.add_argument('--feature_size', type=int, default=24, 
                              help='Feature size for SwinUNETR')
     train_parser.add_argument('--dropout_rate', type=float, default=0.0, 
-                             help='Dropout rate for generator')
-    train_parser.add_argument('--lambda_focal', type=float, default=10.0, 
+                             help='Dropout rate for SwinUNETR')
+    train_parser.add_argument('--lambda_focal', type=float, default=1.0, 
                              help='Weight for focal loss')
-    train_parser.add_argument('--lambda_l1', type=float, default=5.0, 
+    train_parser.add_argument('--lambda_l1', type=float, default=10.0, 
                              help='Weight for L1 loss')
-    train_parser.add_argument('--lambda_fragmentation', type=float, default=50.0, 
-                             help='Weight for fragmentation loss - higher values promote more coherent lesions')
-    train_parser.add_argument('--fragmentation_kernel_size', type=int, default=5, 
-                             help='Size of kernel used for fragmentation loss - larger values promote larger coherent structures')
+    train_parser.add_argument('--lambda_fragmentation', type=float, default=1.0, 
+                             help='Weight for fragmentation loss')
     train_parser.add_argument('--focal_alpha', type=float, default=0.75, 
                              help='Alpha parameter for focal loss')
     train_parser.add_argument('--focal_gamma', type=float, default=2.0, 
                              help='Gamma parameter for focal loss')
-    train_parser.add_argument('--min_non_zero', type=float, default=0.000001, 
-                             help='Minimum percentage of non-zero voxels to include sample')
-    train_parser.add_argument('--generator_save_interval', type=int, default=4, 
-                             help='Interval for saving generator-only checkpoints')
-    train_parser.add_argument('--num_workers', type=int, default=4, 
-                             help='Number of workers for data loading')
+    train_parser.add_argument('--save_interval', type=int, default=10, 
+                             help='Interval for saving model checkpoints (epochs)')
+    train_parser.add_argument('--generator_save_interval', type=int, default=5, 
+                             help='Interval for saving generator checkpoints (epochs)')
+    train_parser.add_argument('--val_split', type=float, default=0.1, 
+                             help='Fraction of data to use for validation')
     train_parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu', 
                              help='Device to use (cuda or cpu)')
     train_parser.add_argument('--disable_amp', action='store_true', 
-                             help='Disable automatic mixed precision training')
-    train_parser.add_argument('--save_interval', type=int, default=5, 
-                             help='Interval for saving full model checkpoints')
+                             help='Disable automatic mixed precision')
+    train_parser.add_argument('--fragmentation_kernel_size', type=int, default=3, 
+                             help='Kernel size for fragmentation loss')
     train_parser.add_argument('--perlin_octaves', type=int, default=4, 
                              help='Number of octaves for Perlin noise (higher = more detail)')
     train_parser.add_argument('--perlin_persistence', type=float, default=0.5, 
@@ -1510,12 +1587,14 @@ def main():
     train_parser.add_argument('--perlin_scale', type=float, default=0.1, 
                              help='Scale parameter for Perlin noise (smaller = smoother)')
     
-    # Generation subparser
+    # Generate mode
     gen_parser = subparsers.add_parser('generate', help='Generate synthetic lesions')
+    
+    # Generation arguments
     gen_parser.add_argument('--model_checkpoint', type=str, required=True, 
-                           help='Path to the trained model checkpoint')
+                           help='Path to model checkpoint')
     gen_parser.add_argument('--lesion_atlas', type=str, required=True, 
-                           help='Path to the lesion frequency atlas .nii file')
+                           help='Path to lesion atlas (frequency map)')
     gen_parser.add_argument('--output_file', type=str, default=None,
                            help='Path to save the generated lesion .nii file (for single sample)')
     gen_parser.add_argument('--output_dir', type=str, default=None,
@@ -1548,6 +1627,12 @@ def main():
                            help='Directory with training lesions to compute target coverage')
     gen_parser.add_argument('--target_coverage', type=float, default=None,
                            help='Target lesion coverage percentage (if not specified, computed from training data)')
+    gen_parser.add_argument('--min_adaptive_threshold', type=float, default=0.00001,
+                           help='Minimum threshold value for adaptive thresholding')
+    gen_parser.add_argument('--max_adaptive_threshold', type=float, default=0.999,
+                           help='Maximum threshold value for adaptive thresholding')
+    gen_parser.add_argument('--adaptive_threshold_iterations', type=int, default=50,
+                           help='Maximum iterations for adaptive threshold search')
     
     args = parser.parse_args()
     
@@ -1572,7 +1657,10 @@ def main():
             morph_close_size=args.morph_close_size,
             use_adaptive_threshold=args.use_adaptive_threshold,
             training_lesion_dir=args.training_lesion_dir,
-            target_coverage=args.target_coverage
+            target_coverage=args.target_coverage,
+            min_adaptive_threshold=args.min_adaptive_threshold,
+            max_adaptive_threshold=args.max_adaptive_threshold,
+            adaptive_threshold_iterations=args.adaptive_threshold_iterations
         )
     else:
         parser.print_help()
