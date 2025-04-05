@@ -1806,6 +1806,8 @@ def main():
                              help='Directory containing lesion NIfTI files')
     train_parser.add_argument('--lesion_atlas', type=str, required=True, 
                              help='Path to lesion atlas (frequency map)')
+    train_parser.add_argument('--val_lesion_dir', type=str, default=None,
+                             help='Directory containing validation lesion NIfTI files (optional)')
     train_parser.add_argument('--output_dir', type=str, required=True, 
                              help='Directory to save model checkpoints and logs')
     train_parser.add_argument('--batch_size', type=int, default=4, 
