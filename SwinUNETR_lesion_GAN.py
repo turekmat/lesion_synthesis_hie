@@ -935,7 +935,7 @@ def connected_components_3d(binary_tensor):
     return output
 
 # Přidání Focal Loss pro lépe vyvážené generování lézí
-def compute_focal_loss(generated, atlas, gamma=2.0, alpha=0.75, min_prob=0.01):
+def compute_focal_loss(generated, atlas, gamma=2.0, alpha=0.8, min_prob=0.01):
     """
     Implementace Focal Loss pro lépe vyvážené generování lézí.
     Focal Loss se zaměřuje na obtížnější případy (méně zastoupené třídy) tím, že 
@@ -959,38 +959,50 @@ def compute_focal_loss(generated, atlas, gamma=2.0, alpha=0.75, min_prob=0.01):
     # Maska mozku - oblasti kde atlas má nenulovou pravděpodobnost
     brain_mask = (atlas > min_prob).float()
     
-    # Aplikace masky mozku na generované hodnoty
-    relevant_output = generated * brain_mask
+    # V generativním kontextu nepoužíváme atlas jako ground truth, ale jako vodítko
+    # Vytvoříme binární "cíl" na základě atlasu - oblasti s vyšší pravděpodobností
+    # jsou prioritizované pro generování lézí
+    target_prob = (atlas > 0.3).float()  # Binární cíl založený na pravděpodobnosti atlasu
     
-    # Počet relevantních voxelů v masce mozku
-    num_voxels = torch.sum(brain_mask) + 1e-8
+    # Pro stabilitu výpočtu - vyhnutí se log(0) a dalším numerickým problémům
+    eps = 1e-7
     
-    # Binary Cross Entropy komponenty
-    p_t = relevant_output
-    # Přidáme malou konstantu pro numerickou stabilitu
-    p_t = torch.clamp(p_t, 1e-7, 1.0 - 1e-7)
+    # Pravděpodobnosti predikce
+    p = generated
+    p = torch.clamp(p, eps, 1.0 - eps)
     
-    # Modulační faktor pro Focal Loss
-    modulating_factor = (1.0 - p_t)**gamma
+    # Pravděpodobnosti pro správnou třídu podle standardní definice Focal Loss
+    # p_t = p pro y=1 (pozitivní třída) a 1-p pro y=0 (negativní třída)
+    p_t = p * target_prob + (1 - p) * (1 - target_prob)
     
-    # Výpočet vážené BCE loss pro pozitivní voxely (kde by měly být léze podle atlasu)
-    # Vyšší pravděpodobnost v atlasu = vyšší váha při trénování
-    weights = brain_mask * atlas * alpha
+    # Alpha faktor - vyvážení kladných a záporných případů
+    # Pro generativní kontext používáme upravený alpha přístup, který zohledňuje atlas
+    alpha_t = alpha * target_prob + (1 - alpha) * (1 - target_prob)
     
-    # Normalizace vah
-    weights = weights / (torch.mean(weights) + 1e-8)
+    # Focal váhování - zaměření na obtížné případy
+    focal_weight = (1 - p_t) ** gamma
     
-    # Focal Loss - povzbuzuje generování lézí v relevantních oblastech
-    focal_loss = -weights * modulating_factor * torch.log(p_t)
-    focal_loss = torch.sum(focal_loss) / num_voxels
+    # Standardní Binary Cross Entropy
+    bce = -target_prob * torch.log(p) - (1 - target_prob) * torch.log(1 - p)
     
-    # Přidáme komponentu, která penalizuje generování lézí mimo relevantní oblasti
-    outside_loss = torch.sum(generated * (1.0 - brain_mask)) / (torch.sum(1.0 - brain_mask) + 1e-8)
+    # Focal Loss vzorec s alpha vyvážením
+    focal_loss = alpha_t * focal_weight * bce
     
-    # Kombinovaná ztráta
-    loss = focal_loss + 5.0 * outside_loss
+    # Aplikace masky mozku - počítáme loss pouze uvnitř mozku
+    masked_loss = focal_loss * brain_mask
     
-    return loss
+    # Průměrování přes všechny voxely mozku pro stabilnější hodnoty
+    batch_size = generated.size(0)
+    brain_voxels = torch.sum(brain_mask) + eps
+    
+    # Konečná hodnota Focal Loss
+    loss = torch.sum(masked_loss) / brain_voxels
+    
+    # Přidáme jemnou penalizaci za léze mimo mozek (mnohem menší váha)
+    outside_brain = generated * (1.0 - brain_mask)
+    outside_penalty = 0.1 * torch.sum(outside_brain) / (torch.sum(1.0 - brain_mask) + eps)
+    
+    return loss + outside_penalty
 
 # Upravení trénovací funkce pro použití Focal Loss
 def train(generator, discriminator, dataloader, num_epochs, device, output_dir):
