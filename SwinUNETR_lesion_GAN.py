@@ -583,76 +583,78 @@ def train(generator, discriminator, dataloader, num_epochs, device, output_dir):
             # Generujeme diverzní šum
             noise = generate_diverse_noise(batch_size=real_labels.size(0), device=device)
             
-            # ---------------------
-            # Trénování diskriminátoru
-            # ---------------------
-            optimizer_D.zero_grad()
-            
-            # Generování falešných vzorků
+            # Generování falešných vzorků (potřebujeme je pro oba módy tréninku)
             fake_labels = generator(noise, atlas)
             
-            # Wasserstein ztráta
-            real_validity = discriminator(real_labels, atlas)
-            fake_validity = discriminator(fake_labels.detach(), atlas)
-            
-            # Wasserstein loss s gradient penalty
-            d_loss = -torch.mean(real_validity) + torch.mean(fake_validity)
-            gradient_penalty = compute_gradient_penalty(discriminator, real_labels, fake_labels.detach(), atlas, device)
-            d_loss += lambda_gp * gradient_penalty
-            
-            d_loss.backward()
-            optimizer_D.step()
-            
             # ---------------------
-            # Trénování generátoru
+            # Trénování diskriminátoru - pouze každou třetí iteraci
             # ---------------------
-            if batch_idx % 5 == 0:  # Updatujeme generátor méně často
-                optimizer_G.zero_grad()
+            if batch_idx % 3 == 0:
+                optimizer_D.zero_grad()
                 
-                # Generujeme znovu vzorky pro trénink generátoru
+                # Wasserstein ztráta
+                real_validity = discriminator(real_labels, atlas)
+                fake_validity = discriminator(fake_labels.detach(), atlas)
+                
+                # Wasserstein loss s gradient penalty
+                d_loss = -torch.mean(real_validity) + torch.mean(fake_validity)
+                gradient_penalty = compute_gradient_penalty(discriminator, real_labels, fake_labels.detach(), atlas, device)
+                d_loss += lambda_gp * gradient_penalty
+                
+                d_loss.backward()
+                optimizer_D.step()
+                
+                epoch_d_loss += d_loss.item()
+            
+            # ---------------------
+            # Trénování generátoru - častěji než diskriminátor (každou iteraci)
+            # ---------------------
+            optimizer_G.zero_grad()
+            
+            # Generujeme znovu vzorky pro trénink generátoru (pokud je trénink diskriminátoru vypnutý v této iteraci)
+            if batch_idx % 3 != 0:
                 fake_labels = generator(noise, atlas)
-                fake_validity = discriminator(fake_labels, atlas)
                 
-                # Adversarial loss - chceme, aby diskriminátor označil generované vzorky jako reálné
-                g_adv_loss = -torch.mean(fake_validity)
-                
-                # Velikost lézí loss
-                size_loss = compute_lesion_size_loss(fake_labels, atlas)
-                
-                # Anatomická konzistence
-                anatomical_loss = compute_anatomical_consistency_loss(fake_labels, atlas)
-                
-                # Pokrytí lézí v požadovaném rozsahu
-                coverage_loss = compute_coverage_loss(fake_labels, atlas)
-                
-                # NOVĚ: Atlas-guided loss pro jemné navádění k pravděpodobnějším oblastem
-                atlas_guidance_loss = compute_atlas_guidance_loss(fake_labels, atlas)
-                epoch_atlas_guidance_loss += atlas_guidance_loss.item()
-                
-                # Celková ztráta generátoru
-                g_loss = g_adv_loss + lambda_size * size_loss + lambda_anatomical * anatomical_loss + \
-                         lambda_coverage * coverage_loss + lambda_atlas_guidance * atlas_guidance_loss
-                
-                g_loss.backward()
-                optimizer_G.step()
-                
-                epoch_g_loss += g_loss.item()
-                
-                # Monitorování pokrytí lézí
-                coverage_info = calculate_lesion_coverage(fake_labels.detach(), atlas)
-                
-                # Zápis do logu
-                with open(coverage_log_path, 'a') as f:
-                    for i, info in enumerate(coverage_info):
-                        f.write(f"{epoch+1},{batch_idx},{i},{info['coverage_percentage']:.4f},{info['num_components']},{info['avg_lesion_size']:.4f}\n")
-                        epoch_coverage_sum += info['coverage_percentage']
-                        epoch_samples += 1
+            fake_validity = discriminator(fake_labels, atlas)
             
-            epoch_d_loss += d_loss.item()
+            # Adversarial loss - chceme, aby diskriminátor označil generované vzorky jako reálné
+            g_adv_loss = -torch.mean(fake_validity)
+            
+            # Velikost lézí loss
+            size_loss = compute_lesion_size_loss(fake_labels, atlas)
+            
+            # Anatomická konzistence
+            anatomical_loss = compute_anatomical_consistency_loss(fake_labels, atlas)
+            
+            # Pokrytí lézí v požadovaném rozsahu
+            coverage_loss = compute_coverage_loss(fake_labels, atlas)
+            
+            # NOVĚ: Atlas-guided loss pro jemné navádění k pravděpodobnějším oblastem
+            atlas_guidance_loss = compute_atlas_guidance_loss(fake_labels, atlas)
+            epoch_atlas_guidance_loss += atlas_guidance_loss.item()
+            
+            # Celková ztráta generátoru
+            g_loss = g_adv_loss + lambda_size * size_loss + lambda_anatomical * anatomical_loss + \
+                     lambda_coverage * coverage_loss + lambda_atlas_guidance * atlas_guidance_loss
+            
+            g_loss.backward()
+            optimizer_G.step()
+            
+            epoch_g_loss += g_loss.item()
+            
+            # Monitorování pokrytí lézí
+            coverage_info = calculate_lesion_coverage(fake_labels.detach(), atlas)
+            
+            # Zápis do logu
+            with open(coverage_log_path, 'a') as f:
+                for i, info in enumerate(coverage_info):
+                    f.write(f"{epoch+1},{batch_idx},{i},{info['coverage_percentage']:.4f},{info['num_components']},{info['avg_lesion_size']:.4f}\n")
+                    epoch_coverage_sum += info['coverage_percentage']
+                    epoch_samples += 1
         
         # Průměrné ztráty za epochu
         avg_g_loss = epoch_g_loss / len(dataloader)
-        avg_d_loss = epoch_d_loss / len(dataloader)
+        avg_d_loss = epoch_d_loss / max(1, len(dataloader) // 3)  # Upraveno pro méně časté trénování diskriminátoru
         avg_coverage = epoch_coverage_sum / max(1, epoch_samples)
         avg_atlas_guidance_loss = epoch_atlas_guidance_loss / len(dataloader)
         
