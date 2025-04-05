@@ -531,7 +531,10 @@ def compute_atlas_guidance_loss(generated, atlas):
                 loss += correction
     
     # Vrátíme jako PyTorch tensor místo float hodnoty
-    return torch.tensor(loss / batch_size, device=generated.device)
+    if isinstance(loss, torch.Tensor):
+        return loss / batch_size
+    else:
+        return torch.tensor(loss, device=generated.device) / batch_size
 
 # Trénovací funkce
 def train(generator, discriminator, dataloader, num_epochs, device, output_dir):
@@ -557,8 +560,8 @@ def train(generator, discriminator, dataloader, num_epochs, device, output_dir):
     lambda_gp = 10.0
     lambda_size = 2.0
     lambda_anatomical = 5.0
-    lambda_coverage = 5.0  # Koeficient pro váhu coverage_loss
-    lambda_atlas_guidance = 1.0  # Nízká hodnota pro jemné navádění, ne striktní vynucování
+    lambda_coverage = 2.0  # Snížit z 5.0
+    lambda_atlas_guidance = 3.0  # Zvýšit z 1.0
     
     # Statistiky pro vykreslení
     g_losses = []
