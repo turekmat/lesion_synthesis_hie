@@ -293,15 +293,15 @@ def compute_anatomical_consistency_loss(generated, atlas):
     
     return loss
 
-def compute_coverage_loss(generated, atlas, min_coverage=0.0001, max_coverage=0.03):
+def compute_coverage_loss(generated, atlas, min_coverage=0.01, max_coverage=3.0):
     """
     Penalizuje léze s celkovým pokrytím mimo požadovaný rozsah (0.01% - 3%)
     
     Args:
         generated: Generovaný výstup modelu
-        atlas: Atlas definující povolené oblasti pro léze
-        min_coverage: Minimální akceptované pokrytí (0.01% = 0.0001)
-        max_coverage: Maximální akceptované pokrytí (3% = 0.03)
+        atlas: Atlas definující povolené oblasti pro léze (funguje jako maska mozku)
+        min_coverage: Minimální akceptované pokrytí (0.01%)
+        max_coverage: Maximální akceptované pokrytí (3%)
     
     Returns:
         Penalizační loss pro pokrytí mimo požadovaný rozsah
@@ -309,19 +309,19 @@ def compute_coverage_loss(generated, atlas, min_coverage=0.0001, max_coverage=0.
     # Binarizace generovaného výstupu
     binary = (generated > 0.5).float()
     
-    # Maska atlasu
-    atlas_mask = (atlas > 0.01).float()
+    # Maska mozku - atlas slouží jako maska mozku
+    brain_mask = (atlas > 0.01).float()
     
     batch_size = generated.size(0)
     loss = 0.0
     
     for i in range(batch_size):
-        # Výpočet celkového pokrytí v rámci atlasu
-        total_atlas_voxels = torch.sum(atlas_mask[i])
-        lesion_voxels = torch.sum(binary[i] * atlas_mask[i])
+        # Výpočet celkového pokrytí v rámci mozku
+        total_brain_voxels = torch.sum(brain_mask[i])
+        lesion_voxels = torch.sum(binary[i] * brain_mask[i])  # Počítáme pouze léze uvnitř mozku
         
-        if total_atlas_voxels > 0:
-            coverage_ratio = lesion_voxels / total_atlas_voxels
+        if total_brain_voxels > 0:
+            coverage_ratio = (lesion_voxels / total_brain_voxels) * 100  # Převedeno na procenta
             
             # Penalizace pokud je pokrytí mimo požadovaný rozsah
             if coverage_ratio < min_coverage:
@@ -363,11 +363,11 @@ def generate_diverse_noise(batch_size=1, z_dim=100, device=None):
 # Vylepšení: Přidání funkce pro výpočet pokrytí lézí pro monitorování
 def calculate_lesion_coverage(generated, atlas):
     """
-    Vypočítá pokrytí lézí v rámci atlasu
+    Vypočítá pokrytí lézí v rámci mozku
     
     Args:
         generated: Generovaný výstup modelu
-        atlas: Atlas definující povolené oblasti pro léze
+        atlas: Atlas definující povolené oblasti pro léze (funguje jako maska mozku)
     
     Returns:
         Dictionary s informacemi o pokrytí a počtu lézí
@@ -375,29 +375,30 @@ def calculate_lesion_coverage(generated, atlas):
     # Binarizace generovaného výstupu
     binary = (generated > 0.5).float()
     
-    # Maska atlasu
-    atlas_mask = (atlas > 0.01).float()
+    # Maska mozku - atlas slouží jako maska mozku
+    brain_mask = (atlas > 0.001).float()
     
     batch_size = generated.size(0)
     results = []
     
     for i in range(batch_size):
-        # Výpočet celkového pokrytí v rámci atlasu
+        # Výpočet celkového pokrytí v rámci mozku
         bin_mask = binary[i, 0].cpu().numpy()
-        atlas_np = atlas_mask[i, 0].cpu().numpy()
+        brain_np = brain_mask[i, 0].cpu().numpy()
         
-        total_atlas_voxels = np.sum(atlas_np)
-        lesion_voxels = np.sum(bin_mask * atlas_np)
+        total_brain_voxels = np.sum(brain_np)
+        lesion_voxels = np.sum(bin_mask * brain_np)  # Počítáme pouze léze uvnitř mozku
         
-        if total_atlas_voxels > 0:
-            coverage_percentage = (lesion_voxels / total_atlas_voxels) * 100
+        if total_brain_voxels > 0:
+            coverage_percentage = (lesion_voxels / total_brain_voxels) * 100  # Převedeno na procenta
         else:
             coverage_percentage = 0.0
         
         # Výpočet počtu komponent a jejich velikostí
-        labeled, num_components = ndimage.label(bin_mask)
+        bin_mask_in_brain = bin_mask * brain_np  # Léze pouze uvnitř mozku
+        labeled, num_components = ndimage.label(bin_mask_in_brain)
         if num_components > 0:
-            component_sizes = ndimage.sum(bin_mask, labeled, range(1, num_components+1))
+            component_sizes = ndimage.sum(bin_mask_in_brain, labeled, range(1, num_components+1))
             avg_size = np.mean(component_sizes) if len(component_sizes) > 0 else 0
         else:
             avg_size = 0
@@ -409,6 +410,58 @@ def calculate_lesion_coverage(generated, atlas):
         })
     
     return results
+
+# Přidání nové ztrátové funkce pro atlas-guided generování
+def compute_atlas_guidance_loss(generated, atlas):
+    """
+    Jemně navádí generátor k preferování oblastí s vyšší pravděpodobností v atlasu.
+    Implementována jako lehká korekce, nikoliv striktní omezení.
+    
+    Hodnoty v atlasu se pohybují v rozmezí:
+    - Min (nenulová): 6.12e-07
+    - Max: 0.326
+    - Průměr: 0.093
+    
+    Args:
+        generated: Generovaný výstup modelu
+        atlas: Atlas definující pravděpodobnost výskytu lézí v různých oblastech
+    
+    Returns:
+        Lehký naváděcí signál pro generátor
+    """
+    # Binarizace generovaného výstupu
+    binary = (generated > 0.5).float()
+    
+    batch_size = generated.size(0)
+    loss = 0.0
+    
+    for i in range(batch_size):
+        # Oblasti, kde jsou generovány léze
+        lesion_areas = binary[i]
+        
+        if torch.sum(lesion_areas) > 0:
+            # Průměrná pravděpodobnost v atlasu v místech, kde jsou generovány léze
+            avg_atlas_prob = torch.sum(atlas[i] * lesion_areas) / torch.sum(lesion_areas)
+            
+            # Průměrná pravděpodobnost v celém atlasu (pro normalizaci)
+            # Bereme v úvahu pouze nenulové hodnoty atlasu
+            atlas_mask = (atlas[i] > 0.001).float()
+            avg_atlas_overall = torch.sum(atlas[i] * atlas_mask) / (torch.sum(atlas_mask) + 1e-8)
+            
+            # Relativní skóre - jak moc se generované léze vyhýbají pravděpodobným oblastem
+            # Čím nižší skóre, tím více jsou léze v méně pravděpodobných oblastech
+            relative_score = avg_atlas_prob / (avg_atlas_overall + 1e-8)
+            
+            # Vzhledem k tomu, že průměrná hodnota atlasu je 0.093 a max je 0.326,
+            # upravíme práh pro relativní skóre na 0.5 místo 0.8
+            # To znamená, že penalizujeme pouze když je průměrná pravděpodobnost
+            # v lézích méně než polovina průměrné pravděpodobnosti v atlasu
+            if relative_score < 0.5:
+                # Použijeme mírnější lineární penalizaci s malým kvadratickým prvkem
+                correction = 0.2 * (0.5 - relative_score) + 0.1 * ((0.5 - relative_score) ** 2)
+                loss += correction
+    
+    return loss / batch_size
 
 # Trénovací funkce
 def train(generator, discriminator, dataloader, num_epochs, device, output_dir):
@@ -434,16 +487,19 @@ def train(generator, discriminator, dataloader, num_epochs, device, output_dir):
     lambda_size = 2.0
     lambda_anatomical = 5.0
     lambda_coverage = 5.0  # Koeficient pro váhu coverage_loss
+    lambda_atlas_guidance = 1.0  # Nízká hodnota pro jemné navádění, ne striktní vynucování
     
     # Statistiky pro vykreslení
     g_losses = []
     d_losses = []
     coverage_stats = []  # Pro sledování pokrytí lézí
+    atlas_guidance_losses = []  # Pro sledování efektivity navádění atlasem
     
     for epoch in range(num_epochs):
         epoch_g_loss = 0.0
         epoch_d_loss = 0.0
         epoch_coverage_sum = 0.0
+        epoch_atlas_guidance_loss = 0.0
         epoch_samples = 0
         
         for batch_idx, batch in enumerate(tqdm(dataloader, desc=f"Epoch {epoch+1}/{num_epochs}")):
@@ -492,11 +548,16 @@ def train(generator, discriminator, dataloader, num_epochs, device, output_dir):
                 # Anatomická konzistence
                 anatomical_loss = compute_anatomical_consistency_loss(fake_labels, atlas)
                 
-                # NOVÁ LOSS: Pokrytí lézí v požadovaném rozsahu (0.01% - 3%)
+                # Pokrytí lézí v požadovaném rozsahu
                 coverage_loss = compute_coverage_loss(fake_labels, atlas)
                 
+                # NOVĚ: Atlas-guided loss pro jemné navádění k pravděpodobnějším oblastem
+                atlas_guidance_loss = compute_atlas_guidance_loss(fake_labels, atlas)
+                epoch_atlas_guidance_loss += atlas_guidance_loss.item()
+                
                 # Celková ztráta generátoru
-                g_loss = g_adv_loss + lambda_size * size_loss + lambda_anatomical * anatomical_loss + lambda_coverage * coverage_loss
+                g_loss = g_adv_loss + lambda_size * size_loss + lambda_anatomical * anatomical_loss + \
+                         lambda_coverage * coverage_loss + lambda_atlas_guidance * atlas_guidance_loss
                 
                 g_loss.backward()
                 optimizer_G.step()
@@ -519,12 +580,14 @@ def train(generator, discriminator, dataloader, num_epochs, device, output_dir):
         avg_g_loss = epoch_g_loss / len(dataloader)
         avg_d_loss = epoch_d_loss / len(dataloader)
         avg_coverage = epoch_coverage_sum / max(1, epoch_samples)
+        avg_atlas_guidance_loss = epoch_atlas_guidance_loss / len(dataloader)
         
         g_losses.append(avg_g_loss)
         d_losses.append(avg_d_loss)
         coverage_stats.append(avg_coverage)
+        atlas_guidance_losses.append(avg_atlas_guidance_loss)
         
-        print(f"Epoch {epoch+1}/{num_epochs} - D Loss: {avg_d_loss:.4f}, G Loss: {avg_g_loss:.4f}, Avg Coverage: {avg_coverage:.4f}%")
+        print(f"Epoch {epoch+1}/{num_epochs} - D Loss: {avg_d_loss:.4f}, G Loss: {avg_g_loss:.4f}, Avg Coverage: {avg_coverage:.4f}%, Atlas Guidance: {avg_atlas_guidance_loss:.4f}")
         
         # Uložení checkpointu
         if (epoch + 1) % 5 == 0 or epoch == num_epochs - 1:
@@ -541,10 +604,10 @@ def train(generator, discriminator, dataloader, num_epochs, device, output_dir):
             save_samples(generator, dataloader, device, epoch, os.path.join(output_dir, 'samples'))
     
     # Vykreslení průběhu ztrát
-    plt.figure(figsize=(15, 5))
+    plt.figure(figsize=(15, 10))
     
     # Plot 1: Ztráty
-    plt.subplot(1, 2, 1)
+    plt.subplot(2, 2, 1)
     plt.plot(g_losses, label='Generator Loss')
     plt.plot(d_losses, label='Discriminator Loss')
     plt.xlabel('Epoch')
@@ -553,7 +616,7 @@ def train(generator, discriminator, dataloader, num_epochs, device, output_dir):
     plt.title('Training Losses')
     
     # Plot 2: Pokrytí lézí
-    plt.subplot(1, 2, 2)
+    plt.subplot(2, 2, 2)
     plt.plot(coverage_stats, label='Average Lesion Coverage (%)', color='green')
     plt.axhline(y=0.01, color='r', linestyle='--', label='Min Target (0.01%)')
     plt.axhline(y=3.0, color='r', linestyle='--', label='Max Target (3.0%)')
@@ -561,6 +624,14 @@ def train(generator, discriminator, dataloader, num_epochs, device, output_dir):
     plt.ylabel('Lesion Coverage (%)')
     plt.legend()
     plt.title('Average Lesion Coverage')
+    
+    # Plot 3: Atlas Guidance Loss
+    plt.subplot(2, 2, 3)
+    plt.plot(atlas_guidance_losses, label='Atlas Guidance Loss', color='purple')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.title('Atlas Guidance Loss (Lower is Better)')
     
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, 'training_stats.png'))
@@ -593,6 +664,17 @@ def save_samples(generator, dataloader, device, epoch, output_dir):
         fake_np = fake_labels[0, 0].cpu().numpy()
         atlas_np = atlas[0, 0].cpu().numpy()
         
+        # Výpočet skóre atlas guidance pro vizualizaci
+        binary = (fake_labels > 0.5).float()
+        lesion_areas = binary[0]
+        
+        atlas_guidance_score = 0.0
+        if torch.sum(lesion_areas) > 0:
+            avg_atlas_prob = torch.sum(atlas[0] * lesion_areas) / torch.sum(lesion_areas)
+            atlas_mask = (atlas[0] > 0.01).float()
+            avg_atlas_overall = torch.sum(atlas[0] * atlas_mask) / (torch.sum(atlas_mask) + 1e-8)
+            atlas_guidance_score = (avg_atlas_prob / (avg_atlas_overall + 1e-8)).item()
+        
         # Najdeme střední řez nebo řez s největším obsahem léze
         mid_z = fake_np.shape[2] // 2
         if np.sum(fake_np[:, :, mid_z]) < 1:
@@ -604,8 +686,11 @@ def save_samples(generator, dataloader, device, epoch, output_dir):
         # Vizualizace
         fig, axes = plt.subplots(1, 3, figsize=(15, 5))
         
-        axes[0].imshow(atlas_np[:, :, mid_z], cmap='viridis')
-        axes[0].set_title('Lesion Atlas')
+        # Atlas s překryvem generovaných lézí
+        axes[0].imshow(atlas_np[:, :, mid_z], cmap='viridis', alpha=0.7)
+        binary_np = (fake_np > 0.5).astype(float)
+        axes[0].imshow(binary_np[:, :, mid_z], cmap='gray', alpha=0.5)
+        axes[0].set_title(f'Atlas s lézemi\nAtlas Guidance Score: {atlas_guidance_score:.2f}')
         axes[0].axis('off')
         
         axes[1].imshow(real_np[:, :, mid_z], cmap='gray')
@@ -614,7 +699,9 @@ def save_samples(generator, dataloader, device, epoch, output_dir):
         
         axes[2].imshow(fake_np[:, :, mid_z], cmap='gray')
         sample_info = coverage_info[0]
-        axes[2].set_title(f'Generated Label\nCoverage: {sample_info["coverage_percentage"]:.2f}%, Lesions: {sample_info["num_components"]}')
+        is_in_range = 0.01 <= sample_info["coverage_percentage"] <= 3.0
+        range_status = "✓" if is_in_range else "✗"
+        axes[2].set_title(f'Generated Label\nCoverage: {sample_info["coverage_percentage"]:.2f}% {range_status}, Lesions: {sample_info["num_components"]}')
         axes[2].axis('off')
         
         plt.tight_layout()
@@ -624,10 +711,12 @@ def save_samples(generator, dataloader, device, epoch, output_dir):
         # Vytvoření log souboru s detaily
         with open(os.path.join(output_dir, f'sample_epoch_{epoch+1}_details.txt'), 'w') as f:
             for i, info in enumerate(coverage_info):
+                is_in_range = 0.01 <= info["coverage_percentage"] <= 3.0
                 f.write(f"Sample {i+1}:\n")
-                f.write(f"  Coverage: {info['coverage_percentage']:.4f}%\n")
+                f.write(f"  Coverage: {info['coverage_percentage']:.4f}% ({'v požadovaném rozmezí' if is_in_range else 'mimo požadované rozmezí'})\n")
                 f.write(f"  Number of lesions: {info['num_components']}\n")
-                f.write(f"  Average lesion size: {info['avg_lesion_size']:.4f} voxels\n\n")
+                f.write(f"  Average lesion size: {info['avg_lesion_size']:.4f} voxels\n")
+                f.write(f"  Atlas Guidance Score: {atlas_guidance_score:.4f} (>1.0 znamená léze v pravděpodobnějších oblastech)\n\n")
     
     generator.train()
 
@@ -637,7 +726,7 @@ def generate_samples(model_path, lesion_atlas_path, output_dir, num_samples=10, 
     set_seed(42)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    # Načtení atlasu
+    # Načtení atlasu (který slouží i jako maska mozku)
     atlas_nii = nib.load(lesion_atlas_path)
     atlas_data = atlas_nii.get_fdata()
     atlas_affine = atlas_nii.affine
@@ -662,10 +751,12 @@ def generate_samples(model_path, lesion_atlas_path, output_dir, num_samples=10, 
     # Vytvoření souboru pro sledování statistik
     stats_file = os.path.join(output_dir, 'lesion_statistics.csv')
     with open(stats_file, 'w') as f:
-        f.write("sample,coverage_percentage,num_components,avg_lesion_size,is_in_target_range\n")
+        f.write("sample,coverage_percentage,num_components,avg_lesion_size,is_in_target_range,atlas_guidance_score\n")
     
     # Generování vzorků
     all_coverages = []
+    all_atlas_scores = []
+    
     for i in range(num_samples):
         with torch.no_grad():
             # Různé varianty šumu pro diverzitu
@@ -684,9 +775,22 @@ def generate_samples(model_path, lesion_atlas_path, output_dir, num_samples=10, 
             is_in_range = 0.01 <= coverage_percentage <= 3.0
             all_coverages.append(coverage_percentage)
             
+            # Výpočet skóre atlas guidance pro statistiku
+            binary = (fake_label > 0.5).float()
+            lesion_areas = binary[0]
+            
+            atlas_guidance_score = 0.0
+            if torch.sum(lesion_areas) > 0:
+                avg_atlas_prob = torch.sum(atlas_tensor[0] * lesion_areas) / torch.sum(lesion_areas)
+                atlas_mask = (atlas_tensor[0] > 0.01).float()
+                avg_atlas_overall = torch.sum(atlas_tensor[0] * atlas_mask) / (torch.sum(atlas_mask) + 1e-8)
+                atlas_guidance_score = (avg_atlas_prob / (avg_atlas_overall + 1e-8)).item()
+            
+            all_atlas_scores.append(atlas_guidance_score)
+            
             # Zápis do statistického souboru
             with open(stats_file, 'a') as f:
-                f.write(f"{i+1},{coverage_percentage:.4f},{num_components},{avg_size:.4f},{is_in_range}\n")
+                f.write(f"{i+1},{coverage_percentage:.4f},{num_components},{avg_size:.4f},{is_in_range},{atlas_guidance_score:.4f}\n")
             
             # Převod na numpy
             fake_np_raw = fake_label[0, 0].cpu().numpy()
@@ -697,6 +801,7 @@ def generate_samples(model_path, lesion_atlas_path, output_dir, num_samples=10, 
             # Výpis informací o vzorku
             print(f"Vzorek {i+1}: {num_components} lézí, průměrná velikost: {avg_size:.2f}, pokrytí: {coverage_percentage:.4f}%")
             print(f"  Pokrytí v cílovém rozsahu (0.01% - 3.0%): {'Ano' if is_in_range else 'Ne'}")
+            print(f"  Atlas Guidance Score: {atlas_guidance_score:.4f} (>1.0 znamená léze v pravděpodobnějších oblastech)")
             
             # Uložení jako NIfTI
             fake_nii = nib.Nifti1Image(fake_np, atlas_affine)
@@ -712,16 +817,25 @@ def generate_samples(model_path, lesion_atlas_path, output_dir, num_samples=10, 
                     mid_z = np.argmax(z_sums)
             
             # Uložení obrázku pro rychlou kontrolu
-            plt.figure(figsize=(10, 5))
+            plt.figure(figsize=(15, 5))
             
-            plt.subplot(1, 2, 1)
+            # Plot 1: Generované léze
+            plt.subplot(1, 3, 1)
             plt.imshow(fake_np[:, :, mid_z], cmap='gray')
             plt.title(f'Sample {i+1} - Axial Slice {mid_z}\nCoverage: {coverage_percentage:.2f}%, Lesions: {num_components}')
             plt.axis('off')
             
-            # Sagitální řez
+            # Plot 2: Atlas s překryvem generovaných lézí
+            plt.subplot(1, 3, 2)
+            atlas_slice = atlas_data[:, :, mid_z]
+            plt.imshow(atlas_slice, cmap='viridis', alpha=0.7)
+            plt.imshow(fake_np[:, :, mid_z], cmap='gray', alpha=0.5)
+            plt.title(f'Atlas s lézemi\nAtlas Guidance Score: {atlas_guidance_score:.2f}')
+            plt.axis('off')
+            
+            # Plot 3: Sagitální řez
             mid_y = fake_np.shape[1] // 2
-            plt.subplot(1, 2, 2)
+            plt.subplot(1, 3, 3)
             plt.imshow(fake_np[:, mid_y, :], cmap='gray')
             plt.title(f'Sagittal Slice {mid_y}')
             plt.axis('off')
@@ -732,22 +846,39 @@ def generate_samples(model_path, lesion_atlas_path, output_dir, num_samples=10, 
     
     # Souhrnné statistiky
     in_range_count = sum(1 for c in all_coverages if 0.01 <= c <= 3.0)
+    avg_atlas_score = sum(all_atlas_scores) / len(all_atlas_scores) if all_atlas_scores else 0
     
     # Vytvoření histogramu pokrytí
-    plt.figure(figsize=(10, 6))
+    plt.figure(figsize=(15, 10))
+    
+    # Plot 1: Histogram pokrytí
+    plt.subplot(2, 1, 1)
     plt.hist(all_coverages, bins=20, color='skyblue', edgecolor='black')
     plt.axvline(x=0.01, color='r', linestyle='--', label='Min Target (0.01%)')
     plt.axvline(x=3.0, color='r', linestyle='--', label='Max Target (3.0%)')
-    plt.xlabel('Lesion Coverage (%)')
+    plt.xlabel('Lesion Coverage (% of Brain Volume)')
     plt.ylabel('Number of Samples')
     plt.title(f'Lesion Coverage Distribution\n{in_range_count}/{num_samples} samples in target range (0.01% - 3.0%)')
     plt.legend()
     plt.grid(True, alpha=0.3)
-    plt.savefig(os.path.join(output_dir, 'coverage_distribution.png'))
+    
+    # Plot 2: Histogram atlas guidance skóre
+    plt.subplot(2, 1, 2)
+    plt.hist(all_atlas_scores, bins=20, color='lightgreen', edgecolor='black')
+    plt.axvline(x=1.0, color='r', linestyle='--', label='Neutral (1.0)')
+    plt.xlabel('Atlas Guidance Score')
+    plt.ylabel('Number of Samples')
+    plt.title(f'Atlas Guidance Score Distribution\nAverage Score: {avg_atlas_score:.4f} (>1.0 znamená léze v pravděpodobnějších oblastech)')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'statistics.png'))
     plt.close()
     
     print(f"Vygenerováno {num_samples} vzorků v adresáři {output_dir}")
     print(f"Vzorky v cílovém rozsahu pokrytí (0.01% - 3.0%): {in_range_count}/{num_samples} ({in_range_count/num_samples*100:.1f}%)")
+    print(f"Průměrné Atlas Guidance Score: {avg_atlas_score:.4f} (>1.0 znamená léze v pravděpodobnějších oblastech)")
 
 # Hlavní funkce
 def main(args):
