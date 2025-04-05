@@ -123,11 +123,7 @@ class PerlinNoiseGenerator:
         # Normalize to [0, 1] range
         result = result / max_amplitude
         result = (result - result.min()) / (result.max() - result.min() + 1e-8)
-        
-        # End timing and print the time taken
-        end_time = time.time()
-        elapsed_time = end_time - start_time
-        print(f"Noise generation completed in {elapsed_time:.4f} seconds")
+    
         
         return result
     
