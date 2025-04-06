@@ -1578,8 +1578,45 @@ def generate_lesions(
     checkpoint = torch.load(model_checkpoint, map_location=device)
     if 'model_state_dict' in checkpoint:
         model.load_state_dict(checkpoint['model_state_dict'])
+    elif 'generator_state_dict' in checkpoint:
+        # Starší formát checkpointu, který ukládá pouze generátor
+        model.generator.load_state_dict(checkpoint['generator_state_dict'])
+        print("Loaded generator weights from checkpoint")
+    elif isinstance(checkpoint, dict) and all(k in checkpoint for k in ['epoch', 'generator_state_dict']):
+        # Training loop checkpoint
+        model.generator.load_state_dict(checkpoint['generator_state_dict'])
+        print(f"Loaded generator weights from epoch {checkpoint.get('epoch', 'unknown')}")
     else:
-        model.load_state_dict(checkpoint)
+        try:
+            # Zkusit načíst jako přímý state_dict
+            model.load_state_dict(checkpoint)
+        except Exception as e:
+            print(f"Error loading checkpoint: {e}")
+            print("Trying to load partial weights...")
+            
+            # Pokud selže, pokusíme se načíst pouze dostupné parametry
+            model_dict = model.state_dict()
+            
+            # Filtrujeme state_dict na klíče, které existují v našem modelu
+            pretrained_dict = {k: v for k, v in checkpoint.items() if k in model_dict}
+            
+            if not pretrained_dict:
+                # Pokud stále nemáme žádné klíče, zkontrolujeme, zda checkpoint obsahuje pouze váhy generátoru
+                if any(k.startswith('swin_unetr') for k in checkpoint.keys()):
+                    print("Found generator weights with different prefix structure")
+                    # Mapování starých klíčů na nové
+                    for k, v in checkpoint.items():
+                        if k.startswith('swin_unetr'):
+                            new_k = f"generator.{k}"
+                            if new_k in model_dict:
+                                pretrained_dict[new_k] = v
+            
+            if pretrained_dict:
+                print(f"Loaded {len(pretrained_dict)}/{len(model_dict)} parameters")
+                model_dict.update(pretrained_dict)
+                model.load_state_dict(model_dict)
+            else:
+                raise ValueError("Could not load any parameters from checkpoint")
     
     # Move model to device
     model.to(device)
