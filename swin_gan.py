@@ -1425,50 +1425,23 @@ def generate_lesions(
     atlas_tensor = torch.from_numpy(atlas_data).float().unsqueeze(0).unsqueeze(0).to(device)
     
     # Compute target coverage if using adaptive threshold based on training data
-    if use_adaptive_threshold and target_coverage is None and training_lesion_dir is not None:
-        if use_different_target_for_each_sample:
-            print("Getting individual target coverages from all training data...")
-            # Získáme coverage z VŠECH trénovacích lézí (ne jen sample_count)
-            lesion_files = sorted(glob.glob(os.path.join(training_lesion_dir, "*lesion.nii*")))
-            # Odfiltrujeme prázdné
-            non_empty_files = []
-            for lesion_file in lesion_files:
-                lesion = nib.load(lesion_file).get_fdata()
-                if np.count_nonzero(lesion) > 0:
-                    non_empty_files.append(lesion_file)
-            
-            print(f"Found {len(non_empty_files)} non-empty lesion files in training data")
-            if not non_empty_files:
-                print("Warning: No non-empty lesion files found, using default coverage of 1%")
-                target_coverages = [1.0]
-            else:
-                # Pro každý vzorek budeme vybírat náhodný cíl
-                target_coverages = []
-                for lesion_file in non_empty_files:
-                    lesion = nib.load(lesion_file).get_fdata()
-                    coverage = compute_lesion_coverage(lesion > 0)
-                    target_coverages.append(coverage)
-                    print(f"File {os.path.basename(lesion_file)}: {coverage:.4f}% coverage")
-            
-            print(f"Using {len(target_coverages)} different target coverages ranging from {min(target_coverages):.6f}% to {max(target_coverages):.6f}%")
-        else:
-            print("Computing target coverage from training data...")
-            target_coverage = compute_target_coverage_from_training(
-                training_lesion_dir, 
-                sample_count=10
-            )
-            print(f"Using target coverage of {target_coverage:.6f}%")
-    
-    # Get individual target coverages if using different targets for each sample
-    if use_adaptive_threshold and use_different_target_for_each_sample and not target_coverages and target_coverage is not None:
-        # Pokud byl zadán jeden target_coverage, ale chceme různé cíle, vygenerujeme náhodné hodnoty kolem
-        print("Generating random target coverages around the specified value...")
-        target_coverages = []
-        for _ in range(num_samples):
-            # Vygenerujeme náhodnou hodnotu v rozmezí ±30% od zadaného cíle
-            random_factor = 0.7 + 0.6 * np.random.random()  # 0.7 až 1.3
-            target_coverages.append(target_coverage * random_factor)
-        print(f"Generated {len(target_coverages)} target coverages around {target_coverage:.6f}%")
+    if use_adaptive_threshold and training_lesion_dir is not None:
+        # Načteme všechny léze z trénovacího adresáře pro pozdější náhodný výběr
+        print("Načítám trénovací soubory pro coverage targety...")
+        lesion_files = sorted(glob.glob(os.path.join(training_lesion_dir, "*lesion.nii*")))
+        # Odfiltrujeme prázdné
+        training_files = []
+        for lesion_file in lesion_files:
+            lesion = nib.load(lesion_file).get_fdata()
+            if np.count_nonzero(lesion) > 0:
+                training_files.append(lesion_file)
+        
+        print(f"Nalezeno {len(training_files)} neprázdných trénovacích souborů pro coverage targets")
+        if not training_files:
+            print("Varování: Žádné neprázdné léze v trénovacím adresáři, použiji defaultní target 1%")
+            target_coverage = 1.0
+    else:
+        training_files = []
     
     # Load the generator
     checkpoint = torch.load(model_checkpoint, map_location=device)
@@ -1542,6 +1515,17 @@ def generate_lesions(
     for i in range(num_samples):
         print(f"Generating sample {i+1}/{num_samples}")
         
+        # Pro každý vzorek vybereme náhodný target coverage z trénovacích dat
+        if use_adaptive_threshold and training_files:
+            # Náhodně vybereme trénovací soubor
+            random_training_file = np.random.choice(training_files)
+            # Načteme jeho lézi a spočítáme coverage
+            lesion = nib.load(random_training_file).get_fdata()
+            current_target = compute_lesion_coverage(lesion > 0)
+            print(f"Náhodně vybraný trénovací soubor: {os.path.basename(random_training_file)}, coverage: {current_target:.6f}%")
+        else:
+            current_target = target_coverage
+        
         # Generate noise if using noise
         noise = None
         if use_noise:
@@ -1584,13 +1568,6 @@ def generate_lesions(
             
             # Binarize the lesion
             if use_adaptive_threshold:
-                # Get target coverage for this sample
-                if use_different_target_for_each_sample and target_coverages:
-                    # Náhodně vybereme jeden cíl z dostupných target_coverages
-                    current_target = np.random.choice(target_coverages)
-                else:
-                    current_target = target_coverage
-                
                 print(f"Finding adaptive threshold for target coverage of {current_target:.6f}%")
                 
                 # Compute optimal threshold for target coverage
