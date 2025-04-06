@@ -690,7 +690,7 @@ class SwinGAN(nn.Module):
                  perlin_lacunarity=2.5,
                  perlin_scale=0.2,
                  use_learnable_noise=False,
-                 gradient_penalty_weight=10.0):
+                 gradient_penalty_weight=30.0):
         """
         SwinGAN for lesion synthesis using Wasserstein GAN (WGAN) with gradient penalty
         
@@ -1237,8 +1237,8 @@ def train_model(args):
         model.load_state_dict(checkpoint['model_state_dict'])
     
     # Optimizers - use lower learning rates for WGAN training stability
-    optimizer_g = torch.optim.Adam(model.generator.parameters(), lr=args.lr_generator, betas=(0.5, 0.9))
-    optimizer_d = torch.optim.Adam(model.discriminator.parameters(), lr=args.lr_discriminator, betas=(0.5, 0.9))
+    optimizer_g = torch.optim.Adam(model.generator.parameters(), lr=0.0002)  # Ponechat vyšší než kritik
+    optimizer_d = torch.optim.Adam(model.discriminator.parameters(), lr=0.0001)  # Snížení z vyšší hodnoty
     
     # Load optimizer states if provided
     if args.checkpoint:
@@ -1500,7 +1500,7 @@ def generate_lesions(
     adaptive_threshold_iterations=50,  # Maximální počet iterací pro hledání adaptivního thresholdu
     use_different_target_for_each_sample=False,  # Použít jiný cílový coverage pro každý vzorek
     use_learnable_noise=False,     # Použít naučené parametry Perlin šumu
-    gradient_penalty_weight=10.0,  # Weight for gradient penalty in WGAN-GP (not used for generation but needed for model loading)
+    gradient_penalty_weight=30.0,  # Weight for gradient penalty in WGAN-GP
     apply_smoothing=True,          # Zda použít vyhlazení lézí pomocí Gaussovského filtru
     apply_morph_close=True         # Zda použít morfologické uzavření pro spojení blízkých částí léze
 ):
@@ -1981,7 +1981,7 @@ def main():
     train_parser.add_argument('--perlin_lacunarity', type=float, default=2.5, help='Lacunarity parameter for Perlin noise')
     train_parser.add_argument('--perlin_scale', type=float, default=0.2, help='Scale parameter for Perlin noise')
     train_parser.add_argument('--use_learnable_noise', action='store_true', help='Use learnable Perlin noise parameters')
-    train_parser.add_argument('--gradient_penalty_weight', type=float, default=10.0, help='Weight for gradient penalty in WGAN-GP')
+    train_parser.add_argument('--gradient_penalty_weight', type=float, default=30.0, help='Weight for gradient penalty in WGAN-GP')
     
     # Dataset parameters
     train_parser.add_argument('--filter_empty', action='store_true', help='Filter out empty lesion files')
