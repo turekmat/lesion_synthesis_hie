@@ -18,7 +18,7 @@ import time  # Import time for performance measurement
 
 
 class PerlinNoiseGenerator:
-    def __init__(self, octaves=4, persistence=0.5, lacunarity=2.0, repeat=1024, seed=None):
+    def __init__(self, octaves=4, persistence=0.5, lacunarity=2.0, repeat=1024, seed=None, learnable=False):
         """
         Generate 3D Perlin noise tailored for lesion generation using GPU acceleration
         
@@ -28,11 +28,13 @@ class PerlinNoiseGenerator:
             lacunarity (float): How much detail is added at each octave
             repeat (int): Period after which the noise pattern repeats
             seed (int): Random seed for reproducibility
+            learnable (bool): Whether to use learnable parameters for the noise
         """
         self.octaves = octaves
         self.persistence = persistence
         self.lacunarity = lacunarity
         self.repeat = repeat
+        self.learnable = learnable
         
         # Zajistíme, že seed je v platném rozsahu
         if seed is not None:
@@ -44,7 +46,29 @@ class PerlinNoiseGenerator:
         # Set the random seed for reproducibility
         torch.manual_seed(self.seed)
         np.random.seed(self.seed)
-    
+        
+        # Inicializace učitelných parametrů pokud learnable=True
+        if learnable:
+            # Parametry pro každou oktávu - učí se samostatně
+            self.learnable_octaves = min(octaves, 8)  # Omezíme počet učitelných oktáv
+            
+            # Pro každou oktávu vytvoříme učitelné parametry
+            # Každá oktáva může mít vlastní persistence a lacunarity
+            self.learn_persistence = nn.Parameter(torch.ones(self.learnable_octaves) * persistence)
+            self.learn_lacunarity = nn.Parameter(torch.ones(self.learnable_octaves) * lacunarity)
+            
+            # Learnable weights pro každou oktávu - jak moc každá oktáva přispívá
+            self.octave_weights = nn.Parameter(torch.ones(self.learnable_octaves))
+            
+            # Learnable parametry pro modulaci fázových posunů
+            self.phase_shifts = nn.Parameter(torch.rand(3, self.learnable_octaves) * 2 * np.pi)
+            
+            # Learnable parametry pro frekvence
+            self.frequency_mods = nn.Parameter(torch.ones(3, self.learnable_octaves))
+            
+            # Parametry pro míchání různých typů šumu
+            self.noise_type_weights = nn.Parameter(torch.ones(4))  # 4 typy šumu
+        
     def generate_3d_perlin(self, shape, scale=0.1, device='cuda'):
         """
         Generate 3D Perlin noise using GPU acceleration
@@ -71,21 +95,41 @@ class PerlinNoiseGenerator:
         # Generate multiple frequency components that will be combined
         result = torch.zeros((D, H, W), dtype=torch.float32, device=device)
         
-        # Define frequency components based on scale
-        frequencies = [1.0]
-        for i in range(1, self.octaves):
-            frequencies.append(frequencies[-1] * self.lacunarity)
-        
-        # Define amplitude for each octave
-        amplitudes = [1.0]
-        for i in range(1, self.octaves):
-            amplitudes.append(amplitudes[-1] * self.persistence)
-        
-        # Zvýšíme celkovou amplitudu šumu pro větší vliv na výstup
-        amplification_factor = 1.5 + torch.rand(1).item() * 0.5  # Náhodné zesílení 1.5-2.0x
-        amplitudes = [amp * amplification_factor for amp in amplitudes]
-        
-        max_amplitude = sum(amplitudes)
+        # Použití learnable parametrů pokud jsou dostupné
+        if self.learnable:
+            # Normalizace octave weights pro stabilitu a použití softplus pro zajištění pozitivity
+            normalized_weights = F.softplus(self.octave_weights) / F.softplus(self.octave_weights).sum()
+            
+            # Ensure persistence is between 0 and 1 using sigmoid
+            learn_persistence = torch.sigmoid(self.learn_persistence)
+            
+            # Ensure lacunarity is positive using softplus
+            learn_lacunarity = F.softplus(self.learn_lacunarity) + 1.0
+            
+            # Normalizace vah pro typy šumu
+            noise_weights = F.softmax(self.noise_type_weights, dim=0)
+            
+            # Používáme learnable_octaves místo pevného počtu oktáv
+            octaves_to_use = self.learnable_octaves
+        else:
+            # Define frequency components based on scale
+            frequencies = [1.0]
+            for i in range(1, self.octaves):
+                frequencies.append(frequencies[-1] * self.lacunarity)
+            
+            # Define amplitude for each octave
+            amplitudes = [1.0]
+            for i in range(1, self.octaves):
+                amplitudes.append(amplitudes[-1] * self.persistence)
+            
+            # Zvýšíme celkovou amplitudu šumu pro větší vliv na výstup
+            amplification_factor = 1.5 + torch.rand(1).item() * 0.5  # Náhodné zesílení 1.5-2.0x
+            amplitudes = [amp * amplification_factor for amp in amplitudes]
+            
+            max_amplitude = sum(amplitudes)
+            octaves_to_use = self.octaves
+            noise_weights = torch.rand(4, device=device)
+            noise_weights = noise_weights / noise_weights.sum()  # Normalizace vah
         
         # Create meshgrid for coordinates
         z = torch.linspace(0, scale, D, device=device)
@@ -101,11 +145,23 @@ class PerlinNoiseGenerator:
         
         # Přidáme různé typy komplexního šumu
         noise_types = ["standard", "turbulent", "ridged", "billow"]
-        noise_weights = torch.rand(len(noise_types), device=device)
-        noise_weights = noise_weights / noise_weights.sum()  # Normalizace vah
+        
+        # Zkonstruujeme frekvence a amplitudy podle toho, zda používáme učitelné parametry
+        if self.learnable:
+            frequencies = [1.0]
+            for i in range(1, octaves_to_use):
+                frequencies.append(frequencies[-1] * learn_lacunarity[i-1].item())
+                
+            amplitudes = [1.0]
+            for i in range(1, octaves_to_use):
+                amplitudes.append(amplitudes[-1] * learn_persistence[i-1].item())
+                
+            # Aplikace learnable weights na amplitudy
+            amplitudes = [amplitudes[i] * normalized_weights[i].item() for i in range(octaves_to_use)]
+            max_amplitude = sum(amplitudes)
         
         # Generate noise by adding different frequency components
-        for octave in range(self.octaves):
+        for octave in range(octaves_to_use):
             # Calculate frequency and amplitude for this octave
             freq = frequencies[octave]
             amplitude = amplitudes[octave]
@@ -115,15 +171,26 @@ class PerlinNoiseGenerator:
             phase_y = y_grid * freq
             phase_z = z_grid * freq
             
-            # Use the random tensor to create truly random phase offsets based on the seed
-            phase_offset_x = random_tensor[0, 0] * 6.28 + octave * 0.5
-            phase_offset_y = random_tensor[0, 1] * 6.28 + octave * 1.2
-            phase_offset_z = random_tensor[0, 2] * 6.28 + octave * 0.8
-            
-            # We'll also randomize the frequency multipliers to get more varied patterns
-            freq_multiplier_x = 1.0 + random_tensor[1, 0] * 0.7  # Zvýšený rozsah z 0.5 na 0.7
-            freq_multiplier_y = 1.0 + random_tensor[1, 1] * 0.7
-            freq_multiplier_z = 1.0 + random_tensor[1, 2] * 0.7
+            if self.learnable:
+                # Použijeme učitelné fázové posuny místo náhodných
+                phase_offset_x = self.phase_shifts[0, octave % self.learnable_octaves]
+                phase_offset_y = self.phase_shifts[1, octave % self.learnable_octaves]
+                phase_offset_z = self.phase_shifts[2, octave % self.learnable_octaves]
+                
+                # Použijeme učitelné frekvenční modulátory
+                freq_multiplier_x = F.softplus(self.frequency_mods[0, octave % self.learnable_octaves]) + 0.5
+                freq_multiplier_y = F.softplus(self.frequency_mods[1, octave % self.learnable_octaves]) + 0.5
+                freq_multiplier_z = F.softplus(self.frequency_mods[2, octave % self.learnable_octaves]) + 0.5
+            else:
+                # Use the random tensor to create truly random phase offsets based on the seed
+                phase_offset_x = random_tensor[0, 0] * 6.28 + octave * 0.5
+                phase_offset_y = random_tensor[0, 1] * 6.28 + octave * 1.2
+                phase_offset_z = random_tensor[0, 2] * 6.28 + octave * 0.8
+                
+                # We'll also randomize the frequency multipliers to get more varied patterns
+                freq_multiplier_x = 1.0 + random_tensor[1, 0] * 0.7  # Zvýšený rozsah z 0.5 na 0.7
+                freq_multiplier_y = 1.0 + random_tensor[1, 1] * 0.7
+                freq_multiplier_z = 1.0 + random_tensor[1, 2] * 0.7
             
             # Generování různých typů šumu pro různé oktávy
             noise_type_idx = octave % len(noise_types)
@@ -159,7 +226,7 @@ class PerlinNoiseGenerator:
             ridged_noise = (noise_ridged_x * weight_x + noise_ridged_y * weight_y + noise_ridged_z * weight_z) / weight_sum
             billow_noise = (noise_billow_x * weight_x + noise_billow_y * weight_y + noise_billow_z * weight_z) / weight_sum
             
-            # Váhovaná kombinace všech typů šumu
+            # Váhovaná kombinace všech typů šumu (buď learnable nebo fixní váhy)
             combined_noise = (
                 standard_noise * noise_weights[0] + 
                 turbulent_noise * noise_weights[1] + 
@@ -355,7 +422,7 @@ class HieLesionDataset(Dataset):
 
 class Generator(nn.Module):
     def __init__(self, in_channels=1, out_channels=1, feature_size=24, dropout_rate=0.0, use_noise=True, noise_dim=16,
-                 perlin_octaves=4, perlin_persistence=0.5, perlin_lacunarity=2.0, perlin_scale=0.1):
+                 perlin_octaves=4, perlin_persistence=0.5, perlin_lacunarity=2.0, perlin_scale=0.1, use_learnable_noise=False):
         """
         Generator based on SwinUNETR for lesion synthesis
         
@@ -370,6 +437,7 @@ class Generator(nn.Module):
             perlin_persistence (float): Persistence parameter for Perlin noise
             perlin_lacunarity (float): Lacunarity parameter for Perlin noise
             perlin_scale (float): Scale parameter for Perlin noise
+            use_learnable_noise (bool): Whether to use learnable Perlin noise parameters
         """
         super(Generator, self).__init__()
         
@@ -377,6 +445,7 @@ class Generator(nn.Module):
         self.noise_dim = noise_dim
         self.feature_size = feature_size  # Uložíme hodnotu i jako atribut
         self.dropout_rate = dropout_rate  # Uložíme hodnotu i jako atribut
+        self.use_learnable_noise = use_learnable_noise
         
         # Initialize Perlin noise generator if using noise
         if use_noise:
@@ -384,7 +453,8 @@ class Generator(nn.Module):
                 octaves=perlin_octaves,
                 persistence=perlin_persistence,
                 lacunarity=perlin_lacunarity,
-                seed=np.random.randint(0, 10000)
+                seed=np.random.randint(0, 10000),
+                learnable=use_learnable_noise
             )
             self.perlin_scale = perlin_scale
         
@@ -591,7 +661,8 @@ class SwinGAN(nn.Module):
                  perlin_octaves=4,
                  perlin_persistence=0.5,
                  perlin_lacunarity=2.0,
-                 perlin_scale=0.1):
+                 perlin_scale=0.1,
+                 use_learnable_noise=False):
         """
         SwinGAN for lesion synthesis
         
@@ -612,6 +683,7 @@ class SwinGAN(nn.Module):
             perlin_persistence (float): Persistence parameter for Perlin noise
             perlin_lacunarity (float): Lacunarity parameter for Perlin noise
             perlin_scale (float): Scale parameter controlling smoothness of Perlin noise
+            use_learnable_noise (bool): Whether to use learnable Perlin noise parameters
         """
         super(SwinGAN, self).__init__()
         
@@ -625,7 +697,8 @@ class SwinGAN(nn.Module):
             perlin_octaves=perlin_octaves,
             perlin_persistence=perlin_persistence,
             perlin_lacunarity=perlin_lacunarity,
-            perlin_scale=perlin_scale
+            perlin_scale=perlin_scale,
+            use_learnable_noise=use_learnable_noise
         )
         self.discriminator = Discriminator(in_channels + out_channels, feature_size)
         
@@ -642,6 +715,7 @@ class SwinGAN(nn.Module):
         # For generating diverse samples
         self.use_noise = use_noise
         self.noise_dim = noise_dim
+        self.use_learnable_noise = use_learnable_noise
         
         # For fragmentation loss
         self.fragmentation_kernel_size = fragmentation_kernel_size
@@ -925,10 +999,11 @@ class SwinGANTrainer:
                     'perlin_octaves': self.model.perlin_octaves,
                     'perlin_persistence': self.model.perlin_persistence,
                     'perlin_lacunarity': self.model.perlin_lacunarity,
-                    'perlin_scale': self.model.perlin_scale
+                    'perlin_scale': self.model.perlin_scale,
+                    'use_learnable_noise': self.model.use_learnable_noise
                 }, generator_path)
                 print(f"Saved generator-only checkpoint to {generator_path}")
-                print(f"Checkpoint includes configuration for use_noise={self.model.use_noise}, noise_dim={self.model.noise_dim}, perlin params: octaves={self.model.perlin_octaves}, persistence={self.model.perlin_persistence}, scale={self.model.perlin_scale}")
+                print(f"Checkpoint includes configuration for use_noise={self.model.use_noise}, noise_dim={self.model.noise_dim}, perlin params: octaves={self.model.perlin_octaves}, persistence={self.model.perlin_persistence}, scale={self.model.perlin_scale}, learnable_noise={self.model.use_learnable_noise}")
             
             # Validation
             if val_dataloader is not None and (epoch + 1) % 1 == 0:
@@ -983,71 +1058,52 @@ class SwinGANTrainer:
 
 def train_model(args):
     """
-    Train the SwinGAN model
+    Train the SwinGAN model with the given arguments
     
     Args:
-        args: Command line arguments
+        args: Command-line arguments
     """
-    print("=== Training SwinGAN model ===")
-    print(f"Lesion directory: {args.lesion_dir}")
-    print(f"Atlas file: {args.lesion_atlas}")
-    print(f"Output directory: {args.output_dir}")
-    print(f"Batch size: {args.batch_size}")
-    print(f"Num epochs: {args.epochs}")
-    print(f"Learning rate (generator): {args.lr_g}")
-    print(f"Learning rate (discriminator): {args.lr_d}")
-    print(f"Feature size: {args.feature_size}")
-    print(f"Non-zero threshold: {args.min_non_zero}")
-    print(f"Device: {args.device}")
-    print(f"Generator save interval: {args.generator_save_interval}")
-    print(f"Fragmentation loss weight: {args.lambda_fragmentation}")
-    print(f"Fragmentation kernel size: {args.fragmentation_kernel_size}")
-    print(f"Using noise for generation diversity: True")
-    print(f"Noise dimension: 16")
-    print(f"Perlin noise octaves: {args.perlin_octaves}")
-    print(f"Perlin noise persistence: {args.perlin_persistence}")
-    print(f"Perlin noise lacunarity: {args.perlin_lacunarity}")
-    print(f"Perlin noise scale: {args.perlin_scale}")
+    # Set device
+    device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
     
-    # Create the output directory if it doesn't exist
-    if not os.path.exists(args.output_dir):
-        os.makedirs(args.output_dir)
+    # Create output directory if it doesn't exist
+    os.makedirs(args.output_dir, exist_ok=True)
     
-    # Create dataset
+    # Setup dataset
     train_dataset = HieLesionDataset(
-        lesion_dir=args.lesion_dir,
-        lesion_atlas_path=args.lesion_atlas,
-        filter_empty=True,
-        min_non_zero_percentage=args.min_non_zero
+        lesion_dir=args.train_lesion_dir,
+        lesion_atlas_path=args.lesion_atlas_path,
+        filter_empty=args.filter_empty,
+        min_non_zero_percentage=args.min_non_zero_percentage
     )
     
-    # Create validation dataset if provided
-    val_loader = None
+    val_dataset = None
     if args.val_lesion_dir:
-        print(f"Validation lesion directory: {args.val_lesion_dir}")
         val_dataset = HieLesionDataset(
             lesion_dir=args.val_lesion_dir,
-            lesion_atlas_path=args.lesion_atlas,
-            filter_empty=True,
-            min_non_zero_percentage=args.min_non_zero
-        )
-        
-        val_loader = DataLoader(
-            val_dataset,
-            batch_size=args.batch_size,
-            shuffle=False,
-            num_workers=args.num_workers,
-            pin_memory=True
+            lesion_atlas_path=args.lesion_atlas_path,
+            filter_empty=args.filter_empty,
+            min_non_zero_percentage=args.min_non_zero_percentage
         )
     
-    # Create data loader
-    train_loader = DataLoader(
+    # Create data loaders
+    train_dataloader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
         pin_memory=True
     )
+    
+    val_dataloader = None
+    if val_dataset:
+        val_dataloader = DataLoader(
+            val_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=True
+        )
     
     # Create model
     model = SwinGAN(
@@ -1060,35 +1116,49 @@ def train_model(args):
         lambda_fragmentation=args.lambda_fragmentation,
         focal_alpha=args.focal_alpha,
         focal_gamma=args.focal_gamma,
-        use_noise=True,
-        noise_dim=16,
+        use_noise=args.use_noise,
+        noise_dim=args.noise_dim,
         fragmentation_kernel_size=args.fragmentation_kernel_size,
         perlin_octaves=args.perlin_octaves,
         perlin_persistence=args.perlin_persistence,
         perlin_lacunarity=args.perlin_lacunarity,
-        perlin_scale=args.perlin_scale
+        perlin_scale=args.perlin_scale,
+        use_learnable_noise=args.use_learnable_noise
     )
     
-    # Create the optimizer
-    optimizer_g = torch.optim.Adam(model.generator.parameters(), lr=args.lr_g)
-    optimizer_d = torch.optim.Adam(model.discriminator.parameters(), lr=args.lr_d)
+    # Load checkpoint if provided
+    if args.checkpoint:
+        print(f"Loading checkpoint from {args.checkpoint}")
+        checkpoint = torch.load(args.checkpoint, map_location=device)
+        model.load_state_dict(checkpoint['model_state_dict'])
     
-    # Create the trainer
+    # Optimizers
+    optimizer_g = torch.optim.Adam(model.generator.parameters(), lr=args.lr_generator, betas=(0.5, 0.999))
+    optimizer_d = torch.optim.Adam(model.discriminator.parameters(), lr=args.lr_discriminator, betas=(0.5, 0.999))
+    
+    # Load optimizer states if provided
+    if args.checkpoint:
+        optimizer_g.load_state_dict(checkpoint['optimizer_g_state_dict'])
+        optimizer_d.load_state_dict(checkpoint['optimizer_d_state_dict'])
+    
+    # Trainer
     trainer = SwinGANTrainer(
         model=model,
         optimizer_g=optimizer_g,
         optimizer_d=optimizer_d,
-        device=args.device,
+        device=device,
         output_dir=args.output_dir,
-        use_amp=not args.disable_amp,
+        use_amp=args.use_amp,
         generator_save_interval=args.generator_save_interval
     )
     
-    # Train the model
-    trainer.train(train_loader, args.epochs, val_dataloader=val_loader, save_interval=args.save_interval)
-    
-    print(f"Training completed. Model saved to {args.output_dir}")
-    print(f"Generator checkpoints saved to {trainer.generator_dir}")
+    # Train
+    trainer.train(
+        dataloader=train_dataloader,
+        epochs=args.epochs,
+        val_dataloader=val_dataloader,
+        save_interval=args.save_interval
+    )
 
 
 def compute_lesion_coverage(binary_lesion, atlas_mask=None):
@@ -1323,584 +1393,254 @@ def generate_lesions(
     min_adaptive_threshold=0.00001,  # Minimální hodnota pro adaptivní threshold
     max_adaptive_threshold=0.999,    # Maximální hodnota pro adaptivní threshold
     adaptive_threshold_iterations=50,  # Maximální počet iterací pro hledání adaptivního thresholdu
-    use_different_target_for_each_sample=False  # Použít jiný cílový coverage pro každý vzorek
+    use_different_target_for_each_sample=False,  # Použít jiný cílový coverage pro každý vzorek
+    use_learnable_noise=False     # Použít naučené parametry Perlin šumu
 ):
-    """
-    Generate synthetic lesions using a trained GAN model
+    # Validate inputs
+    if output_file is None and output_dir is None:
+        raise ValueError("Either output_file or output_dir must be provided")
     
-    Args:
-        model_checkpoint (str): Path to the model checkpoint
-        lesion_atlas (str): Path to the lesion atlas (frequency map)
-        output_file (str, optional): Path to save the generated lesion .nii file (for single sample)
-        output_dir (str, optional): Directory to save multiple generated samples
-        threshold (float): Threshold for binarizing the generated lesion probability map
-        device (str): Device to use for inference ('cuda' or 'cpu')
-        num_samples (int): Number of samples to generate with different noise vectors
-        perlin_octaves (int): Number of octaves for Perlin noise
-        perlin_persistence (float): Persistence parameter for Perlin noise
-        perlin_lacunarity (float): Lacunarity parameter for Perlin noise
-        perlin_scale (float): Scale parameter for Perlin noise
-        min_lesion_size (int): Minimální velikost léze v počtu voxelů (menší léze budou odstraněny)
-        smooth_sigma (float): Hodnota sigma pro vyhlazení lézí pomocí Gaussovského filtru
-        morph_close_size (int): Velikost strukturního elementu pro morfologickou operaci uzavření
-        use_adaptive_threshold (bool): Použít adaptivní threshold pro dosažení podobného pokrytí jako v trénovacích datech
-        training_lesion_dir (str): Adresář s trénovacími lézemi, používá se pro výpočet cílového pokrytí
-        target_coverage (float): Cílové pokrytí lézemi v procentech, pokud není zadáno a use_adaptive_threshold=True, 
-                                 použije se průměrné pokrytí z training_lesion_dir
-        min_adaptive_threshold (float): Minimální hodnota thresholdu pro adaptivní prahování
-        max_adaptive_threshold (float): Maximální hodnota thresholdu pro adaptivní prahování
-        adaptive_threshold_iterations (int): Maximální počet iterací pro hledání adaptivního thresholdu
-        use_different_target_for_each_sample (bool): Použít jiný cílový coverage pro každý vzorek
-    """
-    # Validate input parameters
-    if num_samples > 1 and output_dir is None:
-        raise ValueError("output_dir must be specified when generating multiple samples")
-    if num_samples == 1 and output_file is None and output_dir is None:
-        raise ValueError("Either output_file or output_dir must be specified")
-    if use_adaptive_threshold and training_lesion_dir is None and target_coverage is None:
-        raise ValueError("For adaptive threshold, either training_lesion_dir or target_coverage must be specified")
-    if use_different_target_for_each_sample and training_lesion_dir is None:
-        raise ValueError("For using different target for each sample, training_lesion_dir must be specified")
+    if output_file is not None and num_samples > 1:
+        raise ValueError("output_file can only be used with num_samples=1")
     
-    print(f"Generating lesions with the following parameters:")
-    print(f"Model checkpoint: {model_checkpoint}")
-    print(f"Lesion atlas: {lesion_atlas}")
-    if output_file:
-        print(f"Output file: {output_file}")
-    if output_dir:
-        print(f"Output directory: {output_dir}")
-    print(f"Threshold: {threshold if not use_adaptive_threshold else 'adaptive'}")
-    print(f"Device: {device}")
-    print(f"Number of samples: {num_samples}")
-    print(f"Perlin noise octaves: {perlin_octaves}")
-    print(f"Perlin noise persistence: {perlin_persistence}")
-    print(f"Perlin noise lacunarity: {perlin_lacunarity}")
-    print(f"Perlin noise scale: {perlin_scale}")
-    print(f"Minimum lesion size: {min_lesion_size}")
-    print(f"Smoothing sigma: {smooth_sigma}")
-    print(f"Morphological closing size: {morph_close_size}")
-    if use_adaptive_threshold:
-        print(f"Using adaptive threshold to match training data coverage")
-        if training_lesion_dir:
-            print(f"Training lesion directory: {training_lesion_dir}")
-        if target_coverage is not None:
-            print(f"Target coverage: {target_coverage}%")
-        print(f"Adaptive threshold range: [{min_adaptive_threshold}, {max_adaptive_threshold}]")
-        print(f"Adaptive threshold max iterations: {adaptive_threshold_iterations}")
-        if use_different_target_for_each_sample:
-            print(f"Using different target coverage for each sample")
-    
-    # Load the lesion atlas
-    atlas_img = nib.load(lesion_atlas)
-    atlas_data = atlas_img.get_fdata()
-    
-    # Store original shape for later
-    orig_shape = atlas_data.shape
-    
-    # Normalize the atlas
-    atlas_data = (atlas_data - atlas_data.min()) / (atlas_data.max() - atlas_data.min() + 1e-8)
-    
-    # Create atlas mask for region of interest
-    atlas_mask = atlas_data > 0
-    
-    # If using adaptive threshold with different targets for each sample, prepare list of target coverages
-    target_coverages = None
-    if use_adaptive_threshold and use_different_target_for_each_sample and training_lesion_dir is not None:
-        # List all lesion files
-        lesion_files = sorted(glob.glob(os.path.join(training_lesion_dir, "*lesion.nii*")))
-        
-        # Filter out empty lesion files
-        non_empty_files = []
-        for lesion_file in lesion_files:
-            lesion = nib.load(lesion_file).get_fdata()
-            if np.count_nonzero(lesion) > 0:
-                non_empty_files.append(lesion_file)
-        
-        if not non_empty_files:
-            print("Warning: No non-empty lesion files found in training directory")
-            if target_coverage is not None:
-                # Use specified target_coverage for all samples
-                target_coverages = [target_coverage] * num_samples
-            else:
-                # Use default coverage of 1%
-                target_coverages = [1.0] * num_samples
-        else:
-            # If there are fewer files than samples, allow reusing files
-            if len(non_empty_files) < num_samples:
-                selected_files = np.random.choice(non_empty_files, size=num_samples, replace=True)
-            else:
-                selected_files = np.random.choice(non_empty_files, size=num_samples, replace=False)
-            
-            # Compute coverage for each selected file
-            target_coverages = []
-            for i, lesion_file in enumerate(selected_files):
-                coverage = get_single_lesion_coverage(lesion_file)
-                target_coverages.append(coverage)
-                print(f"Sample {i+1} will use target coverage from {os.path.basename(lesion_file)}: {coverage:.4f}%")
-    # If not using different targets for each sample but using adaptive threshold
-    elif use_adaptive_threshold and target_coverage is None and training_lesion_dir is not None:
-        # Compute single target coverage from all training data
-        target_coverage = compute_target_coverage_from_training(training_lesion_dir)
-    
-    # Convert to tensor
-    atlas_tensor = torch.from_numpy(atlas_data).float().unsqueeze(0).unsqueeze(0)
-    atlas_tensor = atlas_tensor.to(device)
-    
-    # Load the model
-    print(f"Loading generator from checkpoint: {model_checkpoint}")
-    checkpoint = torch.load(model_checkpoint, map_location=device)
-    
-    if 'generator_state_dict' in checkpoint:
-        # Generator-only checkpoint
-        feature_size = checkpoint.get('feature_size', 24)
-        use_noise = checkpoint.get('use_noise', True)
-        noise_dim = checkpoint.get('noise_dim', 16)
-        dropout_rate = checkpoint.get('dropout_rate', 0.0)
-        focal_loss_weight = checkpoint.get('focal_loss_weight', 10.0)
-        l1_loss_weight = checkpoint.get('l1_loss_weight', 5.0)
-        focal_alpha = checkpoint.get('focal_alpha', 0.8)
-        focal_gamma = checkpoint.get('focal_gamma', 2.0)
-        perlin_octaves_ckpt = checkpoint.get('perlin_octaves', perlin_octaves)
-        perlin_persistence_ckpt = checkpoint.get('perlin_persistence', perlin_persistence)
-        perlin_lacunarity_ckpt = checkpoint.get('perlin_lacunarity', perlin_lacunarity)
-        perlin_scale_ckpt = checkpoint.get('perlin_scale', perlin_scale)
-        
-        if perlin_octaves_ckpt is not None:
-            perlin_octaves = perlin_octaves_ckpt
-        if perlin_persistence_ckpt is not None:
-            perlin_persistence = perlin_persistence_ckpt
-        if perlin_lacunarity_ckpt is not None:
-            perlin_lacunarity = perlin_lacunarity_ckpt
-        if perlin_scale_ckpt is not None:
-            perlin_scale = perlin_scale_ckpt
-        
-        print(f"Loading generator from checkpoint with configuration...")
-        print(f"Checkpoint configuration: use_noise={use_noise}, noise_dim={noise_dim}, feature_size={feature_size}")
-        print(f"Perlin noise parameters: octaves={perlin_octaves}, persistence={perlin_persistence}, lacunarity={perlin_lacunarity}, scale={perlin_scale}")
-        
-        # Create the model
-        model = SwinGAN(
-            in_channels=1,
-            out_channels=1,
-            feature_size=feature_size,
-            dropout_rate=dropout_rate,
-            lambda_focal=focal_loss_weight,
-            lambda_l1=l1_loss_weight,
-            focal_alpha=focal_alpha,
-            focal_gamma=focal_gamma,
-            use_noise=use_noise,
-            noise_dim=noise_dim,
-            perlin_octaves=perlin_octaves,
-            perlin_persistence=perlin_persistence,
-            perlin_lacunarity=perlin_lacunarity,
-            perlin_scale=perlin_scale
-        )
-        
-        # Load the generator weights
-        model.generator.load_state_dict(checkpoint['generator_state_dict'])
-    else:
-        # Full model checkpoint
-        model = SwinGAN(
-            in_channels=1,
-            out_channels=1,
-            feature_size=24,
-            use_noise=True,
-            noise_dim=16,
-            perlin_octaves=perlin_octaves,
-            perlin_persistence=perlin_persistence,
-            perlin_lacunarity=perlin_lacunarity,
-            perlin_scale=perlin_scale
-        )
-        model.load_state_dict(checkpoint['model_state_dict'])
-    
-    # Move the model to the device and set to evaluation mode
-    model.to(device)
-    model.eval()  # Přepne model a všechny jeho podmoduly (včetně generátoru) do režimu eval
+    if use_adaptive_threshold and target_coverage is None and training_lesion_dir is None:
+        raise ValueError("For adaptive thresholding, either target_coverage or training_lesion_dir must be provided")
     
     # Create output directory if it doesn't exist
-    if output_dir:
+    if output_dir is not None:
         os.makedirs(output_dir, exist_ok=True)
-    elif output_file:
-        os.makedirs(os.path.dirname(os.path.abspath(output_file)), exist_ok=True)
     
-    # Generate samples with different noise vectors
-    all_samples = []
+    # Set device
+    device = torch.device(device if torch.cuda.is_available() else 'cpu')
     
-    # Set master seed for the overall generation process
-    master_seed = np.random.randint(0, 1000000)
-    print(f"Using master seed: {master_seed} for overall generation process")
+    # Load the atlas
+    atlas_data = nib.load(lesion_atlas).get_fdata()
+    atlas_affine = nib.load(lesion_atlas).affine
+    atlas_header = nib.load(lesion_atlas).header
     
-    # Připravíme si dostatečně rozmanité seedy pro všechny vzorky předem
-    # aby se zabránilo jakýmkoliv vzorcům mezi nimi
-    all_sample_seeds = []
-    base_seeds = set()  # Pro kontrolu unikátnosti
+    # Normalize the atlas to [0, 1]
+    atlas_data = atlas_data / np.max(atlas_data)
     
-    # Vytvoříme kompletně náhodné seedy bez vzorce
-    for _ in range(num_samples):
-        # Vytvořit opravdu náhodné seedy nezávislé na master_seed
-        current_time_ns = time.time_ns()  # Využití nanosekund pro větší entropii
-        random_component = np.random.randint(0, 1000000000)
-        # Pro každý vzorek kombinujeme čas, náhodné číslo, a hash předchozích seedů
-        new_seed = (current_time_ns % 1000000 + random_component + hash(str(base_seeds)) % 100000) % 1000000000
+    # Convert to torch tensor and add batch and channel dimensions
+    atlas_tensor = torch.from_numpy(atlas_data).float().unsqueeze(0).unsqueeze(0).to(device)
+    
+    # Compute target coverage if using adaptive threshold based on training data
+    if use_adaptive_threshold and target_coverage is None and training_lesion_dir is not None:
+        print("Computing target coverage from training data...")
+        target_coverage = compute_target_coverage_from_training(
+            training_lesion_dir, 
+            sample_count=10
+        )
+        print(f"Using target coverage of {target_coverage:.6f}%")
+    
+    # Get individual target coverages if using different targets for each sample
+    target_coverages = []
+    if use_adaptive_threshold and use_different_target_for_each_sample and training_lesion_dir is not None:
+        print("Computing individual target coverages from training data...")
+        target_coverages = compute_target_coverage_from_training(
+            training_lesion_dir, 
+            sample_count=min(30, num_samples),  # Limit the number of samples to avoid long computation
+            return_list=True,
+            random_seed=42  # For reproducibility
+        )
+        # If we need more samples than we have coverages, repeat the list
+        while len(target_coverages) < num_samples:
+            target_coverages.extend(target_coverages[:num_samples - len(target_coverages)])
+        print(f"Using {len(target_coverages)} different target coverages ranging from {min(target_coverages):.6f}% to {max(target_coverages):.6f}%")
+    
+    # Load the generator
+    checkpoint = torch.load(model_checkpoint, map_location=device)
+    
+    # Extract configuration from checkpoint
+    config = {}
+    for key in ['feature_size', 'dropout_rate', 'use_noise', 'noise_dim',
+                'perlin_octaves', 'perlin_persistence', 'perlin_lacunarity', 'perlin_scale']:
+        config[key] = checkpoint.get(key, None)
+    
+    # Handle missing config values and override with arguments
+    feature_size = config.get('feature_size', 24)
+    dropout_rate = config.get('dropout_rate', 0.0)
+    use_noise = config.get('use_noise', True)
+    noise_dim = config.get('noise_dim', 16)
+    
+    # Override Perlin noise parameters if provided
+    if 'perlin_octaves' in checkpoint and perlin_octaves is None:
+        perlin_octaves = checkpoint['perlin_octaves']
+    
+    if 'perlin_persistence' in checkpoint and perlin_persistence is None:
+        perlin_persistence = checkpoint['perlin_persistence']
+    
+    if 'perlin_lacunarity' in checkpoint and perlin_lacunarity is None:
+        perlin_lacunarity = checkpoint['perlin_lacunarity']
+    
+    if 'perlin_scale' in checkpoint and perlin_scale is None:
+        perlin_scale = checkpoint['perlin_scale']
+    
+    # Check for learnable_noise in checkpoint
+    if 'use_learnable_noise' in checkpoint:
+        use_learnable_noise = checkpoint['use_learnable_noise']
+    
+    # Create the generator model
+    generator = Generator(
+        in_channels=1,
+        out_channels=1,
+        feature_size=feature_size,
+        dropout_rate=dropout_rate,
+        use_noise=use_noise,
+        noise_dim=noise_dim,
+        perlin_octaves=perlin_octaves,
+        perlin_persistence=perlin_persistence,
+        perlin_lacunarity=perlin_lacunarity,
+        perlin_scale=perlin_scale,
+        use_learnable_noise=use_learnable_noise
+    )
+    
+    # Load state dict
+    if 'generator_state_dict' in checkpoint:
+        generator.load_state_dict(checkpoint['generator_state_dict'])
+    else:
+        generator.load_state_dict(checkpoint)
+    
+    # Move to device and set to evaluation mode
+    generator.to(device)
+    generator.eval()
+    
+    # Generate samples
+    print(f"Generating {num_samples} lesion samples with threshold={threshold}, min_lesion_size={min_lesion_size}, smooth_sigma={smooth_sigma}, morph_close_size={morph_close_size}")
+    
+    # Initialize array for lesion coverage statistics if using adaptive threshold
+    if use_adaptive_threshold:
+        coverage_stats = []
+    
+    # Strukturní element pro morfologické operace
+    struct_element = generate_binary_structure(3, 1)  # 3D connectivity
+    
+    # Generate each sample
+    generated_lesions = []
+    for i in range(num_samples):
+        print(f"Generating sample {i+1}/{num_samples}")
         
-        # Přidáme další náhodnost Hash
-        if len(all_sample_seeds) > 0:
-            # Využijeme poslední seed pro další náhodnost
-            last_seed = all_sample_seeds[-1]
-            hash_component = hash((last_seed, new_seed, current_time_ns)) % 1000000
-            new_seed = (new_seed + hash_component) % 1000000000
+        # Generate noise if using noise
+        noise = None
+        if use_noise:
+            # Generate a new seed for each sample
+            current_seed = np.random.randint(0, 10000)
+            torch.manual_seed(current_seed)
+            
+            # Create noise with matching shape to atlas
+            D, H, W = atlas_data.shape
+            
+            # Initialize PerlinNoiseGenerator with the specified parameters
+            # and use it to generate noise
+            noise_generator = PerlinNoiseGenerator(
+                octaves=perlin_octaves,
+                persistence=perlin_persistence,
+                lacunarity=perlin_lacunarity,
+                seed=current_seed,
+                learnable=use_learnable_noise
+            )
+            
+            # Generate the noise vector
+            noise = noise_generator.generate_batch_noise(
+                batch_size=1,
+                shape=(D, H, W),
+                noise_dim=noise_dim,
+                scale=perlin_scale,
+                device=device
+            )
         
-        # Ujistíme se, že seed je unikátní
-        while new_seed in base_seeds:
-            new_seed = (new_seed + np.random.randint(1000, 100000)) % 1000000000
-        
-        all_sample_seeds.append(new_seed)
-        base_seeds.add(new_seed)
-        
-        # Počkáme krátký čas, aby se zajistila rozdílnost času pro další seed
-        time.sleep(0.001)
-    
-    # Zkontrolujeme, že rozdíly mezi seedy jsou skutečně náhodné
-    if len(all_sample_seeds) > 1:
-        seed_diffs = [all_sample_seeds[i+1] - all_sample_seeds[i] for i in range(len(all_sample_seeds)-1)]
-        print(f"Seed difference statistics - Min: {min(seed_diffs)}, Max: {max(seed_diffs)}, Mean: {sum(seed_diffs)/len(seed_diffs):.1f}")
-    
-    with torch.no_grad():
-        for i in range(num_samples):
-            # Použijeme předem vygenerovaný náhodný seed pro tento vzorek
-            sample_seed = all_sample_seeds[i]
-            np.random.seed(sample_seed)
-            torch.manual_seed(sample_seed)
-            
-            print(f"\nGenerating sample {i+1} with seed {sample_seed}")
-            
-            # Get the target coverage for this specific sample if using different targets
-            current_target_coverage = target_coverages[i] if target_coverages else target_coverage
-            
-            # Create a random noise vector for this sample
-            if model.use_noise:
-                # Initialize Perlin noise generator using parameters from checkpoint if available
-                perlin_octaves_model = getattr(model, 'perlin_octaves', perlin_octaves)
-                perlin_persistence_model = getattr(model, 'perlin_persistence', perlin_persistence)
-                perlin_lacunarity_model = getattr(model, 'perlin_lacunarity', perlin_lacunarity)
-                perlin_scale_model = getattr(model, 'perlin_scale', perlin_scale)
-                
-                # Add more variation by slightly perturbing the noise parameters for each sample
-                # This helps create more diverse samples
-                sample_octaves = max(1, perlin_octaves_model + np.random.randint(-1, 2))  # +/- 1
-                sample_persistence = max(0.1, min(0.9, perlin_persistence_model + np.random.uniform(-0.1, 0.1)))
-                sample_lacunarity = max(1.0, min(3.0, perlin_lacunarity_model + np.random.uniform(-0.2, 0.2)))
-                sample_scale = max(0.05, min(0.3, perlin_scale_model + np.random.uniform(-0.03, 0.03)))
-                
-                print(f"  Sample-specific noise parameters: octaves={sample_octaves}, "
-                      f"persistence={sample_persistence:.3f}, lacunarity={sample_lacunarity:.3f}, scale={sample_scale:.3f}")
-                
-                # Vytvoříme úplně nový seed pro Perlin, který je skutečně nezávislý
-                # Nepoužíváme offset ani vzorec, ale vysoce náhodnou kombinaci
-                time_ns = time.time_ns()
-                random_state = np.random.RandomState(sample_seed)  # Vytvoříme nový random state se sample seedem
-                random_bits = random_state.randint(0, 2**32, 4)  # Generujeme několik náhodných čísel
-                
-                # Zkombinujeme několik zdrojů entropie
-                perlin_seed = (time_ns % 2**32) ^ random_bits[0]
-                perlin_seed = (perlin_seed + random_bits[1]) % 2**32
-                perlin_seed = (perlin_seed ^ (random_bits[2] << 16 | random_bits[3])) % 1000000000
-                
-                # Pro jistotu ještě promícháme bity pomocí jednoduchého hashing algoritmu
-                # Omezíme seed na platný rozsah pro numpy.random.seed() (0 až 2^32-1)
-                perlin_seed = ((perlin_seed * 0x5DEECE66D) + 0xB) % (2**32 - 1)
-                
-                # Vytvoření zcela nového generátoru Perlin šumu pro každý vzorek
-                perlin_gen = PerlinNoiseGenerator(
-                    octaves=sample_octaves,
-                    persistence=sample_persistence,
-                    lacunarity=sample_lacunarity,
-                    seed=perlin_seed
-                )
-                
-                # Generování základního šumu
-                noise = perlin_gen.generate_batch_noise(
-                    batch_size=1, 
-                    shape=(atlas_data.shape[0], atlas_data.shape[1], atlas_data.shape[2]),
-                    noise_dim=model.noise_dim,
-                    scale=sample_scale,
-                    device=device
-                )
-                
-                # AGRESIVNÍ TRANSFORMACE ŠUMU - aplikujeme vždy
-                # Vytvoříme vícenásobné vrstvy šumu a zkombinujeme je pro větší komplexitu
-                
-                # Generování několika různých šumových komponent
-                noise_layers = []
-                num_layers = np.random.randint(2, 5)  # 2-4 vrstvy šumu
-                
-                for layer in range(num_layers):
-                    # Různý seed pro každou vrstvu - zcela náhodný bez vzorců
-                    # Kombinace více zdrojů entropie pro skutečnou náhodnost
-                    time_ns_layer = time.time_ns()
-                    random_bit_1 = np.random.randint(0, 2**32)
-                    random_bit_2 = np.random.randint(0, 2**32)
-                    
-                    # Zkombinujeme několik zdrojů entropie s bitscramblingem
-                    layer_seed = (time_ns_layer % 2**32) ^ random_bit_1
-                    layer_seed = (layer_seed + random_bit_2) % 2**32
-                    layer_seed = ((layer_seed << 13) ^ layer_seed) % 1000000000
-                    
-                    # Přidáme závislost na indexu vrstvy, ale nelineárním způsobem
-                    layer_index_hash = hash(("layer", layer, sample_seed)) % 1000000
-                    layer_seed = (layer_seed ^ layer_index_hash) % (2**32 - 1)
-                    
-                    # Pro větší diverzitu použijeme nelineární transformace parametrů
-                    # pro každou vrstvu
-                    layer_octaves = np.random.randint(2, 6)
-                    layer_persistence = np.random.uniform(0.3, 0.7)
-                    layer_lacunarity = np.random.uniform(1.5, 2.5)
-                    layer_scale = np.random.uniform(0.05, 0.15)
-                    
-                    # Vytvoření nového generátoru pro tuto vrstvu
-                    layer_gen = PerlinNoiseGenerator(
-                        octaves=layer_octaves,
-                        persistence=layer_persistence,
-                        lacunarity=layer_lacunarity,
-                        seed=layer_seed
-                    )
-                    
-                    # Generování šumu pro tuto vrstvu
-                    layer_noise = layer_gen.generate_batch_noise(
-                        batch_size=1,
-                        shape=(atlas_data.shape[0], atlas_data.shape[1], atlas_data.shape[2]),
-                        noise_dim=model.noise_dim,
-                        scale=layer_scale,
-                        device=device
-                    )
-                    
-                    noise_layers.append(layer_noise)
-                
-                # Kombinace všech vrstev šumu s různou váhou
-                combined_noise = noise.clone()  # Začínáme základním šumem
-                for layer_idx, layer_noise in enumerate(noise_layers):
-                    weight = np.random.uniform(0.2, 0.8)
-                    # Různé způsoby kombinace šumu pro různé typy interakcí
-                    if layer_idx % 3 == 0:
-                        # Aditivní kombinace
-                        combined_noise = combined_noise * (1 - weight) + layer_noise * weight
-                    elif layer_idx % 3 == 1:
-                        # Multiplikativní kombinace
-                        combined_noise = combined_noise * (layer_noise * weight + (1 - weight))
-                    else:
-                        # Max/min kombinace
-                        if np.random.random() > 0.5:
-                            combined_noise = torch.max(combined_noise * (1 - weight), layer_noise * weight)
-                        else:
-                            combined_noise = torch.min(combined_noise * (1 + weight), layer_noise * (1 + weight))
-                
-                noise = combined_noise
-                print(f"  Applied {num_layers} noise layers with complex blending for extreme variation")
-            else:
-                noise = None
-            
-            # Aplikujeme náhodnou transformaci vstupního atlasu pro každý vzorek
-            # To způsobí, že model bude generovat léze v mírně odlišných lokalitách
-            if np.random.random() > 0.3:  # Pro 70% vzorků
-                # Vyrobíme kopii atlasu pro manipulaci
-                transformed_atlas = atlas_tensor.clone()
-                
-                # Náhodné posunutí atlasu o několik voxelů
-                shift_x = np.random.randint(-5, 6)  # Posunutí o -5 až +5 voxelů
-                shift_y = np.random.randint(-5, 6)
-                shift_z = np.random.randint(-3, 4)  # Méně v ose Z
-                
-                if shift_x != 0 or shift_y != 0 or shift_z != 0:
-                    # Použití torch.roll pro cyklické posunutí atlasu
-                    transformed_atlas = torch.roll(transformed_atlas, shifts=(shift_z, shift_x, shift_y), dims=(2, 3, 4))
-                    print(f"  Applied spatial shift to atlas: ({shift_x}, {shift_y}, {shift_z})")
-                
-                # Náhodná lokální úprava intenzity atlasu
-                if np.random.random() > 0.5:
-                    # Vytvoříme náhodnou masku pro lokální zesílení/zeslabení atlasu
-                    intensity_factor = np.random.uniform(0.8, 1.2)
-                    mask_size = np.random.randint(10, 30)
-                    
-                    # Vytvoříme náhodnou lokální masku
-                    mask_center_x = np.random.randint(mask_size, transformed_atlas.shape[3] - mask_size)
-                    mask_center_y = np.random.randint(mask_size, transformed_atlas.shape[4] - mask_size)
-                    mask_center_z = np.random.randint(mask_size//2, transformed_atlas.shape[2] - mask_size//2)
-                    
-                    # Aplikujeme změnu intenzity v dané oblasti
-                    transformed_atlas[0, 0, 
-                                      max(0, mask_center_z - mask_size//2):min(transformed_atlas.shape[2], mask_center_z + mask_size//2),
-                                      max(0, mask_center_x - mask_size):min(transformed_atlas.shape[3], mask_center_x + mask_size),
-                                      max(0, mask_center_y - mask_size):min(transformed_atlas.shape[4], mask_center_y + mask_size)] *= intensity_factor
-                    
-                    print(f"  Applied local intensity modification with factor {intensity_factor:.2f}")
-                
-                # Použití transformovaného atlasu pro generování
-                atlas_input = transformed_atlas
-            else:
-                atlas_input = atlas_tensor
-            
-            # Generate the lesion
-            fake_lesion_logits = model(atlas_input, noise)
+        # Generate the lesion
+        with torch.no_grad():
+            # Forward pass with noise
+            fake_lesion = generator(atlas_tensor, noise)
             
             # Apply sigmoid to get probability map
-            fake_lesion = torch.sigmoid(fake_lesion_logits)
+            fake_lesion_prob = torch.sigmoid(fake_lesion)
             
-            # Convert to numpy array
-            fake_lesion_np = fake_lesion.squeeze().cpu().numpy()
+            # Convert to numpy for post-processing
+            lesion_prob_np = fake_lesion_prob.squeeze().cpu().numpy()
             
-            # AGRESIVNÍ MANIPULACE S PRAVDĚPODOBNOSTNÍ MAPOU
-            # Aplikujeme různé transformace na vygenerovanou pravděpodobnostní mapu
-            
-            # 1. Aplikace náhodné prostorové perturbace - vždy, ne jen pro polovinu vzorků
-            # Vytvoříme výraznější perturbace pro větší diverzitu
-            perturbation_strength = np.random.uniform(0.02, 0.1)  # Silnější perturbace (0.02-0.1 místo pevné 0.02)
-            perturbation = np.random.normal(0, perturbation_strength, fake_lesion_np.shape)
-            fake_lesion_np = fake_lesion_np + perturbation
-            
-            # 2. Aplikace nelineárních transformací pro změnu charakteru mapy
-            transformation_type = np.random.randint(0, 5)  # 5 různých transformací
-            
-            if transformation_type == 0:
-                # Exponenciální transformace - zvýrazní vyšší hodnoty
-                power = np.random.uniform(0.5, 2.0)
-                fake_lesion_np = np.power(fake_lesion_np, power)
-                print(f"  Applied exponential transformation with power {power:.2f}")
-            elif transformation_type == 1:
-                # Sigmoidní transformace - zvýrazní kontrast mezi nízkou a vysokou pravděpodobností
-                alpha = np.random.uniform(5, 15)
-                beta = np.random.uniform(0.3, 0.7)
-                fake_lesion_np = 1 / (1 + np.exp(-alpha * (fake_lesion_np - beta)))
-                print(f"  Applied sigmoid transformation with alpha={alpha:.2f}, beta={beta:.2f}")
-            elif transformation_type == 2:
-                # Logaritmická transformace - zvýrazní nižší hodnoty
-                epsilon = 1e-5  # Malá hodnota pro zabránění log(0)
-                fake_lesion_np = np.log(fake_lesion_np + epsilon) / np.log(1 + epsilon)
-                print(f"  Applied logarithmic transformation")
-            elif transformation_type == 3:
-                # Inverzní transformace v určitých regionech - lokální inverze hodnot
-                if np.random.random() > 0.5:
-                    inv_mask = np.random.uniform(0, 1, fake_lesion_np.shape) > 0.8  # 20% voxelů
-                    fake_lesion_np[inv_mask] = 1 - fake_lesion_np[inv_mask]
-                    print(f"  Applied local intensity inversion")
-            elif transformation_type == 4:
-                # Prahování s více úrovněmi - vytvoří více různých stupňů
-                thresholds = np.sort(np.random.uniform(0.2, 0.8, np.random.randint(2, 5)))
-                levels = np.linspace(0.2, 1.0, len(thresholds) + 1)
+            # Binarize the lesion
+            if use_adaptive_threshold:
+                # Get target coverage for this sample
+                if use_different_target_for_each_sample and target_coverages:
+                    current_target = target_coverages[i % len(target_coverages)]
+                else:
+                    current_target = target_coverage
                 
-                result = np.zeros_like(fake_lesion_np)
-                mask = fake_lesion_np > thresholds[0]
-                result[mask] = levels[0]
+                print(f"Finding adaptive threshold for target coverage of {current_target:.6f}%")
                 
-                for i in range(1, len(thresholds)):
-                    mask = fake_lesion_np > thresholds[i]
-                    result[mask] = levels[i]
-                
-                mask = fake_lesion_np > thresholds[-1]
-                result[mask] = levels[-1]
-                
-                fake_lesion_np = result
-                print(f"  Applied multi-level thresholding with {len(thresholds)} levels")
-            
-            # Zajistíme, že hodnoty zůstanou v platném rozsahu [0, 1]
-            fake_lesion_np = np.clip(fake_lesion_np, 0.0, 1.0)
-            
-            # Apply Gaussian smoothing to reduce noise and small fragments
-            if smooth_sigma > 0:
-                # Náhodný výběr typu vyhlazení
-                smoothing_type = np.random.randint(0, 3)
-                
-                if smoothing_type == 0:
-                    # Standardní Gaussovské vyhlazení s náhodnou sigmou
-                    sample_smooth_sigma = np.random.uniform(0.2, 1.0)  # Širší rozsah (0.2-1.0)
-                    fake_lesion_np = gaussian_filter(fake_lesion_np, sigma=sample_smooth_sigma)
-                    print(f"  Using Gaussian smoothing with sigma: {sample_smooth_sigma:.3f}")
-                elif smoothing_type == 1:
-                    # Anisotropické vyhlazení - různé sigmy pro různé směry
-                    sigma_x = np.random.uniform(0.3, 1.2)
-                    sigma_y = np.random.uniform(0.3, 1.2)
-                    sigma_z = np.random.uniform(0.3, 1.2)
-                    fake_lesion_np = gaussian_filter(fake_lesion_np, sigma=(sigma_z, sigma_x, sigma_y))
-                    print(f"  Using anisotropic smoothing with sigma: ({sigma_x:.2f}, {sigma_y:.2f}, {sigma_z:.2f})")
-                elif smoothing_type == 2:
-                    # Selektivní vyhlazení - vyhlazení pouze určitých oblastí
-                    baseline_sigma = np.random.uniform(0.3, 0.8)
-                    # Vytvoříme masku pro selektivní vyhlazení
-                    smooth_threshold = np.random.uniform(0.3, 0.7)
-                    areas_to_smooth = fake_lesion_np > smooth_threshold
-                    
-                    # Aplikujeme vyhlazení pouze na vybrané oblasti
-                    temp_result = fake_lesion_np.copy()
-                    temp_smooth = gaussian_filter(fake_lesion_np, sigma=baseline_sigma)
-                    temp_result[areas_to_smooth] = temp_smooth[areas_to_smooth]
-                    fake_lesion_np = temp_result
-                    print(f"  Using selective smoothing with threshold {smooth_threshold:.2f} and sigma {baseline_sigma:.2f}")
-            
-            # Apply adaptive threshold if requested
-            if use_adaptive_threshold and current_target_coverage is not None:
-                print(f"Finding adaptive threshold for sample {i+1} to match coverage of {current_target_coverage:.4f}%")
-                found_threshold, actual_coverage, binary_lesion = find_adaptive_threshold(
-                    fake_lesion_np, 
-                    current_target_coverage, 
-                    atlas_mask,
+                # Compute optimal threshold for target coverage
+                adaptive_threshold = find_adaptive_threshold(
+                    lesion_prob_np,
+                    current_target,
+                    atlas_mask=(atlas_data > 0),
                     initial_threshold=threshold,
                     min_threshold=min_adaptive_threshold,
                     max_threshold=max_adaptive_threshold,
                     max_iterations=adaptive_threshold_iterations
                 )
-                print(f"Sample {i+1}: Using threshold {found_threshold:.6f} with coverage {actual_coverage:.4f}%")
+                
+                print(f"Using adaptive threshold: {adaptive_threshold:.6f}")
+                # Use the adaptive threshold
+                lesion_binary = (lesion_prob_np >= adaptive_threshold).astype(np.float32)
             else:
                 # Use fixed threshold
-                binary_lesion = (fake_lesion_np > threshold).astype(np.float32)
-                # Ensure lesions only appear in regions with non-zero atlas values
-                binary_lesion = binary_lesion * atlas_mask
+                lesion_binary = (lesion_prob_np >= threshold).astype(np.float32)
             
-            # Apply morphological operations to create blocky, pixelated lesions
+            # Apply Gaussian smoothing if requested
+            if smooth_sigma > 0:
+                lesion_binary = gaussian_filter(lesion_binary, sigma=smooth_sigma)
+                lesion_binary = (lesion_binary > 0.5).astype(np.float32)  # Re-threshold after smoothing
+            
+            # Apply morphological closing if requested
             if morph_close_size > 0:
-                # Vary morphological operation parameters for each sample
-                sample_morph_size = morph_close_size + np.random.randint(-1, 2)  # -1, 0, or +1
-                sample_morph_size = max(1, sample_morph_size)  # Ensure at least 1
-
-                print(f"  Using blocky morphological operations for pixelated HIE lesion morphology")
+                # Create a structural element for closing
+                close_struct = generate_binary_structure(3, 1)
+                close_struct = binary_dilation(close_struct, iterations=morph_close_size-1)
                 
-                # Vytvoříme základní strukturní element - krychlový pro zachování ostrých hran
-                struct = np.ones((3, 3, 3), dtype=bool)  # Používáme krychli místo konektivity
+                # Apply closing: first dilation, then erosion
+                lesion_binary = binary_closing(lesion_binary, structure=close_struct)
                 
-                # Pro lepší blokovitost nejprve aplikujeme erozi a pak dilataci s krychlí
-                # To vytvoří ostré hrany a rohy
-                if np.random.random() < 0.7:  # 70% šance
-                    binary_lesion = binary_erosion(binary_lesion, structure=struct, iterations=1)
-                    binary_lesion = binary_dilation(binary_lesion, structure=struct, iterations=1)
-                
-                # Pro některé vzorky přidáme další blokové struktury
-                if np.random.random() < 0.6:  # 60% šance
-                    # Převést na boolean pro správnou aplikaci bitových operací
-                    binary_bool = binary_lesion.astype(bool)
-                    dilated = binary_dilation(binary_bool, structure=struct, iterations=2)
-                    border = dilated & ~binary_bool
-                    block_mask = np.random.random(border.shape) < 0.15  # Jen 15% bodů
-                    block_seeds = border & block_mask
-
-                    # Každý seed rozšíříme na malý blok
-                    block_size = np.random.randint(1, 2)  # Reduced maximum block size from 3 to 2
-                    blocks = binary_dilation(block_seeds, structure=struct, iterations=block_size)
-
-                    # Přidáme bloky k lézi - zaručíme že pracujeme s bool typem
-                    binary_bool = binary_bool | blocks
-                    binary_lesion = binary_bool.astype(binary_lesion.dtype)
-
+                # Convert back to float32
+                lesion_binary = lesion_binary.astype(np.float32)
             
-            # Remove small isolated lesions but zachováme ostré hrany
+            # Remove components smaller than min_lesion_size
             if min_lesion_size > 0:
-                # Vary minimum lesion size slightly for each sample, but ensure minimum is enforced
-                sample_min_size = int(min_lesion_size * (0.9 + np.random.uniform(0, 0.2)))  # 0.9-1.1x the original
-                sample_min_size = max(10, sample_min_size)  # Ensure minimum of 10 voxels
+                # Label connected components
+                labeled_array, num_features = measure.label(lesion_binary, structure=struct_element, return_num=True)
                 
-                print(f"  Using sample-specific minimum lesion size: {sample_min_size}")
-                
-                # Aplikujeme filtrovací krok
-                labeled_array, num_features = measure.label(binary_lesion)
+                # Get component sizes
                 component_sizes = np.bincount(labeled_array.ravel())
                 
+                # Zero out small components
+                too_small = component_sizes < min_lesion_size
+                too_small[0] = False  # Don't remove background
+                remove_pixels = too_small[labeled_array]
+                lesion_binary[remove_pixels] = 0
+                
+                # Count final number of components above threshold
+                labeled_array, num_features = measure.label(lesion_binary, structure=struct_element, return_num=True)
+                final_components = num_features
+                print(f"Final lesion has {final_components} connected components")
+            
+            # Calculate lesion coverage for this sample
+            if use_adaptive_threshold:
+                current_coverage = compute_lesion_coverage(lesion_binary, atlas_mask=(atlas_data > 0))
+                coverage_stats.append(current_coverage)
+                print(f"Lesion coverage: {current_coverage:.6f}% (target: {current_target:.6f}%)")
+            
+            # Store the generated lesion
+            generated_lesions.append(lesion_binary)
+            
+            # Save the lesion
+            if output_file is not None:
+                # Save as NIfTI file
+                print(f"Saving lesion to {output_file}")
+                lesion_nii = nib.Nifti1Image(lesion_binary, atlas_affine, atlas_header)
+                nib.save(lesion_nii, output_file)
+            elif output_dir is not None:
+                # Save as NIfTI file
                 # Set background (index 0) size to 0
                 if len(component_sizes) > 0:
                     component_sizes[0] = 0
@@ -2073,120 +1813,82 @@ def generate_lesions(
 
 def main():
     # Create argument parser
-    parser = argparse.ArgumentParser(description='SwinGAN - Synthetic Lesion Generator')
-    subparsers = parser.add_subparsers(dest='mode', help='Mode of operation')
+    parser = argparse.ArgumentParser(description='SwinGAN for HIE lesion synthesis')
+    subparsers = parser.add_subparsers(dest='mode', help='Mode')
     
-    # Train mode
-    train_parser = subparsers.add_parser('train', help='Train a model')
+    # Create train subparser
+    train_parser = subparsers.add_parser('train', help='Train the model')
     
-    # Training arguments
-    train_parser.add_argument('--lesion_dir', type=str, required=True, 
-                             help='Directory containing lesion NIfTI files')
-    train_parser.add_argument('--lesion_atlas', type=str, required=True, 
-                             help='Path to lesion atlas (frequency map)')
-    train_parser.add_argument('--output_dir', type=str, required=True, 
-                             help='Directory to save model checkpoints and logs')
-    train_parser.add_argument('--batch_size', type=int, default=4, 
-                             help='Batch size for training')
-    train_parser.add_argument('--epochs', type=int, default=100, 
-                             help='Number of epochs to train')
-    train_parser.add_argument('--lr_g', type=float, default=1e-4, 
-                             help='Learning rate for generator')
-    train_parser.add_argument('--lr_d', type=float, default=4e-4, 
-                             help='Learning rate for discriminator')
-    train_parser.add_argument('--feature_size', type=int, default=24, 
-                             help='Feature size for SwinUNETR')
-    train_parser.add_argument('--dropout_rate', type=float, default=0.0, 
-                             help='Dropout rate for SwinUNETR')
-    train_parser.add_argument('--lambda_focal', type=float, default=1.0, 
-                             help='Weight for focal loss')
-    train_parser.add_argument('--lambda_l1', type=float, default=10.0, 
-                             help='Weight for L1 loss')
-    train_parser.add_argument('--lambda_fragmentation', type=float, default=1.0, 
-                             help='Weight for fragmentation loss')
-    train_parser.add_argument('--focal_alpha', type=float, default=0.75, 
-                             help='Alpha parameter for focal loss')
-    train_parser.add_argument('--focal_gamma', type=float, default=2.0, 
-                             help='Gamma parameter for focal loss')
-    train_parser.add_argument('--save_interval', type=int, default=10, 
-                             help='Interval for saving model checkpoints (epochs)')
-    train_parser.add_argument('--generator_save_interval', type=int, default=5, 
-                             help='Interval for saving generator checkpoints (epochs)')
-    train_parser.add_argument('--val_split', type=float, default=0.1, 
-                             help='Fraction of data to use for validation')
-    train_parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu', 
-                             help='Device to use (cuda or cpu)')
-    train_parser.add_argument('--disable_amp', action='store_true', 
-                             help='Disable automatic mixed precision')
-    train_parser.add_argument('--min_non_zero', type=float, default=0.00001,
-                             help='Minimum percentage of non-zero voxels to include a sample')
-    train_parser.add_argument('--fragmentation_kernel_size', type=int, default=3, 
-                             help='Kernel size for fragmentation loss')
-    train_parser.add_argument('--perlin_octaves', type=int, default=4, 
-                             help='Number of octaves for Perlin noise (higher = more detail)')
-    train_parser.add_argument('--perlin_persistence', type=float, default=0.5, 
-                             help='Persistence parameter for Perlin noise (0-1)')
-    train_parser.add_argument('--perlin_lacunarity', type=float, default=2.0, 
-                             help='Lacunarity parameter for Perlin noise (how quickly detail increases)')
-    train_parser.add_argument('--perlin_scale', type=float, default=0.1, 
-                             help='Scale parameter for Perlin noise (smaller = smoother)')
-    train_parser.add_argument('--val_lesion_dir', type=str, default=None,
-                             help='Directory containing validation lesion NIfTI files')
-    train_parser.add_argument('--num_workers', type=int, default=4,
-                             help='Number of workers for data loading')
+    # Data paths
+    train_parser.add_argument('--train_lesion_dir', type=str, required=True, help='Path to directory with training lesion files')
+    train_parser.add_argument('--val_lesion_dir', type=str, help='Path to directory with validation lesion files')
+    train_parser.add_argument('--lesion_atlas_path', type=str, required=True, help='Path to lesion atlas file')
+    train_parser.add_argument('--output_dir', type=str, default='./output', help='Output directory')
     
-    # Generate mode
-    gen_parser = subparsers.add_parser('generate', help='Generate synthetic lesions')
+    # Training parameters
+    train_parser.add_argument('--batch_size', type=int, default=1, help='Batch size')
+    train_parser.add_argument('--epochs', type=int, default=100, help='Number of epochs')
+    train_parser.add_argument('--lr_generator', type=float, default=1e-4, help='Generator learning rate')
+    train_parser.add_argument('--lr_discriminator', type=float, default=4e-4, help='Discriminator learning rate')
+    train_parser.add_argument('--save_interval', type=int, default=5, help='Interval for saving checkpoints')
+    train_parser.add_argument('--generator_save_interval', type=int, default=4, help='Interval for saving generator-only checkpoints')
+    train_parser.add_argument('--device', type=str, default='cuda', help='Device to use (cuda/cpu)')
+    train_parser.add_argument('--num_workers', type=int, default=4, help='Number of worker threads for data loading')
+    train_parser.add_argument('--checkpoint', type=str, help='Path to checkpoint for resuming training')
+    train_parser.add_argument('--use_amp', action='store_true', help='Use automatic mixed precision')
     
-    # Generation arguments
-    gen_parser.add_argument('--model_checkpoint', type=str, required=True, 
-                           help='Path to model checkpoint')
-    gen_parser.add_argument('--lesion_atlas', type=str, required=True, 
-                           help='Path to lesion atlas (frequency map)')
-    gen_parser.add_argument('--output_file', type=str, default=None,
-                           help='Path to save the generated lesion .nii file (for single sample)')
-    gen_parser.add_argument('--output_dir', type=str, default=None,
-                           help='Directory to save multiple generated samples')
-    gen_parser.add_argument('--threshold', type=float, default=0.5, 
-                           help='Threshold for binarizing the generated lesions')
-    gen_parser.add_argument('--feature_size', type=int, default=24, 
-                           help='Feature size for SwinUNETR (must match training)')
-    gen_parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu', 
-                           help='Device to use (cuda or cpu)')
-    gen_parser.add_argument('--num_samples', type=int, default=1, 
-                           help='Number of samples to generate with different noise vectors')
-    gen_parser.add_argument('--perlin_octaves', type=int, default=4, 
-                           help='Number of octaves for Perlin noise (higher = more detail)')
-    gen_parser.add_argument('--perlin_persistence', type=float, default=0.5, 
-                           help='Persistence parameter for Perlin noise (0-1)')
-    gen_parser.add_argument('--perlin_lacunarity', type=float, default=2.0, 
-                           help='Lacunarity parameter for Perlin noise (how quickly detail increases)')
-    gen_parser.add_argument('--perlin_scale', type=float, default=0.1, 
-                           help='Scale parameter for Perlin noise (smaller = smoother)')
-    gen_parser.add_argument('--min_lesion_size', type=int, default=10,
-                           help='Minimum size of lesions in voxels (smaller will be removed)')
-    gen_parser.add_argument('--smooth_sigma', type=float, default=0.5,
-                           help='Sigma value for Gaussian smoothing of lesion probability map')
-    gen_parser.add_argument('--morph_close_size', type=int, default=2,
-                           help='Size of structuring element for morphological closing operation')
-    gen_parser.add_argument('--use_adaptive_threshold', action='store_true',
-                           help='Use adaptive thresholding to match training data coverage')
-    gen_parser.add_argument('--training_lesion_dir', type=str, default=None,
-                           help='Directory with training lesions to compute target coverage')
-    gen_parser.add_argument('--target_coverage', type=float, default=None,
-                           help='Target lesion coverage percentage (if not specified, computed from training data)')
-    gen_parser.add_argument('--min_adaptive_threshold', type=float, default=0.00001,
-                           help='Minimum threshold value for adaptive thresholding')
-    gen_parser.add_argument('--max_adaptive_threshold', type=float, default=0.999,
-                           help='Maximum threshold value for adaptive thresholding')
-    gen_parser.add_argument('--adaptive_threshold_iterations', type=int, default=50,
-                           help='Maximum iterations for adaptive threshold search')
-    gen_parser.add_argument('--use_different_target_for_each_sample', action='store_true',
-                           help='Use a different target coverage for each sample (requires training_lesion_dir)')
+    # Model parameters
+    train_parser.add_argument('--feature_size', type=int, default=24, help='Feature size for SwinUNETR')
+    train_parser.add_argument('--dropout_rate', type=float, default=0.0, help='Dropout rate')
+    train_parser.add_argument('--lambda_focal', type=float, default=10.0, help='Weight for focal loss')
+    train_parser.add_argument('--lambda_l1', type=float, default=5.0, help='Weight for L1 loss')
+    train_parser.add_argument('--lambda_fragmentation', type=float, default=50.0, help='Weight for fragmentation loss')
+    train_parser.add_argument('--focal_alpha', type=float, default=0.75, help='Alpha parameter for focal loss')
+    train_parser.add_argument('--focal_gamma', type=float, default=2.0, help='Gamma parameter for focal loss')
+    train_parser.add_argument('--use_noise', action='store_true', help='Use noise injection for diversity')
+    train_parser.add_argument('--noise_dim', type=int, default=16, help='Dimension of the noise vector')
+    train_parser.add_argument('--fragmentation_kernel_size', type=int, default=5, help='Size of kernel for fragmentation loss')
+    train_parser.add_argument('--perlin_octaves', type=int, default=4, help='Number of octaves for Perlin noise')
+    train_parser.add_argument('--perlin_persistence', type=float, default=0.5, help='Persistence parameter for Perlin noise')
+    train_parser.add_argument('--perlin_lacunarity', type=float, default=2.0, help='Lacunarity parameter for Perlin noise')
+    train_parser.add_argument('--perlin_scale', type=float, default=0.1, help='Scale parameter for Perlin noise')
+    train_parser.add_argument('--use_learnable_noise', action='store_true', help='Use learnable Perlin noise parameters')
     
+    # Dataset parameters
+    train_parser.add_argument('--filter_empty', action='store_true', help='Filter out empty lesion files')
+    train_parser.add_argument('--min_non_zero_percentage', type=float, default=0.00001, help='Minimum percentage of non-zero voxels to include sample')
+    
+    # Create generate subparser
+    generate_parser = subparsers.add_parser('generate', help='Generate lesions using a trained model')
+    
+    # Generation parameters
+    generate_parser.add_argument('--model_checkpoint', type=str, required=True, help='Path to generator checkpoint')
+    generate_parser.add_argument('--lesion_atlas', type=str, required=True, help='Path to lesion atlas file')
+    generate_parser.add_argument('--output_file', type=str, help='Output file path (for single sample)')
+    generate_parser.add_argument('--output_dir', type=str, help='Output directory (for multiple samples)')
+    generate_parser.add_argument('--threshold', type=float, default=0.5, help='Threshold for binary segmentation')
+    generate_parser.add_argument('--device', type=str, default='cuda', help='Device to use (cuda/cpu)')
+    generate_parser.add_argument('--num_samples', type=int, default=1, help='Number of samples to generate')
+    generate_parser.add_argument('--perlin_octaves', type=int, default=4, help='Number of octaves for Perlin noise')
+    generate_parser.add_argument('--perlin_persistence', type=float, default=0.5, help='Persistence parameter for Perlin noise')
+    generate_parser.add_argument('--perlin_lacunarity', type=float, default=2.0, help='Lacunarity parameter for Perlin noise')
+    generate_parser.add_argument('--perlin_scale', type=float, default=0.1, help='Scale parameter for Perlin noise')
+    generate_parser.add_argument('--min_lesion_size', type=int, default=10, help='Minimum lesion size in voxels')
+    generate_parser.add_argument('--smooth_sigma', type=float, default=0.5, help='Sigma for Gaussian smoothing')
+    generate_parser.add_argument('--morph_close_size', type=int, default=2, help='Size of structural element for morphological closing')
+    generate_parser.add_argument('--use_adaptive_threshold', action='store_true', help='Use adaptive thresholding')
+    generate_parser.add_argument('--training_lesion_dir', type=str, help='Directory with training lesions for coverage calculation')
+    generate_parser.add_argument('--target_coverage', type=float, help='Target lesion coverage percentage')
+    generate_parser.add_argument('--min_adaptive_threshold', type=float, default=0.00001, help='Minimum threshold for adaptive thresholding')
+    generate_parser.add_argument('--max_adaptive_threshold', type=float, default=0.999, help='Maximum threshold for adaptive thresholding')
+    generate_parser.add_argument('--adaptive_threshold_iterations', type=int, default=50, help='Maximum iterations for adaptive threshold search')
+    generate_parser.add_argument('--use_different_target_for_each_sample', action='store_true', help='Use different target coverage for each sample')
+    generate_parser.add_argument('--use_learnable_noise', action='store_true', help='Use learnable Perlin noise parameters')
+    
+    # Parse arguments
     args = parser.parse_args()
     
-    # Run the appropriate mode
+    # Execute appropriate function based on mode
     if args.mode == 'train':
         train_model(args)
     elif args.mode == 'generate':
