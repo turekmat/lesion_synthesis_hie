@@ -33,7 +33,13 @@ class PerlinNoiseGenerator:
         self.persistence = persistence
         self.lacunarity = lacunarity
         self.repeat = repeat
-        self.seed = seed if seed is not None else np.random.randint(0, 10000)
+        
+        # Zajistíme, že seed je v platném rozsahu
+        if seed is not None:
+            # Omezíme seed na rozsah 0 až 2^32-1
+            self.seed = seed % (2**32 - 1)
+        else:
+            self.seed = np.random.randint(0, 10000)
         
         # Set the random seed for reproducibility
         torch.manual_seed(self.seed)
@@ -1585,7 +1591,8 @@ def generate_lesions(
                 perlin_seed = (perlin_seed ^ (random_bits[2] << 16 | random_bits[3])) % 1000000000
                 
                 # Pro jistotu ještě promícháme bity pomocí jednoduchého hashing algoritmu
-                perlin_seed = ((perlin_seed * 0x5DEECE66D) + 0xB) % 2**48
+                # Omezíme seed na platný rozsah pro numpy.random.seed() (0 až 2^32-1)
+                perlin_seed = ((perlin_seed * 0x5DEECE66D) + 0xB) % (2**32 - 1)
                 
                 # Vytvoření zcela nového generátoru Perlin šumu pro každý vzorek
                 perlin_gen = PerlinNoiseGenerator(
@@ -1625,7 +1632,7 @@ def generate_lesions(
                     
                     # Přidáme závislost na indexu vrstvy, ale nelineárním způsobem
                     layer_index_hash = hash(("layer", layer, sample_seed)) % 1000000
-                    layer_seed = (layer_seed ^ layer_index_hash) % 1000000000
+                    layer_seed = (layer_seed ^ layer_index_hash) % (2**32 - 1)
                     
                     # Pro větší diverzitu použijeme nelineární transformace parametrů
                     # pro každou vrstvu
