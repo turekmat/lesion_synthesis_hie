@@ -1547,6 +1547,17 @@ def generate_lesions(
     if use_adaptive_threshold and target_coverage is None and training_lesion_dir is None:
         raise ValueError("For adaptive thresholding, either target_coverage or training_lesion_dir must be provided")
     
+    # Ensure output directory exists
+    if output_dir is not None:
+        os.makedirs(output_dir, exist_ok=True)
+        print(f"Ensuring output directory exists: {output_dir}")
+    elif output_file is not None:
+        # If only output_file is specified, ensure its parent directory exists
+        parent_dir = os.path.dirname(output_file)
+        if parent_dir:  # Only create if parent_dir is not empty
+            os.makedirs(parent_dir, exist_ok=True)
+            print(f"Ensuring parent directory exists: {parent_dir}")
+    
     # Load lesion atlas
     atlas_nii = nib.load(lesion_atlas)
     atlas_data = atlas_nii.get_fdata()
@@ -1973,6 +1984,13 @@ def generate_lesions(
             # Ensure data is of supported type (not bool)
             binary_lesion_for_saving = binary_lesion.astype(np.int16)  # Convert to int16, which is supported by NIfTI
             lesion_img = nib.Nifti1Image(binary_lesion_for_saving, atlas_affine, atlas_header)
+            
+            # Ensure the parent directory of sample_output_file exists
+            sample_output_dir = os.path.dirname(sample_output_file)
+            if sample_output_dir and not os.path.exists(sample_output_dir):
+                print(f"Creating directory for sample: {sample_output_dir}")
+                os.makedirs(sample_output_dir, exist_ok=True)
+            
             nib.save(lesion_img, sample_output_file)
             
             # Print some statistics
