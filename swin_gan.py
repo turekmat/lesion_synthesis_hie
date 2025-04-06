@@ -1571,7 +1571,7 @@ def generate_lesions(
                 print(f"Finding adaptive threshold for target coverage of {current_target:.6f}%")
                 
                 # Compute optimal threshold for target coverage
-                adaptive_threshold = find_adaptive_threshold(
+                adaptive_threshold, actual_coverage, _ = find_adaptive_threshold(
                     lesion_prob_np,
                     current_target,
                     atlas_mask=(atlas_data > 0),
@@ -1582,6 +1582,7 @@ def generate_lesions(
                 )
                 
                 print(f"Using adaptive threshold: {adaptive_threshold:.6f}")
+                print(f"Actual coverage at this threshold: {actual_coverage:.6f}%")
                 # Use the adaptive threshold
                 lesion_binary = (lesion_prob_np >= adaptive_threshold).astype(np.float32)
             else:
