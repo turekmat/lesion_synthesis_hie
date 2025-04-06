@@ -1676,7 +1676,10 @@ def generate_lesions(
                     
                     # Aplikujeme masku pro odstranění vybraných malých komponent
                     too_small_mask = too_small[labeled_array]
-                    binary_lesion[too_small_mask] = 0
+                    lesion_binary[too_small_mask] = 0
+            
+            # Přiřadíme lesion_binary do binary_lesion pro další zpracování
+            binary_lesion = lesion_binary.copy()
             
             # Pro blokovitější vzhled snížíme Gaussovské vyhlazení na minimum nebo ho přeskočíme
             if smooth_sigma > 0 and np.random.random() < 0.8:  # Zvýšíme šanci na vyhlazení z 50% na 80%
