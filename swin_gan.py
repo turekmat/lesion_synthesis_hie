@@ -517,12 +517,11 @@ class Generator(nn.Module):
             # Normalizace šumu pro zachování rozumného rozsahu
             processed_noise = F.instance_norm(processed_noise)
             
-            # V režimu generování (bez tréninku) vždy použijeme aditivní aplikaci šumu
-            # pro zajištění konzistentního počtu kanálů
+            # V režimu generování (bez tréninku) vždy použijeme konkatenaci šumu s atlasem
+            # aby byl zajištěn správný počet kanálů (2), které SwinUNETR očekává
             if not self.training:
-                # Aditivní aplikace šumu přímo na vstup, která je bezpečnější pro generování
-                noise_mask = torch.sigmoid(x * 3.0)  # Sigmoid transformace atlasu pro váhování šumu
-                x = x + (processed_noise * noise_mask * 0.5)  # Aditivní aplikace s váhováním
+                # Vždy konkatenujeme atlas a zpracovaný šum, aby počet kanálů odpovídal očekávanému počtu
+                x = torch.cat([x, processed_noise], dim=1)
             else:
                 # Během tréninku můžeme použít náhodný přístup
                 if torch.rand(1).item() < 0.5:  # 50% šance na každý způsob aplikace
