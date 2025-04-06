@@ -1712,13 +1712,14 @@ def generate_lesions(
                 # Find the threshold that gives the target coverage
                 threshold_value = find_adaptive_threshold(
                     probability_map_np, 
-                    target_coverage, 
+                    current_target,  # Použijeme current_target místo target_coverage
+                    atlas_mask=(atlas_data > 0),
                     initial_threshold=threshold,
                     min_threshold=min_adaptive_threshold,
                     max_threshold=max_adaptive_threshold,
                     max_iterations=adaptive_threshold_iterations
                 )
-                print(f"Sample {i+1}: Using adaptive threshold {threshold_value:.4f} for target coverage {target_coverage:.4f}%")
+                print(f"Sample {i+1}: Using adaptive threshold {threshold_value:.4f} for target coverage {current_target:.6f}%")
             else:
                 threshold_value = threshold
             
