@@ -1639,8 +1639,26 @@ def generate_lesions(
         
         # Pro každý vzorek vybereme náhodný target coverage z trénovacích dat
         if use_adaptive_threshold and training_lesion_dir is not None:
-            # Náhodně vybereme trénovací soubor
-            random_training_file = np.random.choice(training_lesion_dir)
+            # Ověříme, zda training_lesion_dir je řetězec (cesta k adresáři) nebo seznam souborů
+            if isinstance(training_lesion_dir, str):
+                # Je to cesta k adresáři, najdeme všechny soubory s příponou .nii nebo .nii.gz
+                lesion_files = []
+                for ext in ['.nii', '.nii.gz']:
+                    lesion_files.extend(glob.glob(os.path.join(training_lesion_dir, f'*{ext}')))
+                
+                if not lesion_files:
+                    raise ValueError(f"No .nii or .nii.gz files found in directory: {training_lesion_dir}")
+                
+                print(f"Found {len(lesion_files)} lesion files in directory")
+            else:
+                # Předpokládáme, že training_lesion_dir je již seznam souborů
+                lesion_files = training_lesion_dir
+                
+                if not lesion_files:
+                    raise ValueError("Empty list of training lesion files provided")
+            
+            # Nyní vybereme náhodný soubor ze seznamu
+            random_training_file = np.random.choice(lesion_files)
             # Načteme jeho lézi a spočítáme coverage
             lesion = nib.load(random_training_file).get_fdata()
             current_target = compute_lesion_coverage(lesion > 0)
