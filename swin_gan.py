@@ -1953,7 +1953,9 @@ def generate_lesions(
                 # Místo přidávání plynulého šumu přidáme blokové struktury
                 if np.random.random() < 0.7:
                     # Najdeme hranice léze
-                    border = binary_dilation(binary_lesion, iterations=1) & ~binary_lesion
+                    binary_bool = binary_lesion.astype(bool)
+                    dilated_bool = binary_dilation(binary_bool, iterations=1)
+                    border = dilated_bool & ~binary_bool
                     
                     # Vytvoříme náhodné bloky na hranách - pixelový šum
                     block_noise = np.random.random(border.shape) < 0.3
@@ -1965,7 +1967,10 @@ def generate_lesions(
                     # Pro některé léze přidáme další izolované bloky v blízkosti
                     if np.random.random() < 0.4:
                         # Vytvoříme broader border
-                        outer_border = binary_dilation(binary_lesion, iterations=3) & ~binary_dilation(binary_lesion, iterations=1)
+                        binary_bool = binary_lesion.astype(bool)
+                        dilated_1 = binary_dilation(binary_bool, iterations=1)
+                        dilated_3 = binary_dilation(binary_bool, iterations=3)
+                        outer_border = dilated_3 & ~dilated_1
                         
                         # Vytvoříme méně častější izolované bloky
                         isolated_blocks = np.random.random(outer_border.shape) < 0.05
@@ -1978,13 +1983,20 @@ def generate_lesions(
                 print("  Skipping smoothing to preserve blocky appearance")
                 
                 # Přidáme pixelový šum na hranách
-                border = binary_dilation(binary_lesion, iterations=1) & ~binary_lesion
+                # Nejprve konvertujeme binary_lesion na bool pro logické operace
+                binary_bool = binary_lesion.astype(bool)
+                dilated_bool = binary_dilation(binary_bool, iterations=1)
+                border = dilated_bool & ~binary_bool
                 pixel_noise = np.random.random(border.shape) < 0.25
                 binary_lesion = binary_lesion | (pixel_noise & border)
                 
                 # Pro ještě blokovitější vzhled můžeme přidat i nepřipojené pixely
                 if np.random.random() < 0.5:
-                    outer_region = binary_dilation(binary_lesion, iterations=4) & ~binary_dilation(binary_lesion, iterations=1)
+                    # Opět používáme booleovský typ pro správné logické operace
+                    binary_bool = binary_lesion.astype(bool)
+                    dilated_1 = binary_dilation(binary_bool, iterations=1)
+                    dilated_4 = binary_dilation(binary_bool, iterations=4)
+                    outer_region = dilated_4 & ~dilated_1
                     isolated_pixels = np.random.random(outer_region.shape) < 0.03
                     binary_lesion = binary_lesion | (isolated_pixels & outer_region)
 
