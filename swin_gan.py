@@ -903,9 +903,6 @@ class SwinGANTrainer:
                 atlas = batch['atlas'].to(self.device)
                 real_lesion = batch['lesion'].to(self.device)
                 
-                # Update learning rate schedulers if they exist
-                self._update_schedulers()
-                
                 # Train discriminator
                 self.optimizer_d.zero_grad()
                 
