@@ -122,14 +122,19 @@ class PerlinNoiseGenerator:
             for i in range(1, self.octaves):
                 amplitudes.append(amplitudes[-1] * self.persistence)
             
-            # Zvýšíme celkovou amplitudu šumu pro větší vliv na výstup
-            amplification_factor = 1.5 + torch.rand(1).item() * 0.5  # Náhodné zesílení 1.5-2.0x
+            # ZMĚNA: Výrazně zvýšíme celkovou amplitudu šumu pro agresivnější šum
+            amplification_factor = 2.5 + torch.rand(1).item() * 1.5  # Náhodné zesílení 2.5-4.0x
             amplitudes = [amp * amplification_factor for amp in amplitudes]
             
             max_amplitude = sum(amplitudes)
             octaves_to_use = self.octaves
+            
+            # ZMĚNA: Více náhodné váhy pro různé typy šumu
             noise_weights = torch.rand(4, device=device)
             noise_weights = noise_weights / noise_weights.sum()  # Normalizace vah
+        
+        # ZMĚNA: Upravíme scale pro větší variabilitu - větší scale = více hrubý šum
+        scale = scale * (1.5 + torch.rand(1).item())  # Zvýšení scale o 1.5-2.5x
         
         # Create meshgrid for coordinates
         z = torch.linspace(0, scale, D, device=device)
@@ -187,10 +192,10 @@ class PerlinNoiseGenerator:
                 phase_offset_y = random_tensor[0, 1] * 6.28 + octave * 1.2
                 phase_offset_z = random_tensor[0, 2] * 6.28 + octave * 0.8
                 
-                # We'll also randomize the frequency multipliers to get more varied patterns
-                freq_multiplier_x = 1.0 + random_tensor[1, 0] * 0.7  # Zvýšený rozsah z 0.5 na 0.7
-                freq_multiplier_y = 1.0 + random_tensor[1, 1] * 0.7
-                freq_multiplier_z = 1.0 + random_tensor[1, 2] * 0.7
+                # ZMĚNA: Zvýšíme rozsah náhodnosti frequency multipliers pro více variability
+                freq_multiplier_x = 1.0 + random_tensor[1, 0] * 1.2  # Zvýšený rozsah až na 1.2
+                freq_multiplier_y = 1.0 + random_tensor[1, 1] * 1.2
+                freq_multiplier_z = 1.0 + random_tensor[1, 2] * 1.2
             
             # Generování různých typů šumu pro různé oktávy
             noise_type_idx = octave % len(noise_types)
@@ -421,17 +426,17 @@ class HieLesionDataset(Dataset):
 
 
 class Generator(nn.Module):
-    def __init__(self, in_channels=1, out_channels=1, feature_size=24, dropout_rate=0.0, use_noise=True, noise_dim=16,
-                 perlin_octaves=4, perlin_persistence=0.5, perlin_lacunarity=2.0, perlin_scale=0.1, use_learnable_noise=False):
+    def __init__(self, in_channels=1, out_channels=1, feature_size=24, dropout_rate=0.0, use_noise=True, noise_dim=32,
+                 perlin_octaves=6, perlin_persistence=0.6, perlin_lacunarity=2.5, perlin_scale=0.2, use_learnable_noise=False):
         """
-        Generator based on SwinUNETR for lesion synthesis
+        Generator using SwinUNETR architecture
         
         Args:
-            in_channels (int): Number of input channels (1 for lesion atlas)
-            out_channels (int): Number of output channels (1 for binary lesion mask)
-            feature_size (int): Feature size for SwinUNETR
+            in_channels (int): Number of input channels
+            out_channels (int): Number of output channels
+            feature_size (int): Feature size
             dropout_rate (float): Dropout rate
-            use_noise (bool): Whether to use noise injection for diversity
+            use_noise (bool): Whether to use noise injection (for diversity)
             noise_dim (int): Dimension of the noise vector to inject
             perlin_octaves (int): Number of octaves for Perlin noise
             perlin_persistence (float): Persistence parameter for Perlin noise
@@ -515,14 +520,14 @@ class Generator(nn.Module):
     
     def forward(self, x, noise=None):
         """
-        Forward pass with optional noise input
+        Forward pass of the generator
         
         Args:
             x: Input tensor (lesion atlas)
-            noise: Optional noise tensor. If None and use_noise is True, Perlin noise will be generated
-        
+            noise: Optional noise tensor
+            
         Returns:
-            Generated lesion mask
+            Generated lesion logits
         """
         # Process noise if using it
         if self.use_noise:
@@ -544,54 +549,76 @@ class Generator(nn.Module):
             if noise.dim() == 2:  # Pokud má noise tvar [batch_size, noise_dim]
                 # Rozšíříme noise_dim na D*H*W
                 expanded_noise = noise.view(batch_size, self.noise_dim, 1, 1, 1).expand(batch_size, self.noise_dim, D, H, W)
-                # Vezmeme více dimenzí (kanálů) pro noise_processor pro větší variabilitu
-                # Původně se brala jen jedna dimenze, nyní vezmeme náhodně 2-4 dimenze a zkombinujeme je
-                num_noise_channels = torch.randint(2, 5, (1,)).item()  # Náhodně 2-4 kanály
+                
+                # ZMĚNA: Použijeme více kanálů pro větší variabilitu
+                num_noise_channels = torch.randint(3, min(self.noise_dim, 8) + 1, (1,)).item()  # Náhodně 3-8 kanálů (nebo max self.noise_dim)
                 noise_indices = torch.randperm(self.noise_dim)[:num_noise_channels]
-                combined_noise = torch.zeros((batch_size, 1, D, H, W), device=x.device)
+                
+                # ZMĚNA: Přidáme Gaussovský šum pro zvýšení variability
+                combined_noise = torch.randn((batch_size, 1, D, H, W), device=x.device) * 0.3
                 
                 # Kombinace několika kanálů šumu s různými váhami pro větší komplexitu
                 for i, idx in enumerate(noise_indices):
-                    channel_weight = 1.0 / (i + 1)  # Klesající váhy pro další kanály
+                    # ZMĚNA: Použijeme náhodné váhy pro více variability
+                    channel_weight = torch.rand(1, device=x.device).item() * 0.5 + 0.5  # Váhy mezi 0.5-1.0
                     combined_noise += expanded_noise[:, idx:idx+1, :, :, :] * channel_weight
+                
+                # ZMĚNA: Přidáme další zdroj šumu - čistě náhodný šum
+                if torch.rand(1).item() < 0.8:  # 80% šance
+                    random_noise = torch.randn((batch_size, 1, D, H, W), device=x.device) * 0.5
+                    combined_noise = combined_noise + random_noise
                 
                 noise_3d = combined_noise / num_noise_channels  # Normalizace
                 
-                # Přidáme náhodné zesílení šumu pro větší nepředvídatelnost
-                noise_amplification = 1.0 + torch.rand(1).item()  # Random mezi 1.0 a 2.0
+                # ZMĚNA: Zvýšíme amplifikaci šumu pro agresivnější efekt
+                noise_amplification = 2.0 + torch.rand(1).item() * 1.5  # 2.0-3.5x zesílení
                 noise_3d = noise_3d * noise_amplification
             else:
                 # Předpokládáme, že noise už má správný tvar
-                noise_3d = noise * (1.0 + 0.5 * torch.rand(1).item())  # Náhodné zesílení
+                # ZMĚNA: Zvýšená amplifikace i pro předem dodaný šum
+                noise_amplification = 2.0 + torch.rand(1).item() * 1.5  # 2.0-3.5x zesílení
+                noise_3d = noise * noise_amplification
             
             # Process noise through a more complex network to make it harder to ignore
-            # Původní noise_processor byl příliš jednoduchý, rozšíříme ho
             processed_noise = self.noise_processor(noise_3d)
             
-            # Přidáme další náhodnost do zpracovaného šumu s různou frekvencí
-            if torch.rand(1).item() < 0.7:  # 70% šance na přidání další náhodnosti
-                # Vytvoříme dodatečný nízkofrekvenční šum
-                low_freq_noise = torch.randn_like(processed_noise) * 0.2
-                # Použijeme blur pro vytvoření nízkofrekvenčního šumu
-                kernel_size = 5
-                padding = kernel_size // 2
-                low_freq_noise = F.avg_pool3d(low_freq_noise, kernel_size=kernel_size, stride=1, padding=padding)
-                # Kombinujeme s původním šumem
-                processed_noise = processed_noise + low_freq_noise
+            # ZMĚNA: Vždy přidáme další náhodnost do zpracovaného šumu s různou frekvencí
+            # Vytvoříme dodatečný nízkofrekvenční šum
+            low_freq_noise = torch.randn_like(processed_noise) * 0.4  # Zvýšená amplituda
+            # Použijeme blur pro vytvoření nízkofrekvenčního šumu
+            kernel_size = 5
+            padding = kernel_size // 2
+            low_freq_noise = F.avg_pool3d(low_freq_noise, kernel_size=kernel_size, stride=1, padding=padding)
+            # Kombinujeme s původním šumem
+            processed_noise = processed_noise + low_freq_noise
+            
+            # ZMĚNA: Přidáme zcela nový vysokofrekvenční šum pro více detailů
+            high_freq_noise = torch.randn_like(processed_noise) * 0.2
+            processed_noise = processed_noise + high_freq_noise
             
             # Přímé přidání částí nezpracovaného šumu do výstupu pro zvýšení variability
-            direct_noise_weight = 0.3 * torch.rand(1).item()  # Náhodná váha 0-0.3
+            direct_noise_weight = 0.4 + 0.3 * torch.rand(1).item()  # ZMĚNA: Zvýšená váha 0.4-0.7
             processed_noise = processed_noise + (noise_3d * direct_noise_weight)
+            
+            # ZMĚNA: Občas přidáme nelinearitu pro více komplexní struktury
+            if torch.rand(1).item() < 0.5:
+                processed_noise = torch.tanh(processed_noise * (1.5 + torch.rand(1).item()))
             
             # Normalizace šumu pro zachování rozumného rozsahu
             processed_noise = F.instance_norm(processed_noise)
+            
+            # ZMĚNA: Přidáme ještě poslední vrstvu náhodnosti po normalizaci
+            if torch.rand(1).item() < 0.3:  # 30% šance
+                processed_noise = processed_noise + (torch.randn_like(processed_noise) * 0.2)
             
             # Always concatenate noise with input for correct channel count (2 channels)
             x = torch.cat([x, processed_noise], dim=1)
         else:
             # If not using noise, we still need 2 input channels as expected by SwinUNETR
             batch_size, _, D, H, W = x.shape
-            zero_channel = torch.zeros_like(x)
+            
+            # ZMĚNA: I když nepoužíváme Perlin šum, přidáme alespoň nějaký náhodný šum
+            zero_channel = torch.randn_like(x) * 0.3
             x = torch.cat([x, zero_channel], dim=1)
         
         # SwinUNETR features
@@ -656,12 +683,12 @@ class SwinGAN(nn.Module):
                  focal_alpha=0.75,
                  focal_gamma=2.0,
                  use_noise=True,
-                 noise_dim=16,
+                 noise_dim=32,
                  fragmentation_kernel_size=5,
-                 perlin_octaves=4,
-                 perlin_persistence=0.5,
-                 perlin_lacunarity=2.0,
-                 perlin_scale=0.1,
+                 perlin_octaves=6,
+                 perlin_persistence=0.6,
+                 perlin_lacunarity=2.5,
+                 perlin_scale=0.2,
                  use_learnable_noise=False):
         """
         SwinGAN for lesion synthesis
@@ -1906,13 +1933,13 @@ def main():
     train_parser.add_argument('--lambda_fragmentation', type=float, default=50.0, help='Weight for fragmentation loss')
     train_parser.add_argument('--focal_alpha', type=float, default=0.75, help='Alpha parameter for focal loss')
     train_parser.add_argument('--focal_gamma', type=float, default=2.0, help='Gamma parameter for focal loss')
-    train_parser.add_argument('--use_noise', action='store_true', help='Use noise injection for diversity')
-    train_parser.add_argument('--noise_dim', type=int, default=16, help='Dimension of the noise vector')
+    train_parser.add_argument('--use_noise', action='store_true', default=True, help='Use noise injection for diversity')
+    train_parser.add_argument('--noise_dim', type=int, default=32, help='Dimension of the noise vector')
     train_parser.add_argument('--fragmentation_kernel_size', type=int, default=5, help='Size of kernel for fragmentation loss')
-    train_parser.add_argument('--perlin_octaves', type=int, default=4, help='Number of octaves for Perlin noise')
-    train_parser.add_argument('--perlin_persistence', type=float, default=0.5, help='Persistence parameter for Perlin noise')
-    train_parser.add_argument('--perlin_lacunarity', type=float, default=2.0, help='Lacunarity parameter for Perlin noise')
-    train_parser.add_argument('--perlin_scale', type=float, default=0.1, help='Scale parameter for Perlin noise')
+    train_parser.add_argument('--perlin_octaves', type=int, default=6, help='Number of octaves for Perlin noise')
+    train_parser.add_argument('--perlin_persistence', type=float, default=0.6, help='Persistence parameter for Perlin noise')
+    train_parser.add_argument('--perlin_lacunarity', type=float, default=2.5, help='Lacunarity parameter for Perlin noise')
+    train_parser.add_argument('--perlin_scale', type=float, default=0.2, help='Scale parameter for Perlin noise')
     train_parser.add_argument('--use_learnable_noise', action='store_true', help='Use learnable Perlin noise parameters')
     
     # Dataset parameters
