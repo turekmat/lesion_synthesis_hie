@@ -1553,6 +1553,10 @@ def generate_lesions(
     header = atlas_nii.header
     affine = atlas_nii.affine
     
+    # Nastavení pro NIfTI export
+    atlas_header = header
+    atlas_affine = affine
+    
     # Convert to tensor with batch dimension and channel dimension
     atlas_tensor = torch.from_numpy(atlas_data).float().unsqueeze(0).unsqueeze(0)
     
@@ -1710,7 +1714,7 @@ def generate_lesions(
             # Apply threshold to get binary mask
             if use_adaptive_threshold:
                 # Find the threshold that gives the target coverage
-                threshold_value = find_adaptive_threshold(
+                threshold_result = find_adaptive_threshold(
                     probability_map_np, 
                     current_target,  # Použijeme current_target místo target_coverage
                     atlas_mask=(atlas_data > 0),
@@ -1719,12 +1723,16 @@ def generate_lesions(
                     max_threshold=max_adaptive_threshold,
                     max_iterations=adaptive_threshold_iterations
                 )
-                print(f"Sample {i+1}: Using adaptive threshold {threshold_value:.4f} for target coverage {current_target:.6f}%")
+                # Funkce vrací (threshold, coverage, binary_lesion)
+                threshold_value = threshold_result[0]
+                found_coverage = threshold_result[1]
+                binary_mask = threshold_result[2]
+                
+                print(f"Sample {i+1}: Using adaptive threshold {threshold_value:.4f} for target coverage {current_target:.6f}%, found coverage: {found_coverage:.6f}%")
             else:
                 threshold_value = threshold
-            
-            # Apply threshold
-            binary_mask = (probability_map_np > threshold_value).astype(np.float32)
+                # Apply threshold
+                binary_mask = (probability_map_np > threshold_value).astype(np.float32)
             
             # Apply Gaussian smoothing if requested
             if smooth_sigma > 0 and apply_smoothing:
@@ -1780,21 +1788,24 @@ def generate_lesions(
                     # V starších verzích scipy musíme počet komponent zjistit pomocí np.max
                     final_components = np.max(labeled_array)
                 print(f"Final lesion has {final_components} connected components")
+                
+            # Inicializujeme binary_lesion jako kopii binary_mask pro další zpracování a výpočty
+            binary_lesion = binary_mask.copy()
             
             # Calculate lesion coverage for this sample
             if use_adaptive_threshold:
-                current_coverage = compute_lesion_coverage(binary_mask, atlas_mask=(atlas_data > 0))
-                coverage_stats.append(current_coverage)
-                print(f"Lesion coverage: {current_coverage:.6f}% (target: {current_target:.6f}%)")
+                # Použijeme již vypočítanou hodnotu coverage z find_adaptive_threshold
+                coverage_stats.append(found_coverage)
+                print(f"Lesion coverage confirmed: {found_coverage:.6f}% (target: {current_target:.6f}%)")
             
             # Store the generated lesion
-            generated_lesions.append(binary_mask)
+            generated_lesions.append(binary_lesion)
             
             # Save the lesion
             if output_file is not None:
                 # Save as NIfTI file
                 print(f"Saving lesion to {output_file}")
-                lesion_nii = nib.Nifti1Image(binary_mask, atlas_affine, atlas_header)
+                lesion_nii = nib.Nifti1Image(binary_lesion, atlas_affine, atlas_header)
                 nib.save(lesion_nii, output_file)
             elif output_dir is not None:
                 # Save as NIfTI file
