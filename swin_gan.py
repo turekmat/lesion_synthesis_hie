@@ -1852,6 +1852,10 @@ def main():
                              help='Lacunarity parameter for Perlin noise (how quickly detail increases)')
     train_parser.add_argument('--perlin_scale', type=float, default=0.1, 
                              help='Scale parameter for Perlin noise (smaller = smoother)')
+    train_parser.add_argument('--val_lesion_dir', type=str, default=None,
+                             help='Directory containing validation lesion NIfTI files')
+    train_parser.add_argument('--num_workers', type=int, default=4,
+                             help='Number of workers for data loading')
     
     # Generate mode
     gen_parser = subparsers.add_parser('generate', help='Generate synthetic lesions')
