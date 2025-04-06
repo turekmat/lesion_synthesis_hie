@@ -1585,14 +1585,21 @@ def generate_lesions(
                 print(f"Actual coverage at this threshold: {actual_coverage:.6f}%")
                 # Use the adaptive threshold
                 lesion_binary = (lesion_prob_np >= adaptive_threshold).astype(np.float32)
+                # Ensure lesions respect atlas mask after adaptive thresholding
+                lesion_binary = lesion_binary & (atlas_data > 0)
             else:
                 # Use fixed threshold
                 lesion_binary = (lesion_prob_np >= threshold).astype(np.float32)
+                # Ensure lesions respect atlas mask
+                lesion_binary = lesion_binary * (atlas_data > 0)
             
             # Apply Gaussian smoothing if requested
             if smooth_sigma > 0:
                 lesion_binary = gaussian_filter(lesion_binary, sigma=smooth_sigma)
                 lesion_binary = (lesion_binary > 0.5).astype(np.float32)  # Re-threshold after smoothing
+                # Ensure lesions respect atlas mask after smoothing
+                atlas_mask = atlas_data > 0
+                lesion_binary = lesion_binary * atlas_mask
             
             # Apply morphological closing if requested
             if morph_close_size > 0:
@@ -1605,6 +1612,10 @@ def generate_lesions(
                 
                 # Convert back to float32
                 lesion_binary = lesion_binary.astype(np.float32)
+                
+                # Ensure lesions respect atlas mask (don't add voxels where atlas is 0)
+                atlas_mask = atlas_data > 0
+                lesion_binary = lesion_binary * atlas_mask
             
             # Remove components smaller than min_lesion_size
             if min_lesion_size > 0:
@@ -1698,12 +1709,17 @@ def generate_lesions(
                     # Mírně zvýšíme threshold pro ostřejší hrany
                     adaptive_threshold = max(0.05, adaptive_threshold * 1.05)
                     binary_lesion = smoothed > adaptive_threshold
+                    # Ensure binary_lesion respects atlas mask after adaptive thresholding
+                    binary_lesion = binary_lesion & (atlas_data > 0)
                 
                 # Místo přidávání plynulého šumu přidáme blokové struktury
                 if np.random.random() < 0.7:
                     # Najdeme hranice léze
                     binary_bool = binary_lesion.astype(bool)
                     dilated_bool = binary_dilation(binary_bool, iterations=1)
+                    # Ensure dilation respects atlas mask
+                    atlas_mask = atlas_data > 0
+                    dilated_bool = dilated_bool & atlas_mask
                     border = dilated_bool & ~binary_bool
                     
                     # Vytvoříme náhodné bloky na hranách - pixelový šum
@@ -1720,7 +1736,11 @@ def generate_lesions(
                         # Vytvoříme broader border
                         binary_bool = binary_lesion.astype(bool)
                         dilated_1 = binary_dilation(binary_bool, iterations=1)
+                        # Ensure dilation respects atlas mask
+                        dilated_1 = dilated_1 & atlas_mask
                         dilated_3 = binary_dilation(binary_bool, iterations=3)  # Sníženo z iterations=4 na 3
+                        # Ensure dilation respects atlas mask
+                        dilated_3 = dilated_3 & atlas_mask
                         outer_border = dilated_3 & ~dilated_1
                         
                         # Vytvoříme méně častější izolované bloky
@@ -1739,6 +1759,9 @@ def generate_lesions(
                 # Nejprve konvertujeme binary_lesion na bool pro logické operace
                 binary_bool = binary_lesion.astype(bool)
                 dilated_bool = binary_dilation(binary_bool, iterations=1)
+                # Ensure dilation respects atlas mask
+                atlas_mask = atlas_data > 0
+                dilated_bool = dilated_bool & atlas_mask
                 border = dilated_bool & ~binary_bool
                 pixel_noise = np.random.random(border.shape) < 0.15  # Snížení z 0.25 na 0.15 pro méně šumu
                 # Použijeme logický OR na bool a pak konvertujeme zpět na původní typ
@@ -1750,7 +1773,11 @@ def generate_lesions(
                     # Opět používáme booleovský typ pro správné logické operace
                     binary_bool = binary_lesion.astype(bool)
                     dilated_1 = binary_dilation(binary_bool, iterations=1)
+                    # Ensure dilation respects atlas mask
+                    dilated_1 = dilated_1 & atlas_mask
                     dilated_4 = binary_dilation(binary_bool, iterations=3)  # Sníženo z iterations=4 na 3
+                    # Ensure dilation respects atlas mask
+                    dilated_4 = dilated_4 & atlas_mask
                     outer_region = dilated_4 & ~dilated_1
                     isolated_pixels = np.random.random(outer_region.shape) < 0.01  # Sníženo z 0.03 na 0.01
                     # Použijeme logický OR na bool a pak konvertujeme zpět na původní typ
@@ -1936,7 +1963,8 @@ def main():
             min_adaptive_threshold=args.min_adaptive_threshold,
             max_adaptive_threshold=args.max_adaptive_threshold,
             adaptive_threshold_iterations=args.adaptive_threshold_iterations,
-            use_different_target_for_each_sample=args.use_different_target_for_each_sample
+            use_different_target_for_each_sample=args.use_different_target_for_each_sample,
+            use_learnable_noise=args.use_learnable_noise
         )
     else:
         parser.print_help()
