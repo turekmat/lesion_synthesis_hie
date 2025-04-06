@@ -1736,6 +1736,19 @@ def generate_lesions(
                 
                 sample_output_file = os.path.join(output_dir, filename)
             
+            # Výpočet objemu v procentech celkového objemu mozku před uložením
+            total_brain_volume = np.count_nonzero(atlas_data > 0)  # Počet voxelů, kde je atlas nenulový
+            lesion_volume_voxels = binary_lesion.sum()
+            lesion_volume_percentage = (lesion_volume_voxels / total_brain_volume) * 100.0
+            
+            # Skip saving files with 0.000% coverage (no lesions)
+            if lesion_volume_percentage <= 0.0:
+                if num_samples > 1:
+                    print(f"Sample {i+1}: No lesions detected (0.000% coverage) - skipping save")
+                else:
+                    print("No lesions detected (0.000% coverage) - skipping save")
+                continue
+            
             # Create a new NIfTI image and save it
             # Ensure data is of supported type (not bool)
             binary_lesion_for_saving = binary_lesion.astype(np.int16)  # Convert to int16, which is supported by NIfTI
@@ -1745,11 +1758,6 @@ def generate_lesions(
             # Print some statistics
             # measure.label vrací tuple (labeled_array, num_features)
             labeled_array, num_lesions = measure.label(binary_lesion)
-            
-            # Výpočet objemu v procentech celkového objemu mozku
-            total_brain_volume = np.count_nonzero(atlas_data > 0)  # Počet voxelů, kde je atlas nenulový
-            lesion_volume_voxels = binary_lesion.sum()
-            lesion_volume_percentage = (lesion_volume_voxels / total_brain_volume) * 100.0
             
             # Také vypočítáme objem v ml pro úplnost
             lesion_volume_ml = lesion_volume_voxels * np.prod(atlas_img.header.get_zooms()) / 1000.0  # in ml
