@@ -833,7 +833,7 @@ class SwinGANTrainer:
                 
                 with autocast(device_type='cuda' if self.device == 'cuda' else 'cpu', enabled=self.use_amp):
                     # Generate fake lesions
-                    fake_lesion = self.model.generator(atlas)
+                    fake_lesion = self.model.generator(atlas, noise=None)
                     
                     # Compute discriminator predictions
                     real_pred = self.model.discriminator(atlas, real_lesion)
@@ -856,7 +856,7 @@ class SwinGANTrainer:
                 
                 with autocast(device_type='cuda' if self.device == 'cuda' else 'cpu', enabled=self.use_amp):
                     # Generate fake lesions again (since gradients were detached)
-                    fake_lesion = self.model.generator(atlas)
+                    fake_lesion = self.model.generator(atlas, noise=None)
                     
                     # Compute discriminator prediction on fake lesions
                     fake_pred = self.model.discriminator(atlas, fake_lesion)
@@ -949,8 +949,8 @@ class SwinGANTrainer:
                 
                 # Use autocast for validation as well for consistency
                 with autocast(device_type='cuda' if self.device == 'cuda' else 'cpu', enabled=self.use_amp):
-                    # Generate fake lesions
-                    fake_lesion = self.model.generator(atlas)
+                    # Generate fake lesions - explicitly pass None for noise parameter
+                    fake_lesion = self.model.generator(atlas, noise=None)
                     
                     # Compute discriminator predictions
                     real_pred = self.model.discriminator(atlas, real_lesion)
