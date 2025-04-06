@@ -633,7 +633,7 @@ class Generator(nn.Module):
 class Discriminator(nn.Module):
     def __init__(self, in_channels=2, feature_size=24, depth=4):
         """
-        Discriminator for lesion GAN
+        Wasserstein Critic pro WGAN
         
         Args:
             in_channels (int): Number of input channels (atlas + lesion = 2)
@@ -642,25 +642,25 @@ class Discriminator(nn.Module):
         """
         super(Discriminator, self).__init__()
         
-        # Initial convolution
+        # Initial convolution with spectral normalization
         layers = [
-            nn.Conv3d(in_channels, feature_size, kernel_size=4, stride=2, padding=1, bias=False),
+            nn.utils.spectral_norm(nn.Conv3d(in_channels, feature_size, kernel_size=4, stride=2, padding=1, bias=False)),
             nn.LeakyReLU(0.2, inplace=True)
         ]
         
-        # Downsampling layers
+        # Downsampling layers with spectral normalization
         current_feature_size = feature_size
         for _ in range(depth - 1):
             layers += [
-                nn.Conv3d(current_feature_size, current_feature_size * 2, kernel_size=4, stride=2, padding=1, bias=False),
+                nn.utils.spectral_norm(nn.Conv3d(current_feature_size, current_feature_size * 2, kernel_size=4, stride=2, padding=1, bias=False)),
                 nn.BatchNorm3d(current_feature_size * 2),
                 nn.LeakyReLU(0.2, inplace=True)
             ]
             current_feature_size *= 2
         
-        # Final layers
+        # Final layers - no sigmoid for WGAN critic
         layers += [
-            nn.Conv3d(current_feature_size, 1, kernel_size=4, stride=1, padding=1, bias=False)
+            nn.utils.spectral_norm(nn.Conv3d(current_feature_size, 1, kernel_size=4, stride=1, padding=1, bias=False))
         ]
         
         self.model = nn.Sequential(*layers)
@@ -689,9 +689,10 @@ class SwinGAN(nn.Module):
                  perlin_persistence=0.6,
                  perlin_lacunarity=2.5,
                  perlin_scale=0.2,
-                 use_learnable_noise=False):
+                 use_learnable_noise=False,
+                 gradient_penalty_weight=10.0):
         """
-        SwinGAN for lesion synthesis
+        SwinGAN for lesion synthesis using Wasserstein GAN (WGAN) with gradient penalty
         
         Args:
             in_channels (int): Number of input channels for generator
@@ -711,6 +712,7 @@ class SwinGAN(nn.Module):
             perlin_lacunarity (float): Lacunarity parameter for Perlin noise
             perlin_scale (float): Scale parameter controlling smoothness of Perlin noise
             use_learnable_noise (bool): Whether to use learnable Perlin noise parameters
+            gradient_penalty_weight (float): Weight for gradient penalty in WGAN-GP
         """
         super(SwinGAN, self).__init__()
         
@@ -731,7 +733,6 @@ class SwinGAN(nn.Module):
         
         # Loss functions
         self.focal_loss = FocalLoss(alpha=focal_alpha, gamma=focal_gamma)
-        self.bce_loss = nn.BCEWithLogitsLoss()
         self.l1_loss = nn.L1Loss()
         
         # Loss weights
@@ -752,10 +753,57 @@ class SwinGAN(nn.Module):
         self.perlin_persistence = perlin_persistence
         self.perlin_lacunarity = perlin_lacunarity
         self.perlin_scale = perlin_scale
+        
+        # For WGAN-GP
+        self.gradient_penalty_weight = gradient_penalty_weight
+    
+    def compute_gradient_penalty(self, atlas, real_lesion, fake_lesion, device):
+        """
+        Compute gradient penalty for WGAN-GP
+        
+        Args:
+            atlas: Lesion atlas input
+            real_lesion: Real lesion data
+            fake_lesion: Generated lesion data
+            device: Device to use
+            
+        Returns:
+            torch.Tensor: Gradient penalty term
+        """
+        # Random interpolation coefficient for each sample
+        batch_size = real_lesion.size(0)
+        alpha = torch.rand(batch_size, 1, 1, 1, 1, device=device)
+        
+        # Create interpolated lesions
+        interpolated = alpha * real_lesion + (1 - alpha) * fake_lesion
+        interpolated.requires_grad_(True)  # Enable gradient computation
+        
+        # Get discriminator prediction on interpolated data
+        interp_pred = self.discriminator(atlas, interpolated)
+        
+        # Compute gradients
+        grad_outputs = torch.ones_like(interp_pred, device=device)
+        gradients = torch.autograd.grad(
+            outputs=interp_pred,
+            inputs=interpolated,
+            grad_outputs=grad_outputs,
+            create_graph=True,
+            retain_graph=True,
+            only_inputs=True
+        )[0]
+        
+        # Flatten gradients
+        gradients = gradients.view(batch_size, -1)
+        
+        # Calculate gradient penalty: ((|grad| - 1)^2)
+        gradient_norm = gradients.norm(2, dim=1)
+        gradient_penalty = ((gradient_norm - 1) ** 2).mean()
+        
+        return gradient_penalty
     
     def generator_loss(self, fake_lesion, real_lesion, atlas, fake_pred):
         """
-        Generator loss computation
+        Generator loss computation for WGAN
         
         Args:
             fake_lesion: Generated lesion
@@ -763,10 +811,10 @@ class SwinGAN(nn.Module):
             atlas: Lesion atlas (frequency map)
             fake_pred: Discriminator prediction on fake lesion
         """
-        # Adversarial loss (BCEWithLogitsLoss automatically applies sigmoid)
-        adv_loss = self.bce_loss(fake_pred, torch.ones_like(fake_pred))
+        # WGAN adversarial loss (maximize fake prediction scores)
+        adv_loss = -torch.mean(fake_pred)
         
-        # Apply sigmoid to fake_lesion for other losses since we removed it from generator
+        # Apply sigmoid to fake_lesion for other losses since we're using raw logits
         fake_lesion_sigmoid = torch.sigmoid(fake_lesion)
         
         # Focal loss for sparse lesion segmentation
@@ -799,63 +847,65 @@ class SwinGAN(nn.Module):
         for x in range(kernel_size):
             for y in range(kernel_size):
                 for z in range(kernel_size):
-                    # 3D Gaussovská funkce - převedeme výpočet na tensor
+                    # Výpočet 3D Gaussovy funkce
                     exponent = -((x - center) ** 2 + (y - center) ** 2 + (z - center) ** 2) / (2 * sigma ** 2)
-                    kernel[0, 0, x, y, z] = torch.exp(torch.tensor(exponent, device=fake_lesion.device))
+                    kernel[0, 0, x, y, z] = np.exp(exponent)
         
         # Normalizace kernelu
         kernel = kernel / kernel.sum()
         
-        # Aplikace kernelu na fake_lesion pro získání vyhlazeného obrazu
-        # padding=center zajistí, že výstup bude mít stejnou velikost jako vstup
-        smoothed_lesion = F.conv3d(
-            fake_lesion_sigmoid, kernel, padding=center
-        )
+        # Aplikace gaussovského kernelu na predikce pro vyhlazení
+        smoothed_fake = F.conv3d(fake_lesion_sigmoid, kernel, padding=center)
         
-        # Ztráta fragmentace - chceme, aby model preferoval podobné hodnoty sousedních voxelů
-        # Tím podporujeme vytváření celistvých struktur
-        fragmentation_loss = torch.mean(
-            torch.abs(fake_lesion_sigmoid - smoothed_lesion)
-        ) * self.lambda_fragmentation  # Použijeme parametr lambda_fragmentation
+        # Výpočet ztráty fragmentace - rozdíl mezi původním a vyhlazeným výstupem
+        # Léze s více fragmentací budou mít větší rozdíl po vyhlazení
+        fragmentation_loss = self.l1_loss(fake_lesion_sigmoid, smoothed_fake)
         
-        # Total generator loss včetně nové komponenty
-        total_loss = adv_loss + self.lambda_focal * focal_loss + self.lambda_l1 * l1_loss + constraint_loss + fragmentation_loss
+        # Kombinace všech složek ztráty
+        total_g_loss = (adv_loss + 
+                       self.lambda_focal * focal_loss + 
+                       self.lambda_l1 * l1_loss + 
+                       self.lambda_fragmentation * fragmentation_loss + 
+                       constraint_loss)
         
-        return total_loss, {
-            'adv_loss': adv_loss.item(),
+        # Dictionary s jednotlivými složkami ztráty pro monitorování
+        loss_values = {
+            'adv_g_loss': adv_loss.item(),
             'focal_loss': focal_loss.item(),
             'l1_loss': l1_loss.item(),
             'constraint_loss': constraint_loss.item(),
-            'fragmentation_loss': fragmentation_loss.item(),  # Přidání nové ztráty do statistik
-            'total_g_loss': total_loss.item()
+            'fragmentation_loss': fragmentation_loss.item(),
+            'total_g_loss': total_g_loss.item()
         }
+        
+        return total_g_loss, loss_values
     
-    def discriminator_loss(self, real_pred, fake_pred):
+    def discriminator_loss(self, real_pred, fake_pred, atlas, real_lesion, fake_lesion, device):
         """
-        Discriminator loss computation
+        Discriminator (critic) loss computation for WGAN-GP
         
         Args:
             real_pred: Discriminator prediction on real lesion
             fake_pred: Discriminator prediction on fake lesion
+            atlas: Lesion atlas input
+            real_lesion: Real lesion data
+            fake_lesion: Fake lesion data
+            device: Computation device
         """
-        # Use label smoothing: target for real samples is 0.9 instead of 1.0
-        real_target = torch.ones_like(real_pred) * 0.9
+        # WGAN adversarial loss
+        real_loss = -torch.mean(real_pred)
+        fake_loss = torch.mean(fake_pred)
         
-        # Target for fake samples remains 0
-        fake_target = torch.zeros_like(fake_pred)
-        
-        # Loss on real samples with smoothed labels
-        real_loss = self.bce_loss(real_pred, real_target)
-        
-        # Loss on fake samples
-        fake_loss = self.bce_loss(fake_pred, fake_target)
+        # Gradient penalty
+        gradient_penalty = self.compute_gradient_penalty(atlas, real_lesion, fake_lesion.detach(), device)
         
         # Total discriminator loss
-        total_loss = (real_loss + fake_loss) * 0.5
+        total_loss = real_loss + fake_loss + self.gradient_penalty_weight * gradient_penalty
         
         return total_loss, {
             'real_loss': real_loss.item(),
             'fake_loss': fake_loss.item(),
+            'gradient_penalty': gradient_penalty.item(),
             'total_d_loss': total_loss.item()
         }
 
@@ -883,18 +933,20 @@ class SwinGANTrainer:
                  device='cuda',
                  output_dir='./output',
                  use_amp=True,
-                 generator_save_interval=4):
+                 generator_save_interval=4,
+                 n_critic=5):
         """
-        Trainer for SwinGAN
+        Trainer for SwinGAN with WGAN-GP
         
         Args:
             model: SwinGAN model
             optimizer_g: Optimizer for generator
-            optimizer_d: Optimizer for discriminator
+            optimizer_d: Optimizer for discriminator/critic
             device: Device to use
             output_dir: Output directory for saving models and samples
             use_amp: Whether to use automatic mixed precision
             generator_save_interval: Interval for saving generator-only checkpoints
+            n_critic: Number of critic updates per generator update (usually 5 for WGAN)
         """
         self.model = model
         self.optimizer_g = optimizer_g
@@ -903,6 +955,7 @@ class SwinGANTrainer:
         self.output_dir = output_dir
         self.use_amp = use_amp
         self.generator_save_interval = generator_save_interval
+        self.n_critic = n_critic  # Number of critic iterations per generator iteration
         
         # For mixed precision training
         if self.use_amp:
@@ -920,13 +973,13 @@ class SwinGANTrainer:
         self.model.to(self.device)
     
     def train(self, dataloader, epochs, val_dataloader=None, save_interval=5):
-        """Train the model for a specified number of epochs."""
+        """Train the model for a specified number of epochs using WGAN-GP."""
         start_time = time.time()
         best_val_loss = float('inf')
         self.model.train()
         
-        # Add a counter for generator updates
-        gen_steps_counter = 0
+        # For WGAN training
+        gen_iterations = 0
         
         for epoch in range(epochs):
             epoch_losses = defaultdict(float)
@@ -936,25 +989,30 @@ class SwinGANTrainer:
                 atlas = batch['atlas'].to(self.device)
                 real_lesion = batch['lesion'].to(self.device)
                 
-                # Train discriminator
-                self.optimizer_d.zero_grad()
+                ############################
+                # (1) Train critic/discriminator
+                ############################
                 
-                # Only update discriminator every 5 generator steps (changed from 2)
-                should_update_discriminator = gen_steps_counter % 2 == 0
+                # Train the critic for n_critic iterations
+                critic_iterations = self.n_critic if gen_iterations > 0 else 100  # More iterations at the beginning
                 
-                with autocast(device_type='cuda' if self.device == 'cuda' else 'cpu', enabled=self.use_amp):
-                    # Generate fake lesions
-                    fake_lesion = self.model.generator(atlas, noise=None)
+                for _ in range(critic_iterations):
+                    self.optimizer_d.zero_grad()
                     
-                    # Compute discriminator predictions
-                    real_pred = self.model.discriminator(atlas, real_lesion)
-                    fake_pred = self.model.discriminator(atlas, fake_lesion.detach())
+                    with autocast(device_type='cuda' if self.device == 'cuda' else 'cpu', enabled=self.use_amp):
+                        # Generate fake lesions
+                        fake_lesion = self.model.generator(atlas, noise=None)
+                        
+                        # Compute discriminator predictions
+                        real_pred = self.model.discriminator(atlas, real_lesion)
+                        fake_pred = self.model.discriminator(atlas, fake_lesion.detach())
+                        
+                        # Compute discriminator loss with gradient penalty
+                        d_loss, d_losses_dict = self.model.discriminator_loss(
+                            real_pred, fake_pred, atlas, real_lesion, fake_lesion.detach(), self.device
+                        )
                     
-                    # Compute discriminator loss
-                    d_loss, d_losses_dict = self.model.discriminator_loss(real_pred, fake_pred)
-                
-                # Update discriminator only every 5 generator steps
-                if should_update_discriminator:
+                    # Update discriminator
                     if self.use_amp:
                         self.scaler_d.scale(d_loss).backward()
                         self.scaler_d.step(self.optimizer_d)
@@ -963,11 +1021,14 @@ class SwinGANTrainer:
                         d_loss.backward()
                         self.optimizer_d.step()
                 
-                # Train generator
+                ############################
+                # (2) Train generator
+                ############################
+                
                 self.optimizer_g.zero_grad()
                 
                 with autocast(device_type='cuda' if self.device == 'cuda' else 'cpu', enabled=self.use_amp):
-                    # Generate fake lesions again (since gradients were detached)
+                    # Generate fake lesions
                     fake_lesion = self.model.generator(atlas, noise=None)
                     
                     # Compute discriminator prediction on fake lesions
@@ -987,8 +1048,8 @@ class SwinGANTrainer:
                     g_loss.backward()
                     self.optimizer_g.step()
                 
-                # Increment generator steps counter
-                gen_steps_counter += 1
+                # Increment generator iterations counter
+                gen_iterations += 1
                 
                 # Update epoch losses
                 for k, v in d_losses_dict.items():
@@ -1008,7 +1069,8 @@ class SwinGANTrainer:
             # Print epoch summary
             print(f"Epoch {epoch+1}/{epochs} | "
                   f"G Loss: {epoch_losses['total_g_loss']:.4f} | "
-                  f"D Loss: {epoch_losses['total_d_loss']:.4f}")
+                  f"D Loss: {epoch_losses['total_d_loss']:.4f} | "
+                  f"GP: {epoch_losses.get('gradient_penalty', 0):.4f}")
             
             # Save full model checkpoint at save_interval
             if (epoch + 1) % save_interval == 0:
@@ -1049,7 +1111,7 @@ class SwinGANTrainer:
     
     def validate(self, epoch, val_dataloader):
         """
-        Validate the model
+        Validate the model using WGAN evaluation
         
         Args:
             epoch: Current epoch
@@ -1065,7 +1127,7 @@ class SwinGANTrainer:
                 
                 # Use autocast for validation as well for consistency
                 with autocast(device_type='cuda' if self.device == 'cuda' else 'cpu', enabled=self.use_amp):
-                    # Generate fake lesions - explicitly pass None for noise parameter
+                    # Generate fake lesions
                     fake_lesion = self.model.generator(atlas, noise=None)
                     
                     # Compute discriminator predictions
@@ -1076,7 +1138,9 @@ class SwinGANTrainer:
                     g_loss, g_losses_dict = self.model.generator_loss(
                         fake_lesion, real_lesion, atlas, fake_pred
                     )
-                    d_loss, d_losses_dict = self.model.discriminator_loss(real_pred, fake_pred)
+                    d_loss, d_losses_dict = self.model.discriminator_loss(
+                        real_pred, fake_pred, atlas, real_lesion, fake_lesion, self.device
+                    )
                 
                 # Update validation losses
                 for k, v in d_losses_dict.items():
@@ -1091,40 +1155,33 @@ class SwinGANTrainer:
         # Print validation summary
         print(f"Validation | Epoch {epoch+1} | "
               f"G Loss: {val_losses['total_g_loss']:.4f} | "
-              f"D Loss: {val_losses['total_d_loss']:.4f}")
+              f"D Loss: {val_losses['total_d_loss']:.4f} | "
+              f"GP: {val_losses.get('gradient_penalty', 0):.4f}")
+        
+        # Return generator loss as the main validation metric
+        return val_losses['total_g_loss']
 
 
 def train_model(args):
     """
-    Train the SwinGAN model with the given arguments
+    Train the SwinGAN model
     
     Args:
-        args: Command-line arguments
+        args: Command line arguments
     """
-    # Set device
-    device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
+    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
     
-    # Create output directory if it doesn't exist
-    os.makedirs(args.output_dir, exist_ok=True)
-    
-    # Setup dataset
+    # Create dataset
     train_dataset = HieLesionDataset(
-        lesion_dir=args.train_lesion_dir,
-        lesion_atlas_path=args.lesion_atlas_path,
+        args.train_lesion_dir,
+        args.lesion_atlas_path,
         filter_empty=args.filter_empty,
         min_non_zero_percentage=args.min_non_zero_percentage
     )
+    print(f"Training dataset size: {len(train_dataset)}")
     
-    val_dataset = None
-    if args.val_lesion_dir:
-        val_dataset = HieLesionDataset(
-            lesion_dir=args.val_lesion_dir,
-            lesion_atlas_path=args.lesion_atlas_path,
-            filter_empty=args.filter_empty,
-            min_non_zero_percentage=args.min_non_zero_percentage
-        )
-    
-    # Create data loaders
+    # Create dataloaders
     train_dataloader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
@@ -1133,8 +1190,16 @@ def train_model(args):
         pin_memory=True
     )
     
+    # Create validation dataloader if path is provided
     val_dataloader = None
-    if val_dataset:
+    if args.val_lesion_dir:
+        val_dataset = HieLesionDataset(
+            args.val_lesion_dir,
+            args.lesion_atlas_path,
+            filter_empty=args.filter_empty,
+            min_non_zero_percentage=args.min_non_zero_percentage
+        )
+        print(f"Validation dataset size: {len(val_dataset)}")
         val_dataloader = DataLoader(
             val_dataset,
             batch_size=args.batch_size,
@@ -1161,7 +1226,8 @@ def train_model(args):
         perlin_persistence=args.perlin_persistence,
         perlin_lacunarity=args.perlin_lacunarity,
         perlin_scale=args.perlin_scale,
-        use_learnable_noise=args.use_learnable_noise
+        use_learnable_noise=args.use_learnable_noise,
+        gradient_penalty_weight=args.gradient_penalty_weight
     )
     
     # Load checkpoint if provided
@@ -1170,9 +1236,9 @@ def train_model(args):
         checkpoint = torch.load(args.checkpoint, map_location=device)
         model.load_state_dict(checkpoint['model_state_dict'])
     
-    # Optimizers
-    optimizer_g = torch.optim.Adam(model.generator.parameters(), lr=args.lr_generator, betas=(0.5, 0.999))
-    optimizer_d = torch.optim.Adam(model.discriminator.parameters(), lr=args.lr_discriminator, betas=(0.5, 0.999))
+    # Optimizers - use lower learning rates for WGAN training stability
+    optimizer_g = torch.optim.Adam(model.generator.parameters(), lr=args.lr_generator, betas=(0.5, 0.9))
+    optimizer_d = torch.optim.Adam(model.discriminator.parameters(), lr=args.lr_discriminator, betas=(0.5, 0.9))
     
     # Load optimizer states if provided
     if args.checkpoint:
@@ -1187,10 +1253,11 @@ def train_model(args):
         device=device,
         output_dir=args.output_dir,
         use_amp=args.use_amp,
-        generator_save_interval=args.generator_save_interval
+        generator_save_interval=args.generator_save_interval,
+        n_critic=args.n_critic
     )
     
-    # Train
+    # Train model
     trainer.train(
         dataloader=train_dataloader,
         epochs=args.epochs,
@@ -1418,10 +1485,10 @@ def generate_lesions(
     threshold=0.5,
     device='cuda',
     num_samples=1,
-    perlin_octaves=4,
-    perlin_persistence=0.5,
-    perlin_lacunarity=2.0,
-    perlin_scale=0.1,
+    perlin_octaves=6,
+    perlin_persistence=0.6,
+    perlin_lacunarity=2.5,
+    perlin_scale=0.2,
     min_lesion_size=10,     # Minimální velikost léze (v počtu voxelů)
     smooth_sigma=0.5,       # Hodnota sigma pro vyhlazení lézí
     morph_close_size=2,     # Velikost strukturního elementu pro morfologickou operaci uzavření
@@ -1432,111 +1499,56 @@ def generate_lesions(
     max_adaptive_threshold=0.999,    # Maximální hodnota pro adaptivní threshold
     adaptive_threshold_iterations=50,  # Maximální počet iterací pro hledání adaptivního thresholdu
     use_different_target_for_each_sample=False,  # Použít jiný cílový coverage pro každý vzorek
-    use_learnable_noise=False     # Použít naučené parametry Perlin šumu
+    use_learnable_noise=False,     # Použít naučené parametry Perlin šumu
+    gradient_penalty_weight=10.0   # Weight for gradient penalty in WGAN-GP (not used for generation but needed for model loading)
 ):
     # Validate inputs
     if output_file is None and output_dir is None:
         raise ValueError("Either output_file or output_dir must be provided")
     
     if output_file is not None and num_samples > 1:
-        raise ValueError("output_file can only be used with num_samples=1")
+        raise ValueError("output_file can only be used when generating a single sample. Use output_dir for multiple samples.")
     
     if use_adaptive_threshold and target_coverage is None and training_lesion_dir is None:
         raise ValueError("For adaptive thresholding, either target_coverage or training_lesion_dir must be provided")
     
-    # Create output directory if it doesn't exist
-    if output_dir is not None:
-        os.makedirs(output_dir, exist_ok=True)
+    # Load lesion atlas
+    atlas_nii = nib.load(lesion_atlas)
+    atlas_data = atlas_nii.get_fdata()
+    header = atlas_nii.header
+    affine = atlas_nii.affine
     
-    # Set device
-    device = torch.device(device if torch.cuda.is_available() else 'cpu')
+    # Convert to tensor with batch dimension and channel dimension
+    atlas_tensor = torch.from_numpy(atlas_data).float().unsqueeze(0).unsqueeze(0)
     
-    # Load the atlas
-    atlas_data = nib.load(lesion_atlas).get_fdata()
-    atlas_affine = nib.load(lesion_atlas).affine
-    atlas_header = nib.load(lesion_atlas).header
+    # Move to device
+    atlas_tensor = atlas_tensor.to(device)
     
-    # Normalize the atlas to [0, 1]
-    atlas_data = atlas_data / np.max(atlas_data)
-    
-    # Convert to torch tensor and add batch and channel dimensions
-    atlas_tensor = torch.from_numpy(atlas_data).float().unsqueeze(0).unsqueeze(0).to(device)
-    
-    # Compute target coverage if using adaptive threshold based on training data
-    if use_adaptive_threshold and training_lesion_dir is not None:
-        # Načteme všechny léze z trénovacího adresáře pro pozdější náhodný výběr
-        print("Načítám trénovací soubory pro coverage targety...")
-        lesion_files = sorted(glob.glob(os.path.join(training_lesion_dir, "*lesion.nii*")))
-        # Odfiltrujeme prázdné
-        training_files = []
-        for lesion_file in lesion_files:
-            lesion = nib.load(lesion_file).get_fdata()
-            if np.count_nonzero(lesion) > 0:
-                training_files.append(lesion_file)
-        
-        print(f"Nalezeno {len(training_files)} neprázdných trénovacích souborů pro coverage targets")
-        if not training_files:
-            print("Varování: Žádné neprázdné léze v trénovacím adresáři, použiji defaultní target 1%")
-            target_coverage = 1.0
-    else:
-        training_files = []
-    
-    # Load the generator
-    checkpoint = torch.load(model_checkpoint, map_location=device)
-    
-    # Extract configuration from checkpoint
-    config = {}
-    for key in ['feature_size', 'dropout_rate', 'use_noise', 'noise_dim',
-                'perlin_octaves', 'perlin_persistence', 'perlin_lacunarity', 'perlin_scale']:
-        config[key] = checkpoint.get(key, None)
-    
-    # Handle missing config values and override with arguments
-    feature_size = config.get('feature_size', 24)
-    dropout_rate = config.get('dropout_rate', 0.0)
-    use_noise = config.get('use_noise', True)
-    noise_dim = config.get('noise_dim', 16)
-    
-    # Override Perlin noise parameters if provided
-    if 'perlin_octaves' in checkpoint and perlin_octaves is None:
-        perlin_octaves = checkpoint['perlin_octaves']
-    
-    if 'perlin_persistence' in checkpoint and perlin_persistence is None:
-        perlin_persistence = checkpoint['perlin_persistence']
-    
-    if 'perlin_lacunarity' in checkpoint and perlin_lacunarity is None:
-        perlin_lacunarity = checkpoint['perlin_lacunarity']
-    
-    if 'perlin_scale' in checkpoint and perlin_scale is None:
-        perlin_scale = checkpoint['perlin_scale']
-    
-    # Check for learnable_noise in checkpoint
-    if 'use_learnable_noise' in checkpoint:
-        use_learnable_noise = checkpoint['use_learnable_noise']
-    
-    # Create the generator model
-    generator = Generator(
-        in_channels=1,
-        out_channels=1,
-        feature_size=feature_size,
-        dropout_rate=dropout_rate,
-        use_noise=use_noise,
-        noise_dim=noise_dim,
+    # Create model
+    model = SwinGAN(
+        in_channels=1, 
+        out_channels=1, 
+        feature_size=24,
+        use_noise=True,
+        noise_dim=32,
         perlin_octaves=perlin_octaves,
         perlin_persistence=perlin_persistence,
         perlin_lacunarity=perlin_lacunarity,
         perlin_scale=perlin_scale,
-        use_learnable_noise=use_learnable_noise
+        use_learnable_noise=use_learnable_noise,
+        gradient_penalty_weight=gradient_penalty_weight  # Add WGAN parameter
     )
     
-    # Load state dict
-    if 'generator_state_dict' in checkpoint:
-        generator.load_state_dict(checkpoint['generator_state_dict'])
+    # Load checkpoint
+    checkpoint = torch.load(model_checkpoint, map_location=device)
+    if 'model_state_dict' in checkpoint:
+        model.load_state_dict(checkpoint['model_state_dict'])
     else:
-        generator.load_state_dict(checkpoint)
+        model.load_state_dict(checkpoint)
     
-    # Move to device and set to evaluation mode
-    generator.to(device)
-    generator.eval()
+    # Move model to device
+    model.to(device)
+    model.eval()
     
     # Generate samples
     print(f"Generating {num_samples} lesion samples with threshold={threshold}, min_lesion_size={min_lesion_size}, smooth_sigma={smooth_sigma}, morph_close_size={morph_close_size}")
@@ -1554,9 +1566,9 @@ def generate_lesions(
         print(f"Generating sample {i+1}/{num_samples}")
         
         # Pro každý vzorek vybereme náhodný target coverage z trénovacích dat
-        if use_adaptive_threshold and training_files:
+        if use_adaptive_threshold and training_lesion_dir is not None:
             # Náhodně vybereme trénovací soubor
-            random_training_file = np.random.choice(training_files)
+            random_training_file = np.random.choice(training_lesion_dir)
             # Načteme jeho lézi a spočítáme coverage
             lesion = nib.load(random_training_file).get_fdata()
             current_target = compute_lesion_coverage(lesion > 0)
@@ -1566,7 +1578,7 @@ def generate_lesions(
         
         # Generate noise if using noise
         noise = None
-        if use_noise:
+        if True:
             # Generate a new seed for each sample
             current_seed = np.random.randint(0, 10000)
             torch.manual_seed(current_seed)
@@ -1588,56 +1600,48 @@ def generate_lesions(
             noise = noise_generator.generate_batch_noise(
                 batch_size=1,
                 shape=(D, H, W),
-                noise_dim=noise_dim,
+                noise_dim=32,
                 scale=perlin_scale,
                 device=device
             )
         
+        
         # Generate the lesion
         with torch.no_grad():
-            # Forward pass with noise
-            fake_lesion = generator(atlas_tensor, noise)
+            # Pass the atlas through the generator
+            fake_lesion = model.generator(atlas_tensor, noise)
             
-            # Apply sigmoid to get probability map
-            fake_lesion_prob = torch.sigmoid(fake_lesion)
+            # Convert to probability map using sigmoid
+            probability_map = torch.sigmoid(fake_lesion)
             
-            # Convert to numpy for post-processing
-            lesion_prob_np = fake_lesion_prob.squeeze().cpu().numpy()
+            # Convert to numpy array
+            probability_map_np = probability_map.squeeze().cpu().numpy()
             
-            # Binarize the lesion
+            # Apply threshold to get binary mask
             if use_adaptive_threshold:
-                print(f"Finding adaptive threshold for target coverage of {current_target:.6f}%")
-                
-                # Compute optimal threshold for target coverage
-                adaptive_threshold, actual_coverage, _ = find_adaptive_threshold(
-                    lesion_prob_np,
-                    current_target,
-                    atlas_mask=(atlas_data > 0),
+                # Find the threshold that gives the target coverage
+                threshold_value = find_adaptive_threshold(
+                    probability_map_np, 
+                    target_coverage, 
                     initial_threshold=threshold,
                     min_threshold=min_adaptive_threshold,
                     max_threshold=max_adaptive_threshold,
                     max_iterations=adaptive_threshold_iterations
                 )
-                
-                print(f"Using adaptive threshold: {adaptive_threshold:.6f}")
-                print(f"Actual coverage at this threshold: {actual_coverage:.6f}%")
-                # Use the adaptive threshold
-                lesion_binary = (lesion_prob_np >= adaptive_threshold).astype(np.float32)
-                # Ensure lesions respect atlas mask after adaptive thresholding
-                lesion_binary = lesion_binary * (atlas_data > 0)
+                print(f"Sample {i+1}: Using adaptive threshold {threshold_value:.4f} for target coverage {target_coverage:.4f}%")
             else:
-                # Use fixed threshold
-                lesion_binary = (lesion_prob_np >= threshold).astype(np.float32)
-                # Ensure lesions respect atlas mask
-                lesion_binary = lesion_binary * (atlas_data > 0)
+                threshold_value = threshold
+            
+            # Apply threshold
+            binary_mask = (probability_map_np > threshold_value).astype(np.float32)
             
             # Apply Gaussian smoothing if requested
             if smooth_sigma > 0:
-                lesion_binary = gaussian_filter(lesion_binary, sigma=smooth_sigma)
-                lesion_binary = (lesion_binary > 0.5).astype(np.float32)  # Re-threshold after smoothing
+                binary_mask = gaussian_filter(binary_mask, sigma=smooth_sigma)
+                binary_mask = (binary_mask > 0.5).astype(np.float32)  # Re-threshold after smoothing
                 # Ensure lesions respect atlas mask after smoothing
                 atlas_mask = atlas_data > 0
-                lesion_binary = lesion_binary * atlas_mask
+                binary_mask = binary_mask * atlas_mask
             
             # Apply morphological closing if requested
             if morph_close_size > 0:
@@ -1646,20 +1650,20 @@ def generate_lesions(
                 close_struct = binary_dilation(close_struct, iterations=morph_close_size-1)
                 
                 # Apply closing: first dilation, then erosion
-                lesion_binary = binary_closing(lesion_binary, structure=close_struct)
+                binary_mask = binary_closing(binary_mask, structure=close_struct)
                 
                 # Convert back to float32
-                lesion_binary = lesion_binary.astype(np.float32)
+                binary_mask = binary_mask.astype(np.float32)
                 
                 # Ensure lesions respect atlas mask (don't add voxels where atlas is 0)
                 atlas_mask = atlas_data > 0
-                lesion_binary = lesion_binary * atlas_mask
+                binary_mask = binary_mask * atlas_mask
             
             # Remove components smaller than min_lesion_size
             if min_lesion_size > 0:
                 # Label connected components
                 # Oprava: measure.label vrací tuple (labeled_array, num_features) ve vyšších verzích scipy
-                labeled_result = measure.label(lesion_binary, structure=struct_element)
+                labeled_result = measure.label(binary_mask, structure=struct_element)
                 if isinstance(labeled_result, tuple):
                     labeled_array = labeled_result[0]  # Získáme pouze labeled_array z tuple
                 else:
@@ -1672,10 +1676,10 @@ def generate_lesions(
                 too_small = component_sizes < min_lesion_size
                 too_small[0] = False  # Don't remove background
                 remove_pixels = too_small[labeled_array]
-                lesion_binary[remove_pixels] = 0
+                binary_mask[remove_pixels] = 0
                 
                 # Count final number of components - oprava
-                labeled_result = measure.label(lesion_binary, structure=struct_element)
+                labeled_result = measure.label(binary_mask, structure=struct_element)
                 if isinstance(labeled_result, tuple):
                     labeled_array = labeled_result[0]  # Získáme pouze labeled_array z tuple
                     final_components = labeled_result[1]  # Můžeme získat počet komponent přímo
@@ -1688,18 +1692,18 @@ def generate_lesions(
             
             # Calculate lesion coverage for this sample
             if use_adaptive_threshold:
-                current_coverage = compute_lesion_coverage(lesion_binary, atlas_mask=(atlas_data > 0))
+                current_coverage = compute_lesion_coverage(binary_mask, atlas_mask=(atlas_data > 0))
                 coverage_stats.append(current_coverage)
                 print(f"Lesion coverage: {current_coverage:.6f}% (target: {current_target:.6f}%)")
             
             # Store the generated lesion
-            generated_lesions.append(lesion_binary)
+            generated_lesions.append(binary_mask)
             
             # Save the lesion
             if output_file is not None:
                 # Save as NIfTI file
                 print(f"Saving lesion to {output_file}")
-                lesion_nii = nib.Nifti1Image(lesion_binary, atlas_affine, atlas_header)
+                lesion_nii = nib.Nifti1Image(binary_mask, atlas_affine, atlas_header)
                 nib.save(lesion_nii, output_file)
             elif output_dir is not None:
                 # Save as NIfTI file
@@ -1725,10 +1729,10 @@ def generate_lesions(
                     
                     # Aplikujeme masku pro odstranění vybraných malých komponent
                     too_small_mask = too_small[labeled_array]
-                    lesion_binary[too_small_mask] = 0
+                    binary_mask[too_small_mask] = 0
             
-            # Přiřadíme lesion_binary do binary_lesion pro další zpracování
-            binary_lesion = lesion_binary.copy()
+            # Přiřadíme binary_mask do binary_lesion pro další zpracování
+            binary_lesion = binary_mask.copy()
             
             # Pro blokovitější vzhled snížíme Gaussovské vyhlazení na minimum nebo ho přeskočíme
             if smooth_sigma > 0 and np.random.random() < 0.8:  # Zvýšíme šanci na vyhlazení z 50% na 80%
@@ -1924,6 +1928,7 @@ def main():
     train_parser.add_argument('--num_workers', type=int, default=4, help='Number of worker threads for data loading')
     train_parser.add_argument('--checkpoint', type=str, help='Path to checkpoint for resuming training')
     train_parser.add_argument('--use_amp', action='store_true', help='Use automatic mixed precision')
+    train_parser.add_argument('--n_critic', type=int, default=5, help='Number of critic updates per generator update (WGAN)')
     
     # Model parameters
     train_parser.add_argument('--feature_size', type=int, default=24, help='Feature size for SwinUNETR')
@@ -1941,6 +1946,7 @@ def main():
     train_parser.add_argument('--perlin_lacunarity', type=float, default=2.5, help='Lacunarity parameter for Perlin noise')
     train_parser.add_argument('--perlin_scale', type=float, default=0.2, help='Scale parameter for Perlin noise')
     train_parser.add_argument('--use_learnable_noise', action='store_true', help='Use learnable Perlin noise parameters')
+    train_parser.add_argument('--gradient_penalty_weight', type=float, default=10.0, help='Weight for gradient penalty in WGAN-GP')
     
     # Dataset parameters
     train_parser.add_argument('--filter_empty', action='store_true', help='Filter out empty lesion files')
