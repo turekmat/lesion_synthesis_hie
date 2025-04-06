@@ -887,17 +887,15 @@ class SwinGANTrainer:
         self.model.to(self.device)
     
     def train(self, dataloader, epochs, val_dataloader=None, save_interval=5):
-        """
-        Train the SwinGAN model
+        """Train the model for a specified number of epochs."""
+        start_time = time.time()
+        best_val_loss = float('inf')
+        self.model.train()
         
-        Args:
-            dataloader: Training data loader
-            epochs: Number of epochs to train
-            val_dataloader: Validation data loader
-            save_interval: Interval for saving full model checkpoints
-        """
+        # Add a counter for generator updates
+        gen_steps_counter = 0
+        
         for epoch in range(epochs):
-            self.model.train()
             epoch_losses = defaultdict(float)
             
             # Training loop
@@ -905,8 +903,14 @@ class SwinGANTrainer:
                 atlas = batch['atlas'].to(self.device)
                 real_lesion = batch['lesion'].to(self.device)
                 
+                # Update learning rate schedulers if they exist
+                self._update_schedulers()
+                
                 # Train discriminator
                 self.optimizer_d.zero_grad()
+                
+                # Only update discriminator every 2 generator steps
+                should_update_discriminator = gen_steps_counter % 2 == 0
                 
                 with autocast(device_type='cuda' if self.device == 'cuda' else 'cpu', enabled=self.use_amp):
                     # Generate fake lesions
@@ -919,14 +923,15 @@ class SwinGANTrainer:
                     # Compute discriminator loss
                     d_loss, d_losses_dict = self.model.discriminator_loss(real_pred, fake_pred)
                 
-                # Update discriminator
-                if self.use_amp:
-                    self.scaler_d.scale(d_loss).backward()
-                    self.scaler_d.step(self.optimizer_d)
-                    self.scaler_d.update()
-                else:
-                    d_loss.backward()
-                    self.optimizer_d.step()
+                # Update discriminator only every 2 generator steps
+                if should_update_discriminator:
+                    if self.use_amp:
+                        self.scaler_d.scale(d_loss).backward()
+                        self.scaler_d.step(self.optimizer_d)
+                        self.scaler_d.update()
+                    else:
+                        d_loss.backward()
+                        self.optimizer_d.step()
                 
                 # Train generator
                 self.optimizer_g.zero_grad()
@@ -951,6 +956,9 @@ class SwinGANTrainer:
                 else:
                     g_loss.backward()
                     self.optimizer_g.step()
+                
+                # Increment generator steps counter
+                gen_steps_counter += 1
                 
                 # Update epoch losses
                 for k, v in d_losses_dict.items():
