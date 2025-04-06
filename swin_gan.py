@@ -1586,7 +1586,7 @@ def generate_lesions(
                 # Use the adaptive threshold
                 lesion_binary = (lesion_prob_np >= adaptive_threshold).astype(np.float32)
                 # Ensure lesions respect atlas mask after adaptive thresholding
-                lesion_binary = lesion_binary & (atlas_data > 0)
+                lesion_binary = lesion_binary * (atlas_data > 0)
             else:
                 # Use fixed threshold
                 lesion_binary = (lesion_prob_np >= threshold).astype(np.float32)
@@ -1710,7 +1710,7 @@ def generate_lesions(
                     adaptive_threshold = max(0.05, adaptive_threshold * 1.05)
                     binary_lesion = smoothed > adaptive_threshold
                     # Ensure binary_lesion respects atlas mask after adaptive thresholding
-                    binary_lesion = binary_lesion & (atlas_data > 0)
+                    binary_lesion = binary_lesion.astype(np.float32) * (atlas_data > 0)
                 
                 # Místo přidávání plynulého šumu přidáme blokové struktury
                 if np.random.random() < 0.7:
