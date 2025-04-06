@@ -1609,7 +1609,8 @@ def generate_lesions(
             # Remove components smaller than min_lesion_size
             if min_lesion_size > 0:
                 # Label connected components
-                labeled_array, num_features = measure.label(lesion_binary, structure=struct_element, return_num=True)
+                # Oprava: measure.label nemá parametr return_num v této verzi scipy
+                labeled_array = measure.label(lesion_binary, structure=struct_element)
                 
                 # Get component sizes
                 component_sizes = np.bincount(labeled_array.ravel())
@@ -1620,9 +1621,11 @@ def generate_lesions(
                 remove_pixels = too_small[labeled_array]
                 lesion_binary[remove_pixels] = 0
                 
-                # Count final number of components above threshold
-                labeled_array, num_features = measure.label(lesion_binary, structure=struct_element, return_num=True)
-                final_components = num_features
+                # Count final number of components - oprava
+                labeled_array = measure.label(lesion_binary, structure=struct_element)
+                # Zjistíme počet komponent (počet různých hodnot kromě pozadí)
+                # V starších verzích scipy musíme počet komponent zjistit pomocí np.max
+                final_components = np.max(labeled_array)
                 print(f"Final lesion has {final_components} connected components")
             
             # Calculate lesion coverage for this sample
@@ -1652,15 +1655,15 @@ def generate_lesions(
                     too_small[0] = False  # background není "too small"
                     
                     # Pro každou komponentu určíme, zda ji zachovat
-                    for i in range(1, len(component_sizes)):
-                        size = component_sizes[i]
-                        if size >= sample_min_size:  # Používáme plnou hodnotu min_size, ne dělenou 3
-                            too_small[i] = False  # Není příliš malá
+                    for j in range(1, len(component_sizes)):
+                        size = component_sizes[j]
+                        if size >= min_lesion_size:  # Používáme min_lesion_size místo nedefinované sample_min_size
+                            too_small[j] = False  # Není příliš malá
                         else:
                             # Snížíme šanci na zachování malých bloků
-                            prob_keep = min(0.3, (size / sample_min_size) * 0.5)  # Max 30% šance zachování (namísto 95%)
+                            prob_keep = min(0.3, (size / min_lesion_size) * 0.5)  # Max 30% šance zachování (namísto 95%)
                             if np.random.random() < prob_keep and size >= 10:  # Dodatečná podmínka: musí mít alespoň 10 voxelů
-                                too_small[i] = False  # Zachováme tuto malou komponentu
+                                too_small[j] = False  # Zachováme tuto malou komponentu
                     
                     # Aplikujeme masku pro odstranění vybraných malých komponent
                     too_small_mask = too_small[labeled_array]
@@ -1790,8 +1793,10 @@ def generate_lesions(
             nib.save(lesion_img, sample_output_file)
             
             # Print some statistics
-            # measure.label vrací tuple (labeled_array, num_features)
-            labeled_array, num_lesions = measure.label(binary_lesion)
+            # measure.label vrací tuple (labeled_array, num_features) ve vyšších verzích scipy
+            # V naší verzi musíme počet lézí určit jinak
+            labeled_array = measure.label(binary_lesion)
+            num_lesions = np.max(labeled_array)
             
             # Také vypočítáme objem v ml pro úplnost
             lesion_volume_ml = lesion_volume_voxels * np.prod(atlas_img.header.get_zooms()) / 1000.0  # in ml
