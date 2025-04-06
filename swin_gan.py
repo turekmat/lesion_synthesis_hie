@@ -811,11 +811,17 @@ class SwinGAN(nn.Module):
             real_pred: Discriminator prediction on real lesion
             fake_pred: Discriminator prediction on fake lesion
         """
-        # Loss on real samples (BCEWithLogitsLoss automatically applies sigmoid)
-        real_loss = self.bce_loss(real_pred, torch.ones_like(real_pred))
+        # Use label smoothing: target for real samples is 0.9 instead of 1.0
+        real_target = torch.ones_like(real_pred) * 0.9
+        
+        # Target for fake samples remains 0
+        fake_target = torch.zeros_like(fake_pred)
+        
+        # Loss on real samples with smoothed labels
+        real_loss = self.bce_loss(real_pred, real_target)
         
         # Loss on fake samples
-        fake_loss = self.bce_loss(fake_pred, torch.zeros_like(fake_pred))
+        fake_loss = self.bce_loss(fake_pred, fake_target)
         
         # Total discriminator loss
         total_loss = (real_loss + fake_loss) * 0.5
@@ -906,8 +912,8 @@ class SwinGANTrainer:
                 # Train discriminator
                 self.optimizer_d.zero_grad()
                 
-                # Only update discriminator every 2 generator steps
-                should_update_discriminator = gen_steps_counter % 2 == 0
+                # Only update discriminator every 5 generator steps (changed from 2)
+                should_update_discriminator = gen_steps_counter % 5 == 0
                 
                 with autocast(device_type='cuda' if self.device == 'cuda' else 'cpu', enabled=self.use_amp):
                     # Generate fake lesions
@@ -920,7 +926,7 @@ class SwinGANTrainer:
                     # Compute discriminator loss
                     d_loss, d_losses_dict = self.model.discriminator_loss(real_pred, fake_pred)
                 
-                # Update discriminator only every 2 generator steps
+                # Update discriminator only every 5 generator steps
                 if should_update_discriminator:
                     if self.use_amp:
                         self.scaler_d.scale(d_loss).backward()
@@ -1884,7 +1890,7 @@ def main():
     train_parser.add_argument('--batch_size', type=int, default=1, help='Batch size')
     train_parser.add_argument('--epochs', type=int, default=100, help='Number of epochs')
     train_parser.add_argument('--lr_generator', type=float, default=1e-4, help='Generator learning rate')
-    train_parser.add_argument('--lr_discriminator', type=float, default=4e-4, help='Discriminator learning rate')
+    train_parser.add_argument('--lr_discriminator', type=float, default=1e-5, help='Discriminator learning rate')
     train_parser.add_argument('--save_interval', type=int, default=5, help='Interval for saving checkpoints')
     train_parser.add_argument('--generator_save_interval', type=int, default=4, help='Interval for saving generator-only checkpoints')
     train_parser.add_argument('--device', type=str, default='cuda', help='Device to use (cuda/cpu)')
