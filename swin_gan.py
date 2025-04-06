@@ -1867,7 +1867,7 @@ def generate_lesions(
                 # Vary morphological operation parameters for each sample
                 sample_morph_size = morph_close_size + np.random.randint(-1, 2)  # -1, 0, or +1
                 sample_morph_size = max(1, sample_morph_size)  # Ensure at least 1
-                
+
                 print(f"  Using blocky morphological operations for pixelated HIE lesion morphology")
                 
                 # Vytvoříme základní strukturní element - krychlový pro zachování ostrých hran
@@ -1881,22 +1881,21 @@ def generate_lesions(
                 
                 # Pro některé vzorky přidáme další blokové struktury
                 if np.random.random() < 0.6:  # 60% šance
-                    # Vytvoříme několik malých bloků v okolí existující léze
-                    dilated = binary_dilation(binary_lesion, structure=struct, iterations=2)
-                    border = dilated & ~binary_lesion
-                    
-                    # Na hranách vytvoříme náhodné bloky
+                    # Převést na boolean pro správnou aplikaci bitových operací
+                    binary_bool = binary_lesion.astype(bool)
+                    dilated = binary_dilation(binary_bool, structure=struct, iterations=2)
+                    border = dilated & ~binary_bool
                     block_mask = np.random.random(border.shape) < 0.15  # Jen 15% bodů vytvoří bloky
                     block_seeds = border & block_mask
-                    
+
                     # Každý seed rozšíříme na malý blok
                     block_size = np.random.randint(1, 3)
                     blocks = binary_dilation(block_seeds, structure=struct, iterations=block_size)
-                    
+
                     # Přidáme bloky k lézi - zaručíme že pracujeme s bool typem
-                    binary_bool = binary_lesion.astype(bool)
                     binary_bool = binary_bool | blocks
                     binary_lesion = binary_bool.astype(binary_lesion.dtype)
+
             
             # Remove small isolated lesions but zachováme ostré hrany
             if min_lesion_size > 0:
