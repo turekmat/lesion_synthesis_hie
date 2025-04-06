@@ -913,7 +913,7 @@ class SwinGANTrainer:
                 self.optimizer_d.zero_grad()
                 
                 # Only update discriminator every 5 generator steps (changed from 2)
-                should_update_discriminator = gen_steps_counter % 5 == 0
+                should_update_discriminator = gen_steps_counter % 2 == 0
                 
                 with autocast(device_type='cuda' if self.device == 'cuda' else 'cpu', enabled=self.use_amp):
                     # Generate fake lesions
