@@ -388,11 +388,10 @@ class Generator(nn.Module):
             )
             self.perlin_scale = perlin_scale
         
-        # Adjust input channels if using noise
-        actual_in_channels = in_channels
-        if use_noise:
-            actual_in_channels += 1  # Add one channel for noise
+        # Always use 2 input channels for SwinUNETR
+        actual_in_channels = 2  # Fixed to 2 channels (atlas + noise or zero channel)
             
+        if use_noise:
             # Nahradím původní jednoduchý noise_processor složitějším modelem
             # Původní noise_processor měl jen dvě konvoluce s LeakyReLU
             self.noise_processor = nn.Sequential(
@@ -517,20 +516,13 @@ class Generator(nn.Module):
             # Normalizace šumu pro zachování rozumného rozsahu
             processed_noise = F.instance_norm(processed_noise)
             
-            # V režimu generování (bez tréninku) vždy použijeme konkatenaci šumu s atlasem
-            # aby byl zajištěn správný počet kanálů (2), které SwinUNETR očekává
-            if not self.training:
-                # Vždy konkatenujeme atlas a zpracovaný šum, aby počet kanálů odpovídal očekávanému počtu
-                x = torch.cat([x, processed_noise], dim=1)
-            else:
-                # Během tréninku můžeme použít náhodný přístup
-                if torch.rand(1).item() < 0.5:  # 50% šance na každý způsob aplikace
-                    # Concatenate processed noise with input along channel dimension (původní způsob)
-                    x = torch.cat([x, processed_noise], dim=1)
-                else:
-                    # Aditivní aplikace šumu přímo na vstup
-                    noise_mask = torch.sigmoid(x * 3.0)
-                    x = x + (processed_noise * noise_mask * 0.5)
+            # Always concatenate noise with input for correct channel count (2 channels)
+            x = torch.cat([x, processed_noise], dim=1)
+        else:
+            # If not using noise, we still need 2 input channels as expected by SwinUNETR
+            batch_size, _, D, H, W = x.shape
+            zero_channel = torch.zeros_like(x)
+            x = torch.cat([x, zero_channel], dim=1)
         
         # SwinUNETR features
         features = self.swin_unetr(x)
@@ -1885,7 +1877,7 @@ def generate_lesions(
                     binary_bool = binary_lesion.astype(bool)
                     dilated = binary_dilation(binary_bool, structure=struct, iterations=2)
                     border = dilated & ~binary_bool
-                    block_mask = np.random.random(border.shape) < 0.15  # Jen 15% bodů vytvoří bloky
+                    block_mask = np.random.random(border.shape) < 0.15  # Jen 15% bodů
                     block_seeds = border & block_mask
 
                     # Každý seed rozšíříme na malý blok
@@ -1972,7 +1964,7 @@ def generate_lesions(
                         # Vytvoříme broader border
                         binary_bool = binary_lesion.astype(bool)
                         dilated_1 = binary_dilation(binary_bool, iterations=1)
-                        dilated_3 = binary_dilation(binary_bool, iterations=3)
+                        dilated_3 = binary_dilation(binary_bool, iterations=3)  # Sníženo z iterations=4 na 3
                         outer_border = dilated_3 & ~dilated_1
                         
                         # Vytvoříme méně častější izolované bloky
@@ -2077,29 +2069,6 @@ def generate_lesions(
                 # Varování pokud počet lézí je mimo očekávaný rozsah podle trénovací množiny
                 if num_lesions > 75:
                     print(f"WARNING: Generated {num_lesions} lesions, which is much higher than expected (1-75 based on training set)")
-    
-    # If multiple samples were generated, also save a mean probability map
-    if num_samples > 1:
-        mean_lesion = np.mean(all_samples, axis=0)
-        
-        if output_file:
-            base_name = os.path.basename(output_file)
-            name, ext = os.path.splitext(base_name)
-            if ext == '.gz' and os.path.splitext(name)[1] == '.nii':
-                name = os.path.splitext(name)[0]
-                ext = '.nii.gz'
-        else:
-            name = "lesion"
-            ext = ".nii.gz"
-        
-        mean_filename = f"{name}_mean{ext}"
-        mean_output_file = os.path.join(output_dir, mean_filename)
-        
-        # Ensure mean_lesion is of a supported data type
-        mean_lesion = mean_lesion.astype(np.float32)  # Use float32 for probability map
-        mean_img = nib.Nifti1Image(mean_lesion, atlas_img.affine)
-        nib.save(mean_img, mean_output_file)
-        print(f"Saved mean probability map to {mean_output_file}")
 
 
 def main():
