@@ -1816,7 +1816,7 @@ def generate_lesions(
                 num_lesions = np.max(labeled_array)  # Zjistíme počet pomocí maxima hodnot
             
             # Také vypočítáme objem v ml pro úplnost
-            lesion_volume_ml = lesion_volume_voxels * np.prod(atlas_affine[0, 0:3, 0:3]) / 1000.0  # in ml
+            lesion_volume_ml = lesion_volume_voxels * np.prod(np.abs(np.diag(atlas_affine)[:3])) / 1000.0  # in ml
             
             if num_samples > 1:
                 print(f"Sample {i+1}: Generated {num_lesions} distinct lesions")
