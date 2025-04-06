@@ -1889,7 +1889,7 @@ def generate_lesions(
                     block_seeds = border & block_mask
 
                     # Každý seed rozšíříme na malý blok
-                    block_size = np.random.randint(1, 3)
+                    block_size = np.random.randint(1, 2)  # Reduced maximum block size from 3 to 2
                     blocks = binary_dilation(block_seeds, structure=struct, iterations=block_size)
 
                     # Přidáme bloky k lézi - zaručíme že pracujeme s bool typem
@@ -1899,9 +1899,9 @@ def generate_lesions(
             
             # Remove small isolated lesions but zachováme ostré hrany
             if min_lesion_size > 0:
-                # Vary minimum lesion size slightly for each sample
-                sample_min_size = int(min_lesion_size * (0.8 + np.random.uniform(0, 0.4)))  # 0.8-1.2x the original
-                sample_min_size = max(1, sample_min_size)  # Ensure at least 1
+                # Vary minimum lesion size slightly for each sample, but ensure minimum is enforced
+                sample_min_size = int(min_lesion_size * (0.9 + np.random.uniform(0, 0.2)))  # 0.9-1.1x the original
+                sample_min_size = max(10, sample_min_size)  # Ensure minimum of 10 voxels
                 
                 print(f"  Using sample-specific minimum lesion size: {sample_min_size}")
                 
@@ -1913,7 +1913,7 @@ def generate_lesions(
                 if len(component_sizes) > 0:
                     component_sizes[0] = 0
                 
-                # Pro blokovitý vzhled chceme zachovat i velmi malé komponenty
+                # Upravíme filtrování malých komponent - zvýšíme minimální velikost
                 if len(component_sizes) > 1:
                     too_small = np.ones_like(component_sizes, dtype=bool)
                     too_small[0] = False  # background není "too small"
@@ -1921,12 +1921,12 @@ def generate_lesions(
                     # Pro každou komponentu určíme, zda ji zachovat
                     for i in range(1, len(component_sizes)):
                         size = component_sizes[i]
-                        if size >= max(1, sample_min_size // 3):  # Snížíme práh pro zachování malých bloků
+                        if size >= sample_min_size:  # Používáme plnou hodnotu min_size, ne dělenou 3
                             too_small[i] = False  # Není příliš malá
                         else:
-                            # Zvýšíme šanci na zachování malých bloků
-                            prob_keep = min(0.95, (size / sample_min_size) * 1.5)  # Až 95% šance zachování
-                            if np.random.random() < prob_keep:
+                            # Snížíme šanci na zachování malých bloků
+                            prob_keep = min(0.3, (size / sample_min_size) * 0.5)  # Max 30% šance zachování (namísto 95%)
+                            if np.random.random() < prob_keep and size >= 10:  # Dodatečná podmínka: musí mít alespoň 10 voxelů
                                 too_small[i] = False  # Zachováme tuto malou komponentu
                     
                     # Aplikujeme masku pro odstranění vybraných malých komponent
@@ -1934,11 +1934,11 @@ def generate_lesions(
                     binary_lesion[too_small_mask] = 0
             
             # Pro blokovitější vzhled snížíme Gaussovské vyhlazení na minimum nebo ho přeskočíme
-            if smooth_sigma > 0 and np.random.random() < 0.5:  # Jen 50% šance na jakékoliv vyhlazení
-                # Použijeme velmi nízké sigma pro zachování ostrých hran
-                sample_sigma = smooth_sigma * 0.3  # Výrazně snížená hodnota
+            if smooth_sigma > 0 and np.random.random() < 0.8:  # Zvýšíme šanci na vyhlazení z 50% na 80%
+                # Použijeme vyšší sigma pro méně ostré hrany
+                sample_sigma = smooth_sigma * 0.7  # Méně snížená hodnota (než původní 0.3)
                 
-                print(f"  Using minimal smoothing with sigma: {sample_sigma:.2f}")
+                print(f"  Using smoothing with sigma: {sample_sigma:.2f}")
                 smoothed = gaussian_filter(binary_lesion.astype(float), sigma=sample_sigma)
                 
                 # Adaptivní threshold s vysokou hodnotou pro zachování ostrých přechodů
@@ -1992,7 +1992,7 @@ def generate_lesions(
                 binary_bool = binary_lesion.astype(bool)
                 dilated_bool = binary_dilation(binary_bool, iterations=1)
                 border = dilated_bool & ~binary_bool
-                pixel_noise = np.random.random(border.shape) < 0.25
+                pixel_noise = np.random.random(border.shape) < 0.15  # Snížení z 0.25 na 0.15 pro méně šumu
                 # Použijeme logický OR na bool a pak konvertujeme zpět na původní typ
                 binary_bool = binary_bool | (pixel_noise & border)
                 binary_lesion = binary_bool.astype(binary_lesion.dtype)
@@ -2002,9 +2002,9 @@ def generate_lesions(
                     # Opět používáme booleovský typ pro správné logické operace
                     binary_bool = binary_lesion.astype(bool)
                     dilated_1 = binary_dilation(binary_bool, iterations=1)
-                    dilated_4 = binary_dilation(binary_bool, iterations=4)
+                    dilated_4 = binary_dilation(binary_bool, iterations=3)  # Sníženo z iterations=4 na 3
                     outer_region = dilated_4 & ~dilated_1
-                    isolated_pixels = np.random.random(outer_region.shape) < 0.03
+                    isolated_pixels = np.random.random(outer_region.shape) < 0.01  # Sníženo z 0.03 na 0.01
                     # Použijeme logický OR na bool a pak konvertujeme zpět na původní typ
                     binary_bool = binary_bool | (isolated_pixels & outer_region)
                     binary_lesion = binary_bool.astype(binary_lesion.dtype)
