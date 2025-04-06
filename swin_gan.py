@@ -517,15 +517,21 @@ class Generator(nn.Module):
             # Normalizace šumu pro zachování rozumného rozsahu
             processed_noise = F.instance_norm(processed_noise)
             
-            # Náhodná aplikace šumu - někdy jako přídavný kanál, někdy aditivně k původnímu vstupu
-            if torch.rand(1).item() < 0.5:  # 50% šance na každý způsob aplikace
-                # Concatenate processed noise with input along channel dimension (původní způsob)
-                x = torch.cat([x, processed_noise], dim=1)
-            else:
-                # Aditivní aplikace šumu přímo na vstup (nový způsob, který je obtížnější ignorovat)
-                # Omezíme vliv šumu na oblasti s vyšší hodnotou atlasu pro zachování anatomické relevance
+            # V režimu generování (bez tréninku) vždy použijeme aditivní aplikaci šumu
+            # pro zajištění konzistentního počtu kanálů
+            if not self.training:
+                # Aditivní aplikace šumu přímo na vstup, která je bezpečnější pro generování
                 noise_mask = torch.sigmoid(x * 3.0)  # Sigmoid transformace atlasu pro váhování šumu
                 x = x + (processed_noise * noise_mask * 0.5)  # Aditivní aplikace s váhováním
+            else:
+                # Během tréninku můžeme použít náhodný přístup
+                if torch.rand(1).item() < 0.5:  # 50% šance na každý způsob aplikace
+                    # Concatenate processed noise with input along channel dimension (původní způsob)
+                    x = torch.cat([x, processed_noise], dim=1)
+                else:
+                    # Aditivní aplikace šumu přímo na vstup
+                    noise_mask = torch.sigmoid(x * 3.0)
+                    x = x + (processed_noise * noise_mask * 0.5)
         
         # SwinUNETR features
         features = self.swin_unetr(x)
@@ -1449,57 +1455,76 @@ def generate_lesions(
     atlas_tensor = torch.from_numpy(atlas_data).float().unsqueeze(0).unsqueeze(0)
     atlas_tensor = atlas_tensor.to(device)
     
-    # Create the model
-    model = SwinGAN(in_channels=1, out_channels=1)
-    
-    # Load the checkpoint
+    # Load the model
+    print(f"Loading generator from checkpoint: {model_checkpoint}")
     checkpoint = torch.load(model_checkpoint, map_location=device)
     
-    # Check if checkpoint contains the full model or just generator
-    if 'model_state_dict' in checkpoint:
-        model.load_state_dict(checkpoint['model_state_dict'])
-    elif 'generator_state_dict' in checkpoint:
-        print("Loading generator from checkpoint with configuration...")
-        
-        # Získání konfiguračních parametrů z checkpointu
-        use_noise = checkpoint.get('use_noise', True)  # defaultně True pro zpětnou kompatibilitu
-        noise_dim = checkpoint.get('noise_dim', 16)
+    if 'generator_state_dict' in checkpoint:
+        # Generator-only checkpoint
         feature_size = checkpoint.get('feature_size', 24)
+        use_noise = checkpoint.get('use_noise', True)
+        noise_dim = checkpoint.get('noise_dim', 16)
         dropout_rate = checkpoint.get('dropout_rate', 0.0)
+        focal_loss_weight = checkpoint.get('focal_loss_weight', 10.0)
+        l1_loss_weight = checkpoint.get('l1_loss_weight', 5.0)
+        focal_alpha = checkpoint.get('focal_alpha', 0.8)
+        focal_gamma = checkpoint.get('focal_gamma', 2.0)
+        perlin_octaves_ckpt = checkpoint.get('perlin_octaves', perlin_octaves)
+        perlin_persistence_ckpt = checkpoint.get('perlin_persistence', perlin_persistence)
+        perlin_lacunarity_ckpt = checkpoint.get('perlin_lacunarity', perlin_lacunarity)
+        perlin_scale_ckpt = checkpoint.get('perlin_scale', perlin_scale)
         
-        # Load Perlin noise parameters from checkpoint if available
-        loaded_perlin_octaves = checkpoint.get('perlin_octaves', perlin_octaves)
-        loaded_perlin_persistence = checkpoint.get('perlin_persistence', perlin_persistence)
-        loaded_perlin_lacunarity = checkpoint.get('perlin_lacunarity', perlin_lacunarity)
-        loaded_perlin_scale = checkpoint.get('perlin_scale', perlin_scale)
+        if perlin_octaves_ckpt is not None:
+            perlin_octaves = perlin_octaves_ckpt
+        if perlin_persistence_ckpt is not None:
+            perlin_persistence = perlin_persistence_ckpt
+        if perlin_lacunarity_ckpt is not None:
+            perlin_lacunarity = perlin_lacunarity_ckpt
+        if perlin_scale_ckpt is not None:
+            perlin_scale = perlin_scale_ckpt
         
+        print(f"Loading generator from checkpoint with configuration...")
         print(f"Checkpoint configuration: use_noise={use_noise}, noise_dim={noise_dim}, feature_size={feature_size}")
-        print(f"Perlin noise parameters: octaves={loaded_perlin_octaves}, persistence={loaded_perlin_persistence}, "
-              f"lacunarity={loaded_perlin_lacunarity}, scale={loaded_perlin_scale}")
+        print(f"Perlin noise parameters: octaves={perlin_octaves}, persistence={perlin_persistence}, lacunarity={perlin_lacunarity}, scale={perlin_scale}")
         
-        # Vytvoření nového modelu s načtenými parametry
+        # Create the model
         model = SwinGAN(
-            in_channels=1, 
+            in_channels=1,
             out_channels=1,
             feature_size=feature_size,
             dropout_rate=dropout_rate,
+            lambda_focal=focal_loss_weight,
+            lambda_l1=l1_loss_weight,
+            focal_alpha=focal_alpha,
+            focal_gamma=focal_gamma,
             use_noise=use_noise,
             noise_dim=noise_dim,
-            perlin_octaves=loaded_perlin_octaves,
-            perlin_persistence=loaded_perlin_persistence,
-            perlin_lacunarity=loaded_perlin_lacunarity,
-            perlin_scale=loaded_perlin_scale
+            perlin_octaves=perlin_octaves,
+            perlin_persistence=perlin_persistence,
+            perlin_lacunarity=perlin_lacunarity,
+            perlin_scale=perlin_scale
         )
         
-        # Načtení vah generátoru
+        # Load the generator weights
         model.generator.load_state_dict(checkpoint['generator_state_dict'])
-        model = model.to(device)
-    elif 'generator' in checkpoint:
-        model.generator.load_state_dict(checkpoint['generator'])
     else:
-        model.load_state_dict(checkpoint)
+        # Full model checkpoint
+        model = SwinGAN(
+            in_channels=1,
+            out_channels=1,
+            feature_size=24,
+            use_noise=True,
+            noise_dim=16,
+            perlin_octaves=perlin_octaves,
+            perlin_persistence=perlin_persistence,
+            perlin_lacunarity=perlin_lacunarity,
+            perlin_scale=perlin_scale
+        )
+        model.load_state_dict(checkpoint['model_state_dict'])
     
-    model.eval()
+    # Move the model to the device and set to evaluation mode
+    model.to(device)
+    model.eval()  # Přepne model a všechny jeho podmoduly (včetně generátoru) do režimu eval
     
     # Create output directory if it doesn't exist
     if output_dir:
