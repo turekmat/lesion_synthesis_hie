@@ -1609,8 +1609,12 @@ def generate_lesions(
             # Remove components smaller than min_lesion_size
             if min_lesion_size > 0:
                 # Label connected components
-                # Oprava: measure.label nemá parametr return_num v této verzi scipy
-                labeled_array = measure.label(lesion_binary, structure=struct_element)
+                # Oprava: measure.label vrací tuple (labeled_array, num_features) ve vyšších verzích scipy
+                labeled_result = measure.label(lesion_binary, structure=struct_element)
+                if isinstance(labeled_result, tuple):
+                    labeled_array = labeled_result[0]  # Získáme pouze labeled_array z tuple
+                else:
+                    labeled_array = labeled_result  # Pro starší verze, které vracejí přímo pole
                 
                 # Get component sizes
                 component_sizes = np.bincount(labeled_array.ravel())
@@ -1622,10 +1626,15 @@ def generate_lesions(
                 lesion_binary[remove_pixels] = 0
                 
                 # Count final number of components - oprava
-                labeled_array = measure.label(lesion_binary, structure=struct_element)
-                # Zjistíme počet komponent (počet různých hodnot kromě pozadí)
-                # V starších verzích scipy musíme počet komponent zjistit pomocí np.max
-                final_components = np.max(labeled_array)
+                labeled_result = measure.label(lesion_binary, structure=struct_element)
+                if isinstance(labeled_result, tuple):
+                    labeled_array = labeled_result[0]  # Získáme pouze labeled_array z tuple
+                    final_components = labeled_result[1]  # Můžeme získat počet komponent přímo
+                else:
+                    labeled_array = labeled_result  # Pro starší verze, které vracejí přímo pole
+                    # Zjistíme počet komponent (počet různých hodnot kromě pozadí)
+                    # V starších verzích scipy musíme počet komponent zjistit pomocí np.max
+                    final_components = np.max(labeled_array)
                 print(f"Final lesion has {final_components} connected components")
             
             # Calculate lesion coverage for this sample
@@ -1795,8 +1804,13 @@ def generate_lesions(
             # Print some statistics
             # measure.label vrací tuple (labeled_array, num_features) ve vyšších verzích scipy
             # V naší verzi musíme počet lézí určit jinak
-            labeled_array = measure.label(binary_lesion)
-            num_lesions = np.max(labeled_array)
+            labeled_result = measure.label(binary_lesion)
+            if isinstance(labeled_result, tuple):
+                labeled_array = labeled_result[0]
+                num_lesions = labeled_result[1]  # Počet komponent přímo z výsledku
+            else:
+                labeled_array = labeled_result
+                num_lesions = np.max(labeled_array)  # Zjistíme počet pomocí maxima hodnot
             
             # Také vypočítáme objem v ml pro úplnost
             lesion_volume_ml = lesion_volume_voxels * np.prod(atlas_img.header.get_zooms()) / 1000.0  # in ml
