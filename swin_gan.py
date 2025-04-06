@@ -1757,7 +1757,7 @@ def generate_lesions(
                     binary_bool = binary_bool | (isolated_pixels & outer_region)
                     binary_lesion = binary_bool.astype(binary_lesion.dtype)
 
-            all_samples.append(binary_lesion)
+            generated_lesions.append(binary_lesion)
             
             # Determine output path for this sample
             if num_samples == 1 and output_file:
@@ -1801,7 +1801,7 @@ def generate_lesions(
             # Create a new NIfTI image and save it
             # Ensure data is of supported type (not bool)
             binary_lesion_for_saving = binary_lesion.astype(np.int16)  # Convert to int16, which is supported by NIfTI
-            lesion_img = nib.Nifti1Image(binary_lesion_for_saving, atlas_img.affine)
+            lesion_img = nib.Nifti1Image(binary_lesion_for_saving, atlas_affine, atlas_header)
             nib.save(lesion_img, sample_output_file)
             
             # Print some statistics
@@ -1816,7 +1816,7 @@ def generate_lesions(
                 num_lesions = np.max(labeled_array)  # Zjistíme počet pomocí maxima hodnot
             
             # Také vypočítáme objem v ml pro úplnost
-            lesion_volume_ml = lesion_volume_voxels * np.prod(atlas_img.header.get_zooms()) / 1000.0  # in ml
+            lesion_volume_ml = lesion_volume_voxels * np.prod(atlas_affine[0, 0:3, 0:3]) / 1000.0  # in ml
             
             if num_samples > 1:
                 print(f"Sample {i+1}: Generated {num_lesions} distinct lesions")
