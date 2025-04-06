@@ -1500,8 +1500,43 @@ def generate_lesions(
     adaptive_threshold_iterations=50,  # Maximální počet iterací pro hledání adaptivního thresholdu
     use_different_target_for_each_sample=False,  # Použít jiný cílový coverage pro každý vzorek
     use_learnable_noise=False,     # Použít naučené parametry Perlin šumu
-    gradient_penalty_weight=10.0   # Weight for gradient penalty in WGAN-GP (not used for generation but needed for model loading)
+    gradient_penalty_weight=10.0,  # Weight for gradient penalty in WGAN-GP (not used for generation but needed for model loading)
+    apply_smoothing=True,          # Zda použít vyhlazení lézí pomocí Gaussovského filtru
+    apply_morph_close=True         # Zda použít morfologické uzavření pro spojení blízkých částí léze
 ):
+    """
+    Generuje léze pomocí natrénovaného modelu SwinGAN.
+    
+    Args:
+        model_checkpoint: Cesta k checkpointu modelu
+        lesion_atlas: Cesta k atlasu lézí (frequency map)
+        output_file: Cesta pro uložení jedné léze (pouze pro num_samples=1)
+        output_dir: Adresář pro uložení více lézí (pro num_samples>1)
+        threshold: Prahová hodnota pro binarizaci lézí
+        device: Zařízení pro výpočet ('cuda' nebo 'cpu')
+        num_samples: Počet lézí k vygenerování
+        perlin_octaves: Počet oktáv pro Perlinův šum
+        perlin_persistence: Persistence pro Perlinův šum
+        perlin_lacunarity: Lacunarity pro Perlinův šum
+        perlin_scale: Měřítko pro Perlinův šum
+        min_lesion_size: Minimální velikost léze v počtu voxelů
+        smooth_sigma: Parametr sigma pro Gaussovské vyhlazení
+        morph_close_size: Velikost strukturního elementu pro morfologické uzavření
+        use_adaptive_threshold: Použít adaptivní prahování
+        training_lesion_dir: Adresář s trénovacími lézemi pro adaptivní prahování
+        target_coverage: Cílové pokrytí lézemi v procentech
+        min_adaptive_threshold: Minimální hodnota pro adaptivní prahování
+        max_adaptive_threshold: Maximální hodnota pro adaptivní prahování
+        adaptive_threshold_iterations: Maximální počet iterací pro hledání adaptivního prahu
+        use_different_target_for_each_sample: Použít jiný cílový coverage pro každý vzorek
+        use_learnable_noise: Použít naučené parametry pro Perlinův šum
+        gradient_penalty_weight: Váha penalizace gradientu pro WGAN-GP
+        apply_smoothing: Zda aplikovat Gaussovské vyhlazení na generované léze
+        apply_morph_close: Zda aplikovat morfologické uzavření na generované léze
+    
+    Returns:
+        Seznam vygenerovaných lézí jako numpy array
+    """
     # Validate inputs
     if output_file is None and output_dir is None:
         raise ValueError("Either output_file or output_dir must be provided")
@@ -1636,7 +1671,7 @@ def generate_lesions(
             binary_mask = (probability_map_np > threshold_value).astype(np.float32)
             
             # Apply Gaussian smoothing if requested
-            if smooth_sigma > 0:
+            if smooth_sigma > 0 and apply_smoothing:
                 binary_mask = gaussian_filter(binary_mask, sigma=smooth_sigma)
                 binary_mask = (binary_mask > 0.5).astype(np.float32)  # Re-threshold after smoothing
                 # Ensure lesions respect atlas mask after smoothing
@@ -1644,7 +1679,7 @@ def generate_lesions(
                 binary_mask = binary_mask * atlas_mask
             
             # Apply morphological closing if requested
-            if morph_close_size > 0:
+            if morph_close_size > 0 and apply_morph_close:
                 # Create a structural element for closing
                 close_struct = generate_binary_structure(3, 1)
                 close_struct = binary_dilation(close_struct, iterations=morph_close_size-1)
@@ -1735,7 +1770,7 @@ def generate_lesions(
             binary_lesion = binary_mask.copy()
             
             # Pro blokovitější vzhled snížíme Gaussovské vyhlazení na minimum nebo ho přeskočíme
-            if smooth_sigma > 0 and np.random.random() < 0.8:  # Zvýšíme šanci na vyhlazení z 50% na 80%
+            if smooth_sigma > 0 and apply_smoothing and np.random.random() < 0.8:  # Zvýšíme šanci na vyhlazení z 50% na 80%
                 # Použijeme vyšší sigma pro méně ostré hrany
                 sample_sigma = smooth_sigma * 0.7  # Méně snížená hodnota (než původní 0.3)
                 
@@ -1971,13 +2006,17 @@ def main():
     generate_parser.add_argument('--smooth_sigma', type=float, default=0.5, help='Sigma for Gaussian smoothing')
     generate_parser.add_argument('--morph_close_size', type=int, default=2, help='Size of structural element for morphological closing')
     generate_parser.add_argument('--use_adaptive_threshold', action='store_true', help='Use adaptive thresholding')
-    generate_parser.add_argument('--training_lesion_dir', type=str, help='Directory with training lesions for coverage calculation')
-    generate_parser.add_argument('--target_coverage', type=float, help='Target lesion coverage percentage')
-    generate_parser.add_argument('--min_adaptive_threshold', type=float, default=0.00001, help='Minimum threshold for adaptive thresholding')
-    generate_parser.add_argument('--max_adaptive_threshold', type=float, default=0.999, help='Maximum threshold for adaptive thresholding')
-    generate_parser.add_argument('--adaptive_threshold_iterations', type=int, default=50, help='Maximum iterations for adaptive threshold search')
+    generate_parser.add_argument('--training_lesion_dir', type=str, help='Directory with training lesions for adaptive thresholding')
+    generate_parser.add_argument('--target_coverage', type=float, help='Target lesion coverage in percent')
+    generate_parser.add_argument('--min_adaptive_threshold', type=float, default=0.00001, help='Minimum value for adaptive threshold')
+    generate_parser.add_argument('--max_adaptive_threshold', type=float, default=0.999, help='Maximum value for adaptive threshold')
+    generate_parser.add_argument('--adaptive_threshold_iterations', type=int, default=50, help='Maximum number of iterations for adaptive threshold search')
     generate_parser.add_argument('--use_different_target_for_each_sample', action='store_true', help='Use different target coverage for each sample')
-    generate_parser.add_argument('--use_learnable_noise', action='store_true', help='Use learnable Perlin noise parameters')
+    generate_parser.add_argument('--use_learnable_noise', action='store_true', help='Use learnable parameters for Perlin noise')
+    generate_parser.add_argument('--apply_smoothing', action='store_true', default=True, help='Apply Gaussian smoothing to lesions')
+    generate_parser.add_argument('--no_smoothing', action='store_false', dest='apply_smoothing', help='Disable Gaussian smoothing')
+    generate_parser.add_argument('--apply_morph_close', action='store_true', default=True, help='Apply morphological closing to lesions')
+    generate_parser.add_argument('--no_morph_close', action='store_false', dest='apply_morph_close', help='Disable morphological closing')
     
     # Parse arguments
     args = parser.parse_args()
@@ -2008,7 +2047,9 @@ def main():
             max_adaptive_threshold=args.max_adaptive_threshold,
             adaptive_threshold_iterations=args.adaptive_threshold_iterations,
             use_different_target_for_each_sample=args.use_different_target_for_each_sample,
-            use_learnable_noise=args.use_learnable_noise
+            use_learnable_noise=args.use_learnable_noise,
+            apply_smoothing=args.apply_smoothing,
+            apply_morph_close=args.apply_morph_close
         )
     else:
         parser.print_help()
