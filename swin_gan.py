@@ -12,7 +12,7 @@ from collections import defaultdict
 from torch.amp import GradScaler, autocast
 import argparse
 from scipy import ndimage as measure
-from scipy.ndimage import binary_closing, binary_opening, binary_dilation, generate_binary_structure, gaussian_filter
+from scipy.ndimage import binary_closing, binary_opening, binary_dilation, generate_binary_structure, gaussian_filter, binary_erosion
 from torchvision import transforms
 import time  # Import time for performance measurement
 
@@ -75,6 +75,10 @@ class PerlinNoiseGenerator:
         for i in range(1, self.octaves):
             amplitudes.append(amplitudes[-1] * self.persistence)
         
+        # Zvýšíme celkovou amplitudu šumu pro větší vliv na výstup
+        amplification_factor = 1.5 + torch.rand(1).item() * 0.5  # Náhodné zesílení 1.5-2.0x
+        amplitudes = [amp * amplification_factor for amp in amplitudes]
+        
         max_amplitude = sum(amplitudes)
         
         # Create meshgrid for coordinates
@@ -86,7 +90,13 @@ class PerlinNoiseGenerator:
         
         # Generate a random phase offset tensor for this specific noise generation
         # This is crucial for making different seeds produce different patterns
-        random_tensor = torch.rand(3, 3, device=device)
+        # Zvýšíme rozměr random_tensor pro více nezávislých fázových posunů
+        random_tensor = torch.rand(4, 4, device=device)
+        
+        # Přidáme různé typy komplexního šumu
+        noise_types = ["standard", "turbulent", "ridged", "billow"]
+        noise_weights = torch.rand(len(noise_types), device=device)
+        noise_weights = noise_weights / noise_weights.sum()  # Normalizace vah
         
         # Generate noise by adding different frequency components
         for octave in range(self.octaves):
@@ -105,14 +115,31 @@ class PerlinNoiseGenerator:
             phase_offset_z = random_tensor[0, 2] * 6.28 + octave * 0.8
             
             # We'll also randomize the frequency multipliers to get more varied patterns
-            freq_multiplier_x = 1.0 + random_tensor[1, 0] * 0.5
-            freq_multiplier_y = 1.0 + random_tensor[1, 1] * 0.5
-            freq_multiplier_z = 1.0 + random_tensor[1, 2] * 0.5
+            freq_multiplier_x = 1.0 + random_tensor[1, 0] * 0.7  # Zvýšený rozsah z 0.5 na 0.7
+            freq_multiplier_y = 1.0 + random_tensor[1, 1] * 0.7
+            freq_multiplier_z = 1.0 + random_tensor[1, 2] * 0.7
             
-            # Generate 3D noise using sine waves with randomized phases
+            # Generování různých typů šumu pro různé oktávy
+            noise_type_idx = octave % len(noise_types)
+            noise_type = noise_types[noise_type_idx]
+            
+            # Standard noise using sine waves with randomized phases
             noise_x = torch.sin(2 * np.pi * phase_x * freq_multiplier_x + phase_offset_x)
             noise_y = torch.sin(2 * np.pi * phase_y * freq_multiplier_y + phase_offset_y)
             noise_z = torch.sin(2 * np.pi * phase_z * freq_multiplier_z + phase_offset_z)
+            
+            # Alternativní typy šumu pro více variability
+            noise_turbulent_x = torch.abs(torch.sin(2 * np.pi * phase_x * freq_multiplier_x + phase_offset_x * 2.0))
+            noise_turbulent_y = torch.abs(torch.sin(2 * np.pi * phase_y * freq_multiplier_y + phase_offset_y * 2.0))
+            noise_turbulent_z = torch.abs(torch.sin(2 * np.pi * phase_z * freq_multiplier_z + phase_offset_z * 2.0))
+            
+            noise_ridged_x = 1.0 - torch.abs(torch.sin(2 * np.pi * phase_x * freq_multiplier_x + phase_offset_x))
+            noise_ridged_y = 1.0 - torch.abs(torch.sin(2 * np.pi * phase_y * freq_multiplier_y + phase_offset_y))
+            noise_ridged_z = 1.0 - torch.abs(torch.sin(2 * np.pi * phase_z * freq_multiplier_z + phase_offset_z))
+            
+            noise_billow_x = 2.0 * torch.abs(torch.sin(2 * np.pi * phase_x * freq_multiplier_x + phase_offset_x)) - 1.0
+            noise_billow_y = 2.0 * torch.abs(torch.sin(2 * np.pi * phase_y * freq_multiplier_y + phase_offset_y)) - 1.0
+            noise_billow_z = 2.0 * torch.abs(torch.sin(2 * np.pi * phase_z * freq_multiplier_z + phase_offset_z)) - 1.0
             
             # Combine the noise patterns (with random weights)
             weight_x = 0.3 + random_tensor[2, 0] * 0.4
@@ -120,47 +147,48 @@ class PerlinNoiseGenerator:
             weight_z = 0.3 + random_tensor[2, 2] * 0.4
             weight_sum = weight_x + weight_y + weight_z
             
-            noise = (noise_x * weight_x + noise_y * weight_y + noise_z * weight_z) / weight_sum
+            # Kombinace různých typů šumu
+            standard_noise = (noise_x * weight_x + noise_y * weight_y + noise_z * weight_z) / weight_sum
+            turbulent_noise = (noise_turbulent_x * weight_x + noise_turbulent_y * weight_y + noise_turbulent_z * weight_z) / weight_sum
+            ridged_noise = (noise_ridged_x * weight_x + noise_ridged_y * weight_y + noise_ridged_z * weight_z) / weight_sum
+            billow_noise = (noise_billow_x * weight_x + noise_billow_y * weight_y + noise_billow_z * weight_z) / weight_sum
             
-            # Add turbulence/distortion for more natural patterns
-            if octave > 0:
-                turb_freq = 1.7 + random_tensor[1, 0] * 0.6  # Randomize turbulence frequency
-                distortion_x = torch.sin(2 * np.pi * phase_x * turb_freq + phase_offset_x)
-                distortion_y = torch.sin(2 * np.pi * phase_y * turb_freq + phase_offset_y)
-                distortion_z = torch.sin(2 * np.pi * phase_z * turb_freq + phase_offset_z)
-                
-                # Make distortion smoother with higher octaves to reduce small isolated areas
-                distortion_factor = 0.3 * (1.0 / (octave + 1))
-                noise = noise + (distortion_x * distortion_y * distortion_z) * distortion_factor
+            # Váhovaná kombinace všech typů šumu
+            combined_noise = (
+                standard_noise * noise_weights[0] + 
+                turbulent_noise * noise_weights[1] + 
+                ridged_noise * noise_weights[2] + 
+                billow_noise * noise_weights[3]
+            )
             
-            # Add weighted noise to the total
-            result += noise * amplitude
+            # Přidáme náhodné nelinearity pro větší komplexitu
+            if octave > 0 and torch.rand(1).item() < 0.5:
+                combined_noise = torch.tanh(combined_noise * (1.0 + random_tensor[3, 0] * 0.5))
+            
+            # Add this octave to the result
+            result += combined_noise * amplitude
         
-        # Normalize to [0, 1] range
+        # Normalize to range [-1, 1] considering the max possible amplitude
         result = result / max_amplitude
-        result = (result - result.min()) / (result.max() - result.min() + 1e-8)
         
-        # Apply gaussian smoothing to reduce small isolated regions
-        # This is a key step to reduce the number of small disconnected lesions
-        # We'll use 3D gaussian blur
-        kernel_size = 5
-        sigma = 1.0
+        # Apply Gaussian smoothing if requested (adaptive based on seed)
+        # Upravíme smoothing podle náhodného faktoru pro každý generovaný šum
+        smooth_factor = 0.3 + 0.4 * torch.rand(1).item()  # Hodnota mezi 0.3 a 0.7
+        kernel_size = 3
+        sigma = smooth_factor
         
-        # Create a 3D Gaussian kernel
-        kernel_size = int(kernel_size)
-        # Ensure kernel_size is odd
-        if kernel_size % 2 == 0:
-            kernel_size = kernel_size + 1
-            
-        # Create a 1D Gaussian kernel
-        x = torch.arange(kernel_size, device=device) - (kernel_size - 1) / 2
-        kernel_1d = torch.exp(-0.5 * (x / sigma)**2)
-        kernel_1d = kernel_1d / kernel_1d.sum()
+        # Create 1D Gaussian kernels for separable convolution
+        kernel_x = torch.exp(-torch.arange(-kernel_size//2 + 1, kernel_size//2 + 1, dtype=torch.float32, device=device) ** 2 / (2 * sigma ** 2))
+        kernel_x = kernel_x / kernel_x.sum()
+        kernel_x = kernel_x.view(1, 1, kernel_size, 1, 1)
         
-        # Expand to 3D
-        kernel_x = kernel_1d.view(1, 1, kernel_size, 1, 1).expand(1, 1, kernel_size, 1, 1)
-        kernel_y = kernel_1d.view(1, 1, 1, kernel_size, 1).expand(1, 1, 1, kernel_size, 1)
-        kernel_z = kernel_1d.view(1, 1, 1, 1, kernel_size).expand(1, 1, 1, 1, kernel_size)
+        kernel_y = torch.exp(-torch.arange(-kernel_size//2 + 1, kernel_size//2 + 1, dtype=torch.float32, device=device) ** 2 / (2 * sigma ** 2))
+        kernel_y = kernel_y / kernel_y.sum()
+        kernel_y = kernel_y.view(1, 1, 1, kernel_size, 1)
+        
+        kernel_z = torch.exp(-torch.arange(-kernel_size//2 + 1, kernel_size//2 + 1, dtype=torch.float32, device=device) ** 2 / (2 * sigma ** 2))
+        kernel_z = kernel_z / kernel_z.sum()
+        kernel_z = kernel_z.view(1, 1, 1, 1, kernel_size)
         
         # Apply separable convolution for efficiency
         result_temp = result.unsqueeze(0).unsqueeze(0)  # Add batch and channel dims [1,1,D,H,W]
@@ -359,12 +387,42 @@ class Generator(nn.Module):
         if use_noise:
             actual_in_channels += 1  # Add one channel for noise
             
-            # Noise processing network
+            # Nahradím původní jednoduchý noise_processor složitějším modelem
+            # Původní noise_processor měl jen dvě konvoluce s LeakyReLU
             self.noise_processor = nn.Sequential(
-                nn.Conv3d(1, 8, kernel_size=3, padding=1),
+                # První vrstva - expanze kanálů
+                nn.Conv3d(1, 16, kernel_size=3, padding=1),
                 nn.LeakyReLU(0.2, inplace=True),
+                nn.InstanceNorm3d(16),
+                
+                # Druhá vrstva - udržení kanálů, zvýšení receptivního pole
+                nn.Conv3d(16, 16, kernel_size=3, padding=1),
+                nn.LeakyReLU(0.2, inplace=True),
+                nn.InstanceNorm3d(16),
+                
+                # Residuální blok 1
+                nn.Conv3d(16, 16, kernel_size=3, padding=1),
+                nn.LeakyReLU(0.2, inplace=True),
+                nn.InstanceNorm3d(16),
+                nn.Conv3d(16, 16, kernel_size=3, padding=1),
+                nn.LeakyReLU(0.2, inplace=True),
+                nn.InstanceNorm3d(16),
+                
+                # Residuální blok 2 s dilatovanou konvolucí pro větší receptivní pole
+                nn.Conv3d(16, 16, kernel_size=3, padding=2, dilation=2),
+                nn.LeakyReLU(0.2, inplace=True),
+                nn.InstanceNorm3d(16),
+                nn.Conv3d(16, 16, kernel_size=3, padding=2, dilation=2),
+                nn.LeakyReLU(0.2, inplace=True),
+                nn.InstanceNorm3d(16),
+                
+                # Závěrečné vrstvy pro redukci na jeden kanál
+                nn.Conv3d(16, 8, kernel_size=3, padding=1),
+                nn.LeakyReLU(0.2, inplace=True),
+                nn.InstanceNorm3d(8),
+                
                 nn.Conv3d(8, 1, kernel_size=3, padding=1),
-                nn.LeakyReLU(0.2, inplace=True)
+                nn.Tanh()  # Tanh pro normalizaci do rozsahu [-1, 1]
             )
         
         # SwinUNETR as the backbone
@@ -411,17 +469,57 @@ class Generator(nn.Module):
             if noise.dim() == 2:  # Pokud má noise tvar [batch_size, noise_dim]
                 # Rozšíříme noise_dim na D*H*W
                 expanded_noise = noise.view(batch_size, self.noise_dim, 1, 1, 1).expand(batch_size, self.noise_dim, D, H, W)
-                # Vezmeme pouze jednu dimenzi (kanál) pro noise_processor
-                noise_3d = expanded_noise[:, 0:1, :, :, :]  # [batch_size, 1, D, H, W]
+                # Vezmeme více dimenzí (kanálů) pro noise_processor pro větší variabilitu
+                # Původně se brala jen jedna dimenze, nyní vezmeme náhodně 2-4 dimenze a zkombinujeme je
+                num_noise_channels = torch.randint(2, 5, (1,)).item()  # Náhodně 2-4 kanály
+                noise_indices = torch.randperm(self.noise_dim)[:num_noise_channels]
+                combined_noise = torch.zeros((batch_size, 1, D, H, W), device=x.device)
+                
+                # Kombinace několika kanálů šumu s různými váhami pro větší komplexitu
+                for i, idx in enumerate(noise_indices):
+                    channel_weight = 1.0 / (i + 1)  # Klesající váhy pro další kanály
+                    combined_noise += expanded_noise[:, idx:idx+1, :, :, :] * channel_weight
+                
+                noise_3d = combined_noise / num_noise_channels  # Normalizace
+                
+                # Přidáme náhodné zesílení šumu pro větší nepředvídatelnost
+                noise_amplification = 1.0 + torch.rand(1).item()  # Random mezi 1.0 a 2.0
+                noise_3d = noise_3d * noise_amplification
             else:
                 # Předpokládáme, že noise už má správný tvar
-                noise_3d = noise
+                noise_3d = noise * (1.0 + 0.5 * torch.rand(1).item())  # Náhodné zesílení
             
-            # Process noise through a small network to make it more structured
+            # Process noise through a more complex network to make it harder to ignore
+            # Původní noise_processor byl příliš jednoduchý, rozšíříme ho
             processed_noise = self.noise_processor(noise_3d)
             
-            # Concatenate processed noise with input along channel dimension
-            x = torch.cat([x, processed_noise], dim=1)
+            # Přidáme další náhodnost do zpracovaného šumu s různou frekvencí
+            if torch.rand(1).item() < 0.7:  # 70% šance na přidání další náhodnosti
+                # Vytvoříme dodatečný nízkofrekvenční šum
+                low_freq_noise = torch.randn_like(processed_noise) * 0.2
+                # Použijeme blur pro vytvoření nízkofrekvenčního šumu
+                kernel_size = 5
+                padding = kernel_size // 2
+                low_freq_noise = F.avg_pool3d(low_freq_noise, kernel_size=kernel_size, stride=1, padding=padding)
+                # Kombinujeme s původním šumem
+                processed_noise = processed_noise + low_freq_noise
+            
+            # Přímé přidání částí nezpracovaného šumu do výstupu pro zvýšení variability
+            direct_noise_weight = 0.3 * torch.rand(1).item()  # Náhodná váha 0-0.3
+            processed_noise = processed_noise + (noise_3d * direct_noise_weight)
+            
+            # Normalizace šumu pro zachování rozumného rozsahu
+            processed_noise = F.instance_norm(processed_noise)
+            
+            # Náhodná aplikace šumu - někdy jako přídavný kanál, někdy aditivně k původnímu vstupu
+            if torch.rand(1).item() < 0.5:  # 50% šance na každý způsob aplikace
+                # Concatenate processed noise with input along channel dimension (původní způsob)
+                x = torch.cat([x, processed_noise], dim=1)
+            else:
+                # Aditivní aplikace šumu přímo na vstup (nový způsob, který je obtížnější ignorovat)
+                # Omezíme vliv šumu na oblasti s vyšší hodnotou atlasu pro zachování anatomické relevance
+                noise_mask = torch.sigmoid(x * 3.0)  # Sigmoid transformace atlasu pro váhování šumu
+                x = x + (processed_noise * noise_mask * 0.5)  # Aditivní aplikace s váhováním
         
         # SwinUNETR features
         features = self.swin_unetr(x)
@@ -1112,35 +1210,37 @@ def find_adaptive_threshold(probability_map, target_coverage, atlas_mask=None,
         tuple: (found_threshold, actual_coverage, binary_lesion)
     """
     # First, check if we need a very low threshold by testing the extremes
-    binary_high = (probability_map > max_threshold).astype(np.float32)
+    # High threshold = low coverage
+    binary_at_high_threshold = (probability_map > max_threshold).astype(np.float32)
     if atlas_mask is not None:
-        binary_high = binary_high * atlas_mask
-    coverage_high = compute_lesion_coverage(binary_high, atlas_mask)
+        binary_at_high_threshold = binary_at_high_threshold * atlas_mask
+    low_coverage = compute_lesion_coverage(binary_at_high_threshold, atlas_mask)
     
-    binary_low = (probability_map > min_threshold).astype(np.float32)
+    # Low threshold = high coverage
+    binary_at_low_threshold = (probability_map > min_threshold).astype(np.float32)
     if atlas_mask is not None:
-        binary_low = binary_low * atlas_mask
-    coverage_low = compute_lesion_coverage(binary_low, atlas_mask)
+        binary_at_low_threshold = binary_at_low_threshold * atlas_mask
+    high_coverage = compute_lesion_coverage(binary_at_low_threshold, atlas_mask)
     
-    print(f"Coverage range: [{coverage_low:.4f}% at threshold {min_threshold}] - [{coverage_high:.4f}% at threshold {max_threshold}]")
+    print(f"Coverage range: [{low_coverage:.4f}% at threshold {max_threshold}] - [{high_coverage:.4f}% at threshold {min_threshold}]")
     
     # Verify that the target is within the achievable range
-    if target_coverage > coverage_low:
-        print(f"Warning: Target coverage {target_coverage:.4f}% is higher than maximum possible coverage {coverage_low:.4f}%")
+    if target_coverage > high_coverage:
+        print(f"Warning: Target coverage {target_coverage:.4f}% is higher than maximum possible coverage {high_coverage:.4f}%")
         print(f"Using minimum threshold {min_threshold} to achieve maximum coverage")
-        return min_threshold, coverage_low, binary_low
+        return min_threshold, high_coverage, binary_at_low_threshold
     
-    if target_coverage < coverage_high:
-        print(f"Warning: Target coverage {target_coverage:.4f}% is lower than minimum possible coverage {coverage_high:.4f}%")
+    if target_coverage < low_coverage:
+        print(f"Warning: Target coverage {target_coverage:.4f}% is lower than minimum possible coverage {low_coverage:.4f}%")
         print(f"Using maximum threshold {max_threshold} to achieve minimum coverage")
-        return max_threshold, coverage_high, binary_high
+        return max_threshold, low_coverage, binary_at_high_threshold
     
     # Initialize the binary search with a better initial guess
-    if coverage_low != coverage_high:
+    if high_coverage != low_coverage:
         # Interpolate to get a better initial threshold based on linear mapping
         # This helps to start closer to the target
-        ratio = (target_coverage - coverage_high) / (coverage_low - coverage_high)
-        threshold = min_threshold + ratio * (max_threshold - min_threshold)
+        ratio = (target_coverage - low_coverage) / (high_coverage - low_coverage)
+        threshold = max_threshold - ratio * (max_threshold - min_threshold)
         threshold = max(min_threshold, min(max_threshold, threshold))  # Clamp
     else:
         threshold = initial_threshold
@@ -1179,11 +1279,11 @@ def find_adaptive_threshold(probability_map, target_coverage, atlas_mask=None,
         
         # Adjust threshold using binary search
         if current_coverage > target_coverage:
-            # Too much coverage, increase threshold
+            # Too much coverage, increase threshold (higher threshold = less coverage)
             threshold_min = threshold
             threshold = (threshold + threshold_max) / 2
         else:
-            # Too little coverage, decrease threshold
+            # Too little coverage, decrease threshold (lower threshold = more coverage)
             threshold_max = threshold
             threshold = (threshold + threshold_min) / 2
         
@@ -1228,7 +1328,7 @@ def generate_lesions(
     Args:
         model_checkpoint (str): Path to the model checkpoint
         lesion_atlas (str): Path to the lesion atlas (frequency map)
-        output_file (str, optional): Path to save the generated lesion (for single sample)
+        output_file (str, optional): Path to save the generated lesion .nii file (for single sample)
         output_dir (str, optional): Directory to save multiple generated samples
         threshold (float): Threshold for binarizing the generated lesion probability map
         device (str): Device to use for inference ('cuda' or 'cpu')
@@ -1408,10 +1508,45 @@ def generate_lesions(
     master_seed = np.random.randint(0, 1000000)
     print(f"Using master seed: {master_seed} for overall generation process")
     
+    # Připravíme si dostatečně rozmanité seedy pro všechny vzorky předem
+    # aby se zabránilo jakýmkoliv vzorcům mezi nimi
+    all_sample_seeds = []
+    base_seeds = set()  # Pro kontrolu unikátnosti
+    
+    # Vytvoříme kompletně náhodné seedy bez vzorce
+    for _ in range(num_samples):
+        # Vytvořit opravdu náhodné seedy nezávislé na master_seed
+        current_time_ns = time.time_ns()  # Využití nanosekund pro větší entropii
+        random_component = np.random.randint(0, 1000000000)
+        # Pro každý vzorek kombinujeme čas, náhodné číslo, a hash předchozích seedů
+        new_seed = (current_time_ns % 1000000 + random_component + hash(str(base_seeds)) % 100000) % 1000000000
+        
+        # Přidáme další náhodnost Hash
+        if len(all_sample_seeds) > 0:
+            # Využijeme poslední seed pro další náhodnost
+            last_seed = all_sample_seeds[-1]
+            hash_component = hash((last_seed, new_seed, current_time_ns)) % 1000000
+            new_seed = (new_seed + hash_component) % 1000000000
+        
+        # Ujistíme se, že seed je unikátní
+        while new_seed in base_seeds:
+            new_seed = (new_seed + np.random.randint(1000, 100000)) % 1000000000
+        
+        all_sample_seeds.append(new_seed)
+        base_seeds.add(new_seed)
+        
+        # Počkáme krátký čas, aby se zajistila rozdílnost času pro další seed
+        time.sleep(0.001)
+    
+    # Zkontrolujeme, že rozdíly mezi seedy jsou skutečně náhodné
+    if len(all_sample_seeds) > 1:
+        seed_diffs = [all_sample_seeds[i+1] - all_sample_seeds[i] for i in range(len(all_sample_seeds)-1)]
+        print(f"Seed difference statistics - Min: {min(seed_diffs)}, Max: {max(seed_diffs)}, Mean: {sum(seed_diffs)/len(seed_diffs):.1f}")
+    
     with torch.no_grad():
         for i in range(num_samples):
-            # Derive a unique seed for this sample using the master seed
-            sample_seed = (master_seed + i * 2053) % 1000000  # Use a large prime number (2053) for offset
+            # Použijeme předem vygenerovaný náhodný seed pro tento vzorek
+            sample_seed = all_sample_seeds[i]
             np.random.seed(sample_seed)
             torch.manual_seed(sample_seed)
             
@@ -1438,13 +1573,19 @@ def generate_lesions(
                 print(f"  Sample-specific noise parameters: octaves={sample_octaves}, "
                       f"persistence={sample_persistence:.3f}, lacunarity={sample_lacunarity:.3f}, scale={sample_scale:.3f}")
                 
-                # Create a new seed for Perlin that's different for each sample
-                # Use a more complex seed derivation with better randomization
-                perlin_seed = (sample_seed ^ 0x55AA55AA) + (i * 7919)  # XOR with a constant and add prime offset
+                # Vytvoříme úplně nový seed pro Perlin, který je skutečně nezávislý
+                # Nepoužíváme offset ani vzorec, ale vysoce náhodnou kombinaci
+                time_ns = time.time_ns()
+                random_state = np.random.RandomState(sample_seed)  # Vytvoříme nový random state se sample seedem
+                random_bits = random_state.randint(0, 2**32, 4)  # Generujeme několik náhodných čísel
                 
-                # Further mix the seed with a time component to ensure uniqueness even with same master seed
-                time_component = int(time.time() * 1000) % 10000
-                perlin_seed = (perlin_seed + time_component) % 1000000
+                # Zkombinujeme několik zdrojů entropie
+                perlin_seed = (time_ns % 2**32) ^ random_bits[0]
+                perlin_seed = (perlin_seed + random_bits[1]) % 2**32
+                perlin_seed = (perlin_seed ^ (random_bits[2] << 16 | random_bits[3])) % 1000000000
+                
+                # Pro jistotu ještě promícháme bity pomocí jednoduchého hashing algoritmu
+                perlin_seed = ((perlin_seed * 0x5DEECE66D) + 0xB) % 2**48
                 
                 # Vytvoření zcela nového generátoru Perlin šumu pro každý vzorek
                 perlin_gen = PerlinNoiseGenerator(
@@ -1471,8 +1612,23 @@ def generate_lesions(
                 num_layers = np.random.randint(2, 5)  # 2-4 vrstvy šumu
                 
                 for layer in range(num_layers):
-                    # Různý seed pro každou vrstvu
-                    layer_seed = np.random.randint(0, 1000000)
+                    # Různý seed pro každou vrstvu - zcela náhodný bez vzorců
+                    # Kombinace více zdrojů entropie pro skutečnou náhodnost
+                    time_ns_layer = time.time_ns()
+                    random_bit_1 = np.random.randint(0, 2**32)
+                    random_bit_2 = np.random.randint(0, 2**32)
+                    
+                    # Zkombinujeme několik zdrojů entropie s bitscramblingem
+                    layer_seed = (time_ns_layer % 2**32) ^ random_bit_1
+                    layer_seed = (layer_seed + random_bit_2) % 2**32
+                    layer_seed = ((layer_seed << 13) ^ layer_seed) % 1000000000
+                    
+                    # Přidáme závislost na indexu vrstvy, ale nelineárním způsobem
+                    layer_index_hash = hash(("layer", layer, sample_seed)) % 1000000
+                    layer_seed = (layer_seed ^ layer_index_hash) % 1000000000
+                    
+                    # Pro větší diverzitu použijeme nelineární transformace parametrů
+                    # pro každou vrstvu
                     layer_octaves = np.random.randint(2, 6)
                     layer_persistence = np.random.uniform(0.3, 0.7)
                     layer_lacunarity = np.random.uniform(1.5, 2.5)
@@ -1675,39 +1831,132 @@ def generate_lesions(
                 # Ensure lesions only appear in regions with non-zero atlas values
                 binary_lesion = binary_lesion * atlas_mask
             
-            # Apply morphological operations to remove small isolated regions and fill holes
+            # Apply morphological operations to create blocky, pixelated lesions
             if morph_close_size > 0:
                 # Vary morphological operation parameters for each sample
                 sample_morph_size = morph_close_size + np.random.randint(-1, 2)  # -1, 0, or +1
                 sample_morph_size = max(1, sample_morph_size)  # Ensure at least 1
                 
-                struct = generate_binary_structure(3, 1)  # 6-connectivity
-                for _ in range(sample_morph_size - 1):
-                    struct = binary_dilation(struct)
+                print(f"  Using blocky morphological operations for pixelated HIE lesion morphology")
                 
-                print(f"  Using sample-specific morphological closing size: {sample_morph_size}")
+                # Vytvoříme základní strukturní element - krychlový pro zachování ostrých hran
+                struct = np.ones((3, 3, 3), dtype=bool)  # Používáme krychli místo konektivity
                 
-                # Close holes in the lesions
-                binary_lesion = binary_closing(binary_lesion, structure=struct)
+                # Pro lepší blokovitost nejprve aplikujeme erozi a pak dilataci s krychlí
+                # To vytvoří ostré hrany a rohy
+                if np.random.random() < 0.7:  # 70% šance
+                    binary_lesion = binary_erosion(binary_lesion, structure=struct, iterations=1)
+                    binary_lesion = binary_dilation(binary_lesion, structure=struct, iterations=1)
+                
+                # Pro některé vzorky přidáme další blokové struktury
+                if np.random.random() < 0.6:  # 60% šance
+                    # Vytvoříme několik malých bloků v okolí existující léze
+                    dilated = binary_dilation(binary_lesion, structure=struct, iterations=2)
+                    border = dilated & ~binary_lesion
+                    
+                    # Na hranách vytvoříme náhodné bloky
+                    block_mask = np.random.random(border.shape) < 0.15  # Jen 15% bodů vytvoří bloky
+                    block_seeds = border & block_mask
+                    
+                    # Každý seed rozšíříme na malý blok
+                    block_size = np.random.randint(1, 3)
+                    blocks = binary_dilation(block_seeds, structure=struct, iterations=block_size)
+                    
+                    # Přidáme bloky k lézi
+                    binary_lesion = binary_lesion | blocks
             
-            # Remove small isolated lesions
+            # Remove small isolated lesions but zachováme ostré hrany
             if min_lesion_size > 0:
                 # Vary minimum lesion size slightly for each sample
-                sample_min_size = int(min_lesion_size * (0.9 + np.random.uniform(0, 0.2)))  # 0.9-1.1x the original
+                sample_min_size = int(min_lesion_size * (0.8 + np.random.uniform(0, 0.4)))  # 0.8-1.2x the original
                 sample_min_size = max(1, sample_min_size)  # Ensure at least 1
                 
                 print(f"  Using sample-specific minimum lesion size: {sample_min_size}")
                 
+                # Aplikujeme filtrovací krok
                 labeled_array, num_features = measure.label(binary_lesion)
                 component_sizes = np.bincount(labeled_array.ravel())
+                
                 # Set background (index 0) size to 0
                 if len(component_sizes) > 0:
                     component_sizes[0] = 0
-                # Filter by size
-                too_small = component_sizes < sample_min_size
-                too_small_mask = too_small[labeled_array]
-                binary_lesion[too_small_mask] = 0
+                
+                # Pro blokovitý vzhled chceme zachovat i velmi malé komponenty
+                if len(component_sizes) > 1:
+                    too_small = np.ones_like(component_sizes, dtype=bool)
+                    too_small[0] = False  # background není "too small"
+                    
+                    # Pro každou komponentu určíme, zda ji zachovat
+                    for i in range(1, len(component_sizes)):
+                        size = component_sizes[i]
+                        if size >= max(1, sample_min_size // 3):  # Snížíme práh pro zachování malých bloků
+                            too_small[i] = False  # Není příliš malá
+                        else:
+                            # Zvýšíme šanci na zachování malých bloků
+                            prob_keep = min(0.95, (size / sample_min_size) * 1.5)  # Až 95% šance zachování
+                            if np.random.random() < prob_keep:
+                                too_small[i] = False  # Zachováme tuto malou komponentu
+                    
+                    # Aplikujeme masku pro odstranění vybraných malých komponent
+                    too_small_mask = too_small[labeled_array]
+                    binary_lesion[too_small_mask] = 0
             
+            # Pro blokovitější vzhled snížíme Gaussovské vyhlazení na minimum nebo ho přeskočíme
+            if smooth_sigma > 0 and np.random.random() < 0.5:  # Jen 50% šance na jakékoliv vyhlazení
+                # Použijeme velmi nízké sigma pro zachování ostrých hran
+                sample_sigma = smooth_sigma * 0.3  # Výrazně snížená hodnota
+                
+                print(f"  Using minimal smoothing with sigma: {sample_sigma:.2f}")
+                smoothed = gaussian_filter(binary_lesion.astype(float), sigma=sample_sigma)
+                
+                # Adaptivní threshold s vysokou hodnotou pro zachování ostrých přechodů
+                orig_nonzero = np.count_nonzero(binary_lesion)
+                if orig_nonzero > 0:
+                    sorted_values = np.sort(smoothed.ravel())
+                    threshold_idx = max(0, len(sorted_values) - orig_nonzero)
+                    adaptive_threshold = sorted_values[threshold_idx]
+                    # Mírně zvýšíme threshold pro ostřejší hrany
+                    adaptive_threshold = max(0.05, adaptive_threshold * 1.05)
+                    binary_lesion = smoothed > adaptive_threshold
+                
+                # Místo přidávání plynulého šumu přidáme blokové struktury
+                if np.random.random() < 0.7:
+                    # Najdeme hranice léze
+                    border = binary_dilation(binary_lesion, iterations=1) & ~binary_lesion
+                    
+                    # Vytvoříme náhodné bloky na hranách - pixelový šum
+                    block_noise = np.random.random(border.shape) < 0.3
+                    block_noise = block_noise & border
+                    
+                    # Přidáme pixelový šum k lézi
+                    binary_lesion = binary_lesion | block_noise
+                    
+                    # Pro některé léze přidáme další izolované bloky v blízkosti
+                    if np.random.random() < 0.4:
+                        # Vytvoříme broader border
+                        outer_border = binary_dilation(binary_lesion, iterations=3) & ~binary_dilation(binary_lesion, iterations=1)
+                        
+                        # Vytvoříme méně častější izolované bloky
+                        isolated_blocks = np.random.random(outer_border.shape) < 0.05
+                        isolated_blocks = isolated_blocks & outer_border
+                        
+                        # Přidáme izolované bloky
+                        binary_lesion = binary_lesion | isolated_blocks
+            else:
+                # Pro plně blokovitý vzhled přidáme pixelový šum přímo bez vyhlazení
+                print("  Skipping smoothing to preserve blocky appearance")
+                
+                # Přidáme pixelový šum na hranách
+                border = binary_dilation(binary_lesion, iterations=1) & ~binary_lesion
+                pixel_noise = np.random.random(border.shape) < 0.25
+                binary_lesion = binary_lesion | (pixel_noise & border)
+                
+                # Pro ještě blokovitější vzhled můžeme přidat i nepřipojené pixely
+                if np.random.random() < 0.5:
+                    outer_region = binary_dilation(binary_lesion, iterations=4) & ~binary_dilation(binary_lesion, iterations=1)
+                    isolated_pixels = np.random.random(outer_region.shape) < 0.03
+                    binary_lesion = binary_lesion | (isolated_pixels & outer_region)
+
             all_samples.append(binary_lesion)
             
             # Determine output path for this sample
