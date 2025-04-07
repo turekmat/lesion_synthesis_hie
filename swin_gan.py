@@ -1053,7 +1053,7 @@ class SwinGANTrainer:
                     # Vygenerujeme více vzorků s různými šumy
                     for j in range(num_samples):
                         # Generujeme nový šum pro každý vzorek
-                        noise = self.model.generator.noise_generator.generate_batch_noise(
+                        noise = self.model.generator.perlin_generator.generate_batch_noise(
                             batch_size=1,
                             shape=atlas_np.shape,
                             noise_dim=self.model.noise_dim,
@@ -1114,7 +1114,7 @@ class SwinGANTrainer:
                     depth = atlas_np.shape[2]
                     
                     # Vygenerujeme jednu lézi
-                    noise = self.model.generator.noise_generator.generate_batch_noise(
+                    noise = self.model.generator.perlin_generator.generate_batch_noise(
                         batch_size=1,
                         shape=atlas_np.shape,
                         noise_dim=self.model.noise_dim,
