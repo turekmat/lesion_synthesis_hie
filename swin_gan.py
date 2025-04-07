@@ -958,6 +958,10 @@ class SwinGANTrainer:
         self.generator_save_interval = generator_save_interval
         self.n_critic = n_critic  # Number of critic iterations per generator iteration
         
+        # Parametry pro postprocessing
+        self.smooth_sigma = 0.5  # Výchozí hodnota
+        self.morph_close_size = 2  # Výchozí hodnota
+        
         # For mixed precision training
         if self.use_amp:
             self.scaler_g = GradScaler('cuda' if device == 'cuda' else 'cpu')
@@ -995,6 +999,7 @@ class SwinGANTrainer:
             return
         
         print(f"Generování vizualizací po epoše {epoch+1}...")
+        print(f"Použité parametry - smooth_sigma: {self.smooth_sigma}, morph_close_size: {self.morph_close_size}")
         
         # Přepneme model do eval módu
         self.model.eval()
@@ -1065,15 +1070,26 @@ class SwinGANTrainer:
                         # Konvertujeme na numpy
                         probability_map_np = probability_map[0, 0].cpu().numpy()
                         
-                        # Prahujeme a zobrazíme jak pravděpodobnostní mapu, tak binární lézi
+                        # Prahujeme pro získání binární masky
                         binary_mask = (probability_map_np > 0.5).astype(np.float32)
+                        
+                        # Aplikujeme postprocessing - Gaussovské vyhlazení a morfologické uzavření
+                        if self.smooth_sigma > 0:
+                            binary_mask = gaussian_filter(binary_mask, sigma=self.smooth_sigma)
+                            binary_mask = (binary_mask > 0.5).astype(np.float32)  # Re-threshold
+                        
+                        if self.morph_close_size > 0:
+                            # Vytvoříme strukturní element pro uzavření
+                            struct = generate_binary_structure(3, 1)
+                            struct = binary_dilation(struct, iterations=self.morph_close_size-1)
+                            binary_mask = binary_closing(binary_mask, structure=struct)
                         
                         # Zobrazíme pravděpodobnostní mapu
                         im1 = axes[0, j+1].imshow(probability_map_np[:, :, mid_z], cmap='hot', vmin=0, vmax=1)
                         axes[0, j+1].set_title(f'Pravděpodobnost {j+1}')
                         axes[0, j+1].axis('off')
                         
-                        # Zobrazíme binární lézi
+                        # Zobrazíme binární lézi (po aplikaci postprocessingu)
                         im2 = axes[1, j+1].imshow(binary_mask[:, :, mid_z], cmap='hot', vmin=0, vmax=1)
                         axes[1, j+1].set_title(f'Binární léze {j+1}')
                         axes[1, j+1].axis('off')
@@ -1109,7 +1125,19 @@ class SwinGANTrainer:
                     fake_lesion = self.model.generator(atlas, noise)
                     probability_map = torch.sigmoid(fake_lesion)
                     probability_map_np = probability_map[0, 0].cpu().numpy()
+                    
+                    # Prahujeme a aplikujeme postprocessing
                     binary_mask = (probability_map_np > 0.5).astype(np.float32)
+                    
+                    # Aplikujeme postprocessing - vyhlazení a morfologické uzavření
+                    if self.smooth_sigma > 0:
+                        binary_mask = gaussian_filter(binary_mask, sigma=self.smooth_sigma)
+                        binary_mask = (binary_mask > 0.5).astype(np.float32)  # Re-threshold
+                    
+                    if self.morph_close_size > 0:
+                        struct = generate_binary_structure(3, 1)
+                        struct = binary_dilation(struct, iterations=self.morph_close_size-1)
+                        binary_mask = binary_closing(binary_mask, structure=struct)
                     
                     # Vytvoříme vizualizaci více řezů
                     num_slices = 5
@@ -1433,6 +1461,10 @@ def train_model(args):
         generator_save_interval=args.generator_save_interval,
         n_critic=args.n_critic
     )
+    
+    # Nastavení parametrů pro postprocessing
+    trainer.smooth_sigma = args.smooth_sigma
+    trainer.morph_close_size = args.morph_close_size
     
     # Train model
     trainer.train(
@@ -2244,6 +2276,8 @@ def main():
     train_parser.add_argument('--perlin_scale', type=float, default=0.2, help='Scale parameter for Perlin noise')
     train_parser.add_argument('--use_learnable_noise', action='store_true', help='Use learnable Perlin noise parameters')
     train_parser.add_argument('--gradient_penalty_weight', type=float, default=30.0, help='Weight for gradient penalty in WGAN-GP')
+    train_parser.add_argument('--smooth_sigma', type=float, default=0.5, help='Sigma for Gaussian smoothing during postprocessing')
+    train_parser.add_argument('--morph_close_size', type=int, default=2, help='Size of structural element for morphological closing')
     
     # Dataset parameters
     train_parser.add_argument('--filter_empty', action='store_true', help='Filter out empty lesion files')
