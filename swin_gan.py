@@ -15,6 +15,7 @@ from scipy import ndimage as measure
 from scipy.ndimage import binary_closing, binary_opening, binary_dilation, generate_binary_structure, gaussian_filter, binary_erosion
 from torchvision import transforms
 import time  # Import time for performance measurement
+import matplotlib.pyplot as plt
 
 
 class PerlinNoiseGenerator:
@@ -969,8 +970,181 @@ class SwinGANTrainer:
         self.generator_dir = os.path.join(self.output_dir, 'generator_checkpoints')
         os.makedirs(self.generator_dir, exist_ok=True)
         
+        # Create visualization directory
+        self.visualization_dir = os.path.join(self.output_dir, 'visualizations')
+        os.makedirs(self.visualization_dir, exist_ok=True)
+        
         # Move model to device
         self.model.to(self.device)
+    
+    def save_visualization(self, epoch, dataloader, num_samples=4):
+        """
+        Generuje a ukládá vizualizace lézí pro detekci mode collapse
+        
+        Args:
+            epoch: Aktuální epocha
+            dataloader: Dataloader pro získání atlasů
+            num_samples: Počet různých vzorků k vygenerování pro každý atlas
+        """
+        # Kontrola, zda je matplotlib nainstalován
+        try:
+            import matplotlib.pyplot as plt
+        except ImportError:
+            print("VAROVÁNÍ: Modul matplotlib není nainstalován. Vizualizace nebude vytvořena.")
+            print("Pro instalaci: pip install matplotlib")
+            return
+        
+        print(f"Generování vizualizací po epoše {epoch+1}...")
+        
+        # Přepneme model do eval módu
+        self.model.eval()
+        
+        # Vytvoříme adresář pro aktuální epochu
+        epoch_dir = os.path.join(self.visualization_dir, f'epoch_{epoch+1}')
+        os.makedirs(epoch_dir, exist_ok=True)
+        
+        # Získáme několik atlasů z dataloaderů
+        try:
+            atlas_samples = []
+            real_lesion_samples = []
+            
+            # Získáme až 4 různé atlasy z dataloaderu
+            max_batches = min(4, len(dataloader))
+            dataloader_iter = iter(dataloader)
+            
+            for i in range(max_batches):
+                batch = next(dataloader_iter)
+                atlas = batch['atlas'].to(self.device)
+                real_lesion = batch['lesion'].to(self.device)
+                
+                # Uložíme pouze první atlas a lézi z každého batche
+                atlas_samples.append(atlas[0:1])
+                real_lesion_samples.append(real_lesion[0:1])
+            
+            # Pro každý atlas vygenerujeme několik různých lézí
+            with torch.no_grad():
+                for i, (atlas, real_lesion) in enumerate(zip(atlas_samples, real_lesion_samples)):
+                    # Připravíme mřížku obrázků - atlas, reálná léze a několik generovaných
+                    fig, axes = plt.subplots(2, num_samples + 1, figsize=(4 * (num_samples + 1), 8))
+                    
+                    # Vytvoříme řez středem objemu
+                    atlas_np = atlas[0, 0].cpu().numpy()
+                    real_lesion_np = real_lesion[0, 0].cpu().numpy()
+                    
+                    # Najdeme střední řez, kde je nejvíce nenulových hodnot v atlasu
+                    non_zero_counts = [np.count_nonzero(atlas_np[:, :, z]) for z in range(atlas_np.shape[2])]
+                    mid_z = np.argmax(non_zero_counts)
+                    
+                    # Zobrazíme atlas
+                    axes[0, 0].imshow(atlas_np[:, :, mid_z], cmap='gray')
+                    axes[0, 0].set_title('Atlas')
+                    axes[0, 0].axis('off')
+                    
+                    # Zobrazíme reálnou lézi
+                    axes[1, 0].imshow(real_lesion_np[:, :, mid_z], cmap='hot')
+                    axes[1, 0].set_title('Reálná léze')
+                    axes[1, 0].axis('off')
+                    
+                    # Vygenerujeme více vzorků s různými šumy
+                    for j in range(num_samples):
+                        # Generujeme nový šum pro každý vzorek
+                        noise = self.model.generator.noise_generator.generate_batch_noise(
+                            batch_size=1,
+                            shape=atlas_np.shape,
+                            noise_dim=self.model.noise_dim,
+                            scale=self.model.perlin_scale,
+                            device=self.device
+                        )
+                        
+                        # Vygenerujeme lézi s tímto šumem
+                        fake_lesion = self.model.generator(atlas, noise)
+                        
+                        # Použijeme sigmoid pro konverzi na pravděpodobnostní mapu
+                        probability_map = torch.sigmoid(fake_lesion)
+                        
+                        # Konvertujeme na numpy
+                        probability_map_np = probability_map[0, 0].cpu().numpy()
+                        
+                        # Prahujeme a zobrazíme jak pravděpodobnostní mapu, tak binární lézi
+                        binary_mask = (probability_map_np > 0.5).astype(np.float32)
+                        
+                        # Zobrazíme pravděpodobnostní mapu
+                        im1 = axes[0, j+1].imshow(probability_map_np[:, :, mid_z], cmap='hot', vmin=0, vmax=1)
+                        axes[0, j+1].set_title(f'Pravděpodobnost {j+1}')
+                        axes[0, j+1].axis('off')
+                        
+                        # Zobrazíme binární lézi
+                        im2 = axes[1, j+1].imshow(binary_mask[:, :, mid_z], cmap='hot', vmin=0, vmax=1)
+                        axes[1, j+1].set_title(f'Binární léze {j+1}')
+                        axes[1, j+1].axis('off')
+                    
+                    # Přidáme colorbar
+                    cbar_ax1 = fig.add_axes([0.92, 0.55, 0.01, 0.3])
+                    fig.colorbar(im1, cax=cbar_ax1)
+                    
+                    cbar_ax2 = fig.add_axes([0.92, 0.15, 0.01, 0.3])
+                    fig.colorbar(im2, cax=cbar_ax2)
+                    
+                    plt.tight_layout(rect=[0, 0, 0.9, 1])
+                    plt.savefig(os.path.join(epoch_dir, f'sample_{i+1}.png'), dpi=150)
+                    plt.close()
+                
+                # Vytvoříme také souhrnný obrázek zobrazující více řezů jednoho atlasu a léze
+                if len(atlas_samples) > 0:
+                    atlas = atlas_samples[0]
+                    atlas_np = atlas[0, 0].cpu().numpy()
+                    
+                    # Najdeme střed objemu
+                    depth = atlas_np.shape[2]
+                    
+                    # Vygenerujeme jednu lézi
+                    noise = self.model.generator.noise_generator.generate_batch_noise(
+                        batch_size=1,
+                        shape=atlas_np.shape,
+                        noise_dim=self.model.noise_dim,
+                        scale=self.model.perlin_scale,
+                        device=self.device
+                    )
+                    
+                    fake_lesion = self.model.generator(atlas, noise)
+                    probability_map = torch.sigmoid(fake_lesion)
+                    probability_map_np = probability_map[0, 0].cpu().numpy()
+                    binary_mask = (probability_map_np > 0.5).astype(np.float32)
+                    
+                    # Vytvoříme vizualizaci více řezů
+                    num_slices = 5
+                    slice_indices = np.linspace(depth // 4, 3 * depth // 4, num_slices).astype(int)
+                    
+                    fig, axes = plt.subplots(3, num_slices, figsize=(4 * num_slices, 12))
+                    
+                    for j, z in enumerate(slice_indices):
+                        # Atlas
+                        axes[0, j].imshow(atlas_np[:, :, z], cmap='gray')
+                        axes[0, j].set_title(f'Atlas - Řez {z+1}')
+                        axes[0, j].axis('off')
+                        
+                        # Pravděpodobnostní mapa
+                        axes[1, j].imshow(probability_map_np[:, :, z], cmap='hot', vmin=0, vmax=1)
+                        axes[1, j].set_title(f'Pravděpodobnost - Řez {z+1}')
+                        axes[1, j].axis('off')
+                        
+                        # Binární léze
+                        axes[2, j].imshow(binary_mask[:, :, z], cmap='hot', vmin=0, vmax=1)
+                        axes[2, j].set_title(f'Binární léze - Řez {z+1}')
+                        axes[2, j].axis('off')
+                    
+                    plt.tight_layout()
+                    plt.savefig(os.path.join(epoch_dir, 'multi_slice_view.png'), dpi=150)
+                    plt.close()
+                
+        except Exception as e:
+            print(f"Chyba při generování vizualizací: {e}")
+            import traceback
+            traceback.print_exc()
+        
+        # Přepneme model zpět do train módu
+        self.model.train()
+        print(f"Vizualizace uloženy do {epoch_dir}")
     
     def train(self, dataloader, epochs, val_dataloader=None, save_interval=5):
         """Train the model for a specified number of epochs using WGAN-GP."""
@@ -994,7 +1168,7 @@ class SwinGANTrainer:
                 ############################
                 
                 # Train the critic for n_critic iterations
-                critic_iterations = self.n_critic if gen_iterations > 0 else 100  # More iterations at the beginning
+                critic_iterations = self.n_critic if gen_iterations > 0 else 100
                 
                 for _ in range(critic_iterations):
                     self.optimizer_d.zero_grad()
@@ -1071,6 +1245,9 @@ class SwinGANTrainer:
                   f"G Loss: {epoch_losses['total_g_loss']:.4f} | "
                   f"D Loss: {epoch_losses['total_d_loss']:.4f} | "
                   f"GP: {epoch_losses.get('gradient_penalty', 0):.4f}")
+            
+            # Generování vizualizací po každé epoše
+            self.save_visualization(epoch, dataloader)
             
             # Save full model checkpoint at save_interval
             if (epoch + 1) % save_interval == 0:
