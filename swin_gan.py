@@ -31,7 +31,8 @@ class PerlinNoiseGenerator:
             seed (int): Random seed for reproducibility
             learnable (bool): Whether to use learnable parameters for the noise
         """
-        self.octaves = octaves
+        # MODIFIED: Lower default octaves for less detail
+        self.octaves = octaves 
         self.persistence = persistence
         self.lacunarity = lacunarity
         self.repeat = repeat
@@ -123,19 +124,19 @@ class PerlinNoiseGenerator:
             for i in range(1, self.octaves):
                 amplitudes.append(amplitudes[-1] * self.persistence)
             
-            # ZMĚNA: Výrazně zvýšíme celkovou amplitudu šumu pro agresivnější šum
-            amplification_factor = 2.5 + torch.rand(1).item() * 1.5  # Náhodné zesílení 2.5-4.0x
+            # MODIFIED: Reduced amplification factor for less aggressive noise
+            amplification_factor = 1.5 + torch.rand(1).item() * 1.0  # Reduced from 2.5-4.0 to 1.5-2.5
             amplitudes = [amp * amplification_factor for amp in amplitudes]
             
             max_amplitude = sum(amplitudes)
             octaves_to_use = self.octaves
             
-            # ZMĚNA: Více náhodné váhy pro různé typy šumu
-            noise_weights = torch.rand(4, device=device)
-            noise_weights = noise_weights / noise_weights.sum()  # Normalizace vah
+            # MODIFIED: Simpler noise weights for less variability
+            noise_weights = torch.ones(4, device=device) * 0.25  # Equal weights instead of random weights
+            
         
-        # ZMĚNA: Upravíme scale pro větší variabilitu - větší scale = více hrubý šum
-        scale = scale * (1.5 + torch.rand(1).item())  # Zvýšení scale o 1.5-2.5x
+        # MODIFIED: Use smaller scale for smoother, less detailed noise
+        scale = scale * (0.8 + torch.rand(1).item() * 0.5)  # Reduced from 1.5-2.5x to 0.8-1.3x
         
         # Create meshgrid for coordinates
         z = torch.linspace(0, scale, D, device=device)
@@ -1694,13 +1695,15 @@ def generate_lesions(
     threshold=0.5,
     device='cuda',
     num_samples=1,
-    perlin_octaves=6,
-    perlin_persistence=0.6,
-    perlin_lacunarity=2.5,
-    perlin_scale=0.2,
+    # MODIFIED: Reduce octaves and modify perlin parameters for simpler shapes
+    perlin_octaves=3,  # Reduced from 6 to 3
+    perlin_persistence=0.4,  # Reduced from 0.6 to 0.4
+    perlin_lacunarity=2.0,  # Reduced from 2.5 to 2.0
+    perlin_scale=0.1,  # Reduced from 0.2 to 0.1
     min_lesion_size=10,     # Minimální velikost léze (v počtu voxelů)
-    smooth_sigma=0.5,       # Hodnota sigma pro vyhlazení lézí
-    morph_close_size=2,     # Velikost strukturního elementu pro morfologickou operaci uzavření
+    # MODIFIED: Reduce smoothing for blockier appearance
+    smooth_sigma=0.2,       # Reduced from 0.5 to 0.2
+    morph_close_size=1,     # Reduced from 2 to 1
     use_adaptive_threshold=False,  # Použít adaptivní threshold
     training_lesion_dir=None,      # Adresář s trénovacími lézemi
     target_coverage=None,          # Cílové pokrytí lézemi v procentech
@@ -1710,8 +1713,9 @@ def generate_lesions(
     use_different_target_for_each_sample=False,  # Použít jiný cílový coverage pro každý vzorek
     use_learnable_noise=False,     # Použít naučené parametry Perlin šumu
     gradient_penalty_weight=30.0,  # Weight for gradient penalty in WGAN-GP
-    apply_smoothing=True,          # Zda použít vyhlazení lézí pomocí Gaussovského filtru
-    apply_morph_close=True         # Zda použít morfologické uzavření pro spojení blízkých částí léze
+    # MODIFIED: Make smoothing and morphological operations less likely
+    apply_smoothing=False,         # Changed from True to False to preserve blocky appearance
+    apply_morph_close=False        # Changed from True to False to preserve blocky appearance
 ):
     """
     Generuje léze pomocí natrénovaného modelu SwinGAN.
@@ -2057,9 +2061,9 @@ def generate_lesions(
             binary_lesion = binary_mask.copy()
             
             # Pro blokovitější vzhled snížíme Gaussovské vyhlazení na minimum nebo ho přeskočíme
-            if smooth_sigma > 0 and apply_smoothing and np.random.random() < 0.8:  # Zvýšíme šanci na vyhlazení z 50% na 80%
+            if smooth_sigma > 0 and apply_smoothing and np.random.random() < 0.2:  # Reduced chance from 0.8 to 0.2
                 # Použijeme vyšší sigma pro méně ostré hrany
-                sample_sigma = smooth_sigma * 0.7  # Méně snížená hodnota (než původní 0.3)
+                sample_sigma = smooth_sigma * 0.5  # Further reduced from 0.7 to 0.5
                 
                 print(f"  Using smoothing with sigma: {sample_sigma:.2f}")
                 smoothed = gaussian_filter(binary_lesion.astype(float), sigma=sample_sigma)
@@ -2071,13 +2075,13 @@ def generate_lesions(
                     threshold_idx = max(0, len(sorted_values) - orig_nonzero)
                     adaptive_threshold = sorted_values[threshold_idx]
                     # Mírně zvýšíme threshold pro ostřejší hrany
-                    adaptive_threshold = max(0.05, adaptive_threshold * 1.05)
+                    adaptive_threshold = max(0.05, adaptive_threshold * 1.1)  # Increased from 1.05 to 1.1
                     binary_lesion = smoothed > adaptive_threshold
                     # Ensure binary_lesion respects atlas mask after adaptive thresholding
                     binary_lesion = binary_lesion.astype(np.float32) * (atlas_data > 0)
                 
-                # Místo přidávání plynulého šumu přidáme blokové struktury
-                if np.random.random() < 0.7:
+                # MODIFIED: Reduce chance of adding block structures
+                if np.random.random() < 0.3:  # Reduced from 0.7 to 0.3
                     # Najdeme hranice léze
                     binary_bool = binary_lesion.astype(bool)
                     dilated_bool = binary_dilation(binary_bool, iterations=1)
@@ -2087,7 +2091,7 @@ def generate_lesions(
                     border = dilated_bool & ~binary_bool
                     
                     # Vytvoříme náhodné bloky na hranách - pixelový šum
-                    block_noise = np.random.random(border.shape) < 0.3
+                    block_noise = np.random.random(border.shape) < 0.15  # Reduced from 0.3 to 0.15
                     block_noise = block_noise & border
                     
                     # Přidáme pixelový šum k lézi - zaručíme že pracujeme s bool typem
@@ -2095,20 +2099,20 @@ def generate_lesions(
                     binary_bool = binary_bool | block_noise
                     binary_lesion = binary_bool.astype(binary_lesion.dtype)
                     
-                    # Pro některé léze přidáme další izolované bloky v blízkosti
-                    if np.random.random() < 0.4:
+                    # MODIFIED: Drastically reduce isolated blocks
+                    if np.random.random() < 0.1:  # Reduced from 0.4 to 0.1
                         # Vytvoříme broader border
                         binary_bool = binary_lesion.astype(bool)
                         dilated_1 = binary_dilation(binary_bool, iterations=1)
                         # Ensure dilation respects atlas mask
                         dilated_1 = dilated_1 & atlas_mask
-                        dilated_3 = binary_dilation(binary_bool, iterations=3)  # Sníženo z iterations=4 na 3
+                        dilated_3 = binary_dilation(binary_bool, iterations=2)  # Further reduced from 3 to 2
                         # Ensure dilation respects atlas mask
                         dilated_3 = dilated_3 & atlas_mask
                         outer_border = dilated_3 & ~dilated_1
                         
                         # Vytvoříme méně častější izolované bloky
-                        isolated_blocks = np.random.random(outer_border.shape) < 0.05
+                        isolated_blocks = np.random.random(outer_border.shape) < 0.01  # Reduced from 0.05 to 0.01
                         isolated_blocks = isolated_blocks & outer_border
                         
                         # Přidáme izolované bloky - zaručíme že pracujeme s bool typem
@@ -2116,7 +2120,7 @@ def generate_lesions(
                         binary_bool = binary_bool | isolated_blocks
                         binary_lesion = binary_bool.astype(binary_lesion.dtype)
             else:
-                # Pro plně blokovitý vzhled přidáme pixelový šum přímo bez vyhlazení
+                # MODIFIED: Make base blocks cleaner with less noise at edges
                 print("  Skipping smoothing to preserve blocky appearance")
                 
                 # Přidáme pixelový šum na hranách
@@ -2127,23 +2131,23 @@ def generate_lesions(
                 atlas_mask = atlas_data > 0
                 dilated_bool = dilated_bool & atlas_mask
                 border = dilated_bool & ~binary_bool
-                pixel_noise = np.random.random(border.shape) < 0.15  # Snížení z 0.25 na 0.15 pro méně šumu
+                pixel_noise = np.random.random(border.shape) < 0.05  # Further reduced from 0.15 to 0.05
                 # Použijeme logický OR na bool a pak konvertujeme zpět na původní typ
                 binary_bool = binary_bool | (pixel_noise & border)
                 binary_lesion = binary_bool.astype(binary_lesion.dtype)
                 
-                # Pro ještě blokovitější vzhled můžeme přidat i nepřipojené pixely
-                if np.random.random() < 0.5:
+                # MODIFIED: Further reduce isolated pixels for cleaner shapes
+                if np.random.random() < 0.2:  # Reduced from 0.5 to 0.2
                     # Opět používáme booleovský typ pro správné logické operace
                     binary_bool = binary_lesion.astype(bool)
                     dilated_1 = binary_dilation(binary_bool, iterations=1)
                     # Ensure dilation respects atlas mask
                     dilated_1 = dilated_1 & atlas_mask
-                    dilated_4 = binary_dilation(binary_bool, iterations=3)  # Sníženo z iterations=4 na 3
+                    dilated_4 = binary_dilation(binary_bool, iterations=2)  # Further reduced from 3 to 2
                     # Ensure dilation respects atlas mask
                     dilated_4 = dilated_4 & atlas_mask
                     outer_region = dilated_4 & ~dilated_1
-                    isolated_pixels = np.random.random(outer_region.shape) < 0.01  # Sníženo z 0.03 na 0.01
+                    isolated_pixels = np.random.random(outer_region.shape) < 0.001  # Reduced from 0.01 to 0.001
                     # Použijeme logický OR na bool a pak konvertujeme zpět na původní typ
                     binary_bool = binary_bool | (isolated_pixels & outer_region)
                     binary_lesion = binary_bool.astype(binary_lesion.dtype)
