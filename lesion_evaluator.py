@@ -14,7 +14,7 @@ from tqdm import tqdm
 import glob
 
 class LesionShapeEvaluator:
-    def __init__(self, real_data_dir, generated_data_dir, output_dir='./evaluation_results'):
+    def __init__(self, real_data_dir, generated_data_dir, output_dir='./evaluation_results', num_smallest_real=20):
         """
         Inicializace evaluátoru tvarů lézí.
         
@@ -22,15 +22,19 @@ class LesionShapeEvaluator:
             real_data_dir (str): Cesta k adresáři s reálnými lézemi (NIfTI soubory)
             generated_data_dir (str): Cesta k adresáři s vygenerovanými lézemi (NIfTI soubory)
             output_dir (str): Cesta pro ukládání výsledků evaluace
+            num_smallest_real (int): Počet nejmenších reálných lézí, které se mají použít pro porovnání
         """
         self.real_data_dir = real_data_dir
         self.generated_data_dir = generated_data_dir
         self.output_dir = output_dir
+        self.num_smallest_real = num_smallest_real
         
         os.makedirs(output_dir, exist_ok=True)
         
         # Datové struktury pro evaluaci
         self.real_features = []
+        self.real_volumes = []  # Pro ukládání objemů pro následné řazení
+        self.real_file_paths = []  # Pro ukládání cest k souborům
         self.generated_features = []
         self.feature_names = [
             'volume', 'surface_area', 'sphericity', 'elongation', 
@@ -39,20 +43,42 @@ class LesionShapeEvaluator:
         ]
     
     def load_and_process_data(self, verbose=True):
-        """Načtení a extrakce tvarových vlastností z obou datasetů"""
+        """Načtení a extrakce tvarových vlastností z obou datasetů, výběr nejmenších reálných lézí"""
         if verbose:
             print("Načítání a zpracování reálných lézí...")
         
-        # Načtení reálných lézí
+        # Načtení všech reálných lézí a jejich objemů
         real_files = glob.glob(os.path.join(self.real_data_dir, "*.nii*"))
+        temp_real_features = []
+        temp_real_volumes = []
+        temp_real_file_paths = []
+        
         for file in tqdm(real_files, desc="Reálné léze"):
             try:
                 lesion_data = nib.load(file).get_fdata()
-                if np.count_nonzero(lesion_data) > 0:  # Přeskočit prázdné léze
+                volume = np.count_nonzero(lesion_data)
+                if volume > 0:  # Přeskočit prázdné léze
                     features = self.extract_shape_features(lesion_data)
-                    self.real_features.append(features)
+                    temp_real_features.append(features)
+                    temp_real_volumes.append(volume)
+                    temp_real_file_paths.append(file)
             except Exception as e:
                 print(f"Chyba při zpracování {file}: {e}")
+        
+        # Seřadit léze podle objemu (od nejmenšího po největší)
+        sorted_indices = np.argsort(temp_real_volumes)
+        
+        # Vybrat pouze nejmenších N lézí
+        selected_indices = sorted_indices[:self.num_smallest_real]
+        
+        # Uložit vybrané léze
+        self.real_features = [temp_real_features[i] for i in selected_indices]
+        self.real_file_paths = [temp_real_file_paths[i] for i in selected_indices]
+        selected_volumes = [temp_real_volumes[i] for i in selected_indices]
+        
+        if verbose:
+            print(f"Vybráno {len(self.real_features)} nejmenších reálných lézí z celkových {len(temp_real_features)}")
+            print(f"Rozsah objemů vybraných lézí: {min(selected_volumes)} - {max(selected_volumes)} voxelů")
         
         if verbose:
             print("Načítání a zpracování vygenerovaných lézí...")
@@ -73,7 +99,7 @@ class LesionShapeEvaluator:
         self.generated_features = np.array(self.generated_features)
         
         if verbose:
-            print(f"Zpracováno {len(self.real_features)} reálných a {len(self.generated_features)} vygenerovaných lézí")
+            print(f"Zpracováno {len(self.real_features)} vybraných reálných a {len(self.generated_features)} vygenerovaných lézí")
     
     def extract_shape_features(self, lesion_data):
         """
@@ -334,8 +360,8 @@ class LesionShapeEvaluator:
         plt.tight_layout()
         plt.savefig(os.path.join(self.output_dir, 'distribution_similarity_heatmap.png'), dpi=300)
     
-    def generate_report(self):
-        """Generuje souhrnný report o všech evaluacích"""
+    def print_evaluation_results(self):
+        """Tiskne souhrnný report o všech evaluacích místo generování HTML"""
         if len(self.real_features) == 0 or len(self.generated_features) == 0:
             raise ValueError("Nejprve je třeba načíst data pomocí load_and_process_data()")
         
@@ -360,107 +386,60 @@ class LesionShapeEvaluator:
         low_prob_count = np.sum(shape_probs < 0.3)
         low_prob_percentage = (low_prob_count / len(shape_probs)) * 100
         
-        # Vytvoření DataFrame pro výsledky podobnosti distribucí
-        similarity_df = pd.DataFrame.from_dict(dist_similarity, orient='index')
+        # Tisk výsledků
+        print("\n" + "="*80)
+        print(f" EVALUAČNÍ REPORT TVARŮ LÉZÍ - {self.num_smallest_real} NEJMENŠÍCH REÁLNÝCH LÉZÍ")
+        print("="*80)
         
-        # Vytvoření a uložení reportu ve formátu HTML
-        with open(os.path.join(self.output_dir, 'evaluation_report.html'), 'w') as f:
-            f.write(f"""
-            <html>
-            <head>
-                <title>Evaluační report tvarů lézí</title>
-                <style>
-                    body {{ font-family: Arial, sans-serif; margin: 20px; }}
-                    h1, h2, h3 {{ color: #2c3e50; }}
-                    table {{ border-collapse: collapse; width: 100%; margin-bottom: 20px; }}
-                    th, td {{ border: 1px solid #ddd; padding: 8px; text-align: left; }}
-                    th {{ background-color: #f2f2f2; }}
-                    .highlight {{ background-color: #e6f7ff; }}
-                    .good {{ color: green; }}
-                    .bad {{ color: red; }}
-                    .warning {{ color: orange; }}
-                    img {{ max-width: 100%; height: auto; margin: 20px 0; }}
-                </style>
-            </head>
-            <body>
-                <h1>Evaluační report tvarů lézí</h1>
-                
-                <h2>Přehled</h2>
-                <p>Tato evaluace porovnává tvary {len(self.generated_features)} vygenerovaných lézí s {len(self.real_features)} reálnými lézemi.</p>
-                
-                <h2>Statistiky pravděpodobnosti tvarů</h2>
-                <table>
-                    <tr><th>Metrika</th><th>Hodnota</th><th>Interpretace</th></tr>
-                    <tr><td>Průměrná pravděpodobnost</td><td>{prob_mean:.4f}</td>
-                        <td>{'<span class="good">Dobrá podobnost</span>' if prob_mean > 0.5 else '<span class="warning">Střední podobnost</span>' if prob_mean > 0.3 else '<span class="bad">Nízká podobnost</span>'}</td></tr>
-                    <tr><td>Mediánová pravděpodobnost</td><td>{prob_median:.4f}</td>
-                        <td>{'<span class="good">Dobrá podobnost</span>' if prob_median > 0.5 else '<span class="warning">Střední podobnost</span>' if prob_median > 0.3 else '<span class="bad">Nízká podobnost</span>'}</td></tr>
-                    <tr><td>Směrodatná odchylka</td><td>{prob_std:.4f}</td>
-                        <td>{'<span class="good">Konzistentní kvalita</span>' if prob_std < 0.2 else '<span class="warning">Střední variabilita</span>' if prob_std < 0.3 else '<span class="bad">Vysoká variabilita</span>'}</td></tr>
-                    <tr><td>Minimální pravděpodobnost</td><td>{prob_min:.4f}</td><td>Nejméně pravděpodobná léze</td></tr>
-                    <tr><td>Maximální pravděpodobnost</td><td>{prob_max:.4f}</td><td>Nejpravděpodobnější léze</td></tr>
-                    <tr><td>Léze s vysokou pravděpodobností (>0.7)</td><td>{high_prob_count} ({high_prob_percentage:.1f}%)</td>
-                        <td>{'<span class="good">Vysoký podíl realistických lézí</span>' if high_prob_percentage > 50 else '<span class="warning">Střední podíl realistických lézí</span>' if high_prob_percentage > 25 else '<span class="bad">Nízký podíl realistických lézí</span>'}</td></tr>
-                    <tr><td>Léze s nízkou pravděpodobností (<0.3)</td><td>{low_prob_count} ({low_prob_percentage:.1f}%)</td>
-                        <td>{'<span class="good">Nízký podíl nerealistických lézí</span>' if low_prob_percentage < 10 else '<span class="warning">Střední podíl nerealistických lézí</span>' if low_prob_percentage < 30 else '<span class="bad">Vysoký podíl nerealistických lézí</span>'}</td></tr>
-                </table>
-                
-                <h2>Podobnost distribucí tvarových vlastností</h2>
-                <p>Kolmogorov-Smirnov p-hodnota > 0.05 znamená, že distribuce jsou statisticky podobné.</p>
-                <table>
-                    <tr>
-                        <th>Vlastnost</th>
-                        <th>KS p-hodnota</th>
-                        <th>Wasserstein vzdálenost</th>
-                        <th>Je podobná?</th>
-                    </tr>
-            """)
-            
-            # Přidání řádků pro každou vlastnost
-            for feature, stats in dist_similarity.items():
-                is_similar = stats['is_similar']
-                row_class = 'highlight' if is_similar else ''
-                similarity_text = '<span class="good">Ano</span>' if is_similar else '<span class="bad">Ne</span>'
-                
-                f.write(f"""
-                    <tr class="{row_class}">
-                        <td>{feature}</td>
-                        <td>{stats['ks_pvalue']:.4f}</td>
-                        <td>{stats['wasserstein_distance']:.4f}</td>
-                        <td>{similarity_text}</td>
-                    </tr>
-                """)
-            
-            # Dokončení reportu
-            f.write(f"""
-                </table>
-                
-                <h2>Závěr</h2>
-                <p>
-                    Na základě provedené analýzy lze říci, že vygenerované léze jsou
-                    {'<span class="good">velmi podobné</span>' if prob_mean > 0.7 else '<span class="warning">částečně podobné</span>' if prob_mean > 0.4 else '<span class="bad">málo podobné</span>'}
-                    reálným lézím z hlediska tvaru.
-                </p>
-                <p>
-                    Největší rozdíly jsou v následujících vlastnostech:
-                    {', '.join([f'<strong>{f}</strong>' for f, stats in dist_similarity.items() if not stats['is_similar']])}
-                </p>
-                
-                <h2>Vizualizace</h2>
-                <h3>Distribuce tvarových vlastností</h3>
-                <img src="shape_feature_distributions.png" alt="Distribuce tvarových vlastností">
-                
-                <h3>Scatter ploty klíčových vlastností</h3>
-                <img src="shape_feature_scatterplots.png" alt="Scatter ploty tvarových vlastností">
-                
-                <h3>Distribuce pravděpodobností tvarů</h3>
-                <img src="shape_probability_distribution.png" alt="Distribuce pravděpodobností tvarů">
-                
-                <h3>Heatmapa podobnosti distribucí</h3>
-                <img src="distribution_similarity_heatmap.png" alt="Heatmapa podobnosti distribucí">
-            </body>
-            </html>
-            """)
+        print("\nREÁLNÉ LÉZE POUŽITÉ PRO POROVNÁNÍ:")
+        for i, file_path in enumerate(self.real_file_paths):
+            print(f"  {i+1}. {os.path.basename(file_path)} - Objem: {self.real_features[i, 0]:.0f} voxelů")
+        
+        print("\nSTATISTIKY PRAVDĚPODOBNOSTI TVARŮ:")
+        print(f"  Průměrná pravděpodobnost: {prob_mean:.4f}")
+        print(f"  Mediánová pravděpodobnost: {prob_median:.4f}")
+        print(f"  Směrodatná odchylka: {prob_std:.4f}")
+        print(f"  Minimální pravděpodobnost: {prob_min:.4f}")
+        print(f"  Maximální pravděpodobnost: {prob_max:.4f}")
+        print(f"  Léze s vysokou pravděpodobností (>0.7): {high_prob_count} ({high_prob_percentage:.1f}%)")
+        print(f"  Léze s nízkou pravděpodobností (<0.3): {low_prob_count} ({low_prob_percentage:.1f}%)")
+        
+        # Výstup podobnosti distribucí
+        print("\nPODOBNOST DISTRIBUCÍ TVAROVÝCH VLASTNOSTÍ:")
+        print("  Kolmogorov-Smirnov p-hodnota > 0.05 znamená, že distribuce jsou statisticky podobné.\n")
+        
+        # Tvorba tabulky pro konzoli
+        header = f"{'Vlastnost':<20} | {'KS p-hodnota':<15} | {'Wasserstein vzd.':<15} | {'Je podobná?':<12}"
+        print("  " + header)
+        print("  " + "-"*len(header))
+        
+        for feature, stats in dist_similarity.items():
+            is_similar = stats['is_similar']
+            similarity_text = "Ano" if is_similar else "Ne"
+            print(f"  {feature:<20} | {stats['ks_pvalue']:<15.4f} | {stats['wasserstein_distance']:<15.4f} | {similarity_text:<12}")
+        
+        # Závěr
+        print("\nZÁVĚR:")
+        if prob_mean > 0.7:
+            similarity_level = "velmi podobné"
+        elif prob_mean > 0.4:
+            similarity_level = "částečně podobné"
+        else:
+            similarity_level = "málo podobné"
+        
+        print(f"  Na základě provedené analýzy lze říci, že vygenerované léze jsou {similarity_level}")
+        print(f"  reálným lézím z hlediska tvaru.")
+        
+        # Výpis vlastností s největšími rozdíly
+        different_features = [f for f, stats in dist_similarity.items() if not stats['is_similar']]
+        if different_features:
+            print("\n  Největší rozdíly jsou v následujících vlastnostech:")
+            print(f"  {', '.join(different_features)}")
+        else:
+            print("\n  Nebyly nalezeny statisticky významné rozdíly v žádné vlastnosti.")
+        
+        print("\nVizualizace byly uloženy do adresáře:", self.output_dir)
+        print("="*80)
         
         # Uložení výsledků také jako CSV soubory pro případnou další analýzu
         pd.DataFrame(self.real_features, columns=self.feature_names).to_csv(
@@ -472,10 +451,8 @@ class LesionShapeEvaluator:
         pd.DataFrame({'probability': shape_probs}).to_csv(
             os.path.join(self.output_dir, 'shape_probabilities.csv'), index=False)
         
-        similarity_df.to_csv(os.path.join(self.output_dir, 'distribution_similarity.csv'))
-        
-        print(f"Report byl vygenerován do: {os.path.join(self.output_dir, 'evaluation_report.html')}")
-        return os.path.join(self.output_dir, 'evaluation_report.html')
+        pd.DataFrame.from_dict(dist_similarity, orient='index').to_csv(
+            os.path.join(self.output_dir, 'distribution_similarity.csv'))
 
 
 # Příklad použití
@@ -487,13 +464,15 @@ def main():
     parser.add_argument("--real_dir", type=str, required=True, help="Adresář s reálnými lézemi")
     parser.add_argument("--gen_dir", type=str, required=True, help="Adresář s vygenerovanými lézemi")
     parser.add_argument("--output_dir", type=str, default="./lesion_evaluation", help="Výstupní adresář pro výsledky")
+    parser.add_argument("--num_smallest", type=int, default=20, help="Počet nejmenších reálných lézí pro porovnání")
     
     args = parser.parse_args()
     
     evaluator = LesionShapeEvaluator(
         real_data_dir=args.real_dir,
         generated_data_dir=args.gen_dir,
-        output_dir=args.output_dir
+        output_dir=args.output_dir,
+        num_smallest_real=args.num_smallest
     )
     
     # Načtení a zpracování dat
@@ -502,10 +481,10 @@ def main():
     # Generování vizualizací
     evaluator.visualize_results()
     
-    # Vytvoření reportu
-    report_path = evaluator.generate_report()
+    # Tisk výsledků místo generování HTML reportu
+    evaluator.print_evaluation_results()
     
-    print(f"Evaluace dokončena. Výsledky jsou dostupné v: {report_path}")
+    print(f"Evaluace dokončena. Výsledky byly vypsány výše a vizualizace uloženy do: {args.output_dir}")
 
 
 if __name__ == "__main__":
