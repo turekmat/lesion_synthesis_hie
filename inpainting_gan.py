@@ -714,94 +714,155 @@ def train(zadc_dir, label_dir, synthetic_lesions_dir, output_dir, num_epochs=200
                     if not lesion_slices:
                         # If no lesion found, use middle slices
                         mid_slice = mask_vol.shape[0] // 2
-                        lesion_slices = list(range(max(0, mid_slice-5), min(mask_vol.shape[0], mid_slice+6), 2))
+                        lesion_slices = list(range(max(0, mid_slice-5), min(mask_vol.shape[0], mid_slice+6)))
                     
-                    # Take a subset of slices if too many
-                    if len(lesion_slices) > 5:
-                        # Space out evenly through lesion area
-                        step = len(lesion_slices) // 5
-                        lesion_slices = lesion_slices[::step][:5]
+                    # We want ALL slices with lesion content
+                    print(f"Visualizing all {len(lesion_slices)} slices with lesion content")
                     
-                    # Create a multi-slice visualization
-                    num_slices = len(lesion_slices)
-                    fig, axes = plt.subplots(4, num_slices, figsize=(4*num_slices, 16))
+                    # Calculate overall change in lesion area
+                    lesion_area_values_before = input_vol[mask_vol > 0]
+                    lesion_area_values_after = fake_vol[mask_vol > 0]
+                    mean_value_before = np.mean(lesion_area_values_before) if len(lesion_area_values_before) > 0 else 0
+                    mean_value_after = np.mean(lesion_area_values_after) if len(lesion_area_values_after) > 0 else 0
+                    mean_abs_change = np.mean(np.abs(lesion_area_values_after - lesion_area_values_before)) if len(lesion_area_values_before) > 0 else 0
                     
-                    # If only one slice, reshape axes for indexing
-                    if num_slices == 1:
-                        axes = axes.reshape(4, 1)
-                    
-                    for j, slice_idx in enumerate(lesion_slices):
-                        # Create overlay of input with lesion mask for visualization
-                        input_with_mask = np.stack([input_vol[slice_idx], input_vol[slice_idx], input_vol[slice_idx]], axis=2)
-                        # Add red overlay for lesion
-                        mask_overlay = mask_vol[slice_idx] > 0
-                        input_with_mask[mask_overlay, 0] = 1.0  # Red channel
-                        input_with_mask[mask_overlay, 1] = 0.0  # Green channel
-                        input_with_mask[mask_overlay, 2] = 0.0  # Blue channel
+                    # Create multi-page PDF to store all slices if there are too many
+                    use_pdf = len(lesion_slices) > 15
+                    if use_pdf:
+                        from matplotlib.backends.backend_pdf import PdfPages
+                        pdf_filename = os.path.join(output_dir, f'epoch_{epoch+1:03d}_sample_{i}_all_slices.pdf')
+                        pdf = PdfPages(pdf_filename)
                         
-                        # Create difference map between fake and input to show changes
-                        diff_map = np.abs(fake_vol[slice_idx] - input_vol[slice_idx])
+                        # Create multiple figures with max 15 slices per figure
+                        for slice_batch_idx in range(0, len(lesion_slices), 15):
+                            batch_slices = lesion_slices[slice_batch_idx:slice_batch_idx+15]
+                            fig, axes = plt.subplots(4, len(batch_slices), figsize=(4*len(batch_slices), 16))
+                            
+                            # If only one slice, reshape axes for indexing
+                            if len(batch_slices) == 1:
+                                axes = axes.reshape(4, 1)
+                                
+                            for j, slice_idx in enumerate(batch_slices):
+                                # Process slice as before...
+                                # Create overlay of input with lesion mask for visualization
+                                input_with_mask = np.stack([input_vol[slice_idx], input_vol[slice_idx], input_vol[slice_idx]], axis=2)
+                                # Add red overlay for lesion
+                                mask_overlay = mask_vol[slice_idx] > 0
+                                input_with_mask[mask_overlay, 0] = 1.0  # Red channel
+                                input_with_mask[mask_overlay, 1] = 0.0  # Green channel
+                                input_with_mask[mask_overlay, 2] = 0.0  # Blue channel
+                                
+                                # Calculate changes for this particular slice
+                                slice_mask = mask_vol[slice_idx] > 0
+                                if np.any(slice_mask):
+                                    slice_before = input_vol[slice_idx][slice_mask]
+                                    slice_after = fake_vol[slice_idx][slice_mask]
+                                    slice_mean_change = np.mean(np.abs(slice_after - slice_before))
+                                    slice_title = f'Slice {slice_idx} (Δ={slice_mean_change:.4f})'
+                                else:
+                                    slice_title = f'Slice {slice_idx}'
+                                
+                                # Create difference map between fake and input to show changes
+                                diff_map = np.abs(fake_vol[slice_idx] - input_vol[slice_idx])
+                                
+                                # Plot each slice
+                                axes[0, j].imshow(input_vol[slice_idx], cmap='gray')
+                                axes[0, j].set_title(slice_title)
+                                axes[0, j].axis('off')
+                                
+                                axes[1, j].imshow(input_with_mask)
+                                axes[1, j].set_title(f'Lesion Overlay')
+                                axes[1, j].axis('off')
+                                
+                                axes[2, j].imshow(fake_vol[slice_idx], cmap='gray')
+                                axes[2, j].set_title(f'Generated')
+                                axes[2, j].axis('off')
+                                
+                                # Show difference map - where changes were made
+                                axes[3, j].imshow(diff_map, cmap='hot')
+                                axes[3, j].set_title(f'Change Map')
+                                axes[3, j].axis('off')
+                            
+                            # Add row labels
+                            axes[0, 0].set_ylabel('Input Volume')
+                            axes[1, 0].set_ylabel('Lesion Location')
+                            axes[2, 0].set_ylabel('Generated Result')
+                            axes[3, 0].set_ylabel('Change Heatmap')
+                            
+                            # Add overall statistics to the figure
+                            plt.suptitle(f'Epoch {epoch+1} - G:{epoch_losses["g_loss"]:.4f}, D:{epoch_losses["d_loss"]:.4f}\n'
+                                         f'Mean value in lesion area: Before={mean_value_before:.4f}, After={mean_value_after:.4f}, Change={mean_abs_change:.4f}')
+                            
+                            plt.tight_layout()
+                            pdf.savefig(fig)
+                            plt.close()
+                            
+                        pdf.close()
+                        print(f"Saved all {len(lesion_slices)} slices to {pdf_filename}")
+                    else:
+                        # If few enough slices, just create one image
+                        num_slices = len(lesion_slices)
+                        fig, axes = plt.subplots(4, num_slices, figsize=(4*num_slices, 16))
                         
-                        # Plot each slice
-                        axes[0, j].imshow(input_vol[slice_idx], cmap='gray')
-                        axes[0, j].set_title(f'Slice {slice_idx}')
-                        axes[0, j].axis('off')
+                        # If only one slice, reshape axes for indexing
+                        if num_slices == 1:
+                            axes = axes.reshape(4, 1)
                         
-                        axes[1, j].imshow(input_with_mask)
-                        axes[1, j].set_title(f'Lesion Overlay')
-                        axes[1, j].axis('off')
+                        for j, slice_idx in enumerate(lesion_slices):
+                            # Create overlay of input with lesion mask for visualization
+                            input_with_mask = np.stack([input_vol[slice_idx], input_vol[slice_idx], input_vol[slice_idx]], axis=2)
+                            # Add red overlay for lesion
+                            mask_overlay = mask_vol[slice_idx] > 0
+                            input_with_mask[mask_overlay, 0] = 1.0  # Red channel
+                            input_with_mask[mask_overlay, 1] = 0.0  # Green channel
+                            input_with_mask[mask_overlay, 2] = 0.0  # Blue channel
+                            
+                            # Calculate changes for this particular slice
+                            slice_mask = mask_vol[slice_idx] > 0
+                            if np.any(slice_mask):
+                                slice_before = input_vol[slice_idx][slice_mask]
+                                slice_after = fake_vol[slice_idx][slice_mask]
+                                slice_mean_change = np.mean(np.abs(slice_after - slice_before))
+                                slice_title = f'Slice {slice_idx} (Δ={slice_mean_change:.4f})'
+                            else:
+                                slice_title = f'Slice {slice_idx}'
+                            
+                            # Create difference map between fake and input to show changes
+                            diff_map = np.abs(fake_vol[slice_idx] - input_vol[slice_idx])
+                            
+                            # Plot each slice
+                            axes[0, j].imshow(input_vol[slice_idx], cmap='gray')
+                            axes[0, j].set_title(slice_title)
+                            axes[0, j].axis('off')
+                            
+                            axes[1, j].imshow(input_with_mask)
+                            axes[1, j].set_title(f'Lesion Overlay')
+                            axes[1, j].axis('off')
+                            
+                            axes[2, j].imshow(fake_vol[slice_idx], cmap='gray')
+                            axes[2, j].set_title(f'Generated')
+                            axes[2, j].axis('off')
+                            
+                            # Show difference map - where changes were made
+                            axes[3, j].imshow(diff_map, cmap='hot')
+                            axes[3, j].set_title(f'Change Map')
+                            axes[3, j].axis('off')
                         
-                        axes[2, j].imshow(fake_vol[slice_idx], cmap='gray')
-                        axes[2, j].set_title(f'Generated')
-                        axes[2, j].axis('off')
+                        # Add row labels
+                        if num_slices > 0:
+                            axes[0, 0].set_ylabel('Input Volume')
+                            axes[1, 0].set_ylabel('Lesion Location')
+                            axes[2, 0].set_ylabel('Generated Result')
+                            axes[3, 0].set_ylabel('Change Heatmap')
                         
-                        # Show difference map - where changes were made
-                        axes[3, j].imshow(diff_map, cmap='hot')
-                        axes[3, j].set_title(f'Change Map')
-                        axes[3, j].axis('off')
-                    
-                    # Add row labels
-                    if num_slices > 0:
-                        axes[0, 0].set_ylabel('Input Volume')
-                        axes[1, 0].set_ylabel('Lesion Location')
-                        axes[2, 0].set_ylabel('Generated Result')
-                        axes[3, 0].set_ylabel('Change Heatmap')
-                    
-                    # Add loss information to the figure
-                    plt.suptitle(f'Epoch {epoch+1} - G_loss: {epoch_losses["g_loss"]:.4f}, D_loss: {epoch_losses["d_loss"]:.4f}')
-                    
-                    # Save with epoch number and sample number
-                    plt.tight_layout()
-                    plt.savefig(os.path.join(output_dir, f'epoch_{epoch+1:03d}_sample_{i}_full_volume.png'))
-                    plt.close()
-                    
-                    # Create a 3-panel side-by-side comparison (before/mask/after)
-                    fig, axes = plt.subplots(num_slices, 3, figsize=(15, 4*num_slices))
-                    
-                    # Handle single slice case
-                    if num_slices == 1:
-                        axes = axes.reshape(1, 3)
-                    
-                    for j, slice_idx in enumerate(lesion_slices):
-                        # Input
-                        axes[j, 0].imshow(input_vol[slice_idx], cmap='gray')
-                        axes[j, 0].set_title(f'Input (Slice {slice_idx})')
-                        axes[j, 0].axis('off')
+                        # Add overall statistics to the figure
+                        plt.suptitle(f'Epoch {epoch+1} - G:{epoch_losses["g_loss"]:.4f}, D:{epoch_losses["d_loss"]:.4f}\n'
+                                     f'Mean value in lesion area: Before={mean_value_before:.4f}, After={mean_value_after:.4f}, Change={mean_abs_change:.4f}')
                         
-                        # Mask
-                        axes[j, 1].imshow(mask_vol[slice_idx], cmap='gray')
-                        axes[j, 1].set_title(f'Lesion Mask')
-                        axes[j, 1].axis('off')
-                        
-                        # Output
-                        axes[j, 2].imshow(fake_vol[slice_idx], cmap='gray')
-                        axes[j, 2].set_title(f'Generated')
-                        axes[j, 2].axis('off')
-                    
-                    plt.suptitle(f'Epoch {epoch+1} - Before and After Lesion Insertion')
-                    plt.tight_layout()
-                    plt.savefig(os.path.join(output_dir, f'epoch_{epoch+1:03d}_sample_{i}_comparison.png'))
-                    plt.close()
+                        # Save with epoch number and sample number
+                        plt.tight_layout()
+                        plt.savefig(os.path.join(output_dir, f'epoch_{epoch+1:03d}_sample_{i}_full_volume.png'), dpi=150)
+                        plt.close()
     
     # Plot training curves
     plt.figure(figsize=(12, 8))
