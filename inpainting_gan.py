@@ -21,9 +21,9 @@ class LesionInpaintingDataset(Dataset):
     Dataset for HIE lesion inpainting.
     
     It pairs:
-    1. ADC maps without lesions in a specific area
-    2. Binary masks for synthetic lesions
-    3. Ground truth ADC maps with lesions (for validation)
+    1. ADC maps without lesions in a specific area (truly healthy brain)
+    2. Binary masks for synthetic lesions (where to place new lesions)
+    3. Ground truth ADC maps with real lesions (for learning what lesions look like)
     """
     def __init__(self, 
                  zadc_dir,
@@ -176,15 +176,15 @@ class LesionInpaintingDataset(Dataset):
     def __getitem__(self, idx):
         sample = self.samples[idx]
         
-        # Load ZADC map
+        # Load ZADC map (may contain real lesions)
         zadc_img = sitk.ReadImage(sample['zadc'])
         zadc_array = sitk.GetArrayFromImage(zadc_img)
         
-        # Load original lesion mask
+        # Load original lesion mask (real lesions)
         label_img = sitk.ReadImage(sample['label'])
         label_array = sitk.GetArrayFromImage(label_img)
         
-        # Load synthetic lesion
+        # Load synthetic lesion (where we want to place a lesion)
         syn_lesion_img = sitk.ReadImage(sample['synthetic_lesion'])
         syn_lesion_array = sitk.GetArrayFromImage(syn_lesion_img)
         
@@ -195,9 +195,32 @@ class LesionInpaintingDataset(Dataset):
         label_array = (label_array > 0).astype(np.float32)
         syn_lesion_array = (syn_lesion_array > 0).astype(np.float32)
         
-        # Create "healthy" brain - masking out any lesions
-        # We'll create a version of the brain where lesions are "erased" through inpainting
+        # Create truly healthy brain by removing existing lesions
+        # This is a critical step: we replace lesion areas with estimated healthy tissue values
         healthy_brain = zadc_array.copy()
+        
+        # Find non-zero regions in the original lesion mask (existing lesions)
+        real_lesion_indices = np.where(label_array > 0)
+        
+        if len(real_lesion_indices[0]) > 0:
+            # Calculate average intensity of surrounding non-lesion tissue
+            # First, dilate the lesion mask to create a border region
+            from scipy import ndimage
+            dilated_mask = ndimage.binary_dilation(label_array, iterations=2)
+            border_mask = dilated_mask & ~label_array  # Border around lesion but not lesion itself
+            
+            # Get average intensity value in the border region
+            if np.any(border_mask):
+                border_values = zadc_array[border_mask]
+                healthy_tissue_value = np.mean(border_values)
+            else:
+                # Fallback - use global average of non-lesion areas
+                healthy_tissue_value = np.mean(zadc_array[~label_array])
+            
+            # Replace lesion areas with healthy tissue values
+            healthy_brain[label_array > 0] = healthy_tissue_value
+            
+            print(f"Removed real lesions from input brain. Avg healthy value: {healthy_tissue_value:.4f}")
         
         # Find non-zero region in the synthetic lesion
         z_indices, y_indices, x_indices = np.where(syn_lesion_array > 0)
@@ -219,7 +242,7 @@ class LesionInpaintingDataset(Dataset):
             
             # Extract patches
             zadc_patch = zadc_array[z_start:z_end, y_start:y_end, x_start:x_end]
-            healthy_patch = healthy_brain[z_start:z_end, y_start:y_end, x_start:x_end]
+            healthy_patch = healthy_brain[z_start:z_end, y_start:y_end, x_start:x_end]  # Now truly healthy
             label_patch = label_array[z_start:z_end, y_start:y_end, x_start:x_end]
             syn_lesion_patch = syn_lesion_array[z_start:z_end, y_start:y_end, x_start:x_end]
             
@@ -235,17 +258,45 @@ class LesionInpaintingDataset(Dataset):
                 syn_lesion_patch = np.pad(syn_lesion_patch, ((0, z_pad), (0, y_pad), (0, x_pad)), mode='constant')
             
             # Convert to tensors
-            zadc_tensor = torch.from_numpy(zadc_patch).float().unsqueeze(0)  # Add channel dimension
-            healthy_tensor = torch.from_numpy(healthy_patch).float().unsqueeze(0)
-            label_tensor = torch.from_numpy(label_patch).float().unsqueeze(0)
-            syn_lesion_tensor = torch.from_numpy(syn_lesion_patch).float().unsqueeze(0)
+            zadc_tensor = torch.from_numpy(zadc_patch).float().unsqueeze(0)  # Real brain with lesions
+            healthy_tensor = torch.from_numpy(healthy_patch).float().unsqueeze(0)  # Truly healthy brain
+            label_tensor = torch.from_numpy(label_patch).float().unsqueeze(0)  # Real lesion mask
+            syn_lesion_tensor = torch.from_numpy(syn_lesion_patch).float().unsqueeze(0)  # Synthetic lesion mask
             
-            # Combined input: healthy brain and synthetic lesion mask
+            # Combined input: TRULY healthy brain and synthetic lesion mask
             input_tensor = torch.cat([healthy_tensor, syn_lesion_tensor], dim=0)
             
+            # If there's a substantial overlap between the synthetic lesion and real lesion,
+            # we can use the real brain as a target. Otherwise, we need to create a hybrid target.
+            synthetic_real_overlap = np.sum(syn_lesion_patch * label_patch) / np.sum(syn_lesion_patch)
+            
+            if synthetic_real_overlap > 0.5:
+                # More than 50% overlap - we can use the real brain with its lesion as target
+                target_tensor = zadc_tensor
+                print(f"Using real lesion as target (overlap: {synthetic_real_overlap:.2f})")
+            else:
+                # Less overlap - create a hybrid target where we add "lesion-like" values to the healthy brain
+                # in the area of the synthetic mask
+                hybrid_target = healthy_patch.copy()
+                
+                # Calculate average intensity in real lesion areas
+                if np.sum(label_patch) > 0:
+                    lesion_value = np.mean(zadc_patch[label_patch > 0])
+                else:
+                    # No real lesions in this patch, use a typical lesion intensity reduction
+                    # (ADC typically shows hypointensity in acute stroke)
+                    non_zero_mask = healthy_patch > 0.1  # Avoid background
+                    avg_healthy = np.mean(healthy_patch[non_zero_mask])
+                    lesion_value = avg_healthy * 0.6  # Typical reduction in ADC values
+                
+                # Apply lesion-like values to the synthetic mask area
+                hybrid_target[syn_lesion_patch > 0] = lesion_value
+                target_tensor = torch.from_numpy(hybrid_target).float().unsqueeze(0)
+                print(f"Created hybrid target (low overlap: {synthetic_real_overlap:.2f}, lesion value: {lesion_value:.4f})")
+            
             return {
-                'input': input_tensor,  # Healthy brain + synthetic lesion mask
-                'target': zadc_tensor,   # Original ZADC with real lesions
+                'input': input_tensor,  # Truly healthy brain + synthetic lesion mask
+                'target': target_tensor,  # Brain with real or simulated lesion
                 'original_mask': label_tensor,  # Original lesion mask
                 'synthetic_mask': syn_lesion_tensor  # Synthetic lesion mask
             }
