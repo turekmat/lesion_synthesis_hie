@@ -91,7 +91,6 @@ class LesionInpaintingDataset(Dataset):
                 synthetic_dir = os.path.join(synthetic_lesions_dir, patient_id)
                 if os.path.exists(synthetic_dir):
                     valid_patients.append(patient_id)
-                    print(f"Found valid patient {patient_id} with synthetic lesions")
                 else:
                     print(f"No synthetic lesions found for patient {patient_id} at {synthetic_dir}")
             else:
@@ -162,7 +161,6 @@ class LesionInpaintingDataset(Dataset):
                     'label': label_file,
                     'synthetic_lesion': syn_lesion
                 })
-                print(f"  - Added sample pair with synthetic lesion: {os.path.basename(syn_lesion)}")
         
         print(f"Created {len(self.samples)} samples for {mode} mode")
         
@@ -686,51 +684,124 @@ def train(zadc_dir, label_dir, synthetic_lesions_dir, output_dir, num_epochs=200
         # Save checkpoint based on specified save_interval
         if (epoch + 1) % save_interval == 0:
             gan_model.save_models(output_dir, epoch + 1)
-            
-            # Visualize some results
-            # Get a sample from validation set
-            if val_loader is not None:
-                with torch.no_grad():
-                    val_sample = next(iter(val_loader))
-                    input_data = val_sample['input'].to(gan_model.device)
-                    real_brain = val_sample['target'].to(gan_model.device)
-                    synthetic_mask = val_sample['synthetic_mask'].to(gan_model.device)
+        
+        # Generate visualizations after each epoch
+        if val_loader is not None:
+            with torch.no_grad():
+                # Get a sample from validation set
+                val_sample = next(iter(val_loader))
+                input_data = val_sample['input'].to(gan_model.device)
+                real_brain = val_sample['target'].to(gan_model.device)
+                synthetic_mask = val_sample['synthetic_mask'].to(gan_model.device)
+                
+                # Generate inpainted image
+                fake_brain = gan_model.generator(input_data)
+                
+                # Create detailed visualizations for each sample
+                for i in range(min(2, input_data.shape[0])):
+                    # Get current sample data
+                    input_vol = input_data[i, 0].cpu().numpy()
+                    mask_vol = synthetic_mask[i, 0].cpu().numpy()
+                    real_vol = real_brain[i, 0].cpu().numpy()
+                    fake_vol = fake_brain[i, 0].cpu().numpy()
                     
-                    # Generate inpainted image
-                    fake_brain = gan_model.generator(input_data)
+                    # Find slices containing the lesion
+                    lesion_slices = []
+                    for z in range(mask_vol.shape[0]):
+                        if np.any(mask_vol[z] > 0):
+                            lesion_slices.append(z)
                     
-                    # Save middle slices
-                    for i in range(min(4, batch_size)):
-                        slice_idx = fake_brain.shape[2] // 2
+                    if not lesion_slices:
+                        # If no lesion found, use middle slices
+                        mid_slice = mask_vol.shape[0] // 2
+                        lesion_slices = list(range(max(0, mid_slice-5), min(mask_vol.shape[0], mid_slice+6), 2))
+                    
+                    # Take a subset of slices if too many
+                    if len(lesion_slices) > 5:
+                        # Space out evenly through lesion area
+                        step = len(lesion_slices) // 5
+                        lesion_slices = lesion_slices[::step][:5]
+                    
+                    # Create a multi-slice visualization
+                    num_slices = len(lesion_slices)
+                    fig, axes = plt.subplots(4, num_slices, figsize=(4*num_slices, 16))
+                    
+                    # If only one slice, reshape axes for indexing
+                    if num_slices == 1:
+                        axes = axes.reshape(4, 1)
+                    
+                    for j, slice_idx in enumerate(lesion_slices):
+                        # Create overlay of input with lesion mask for visualization
+                        input_with_mask = np.stack([input_vol[slice_idx], input_vol[slice_idx], input_vol[slice_idx]], axis=2)
+                        # Add red overlay for lesion
+                        mask_overlay = mask_vol[slice_idx] > 0
+                        input_with_mask[mask_overlay, 0] = 1.0  # Red channel
+                        input_with_mask[mask_overlay, 1] = 0.0  # Green channel
+                        input_with_mask[mask_overlay, 2] = 0.0  # Blue channel
                         
-                        # Extract middle slices
-                        input_slice = input_data[i, 0, slice_idx].cpu().numpy()
-                        mask_slice = synthetic_mask[i, 0, slice_idx].cpu().numpy()
-                        real_slice = real_brain[i, 0, slice_idx].cpu().numpy()
-                        fake_slice = fake_brain[i, 0, slice_idx].cpu().numpy()
+                        # Create difference map between fake and input to show changes
+                        diff_map = np.abs(fake_vol[slice_idx] - input_vol[slice_idx])
                         
-                        # Create figure
-                        fig, axes = plt.subplots(2, 2, figsize=(12, 12))
+                        # Plot each slice
+                        axes[0, j].imshow(input_vol[slice_idx], cmap='gray')
+                        axes[0, j].set_title(f'Slice {slice_idx}')
+                        axes[0, j].axis('off')
                         
-                        # Plot images
-                        axes[0, 0].imshow(input_slice, cmap='gray')
-                        axes[0, 0].set_title('Input (Healthy Brain)')
-                        axes[0, 0].axis('off')
+                        axes[1, j].imshow(input_with_mask)
+                        axes[1, j].set_title(f'Lesion Overlay')
+                        axes[1, j].axis('off')
                         
-                        axes[0, 1].imshow(mask_slice, cmap='gray')
-                        axes[0, 1].set_title('Synthetic Lesion Mask')
-                        axes[0, 1].axis('off')
+                        axes[2, j].imshow(fake_vol[slice_idx], cmap='gray')
+                        axes[2, j].set_title(f'Generated')
+                        axes[2, j].axis('off')
                         
-                        axes[1, 0].imshow(real_slice, cmap='gray')
-                        axes[1, 0].set_title('Real Brain')
-                        axes[1, 0].axis('off')
+                        # Show difference map - where changes were made
+                        axes[3, j].imshow(diff_map, cmap='hot')
+                        axes[3, j].set_title(f'Change Map')
+                        axes[3, j].axis('off')
+                    
+                    # Add row labels
+                    if num_slices > 0:
+                        axes[0, 0].set_ylabel('Input Volume')
+                        axes[1, 0].set_ylabel('Lesion Location')
+                        axes[2, 0].set_ylabel('Generated Result')
+                        axes[3, 0].set_ylabel('Change Heatmap')
+                    
+                    # Add loss information to the figure
+                    plt.suptitle(f'Epoch {epoch+1} - G_loss: {epoch_losses["g_loss"]:.4f}, D_loss: {epoch_losses["d_loss"]:.4f}')
+                    
+                    # Save with epoch number and sample number
+                    plt.tight_layout()
+                    plt.savefig(os.path.join(output_dir, f'epoch_{epoch+1:03d}_sample_{i}_full_volume.png'))
+                    plt.close()
+                    
+                    # Create a 3-panel side-by-side comparison (before/mask/after)
+                    fig, axes = plt.subplots(num_slices, 3, figsize=(15, 4*num_slices))
+                    
+                    # Handle single slice case
+                    if num_slices == 1:
+                        axes = axes.reshape(1, 3)
+                    
+                    for j, slice_idx in enumerate(lesion_slices):
+                        # Input
+                        axes[j, 0].imshow(input_vol[slice_idx], cmap='gray')
+                        axes[j, 0].set_title(f'Input (Slice {slice_idx})')
+                        axes[j, 0].axis('off')
                         
-                        axes[1, 1].imshow(fake_slice, cmap='gray')
-                        axes[1, 1].set_title('Generated Brain with Lesion')
-                        axes[1, 1].axis('off')
+                        # Mask
+                        axes[j, 1].imshow(mask_vol[slice_idx], cmap='gray')
+                        axes[j, 1].set_title(f'Lesion Mask')
+                        axes[j, 1].axis('off')
                         
-                        plt.savefig(os.path.join(output_dir, f'visualization_epoch{epoch+1}_sample{i}.png'))
-                        plt.close()
+                        # Output
+                        axes[j, 2].imshow(fake_vol[slice_idx], cmap='gray')
+                        axes[j, 2].set_title(f'Generated')
+                        axes[j, 2].axis('off')
+                    
+                    plt.suptitle(f'Epoch {epoch+1} - Before and After Lesion Insertion')
+                    plt.tight_layout()
+                    plt.savefig(os.path.join(output_dir, f'epoch_{epoch+1:03d}_sample_{i}_comparison.png'))
+                    plt.close()
     
     # Plot training curves
     plt.figure(figsize=(12, 8))
