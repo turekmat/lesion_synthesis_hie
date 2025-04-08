@@ -48,17 +48,75 @@ class LesionInpaintingDataset(Dataset):
         self.mode = mode
         self.transform = transform
         
+        # Debugging info
+        print(f"\n----- Dataset Initialization ({mode}) -----")
+        print(f"ZADC directory: {zadc_dir}")
+        print(f"Label directory: {label_dir}")
+        print(f"Synthetic lesions directory: {synthetic_lesions_dir}")
+        
+        # Show example glob patterns that will be used
+        print("\nFile patterns to look for:")
+        print(f"ZADC files pattern: {os.path.join(zadc_dir, 'Zmap_*.mha')}")
+        print(f"Label files pattern: {os.path.join(label_dir, '*_lesion.mha')}")
+        print(f"Synthetic lesions pattern: {os.path.join(synthetic_lesions_dir, 'PATIENT_ID', 'registered_lesion_*.mha')}")
+        print(f"Expected structure: ZADC files named 'Zmap_MGHNICU_xxx-VISIT_xx-ADC_smooth2mm_clipped10.mha'")
+        print(f"Expected structure: Label files named 'MGHNICU_xxx-VISIT_xx_lesion.mha'")
+        print(f"Expected structure: Synthetic lesions named 'registered_lesion_sampleXX.mha' in patient subdirectories\n")
+        
+        # Verify directories exist
+        if not os.path.exists(zadc_dir):
+            print(f"WARNING: ZADC directory {zadc_dir} does not exist!")
+        if not os.path.exists(label_dir):
+            print(f"WARNING: Label directory {label_dir} does not exist!")
+        if not os.path.exists(synthetic_lesions_dir):
+            print(f"WARNING: Synthetic lesions directory {synthetic_lesions_dir} does not exist!")
+        
         # Get all ZADC files
         self.zadc_files = sorted(glob.glob(os.path.join(zadc_dir, "*.mha")))
+        print(f"Found {len(self.zadc_files)} ZADC files")
+        
+        if len(self.zadc_files) == 0:
+            print(f"Contents of ZADC directory: {os.listdir(zadc_dir) if os.path.exists(zadc_dir) else 'Directory not found'}")
         
         # Filter for patients with corresponding synthetic lesions
         valid_patients = []
         for zadc_file in self.zadc_files:
-            patient_id = os.path.basename(zadc_file).split('-')[0] + '-' + os.path.basename(zadc_file).split('-')[1]
-            if os.path.exists(os.path.join(synthetic_lesions_dir, patient_id)):
-                valid_patients.append(patient_id)
+            # Extract base filename
+            base_filename = os.path.basename(zadc_file)
+            
+            # Check if the filename starts with "Zmap_" and remove it
+            if base_filename.startswith("Zmap_"):
+                # Remove "Zmap_" prefix
+                base_without_prefix = base_filename[5:]  # Skip the first 5 characters "Zmap_"
+            else:
+                base_without_prefix = base_filename
+            
+            # Extract the patient ID from the first two segments
+            parts = base_without_prefix.split('-')
+            if len(parts) >= 2:
+                patient_id = parts[0] + '-' + parts[1]
+                
+                # Check if corresponding synthetic lesion directory exists
+                synthetic_dir = os.path.join(synthetic_lesions_dir, patient_id)
+                if os.path.exists(synthetic_dir):
+                    valid_patients.append(patient_id)
+                    print(f"Found valid patient {patient_id} with synthetic lesions")
+                else:
+                    print(f"No synthetic lesions found for patient {patient_id} at {synthetic_dir}")
+            else:
+                print(f"Could not extract patient ID from filename: {base_filename}")
         
         self.valid_patients = valid_patients
+        print(f"Found {len(self.valid_patients)} valid patients with synthetic lesions")
+        
+        if len(self.valid_patients) == 0:
+            # Print the first few ZADC filenames to help diagnose the issue
+            if len(self.zadc_files) > 0:
+                print(f"Sample ZADC files (first 5):")
+                for i, file in enumerate(self.zadc_files[:5]):
+                    print(f"  {i+1}. {os.path.basename(file)}")
+            
+            print(f"Contents of synthetic lesions dir: {os.listdir(synthetic_lesions_dir) if os.path.exists(synthetic_lesions_dir) else 'Directory not found'}")
         
         # Split into train/val
         if mode == 'train':
@@ -66,19 +124,64 @@ class LesionInpaintingDataset(Dataset):
         else:
             self.patients = self.valid_patients[int(0.8 * len(self.valid_patients)):]
         
+        print(f"Using {len(self.patients)} patients for {mode} mode")
+        
         # Create patient-synthetic lesion pairs
         self.samples = []
         for patient in self.patients:
-            zadc_file = glob.glob(os.path.join(zadc_dir, f"Zmap_{patient}*.mha"))[0]
-            label_file = glob.glob(os.path.join(label_dir, f"{patient}*lesion.mha"))[0]
-            synthetic_lesions = glob.glob(os.path.join(synthetic_lesions_dir, patient, "*.mha"))
+            print(f"\nProcessing patient: {patient}")
             
+            # Check for ZADC files (format: Zmap_MGHNICU_xxx-VISIT_xx-ADC_smooth2mm_clipped10.mha)
+            zadc_pattern = os.path.join(zadc_dir, f"Zmap_{patient}*.mha")
+            zadc_files = glob.glob(zadc_pattern)
+            if not zadc_files:
+                print(f"WARNING: No ZADC files found for pattern: {zadc_pattern}")
+                continue
+            zadc_file = zadc_files[0]
+            print(f"Found ZADC file: {os.path.basename(zadc_file)}")
+            
+            # Check for label files (format: MGHNICU_xxx-VISIT_xx_lesion.mha)
+            label_pattern = os.path.join(label_dir, f"{patient}_lesion.mha")
+            label_files = glob.glob(label_pattern)
+            if not label_files:
+                print(f"WARNING: No label files found for pattern: {label_pattern}")
+                # Try alternative pattern with wildcard
+                alt_label_pattern = os.path.join(label_dir, f"{patient}*lesion.mha")
+                label_files = glob.glob(alt_label_pattern)
+                if not label_files:
+                    print(f"WARNING: No label files found for alternative pattern: {alt_label_pattern}")
+                    continue
+            label_file = label_files[0]
+            print(f"Found label file: {os.path.basename(label_file)}")
+            
+            # Check for synthetic lesions (format: .../MGHNICU_xxx-VISIT_xx/registered_lesion_sampleXX.mha)
+            syn_pattern = os.path.join(synthetic_lesions_dir, patient, "registered_lesion_*.mha")
+            synthetic_lesions = glob.glob(syn_pattern)
+            if not synthetic_lesions:
+                print(f"WARNING: No synthetic lesions found for pattern: {syn_pattern}")
+                print(f"Does directory exist? {os.path.exists(os.path.join(synthetic_lesions_dir, patient))}")
+                if os.path.exists(os.path.join(synthetic_lesions_dir, patient)):
+                    print(f"Contents of patient directory: {os.listdir(os.path.join(synthetic_lesions_dir, patient))}")
+                continue
+            
+            print(f"Found {len(synthetic_lesions)} synthetic lesions")
+            
+            # Create sample pairs
             for syn_lesion in synthetic_lesions:
                 self.samples.append({
                     'zadc': zadc_file,
                     'label': label_file,
                     'synthetic_lesion': syn_lesion
                 })
+                print(f"  - Added sample pair with synthetic lesion: {os.path.basename(syn_lesion)}")
+        
+        print(f"Created {len(self.samples)} samples for {mode} mode")
+        
+        if len(self.samples) == 0:
+            print(f"ERROR: No valid samples could be created for {mode} mode!")
+            print("Please check data paths and ensure the directory structure matches expected patterns")
+        
+        print(f"----- End Dataset Initialization ({mode}) -----\n")
     
     def __len__(self):
         return len(self.samples)
@@ -485,6 +588,14 @@ def train(zadc_dir, label_dir, synthetic_lesions_dir, output_dir, num_epochs=200
     # Create output directory
     os.makedirs(output_dir, exist_ok=True)
     
+    print("\n===== VALIDATING DATASET PATHS =====")
+    print(f"ZADC directory: {zadc_dir} - Exists: {os.path.exists(zadc_dir)}")
+    print(f"Label directory: {label_dir} - Exists: {os.path.exists(label_dir)}")
+    print(f"Synthetic lesions directory: {synthetic_lesions_dir} - Exists: {os.path.exists(synthetic_lesions_dir)}")
+    if os.path.exists(synthetic_lesions_dir):
+        print(f"Contents of synthetic_lesions_dir: {os.listdir(synthetic_lesions_dir)[:10]}")
+    print("=====================================\n")
+    
     # Create datasets
     train_dataset = LesionInpaintingDataset(
         zadc_dir=zadc_dir,
@@ -502,6 +613,21 @@ def train(zadc_dir, label_dir, synthetic_lesions_dir, output_dir, num_epochs=200
         mode='val'
     )
     
+    # Check if datasets have samples
+    if len(train_dataset) == 0:
+        raise ValueError(
+            "Training dataset is empty! Cannot continue with training.\n"
+            "Please check the following:\n"
+            "1. The directories exist and contain the expected files\n"
+            "2. The file naming conventions match those expected in the code\n"
+            "3. The synthetic_lesions_dir has subdirectories named after patients\n"
+            "4. Each patient directory contains synthetic lesion MHA files"
+        )
+    
+    if len(val_dataset) == 0:
+        print("WARNING: Validation dataset is empty. Training will continue without validation.")
+        val_dataset = None
+    
     # Create data loaders
     train_loader = DataLoader(
         train_dataset,
@@ -511,13 +637,15 @@ def train(zadc_dir, label_dir, synthetic_lesions_dir, output_dir, num_epochs=200
         pin_memory=True
     )
     
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=4,
-        pin_memory=True
-    )
+    val_loader = None
+    if val_dataset is not None and len(val_dataset) > 0:
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=4,
+            pin_memory=True
+        )
     
     # Initialize model
     gan_model = LesionInpaintingGAN(img_shape=(96, 96, 96))
