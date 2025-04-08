@@ -451,7 +451,17 @@ def create_pseudo_healthy_brain_with_atlas(adc_data, label_data, atlas_path, std
         print("Extracting normative values from atlas in lesion area...")
         
         # Získání hodnot z atlasu pro všechny voxely v transformované lézi
-        atlas_values_in_lesion = atlas_np[registered_lesion_np]
+        # NOVÁ ÚPRAVA: Filtruji nulové hodnoty z atlasu v oblasti léze
+        valid_atlas_mask = (atlas_np > 0) & registered_lesion_np
+        if np.any(valid_atlas_mask):
+            # Použijeme pouze nenulové hodnoty z atlasu pro nahrazování
+            atlas_values_in_lesion = atlas_np[valid_atlas_mask]
+            print(f"Found {len(atlas_values_in_lesion)} valid non-zero atlas values in the registered lesion area")
+        else:
+            # Pokud nejsou k dispozici žádné nenulové hodnoty, musíme použít jinou metodu
+            print("Warning: No non-zero atlas values found in the registered lesion area.")
+            print("Falling back to symmetric replacement method...")
+            return create_pseudo_healthy_brain(adc_data, label_data)
         
         if len(atlas_values_in_lesion) > 0:
             # Výpočet statistik (průměrná hodnota v atlasu pro oblast léze)
@@ -461,8 +471,15 @@ def create_pseudo_healthy_brain_with_atlas(adc_data, label_data, atlas_path, std
             # jinak vypočítáme směrodatnou odchylku z hodnot v lézi
             if std_atlas_np is not None:
                 print("Using standard deviation values from provided std atlas")
-                std_values_in_lesion = std_atlas_np[registered_lesion_np]
-                atlas_std_global = np.mean(std_values_in_lesion)  # Průměrná hodnota směrodatné odchylky
+                # NOVÁ ÚPRAVA: Použijeme pouze nenulové hodnoty std atlasu
+                valid_std_mask = (std_atlas_np > 0) & registered_lesion_np
+                if np.any(valid_std_mask):
+                    std_values_in_lesion = std_atlas_np[valid_std_mask]
+                    atlas_std_global = np.mean(std_values_in_lesion)  # Průměrná hodnota směrodatné odchylky
+                else:
+                    # Pokud nejsou k dispozici žádné nenulové hodnoty std atlasu, použijeme základní odhad
+                    atlas_std_global = 0.1 * atlas_mean  # Výchozí 10% odhad
+                    print("Warning: No non-zero standard deviation values found. Using 10% of mean as default.")
                 print(f"Atlas normative values in lesion area: mean={atlas_mean:.2f}, mean std={atlas_std_global:.2f}")
             else:
                 # Pokud nemáme std atlas, spočítáme směrodatnou odchylku z hodnot v lézi
@@ -500,6 +517,41 @@ def create_pseudo_healthy_brain_with_atlas(adc_data, label_data, atlas_path, std
                 
                 registered_current_lesion_np = registered_current_lesion.numpy() > 0.5
                 
+                # NOVÁ ÚPRAVA: Kontrola, jestli jsou v atlasu nenulové hodnoty pro tuto lézi
+                valid_lesion_atlas_mask = (atlas_np > 0) & registered_current_lesion_np
+                if not np.any(valid_lesion_atlas_mask):
+                    print(f"Warning: No non-zero atlas values for lesion component {lesion_idx}.")
+                    print("Using alternative method for this lesion component...")
+                    
+                    # Pro tuto lézi použijeme metodu symetrie nebo perimetru
+                    # Vytvoříme dilatovanou masku léze
+                    dilated_lesion = ndimage.binary_dilation(current_lesion, iterations=5)
+                    
+                    # Vytvoříme prstenec kolem léze (dilatovaná bez původní)
+                    ring_mask = dilated_lesion & ~current_lesion & ~lesion_mask
+                    
+                    if np.any(ring_mask):
+                        # Vypočítáme průměrnou hodnotu v prstenci
+                        ring_values = adc_data[ring_mask]
+                        avg_ring_value = np.mean(ring_values)
+                        
+                        # Aplikujeme průměrnou hodnotu prstence s šumem na oblast léze
+                        current_coords = np.where(current_lesion)
+                        current_coords = list(zip(current_coords[0], current_coords[1], current_coords[2]))
+                        
+                        for x, y, z in current_coords:
+                            # Váha přechodu
+                            weight = transition_mask[x, y, z]
+                            
+                            # Přidáme šum škálovaný na cca 10% průměrné hodnoty
+                            noise_scale = 0.1 * avg_ring_value
+                            noisy_value = avg_ring_value + (noise[x, y, z] - 0.5) * 2 * noise_scale
+                            
+                            # Plynulý přechod mezi původní a novou hodnotou
+                            pseudo_healthy[x, y, z] = (1 - weight) * adc_data[x, y, z] + weight * noisy_value
+                    
+                    continue  # Přeskočíme normální zpracování pomocí atlasu pro tuto komponentu
+                
                 # Souřadnice voxelů v aktuální lézi
                 current_coords = np.where(current_lesion)
                 current_coords = list(zip(current_coords[0], current_coords[1], current_coords[2]))
@@ -534,7 +586,7 @@ def create_pseudo_healthy_brain_with_atlas(adc_data, label_data, atlas_path, std
                     pseudo_healthy[x, y, z] = (1 - weight) * adc_data[x, y, z] + weight * scaled_value
         
         else:
-            print("Warning: No lesion voxels found in registered space. Using original method.")
+            print("Warning: No valid lesion voxels found in registered space. Using original method.")
             return create_pseudo_healthy_brain(adc_data, label_data)
         
         print("Atlas-based lesion replacement completed")
