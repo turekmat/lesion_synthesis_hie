@@ -347,12 +347,18 @@ def visualize_results(adc_data, pseudo_healthy, label_data, patient_id, output_d
     output_path = os.path.join(output_dir, f"{patient_id}_visualization.pdf")
     print(f"Creating visualization PDF: {output_path}")
     
+    # SimpleITK returns data in [z,y,x] order, we need to transpose for correct orientation
+    # Transpose to get proper axial view (top-down view)
+    adc_data_axial = np.transpose(adc_data, (1, 2, 0))
+    pseudo_healthy_axial = np.transpose(pseudo_healthy, (1, 2, 0))
+    label_data_axial = np.transpose(label_data, (1, 2, 0))
+    
     # Calculate value limits for consistent display
-    vmin = np.percentile(adc_data[adc_data > 0], 1) if np.any(adc_data > 0) else 0
-    vmax = np.percentile(adc_data[adc_data > 0], 99) if np.any(adc_data > 0) else 1
+    vmin = np.percentile(adc_data_axial[adc_data_axial > 0], 1) if np.any(adc_data_axial > 0) else 0
+    vmax = np.percentile(adc_data_axial[adc_data_axial > 0], 99) if np.any(adc_data_axial > 0) else 1
     
     # Create a binary mask for the lesion outline
-    lesion_mask = label_data > 0
+    lesion_mask = label_data_axial > 0
     
     # Create lesion outline using binary erosion
     if np.any(lesion_mask):
@@ -363,8 +369,8 @@ def visualize_results(adc_data, pseudo_healthy, label_data, patient_id, output_d
     
     # Find which slices actually contain brain tissue (non-zero values)
     non_zero_slices = []
-    for z in range(adc_data.shape[2]):
-        if np.any(adc_data[:, :, z] > 0):
+    for z in range(adc_data_axial.shape[2]):
+        if np.any(adc_data_axial[:, :, z] > 0):
             non_zero_slices.append(z)
     
     if not non_zero_slices:
@@ -379,29 +385,29 @@ def visualize_results(adc_data, pseudo_healthy, label_data, patient_id, output_d
             
             # Original ADC
             ax1 = fig.add_subplot(1, 3, 1)
-            im1 = ax1.imshow(adc_data[:, :, z], cmap='gray', vmin=vmin, vmax=vmax, aspect='equal')
-            ax1.set_title(f'Original ADC (Slice {z})')
+            im1 = ax1.imshow(adc_data_axial[:, :, z], cmap='gray', vmin=vmin, vmax=vmax, aspect='equal', origin='lower')
+            ax1.set_title(f'Original ADC (Axial Slice {z})')
             ax1.set_axis_off()
             
             # Pseudo-healthy ADC
             ax2 = fig.add_subplot(1, 3, 2)
-            im2 = ax2.imshow(pseudo_healthy[:, :, z], cmap='gray', vmin=vmin, vmax=vmax, aspect='equal')
-            ax2.set_title(f'Pseudo-healthy ADC (Slice {z})')
+            im2 = ax2.imshow(pseudo_healthy_axial[:, :, z], cmap='gray', vmin=vmin, vmax=vmax, aspect='equal', origin='lower')
+            ax2.set_title(f'Pseudo-healthy ADC (Axial Slice {z})')
             ax2.set_axis_off()
             
             # Original ADC with lesion outline
             ax3 = fig.add_subplot(1, 3, 3)
-            im3 = ax3.imshow(adc_data[:, :, z], cmap='gray', vmin=vmin, vmax=vmax, aspect='equal')
+            im3 = ax3.imshow(adc_data_axial[:, :, z], cmap='gray', vmin=vmin, vmax=vmax, aspect='equal', origin='lower')
             
             # Overlay the lesion outline in red
             if np.any(lesion_outline[:, :, z]):
                 # Create a mask for overlay
-                mask = np.zeros((*adc_data.shape[:2], 4))  # RGBA
+                mask = np.zeros((*adc_data_axial.shape[:2], 4))  # RGBA
                 mask[:, :, 0] = 1  # Red channel
                 mask[:, :, 3] = lesion_outline[:, :, z] * 1.0  # Alpha channel
-                ax3.imshow(mask, alpha=0.5, aspect='equal')
+                ax3.imshow(mask, alpha=0.5, aspect='equal', origin='lower')
             
-            ax3.set_title(f'Original ADC with Lesion Outline (Slice {z})')
+            ax3.set_title(f'Original ADC with Lesion Outline (Axial Slice {z})')
             ax3.set_axis_off()
             
             # Ensure proper layout and spacing
