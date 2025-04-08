@@ -361,28 +361,24 @@ def visualize_results(adc_data, pseudo_healthy, label_data, patient_id, output_d
     # Generate PDF with all slices
     with PdfPages(output_path) as pdf:
         for z in non_zero_slices:
-            plt.figure(figsize=(15, 5))
+            # Create a figure with equal subplot sizes
+            fig = plt.figure(figsize=(15, 6))
             
             # Original ADC
-            plt.subplot(1, 3, 1)
-            plt.imshow(adc_data[:, :, z], cmap='gray', vmin=vmin, vmax=vmax)
-            plt.title(f'Original ADC (Slice {z})')
-            plt.axis('off')
+            ax1 = fig.add_subplot(1, 3, 1)
+            im1 = ax1.imshow(adc_data[:, :, z], cmap='gray', vmin=vmin, vmax=vmax, aspect='equal')
+            ax1.set_title(f'Original ADC (Slice {z})')
+            ax1.set_axis_off()
             
             # Pseudo-healthy ADC
-            plt.subplot(1, 3, 2)
-            plt.imshow(pseudo_healthy[:, :, z], cmap='gray', vmin=vmin, vmax=vmax)
-            plt.title(f'Pseudo-healthy ADC (Slice {z})')
-            plt.axis('off')
+            ax2 = fig.add_subplot(1, 3, 2)
+            im2 = ax2.imshow(pseudo_healthy[:, :, z], cmap='gray', vmin=vmin, vmax=vmax, aspect='equal')
+            ax2.set_title(f'Pseudo-healthy ADC (Slice {z})')
+            ax2.set_axis_off()
             
-            # Difference with lesion outline
-            plt.subplot(1, 3, 3)
-            diff = np.abs(pseudo_healthy[:, :, z] - adc_data[:, :, z])
-            # Normalize the difference for better visualization
-            if np.any(diff > 0):
-                diff = diff / np.max(diff)
-            
-            plt.imshow(adc_data[:, :, z], cmap='gray', vmin=vmin, vmax=vmax)
+            # Original ADC with lesion outline
+            ax3 = fig.add_subplot(1, 3, 3)
+            im3 = ax3.imshow(adc_data[:, :, z], cmap='gray', vmin=vmin, vmax=vmax, aspect='equal')
             
             # Overlay the lesion outline in red
             if np.any(lesion_outline[:, :, z]):
@@ -390,14 +386,17 @@ def visualize_results(adc_data, pseudo_healthy, label_data, patient_id, output_d
                 mask = np.zeros((*adc_data.shape[:2], 4))  # RGBA
                 mask[:, :, 0] = 1  # Red channel
                 mask[:, :, 3] = lesion_outline[:, :, z] * 1.0  # Alpha channel
-                plt.imshow(mask, alpha=0.5)
+                ax3.imshow(mask, alpha=0.5, aspect='equal')
             
-            plt.title(f'Original ADC with Lesion Outline (Slice {z})')
-            plt.axis('off')
+            ax3.set_title(f'Original ADC with Lesion Outline (Slice {z})')
+            ax3.set_axis_off()
             
+            # Ensure proper layout and spacing
             plt.tight_layout()
-            pdf.savefig()
-            plt.close()
+            
+            # Save the current figure to PDF
+            pdf.savefig(fig)
+            plt.close(fig)
     
     print(f"Visualization saved to {output_path}")
 
