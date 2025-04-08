@@ -16,147 +16,123 @@ import argparse
 from torchvision.utils import make_grid
 from matplotlib.backends.backend_pdf import PdfPages
 from scipy import ndimage
+import torch.optim as optim
+import torch.utils.data as data
+import torchvision.transforms as transforms
+from skimage.morphology import binary_dilation
+import scipy.ndimage as ndimage
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_pdf import PdfPages
+import SimpleITK as sitk
+from glob import glob
+import re
+import warnings
+import argparse
+import random
+import time
+import logging
+import sys
+import scipy
+import nibabel as nib
+from scipy.ndimage import binary_dilation, gaussian_filter
 
 
 class LesionInpaintingDataset(Dataset):
-    """
-    Dataset for HIE lesion inpainting.
+    """Dataset for training a GAN to inpaint synthetic lesions in ADC maps.
     
-    It pairs:
-    1. ADC maps without lesions in a specific area (truly healthy brain created using atlas)
-    2. Binary masks for synthetic lesions (where to place new lesions)
-    3. Ground truth ADC maps with real lesions (for learning what lesions look like)
+    Args:
+        adc_dir (str): Directory containing ADC maps.
+        label_dir (str): Directory containing real lesion label masks.
+        synthetic_lesions_dir (str): Directory containing synthetic lesions.
+        split (str): Either 'train' or 'val'.
+        adc_mean_atlas_path (str, optional): Path to the mean ADC atlas. Default is None.
+        adc_std_atlas_path (str, optional): Path to the standard deviation ADC atlas. Default is None.
+        dilation_radius (int, optional): Radius for dilating the lesion mask. Default is 3.
+        smoothing_iterations (int, optional): Number of iterations for Gaussian smoothing. Default is 5.
     """
-    def __init__(self, 
-                 adc_dir,
-                 label_dir, 
-                 synthetic_lesions_dir,
-                 output_dir,
-                 adc_mean_atlas_path=None,
-                 adc_std_atlas_path=None,
-                 patch_size=(96, 96, 96),
-                 mode='train',
-                 transform=None):
-        """
-        Inicializuje dataset pro inpainting lézí.
-        
-        Args:
-            adc_dir: Adresář s ADC mapami
-            label_dir: Adresář s maskami reálných lézí
-            synthetic_lesions_dir: Adresář se syntetickými lézemi
-            output_dir: Adresář pro ukládání výsledků
-            adc_mean_atlas_path: Cesta k průměrnému ADC atlasu (volitelné)
-            adc_std_atlas_path: Cesta k atlasu směrodatných odchylek ADC (volitelné)
-            patch_size: Velikost výstupního patche (pro trénink)
-            mode: 'train' nebo 'validation'
-            transform: Transformace aplikované na data
-        """
+    def __init__(
+        self, 
+        adc_dir, 
+        label_dir, 
+        synthetic_lesions_dir, 
+        split='train', 
+        adc_mean_atlas_path=None, 
+        adc_std_atlas_path=None,
+        dilation_radius=3,
+        smoothing_iterations=5
+    ):
         self.adc_dir = adc_dir
         self.label_dir = label_dir
         self.synthetic_lesions_dir = synthetic_lesions_dir
-        self.output_dir = output_dir
-        self.patch_size = patch_size
-        self.mode = mode
-        self.transform = transform
+        self.split = split
+        self.adc_mean_atlas_path = adc_mean_atlas_path
+        self.adc_std_atlas_path = adc_std_atlas_path
+        self.dilation_radius = dilation_radius
+        self.smoothing_iterations = smoothing_iterations
         
-        # Načíst atlasy, pokud jsou k dispozici
-        self.has_atlas = False
+        # Load atlases if provided
         self.adc_mean_atlas = None
         self.adc_std_atlas = None
-        
-        if adc_mean_atlas_path is not None and os.path.exists(adc_mean_atlas_path):
+        if adc_mean_atlas_path and os.path.exists(adc_mean_atlas_path):
             try:
-                # Načíst atlas průměrných hodnot ADC
-                print(f"Načítám průměrný ADC atlas: {adc_mean_atlas_path}")
-                atlas_img = sitk.ReadImage(adc_mean_atlas_path)
-                self.adc_mean_atlas = sitk.GetArrayFromImage(atlas_img)
-                
-                # Kontrola, zda atlas obsahuje NaN hodnoty
-                if np.isnan(self.adc_mean_atlas).any():
-                    print("VAROVÁNÍ: Průměrný atlas obsahuje NaN hodnoty, nahrazuji nulami")
-                    self.adc_mean_atlas = np.nan_to_num(self.adc_mean_atlas)
-                
-                self.has_atlas = True
-                print(f"Atlas načten, velikost: {self.adc_mean_atlas.shape}")
-                
-                # Vytvořit adresář pro vizualizace registrace
-                os.makedirs(os.path.join(self.output_dir, 'registration_vis'), exist_ok=True)
-                
-                # Načíst atlas směrodatných odchylek, pokud existuje
-                if adc_std_atlas_path is not None and os.path.exists(adc_std_atlas_path):
-                    print(f"Načítám atlas směrodatných odchylek ADC: {adc_std_atlas_path}")
-                    std_atlas_img = sitk.ReadImage(adc_std_atlas_path)
-                    self.adc_std_atlas = sitk.GetArrayFromImage(std_atlas_img)
-                    
-                    # Kontrola, zda atlas směrodatných odchylek obsahuje NaN hodnoty
-                    if np.isnan(self.adc_std_atlas).any():
-                        print("VAROVÁNÍ: Atlas směrodatných odchylek obsahuje NaN hodnoty, nahrazuji nulami")
-                        self.adc_std_atlas = np.nan_to_num(self.adc_std_atlas)
-                        
-                    print(f"Atlas směrodatných odchylek načten, velikost: {self.adc_std_atlas.shape}")
-                else:
-                    print("Atlas směrodatných odchylek není k dispozici")
+                self.adc_mean_atlas = nib.load(adc_mean_atlas_path).get_fdata()
+                print(f"Loaded mean ADC atlas from {adc_mean_atlas_path}, shape: {self.adc_mean_atlas.shape}")
             except Exception as e:
-                print(f"Chyba při načítání atlasů: {e}")
-                self.has_atlas = False
+                print(f"Failed to load mean ADC atlas from {adc_mean_atlas_path}: {str(e)}")
         else:
-            print("Atlas ADC není k dispozici, bude použita základní metoda vytváření zdravého mozku")
+            print(f"WARNING: Mean ADC atlas not found at {adc_mean_atlas_path}. Will use smooth inpainting method.")
         
-        # Najít všechny soubory ADC map a masek lézí
-        adc_pattern = os.path.join(adc_dir, "*.nii.gz")
-        label_pattern = os.path.join(label_dir, "*.nii.gz")
+        if adc_std_atlas_path and os.path.exists(adc_std_atlas_path):
+            try:
+                self.adc_std_atlas = nib.load(adc_std_atlas_path).get_fdata()
+                print(f"Loaded std ADC atlas from {adc_std_atlas_path}, shape: {self.adc_std_atlas.shape}")
+            except Exception as e:
+                print(f"Failed to load std ADC atlas from {adc_std_atlas_path}: {str(e)}")
+                
+        # Extract patient IDs from ADC files
+        adc_files = sorted(glob.glob(os.path.join(adc_dir, "*.nii.gz")))
+        patient_ids = [os.path.basename(f).split("_")[0] for f in adc_files]
+        patient_ids = list(set(patient_ids))  # Remove duplicates
         
-        adc_files = sorted(glob.glob(adc_pattern))
-        label_files = sorted(glob.glob(label_pattern))
-        
-        # Extrahovat ID pacientů z názvů souborů ADC
-        self.adc_files = {}
-        for f in adc_files:
-            patient_id = os.path.basename(f).split(".")[0]  # Předpokládáme formát ID.nii.gz
-            self.adc_files[patient_id] = f
-        
-        # Přiřadit soubory masek k ID pacientů
-        self.label_files = {}
-        for f in label_files:
-            patient_id = os.path.basename(f).split(".")[0]
-            if patient_id in self.adc_files:  # Jen pacienti, kteří mají ADC
-                self.label_files[patient_id] = f
-        
-        # Zkontrolovat, kteří pacienti mají syntetické léze
+        # Filter patients based on whether they have the necessary files
         valid_patient_ids = []
-        for patient_id in self.adc_files.keys():
-            if patient_id in self.label_files:
-                synth_dir = os.path.join(synthetic_lesions_dir, patient_id)
-                if os.path.exists(synth_dir):
-                    lesion_files = glob.glob(os.path.join(synth_dir, "*.nii.gz"))
-                    if len(lesion_files) > 0:
-                        valid_patient_ids.append(patient_id)
+        for patient_id in patient_ids:
+            label_files = glob.glob(os.path.join(label_dir, f"{patient_id}_*.nii.gz"))
+            synthetic_lesion_dir = os.path.join(synthetic_lesions_dir, patient_id)
+            
+            if label_files and os.path.exists(synthetic_lesion_dir):
+                valid_patient_ids.append(patient_id)
         
-        print(f"Nalezeno {len(valid_patient_ids)} platných pacientů s ADC, maskami lézí a syntetickými lézemi")
+        # Split patients into train and validation sets
+        random.seed(42)  # For reproducibility
+        random.shuffle(valid_patient_ids)
+        train_ratio = 0.8
+        train_size = int(len(valid_patient_ids) * train_ratio)
         
-        # Rozdělit data na trénovací a validační množinu
-        np.random.seed(42)  # Pro reprodukovatelné rozdělení
-        np.random.shuffle(valid_patient_ids)
-        split_idx = int(len(valid_patient_ids) * 0.8)  # 80% trénovací, 20% validační
+        if split == 'train':
+            self.patient_ids = valid_patient_ids[:train_size]
+        else:  # val
+            self.patient_ids = valid_patient_ids[train_size:]
         
-        if mode == 'train':
-            self.patient_ids = valid_patient_ids[:split_idx]
-        else:  # validation
-            self.patient_ids = valid_patient_ids[split_idx:]
+        print(f"Number of patients in {split} set: {len(self.patient_ids)}")
         
-        print(f"Používám {len(self.patient_ids)} pacientů pro {mode}")
-        
-        # Vytvořit páry vzorků (pacient_id, synth_lesion_id)
+        # Create sample pairs for each patient
         self.sample_pairs = []
         for patient_id in self.patient_ids:
-            synth_dir = os.path.join(synthetic_lesions_dir, patient_id)
-            lesion_files = glob.glob(os.path.join(synth_dir, "*.nii.gz"))
-            for lesion_file in lesion_files:
-                # Extrahovat ID syntetické léze z názvu souboru
-                lesion_id = os.path.basename(lesion_file).split(".")[0]
-                self.sample_pairs.append((patient_id, lesion_id))
+            adc_files = sorted(glob.glob(os.path.join(adc_dir, f"{patient_id}_*.nii.gz")))
+            label_files = sorted(glob.glob(os.path.join(label_dir, f"{patient_id}_*.nii.gz")))
+            synthetic_lesion_dir = os.path.join(synthetic_lesions_dir, patient_id)
+            synthetic_lesion_files = sorted(glob.glob(os.path.join(synthetic_lesion_dir, "*.nii.gz")))
+            
+            for adc_path, label_path in zip(adc_files, label_files):
+                for synthetic_lesion_path in synthetic_lesion_files:
+                    self.sample_pairs.append({
+                        "adc_path": adc_path,
+                        "label_path": label_path,
+                        "synthetic_lesion_path": synthetic_lesion_path
+                    })
         
-        print(f"Vytvořeno {len(self.sample_pairs)} trénovacích/validačních párů")
+        print(f"Number of training samples in {split} set: {len(self.sample_pairs)}")
     
     def register_atlas_to_subject(self, subject_img, subject_array, label_array):
         """
@@ -397,153 +373,93 @@ class LesionInpaintingDataset(Dataset):
         return len(self.sample_pairs)
     
     def __getitem__(self, idx):
-        """
-        Get a sample from the dataset.
+        """Get a sample pair (input, target) for training.
         
         Args:
-            idx: Index of the sample
+            idx (int): Index of the sample.
             
         Returns:
-            Dictionary with input, target, and metadata
+            tuple: (input, target) tensors for training.
+                input: [2, D, H, W] tensor with healthy brain and synthetic lesion mask
+                target: [1, D, H, W] tensor with brain containing lesion
         """
-        # Get patient ID and synthetic lesion ID
-        patient_id, synth_lesion_id = self.sample_pairs[idx]
+        sample = self.samples[idx]
+        patient_id = sample['patient_id']
+        syn_lesion_idx = sample['syn_lesion_idx']
         
-        # Construct file paths
-        adc_path = self.adc_files[patient_id]
-        label_path = self.label_files[patient_id]
-        synth_lesion_path = os.path.join(self.synthetic_lesions_dir, patient_id, f"{synth_lesion_id}.nii.gz")
-        
-        # Load ADC and label files
         try:
-            adc_img = sitk.ReadImage(adc_path)
-            adc_array = sitk.GetArrayFromImage(adc_img)
+            # Load ADC map
+            adc_path = os.path.join(self.adc_dir, f"{patient_id}_adc.nii.gz")
+            adc_nib = nib.load(adc_path)
+            adc_array = adc_nib.get_fdata()
             
-            label_img = sitk.ReadImage(label_path)
-            label_array = sitk.GetArrayFromImage(label_img).astype(bool)
-            
-            synthetic_lesion_img = sitk.ReadImage(synth_lesion_path)
-            synthetic_lesion_array = sitk.GetArrayFromImage(synthetic_lesion_img).astype(bool)
-        except Exception as e:
-            print(f"Error loading data for patient {patient_id}, lesion {synth_lesion_id}: {e}")
-            # Return empty sample in case of error
-            return {
-                "input": torch.zeros((2, 32, 32, 32)),
-                "target": torch.zeros((1, 32, 32, 32)),
-                "metadata": {
-                    "patient_id": patient_id,
-                    "synthetic_lesion_id": synth_lesion_id,
-                    "error": str(e)
-                }
-            }
-            
-        # Naměřit statistiky o obrazu
-        adc_mean = np.mean(adc_array[adc_array > 0])  # Průměr nenulových hodnot
-        adc_std = np.std(adc_array[adc_array > 0])    # Směrodatná odchylka nenulových hodnot
-        
-        # Vypočítat percentily pro detekci outlierů
-        non_zero = adc_array[adc_array > 0]
-        p01 = np.percentile(non_zero, 1) if len(non_zero) > 0 else 0
-        p99 = np.percentile(non_zero, 99) if len(non_zero) > 0 else 1
-        
-        print(f"ADC stats - mean: {adc_mean:.4f}, std: {adc_std:.4f}, p01: {p01:.4f}, p99: {p99:.4f}")
-        
-        # Normalizace ADC obrazu pomocí percentilů
-        adc_normalized = np.copy(adc_array)
-        adc_normalized[adc_normalized < p01] = p01  # Oříznout spodní outliers
-        adc_normalized[adc_normalized > p99] = p99  # Oříznout horní outliers
-        adc_normalized = (adc_normalized - p01) / (p99 - p01)  # Normalizace na [0,1]
-        
-        # Vytvořit "skutečně zdravý mozek" pomocí atlasu ADC nebo jednoduchého nahrazení hodnot
-        if self.has_atlas:
-            print("Creating healthy brain using registered ADC atlas...")
-            
-            # Registrovat atlas k subjektu
-            registered_atlas, registered_std_atlas = self.register_atlas_to_subject(adc_img, adc_array, label_array)
-            
-            # Kontrola registrace
-            if registered_atlas is not None:
-                # Normalizace registrovaného atlasu do stejného rozsahu jako ADC
-                atlas_normalized = np.copy(registered_atlas)
-                atlas_normalized[atlas_normalized < p01] = p01
-                atlas_normalized[atlas_normalized > p99] = p99
-                atlas_normalized = (atlas_normalized - p01) / (p99 - p01)
-                
-                # Vytvořit masku dilací existujících lézí
-                kernel = np.ones((3,3,3))
-                dilated_mask = ndimage.binary_dilation(label_array, structure=kernel, iterations=2)
-                
-                # Vytvořit hranici okolo léze (dilated - original)
-                border_mask = dilated_mask & np.logical_not(label_array)
-                
-                # Vypočítat poměr mezi hodnotami subjektu a atlasu v hranici
-                if np.sum(border_mask) > 0:
-                    ratio = np.mean(adc_normalized[border_mask]) / np.mean(atlas_normalized[border_mask] + 1e-6)
-                    print(f"Border ratio: {ratio:.4f}")
-                    # Omezit extrémní hodnoty poměru
-                    ratio = np.clip(ratio, 0.5, 2.0)
-                else:
-                    ratio = 1.0
-                    print("No border found, using default ratio 1.0")
-                
-                # Upravit atlas podle poměru a vytvořit zdravý mozek
-                healthy_brain = adc_normalized.copy()
-                
-                # Použít atlas pouze v oblasti léze
-                healthy_brain[label_array] = atlas_normalized[label_array] * ratio
-                
-                # Vytvořit diagnostickou vizualizaci procesu
-                create_registration_visualization(
-                    adc_normalized, 
-                    atlas_normalized, 
-                    label_array, 
-                    healthy_brain,
-                    ratio,
-                    os.path.join(self.output_dir, 'registration_vis', f"{patient_id}_{synth_lesion_id}_registration.png")
-                )
-                
-                print("Healthy brain created using atlas registration")
+            # Normalize ADC map to [0, 1]
+            adc_min = np.min(adc_array)
+            adc_max = np.max(adc_array)
+            if adc_max > adc_min:
+                adc_array_norm = (adc_array - adc_min) / (adc_max - adc_min)
             else:
-                print("Atlas registration failed, falling back to basic method")
-                # Fallback metoda - jednoduchá náhrada lézí
-                healthy_brain = self.create_basic_healthy_brain(adc_normalized, label_array)
-        else:
-            # Pokud nemáme atlas, použijeme základní metodu
-            print("No atlas available, using basic healthy brain creation")
-            healthy_brain = self.create_basic_healthy_brain(adc_normalized, label_array)
-        
-        # Vypočítat překryv mezi existující a syntetickou lézí
-        overlap = np.logical_and(label_array, synthetic_lesion_array)
-        overlap_percentage = np.sum(overlap) / np.sum(synthetic_lesion_array) if np.sum(synthetic_lesion_array) > 0 else 0
-        print(f"Overlap percentage: {overlap_percentage:.4f}")
-        
-        # Určit cílový výstup
-        if overlap_percentage > 0.5:
-            # Pokud je překryv významný, použijeme původní ADC jako cíl (obsahující reálnou lézi)
-            target = adc_normalized
-            print("Using original ADC as target (high overlap)")
-        else:
-            # Jinak vytvoříme hybridní cíl
-            target = self.create_target_with_synthetic_lesion(healthy_brain, synthetic_lesion_array, adc_normalized)
-            print("Using hybrid target with synthetic lesion")
-        
-        # Spojit zdravý mozek a syntetickou lézi jako vstup pro model
-        model_input = np.stack([healthy_brain, synthetic_lesion_array.astype(np.float32)], axis=0)
-        model_target = target[np.newaxis, ...]  # Add channel dimension
-        
-        # Konvertovat na tensory
-        input_tensor = torch.from_numpy(model_input.astype(np.float32))
-        target_tensor = torch.from_numpy(model_target.astype(np.float32))
-        
-        return {
-            "input": input_tensor,
-            "target": target_tensor,
-            "metadata": {
-                "patient_id": patient_id,
-                "synthetic_lesion_id": synth_lesion_id,
-                "overlap_percentage": overlap_percentage
-            }
-        }
+                adc_array_norm = adc_array.copy()
+            
+            # Load real lesion mask
+            label_path = os.path.join(self.label_dir, f"{patient_id}_label.nii.gz")
+            label_array = nib.load(label_path).get_fdata() > 0.5
+            
+            # Create a "healthy brain" by replacing lesions using our smooth inpainting function
+            healthy_brain = create_smooth_healthy_brain(
+                adc_array_norm, 
+                label_array,
+                dilation_radius=self.dilation_radius,
+                smoothing_iterations=self.smoothing_iterations
+            )
+            
+            # Load synthetic lesion
+            syn_lesion_path = os.path.join(self.synthetic_lesions_dir, patient_id, f"syn_lesion_{syn_lesion_idx}.nii.gz")
+            syn_lesion_array = nib.load(syn_lesion_path).get_fdata() > 0.5
+            
+            # Calculate overlap between synthetic and real lesions
+            overlap = np.sum(syn_lesion_array & label_array) / np.sum(syn_lesion_array) if np.sum(syn_lesion_array) > 0 else 0
+            
+            # If synthetic lesion overlaps significantly with real lesion,
+            # use the original brain with real lesion as target.
+            # Otherwise, create a target with only the synthetic lesion.
+            if overlap > 0.5:
+                target = adc_array_norm.copy()
+            else:
+                # For synthetic lesions that don't overlap with real ones,
+                # insert a lesion-like intensity into the healthy brain
+                target = healthy_brain.copy()
+                
+                # Only modify the synthetic lesion area
+                if np.any(syn_lesion_array):
+                    # Calculate average intensity in real lesions for reference
+                    if np.any(label_array):
+                        lesion_intensity = np.mean(adc_array_norm[label_array])
+                    else:
+                        # If no real lesions, use a typical lesion intensity
+                        # (ADC lesions are typically hyperintense, around 0.7-0.9 in normalized scale)
+                        lesion_intensity = 0.8
+                    
+                    # Insert the lesion with some random variation
+                    random_variation = np.random.normal(0, 0.05, size=np.count_nonzero(syn_lesion_array))
+                    target[syn_lesion_array] = np.clip(lesion_intensity + random_variation, 0, 1)
+            
+            # Convert to PyTorch tensors
+            healthy_brain_tensor = torch.from_numpy(healthy_brain).float().unsqueeze(0)
+            syn_lesion_tensor = torch.from_numpy(syn_lesion_array.astype(np.float32)).unsqueeze(0)
+            target_tensor = torch.from_numpy(target).float().unsqueeze(0)
+            
+            # Combine healthy brain and synthetic lesion mask as input
+            input_tensor = torch.cat([healthy_brain_tensor, syn_lesion_tensor], dim=0)
+            
+            return input_tensor, target_tensor
+            
+        except Exception as e:
+            print(f"Error processing sample {patient_id}, syn_lesion_{syn_lesion_idx}: {str(e)}")
+            # Return a dummy sample pair as fallback
+            dummy_shape = (2, 128, 128, 128)
+            dummy_target_shape = (1, 128, 128, 128)
+            return torch.zeros(dummy_shape, dtype=torch.float32), torch.zeros(dummy_target_shape, dtype=torch.float32)
 
 # Přidat pomocnou funkci pro vytvoření základního zdravého mozku
 def create_basic_healthy_brain(self, adc_normalized, label_array):
@@ -1007,366 +923,271 @@ class LesionInpaintingGAN:
         return inpainted_brain
 
 
-def train(adc_dir, label_dir, synthetic_lesions_dir, output_dir, 
+def train(adc_dir, label_dir, synthetic_lesions_dir, output_dir,
          adc_mean_atlas_path=None, adc_std_atlas_path=None,
-         num_epochs=200, batch_size=4, save_interval=5):
+         num_epochs=200, batch_size=4,
+         dilation_radius=3, smoothing_iterations=5):
     """
-    Trénuje model pro inpainting lézí.
+    Train the lesion inpainting GAN.
     
     Args:
-        adc_dir: Adresář s ADC mapami
-        label_dir: Adresář s maskami lézí
-        synthetic_lesions_dir: Adresář se syntetickými lézemi
-        output_dir: Adresář pro ukládání výsledků
-        adc_mean_atlas_path: Cesta k průměrnému ADC atlasu
-        adc_std_atlas_path: Cesta k atlasu směrodatných odchylek ADC
-        num_epochs: Počet trénovacích epoch
-        batch_size: Velikost dávky
-        save_interval: Interval (v epochách) pro ukládání kontrolních bodů
+        adc_dir (str): Directory containing ADC maps.
+        label_dir (str): Directory containing lesion labels.
+        synthetic_lesions_dir (str): Directory containing synthetic lesions.
+        output_dir (str): Directory to save model checkpoints and results.
+        adc_mean_atlas_path (str, optional): Path to ADC mean atlas. Defaults to None.
+        adc_std_atlas_path (str, optional): Path to ADC standard deviation atlas. Defaults to None.
+        num_epochs (int, optional): Number of training epochs. Defaults to 200.
+        batch_size (int, optional): Batch size for training. Defaults to 4.
+        dilation_radius (int, optional): Radius for dilating lesion masks. Defaults to 3.
+        smoothing_iterations (int, optional): Number of iterations for smoothing. Defaults to 5.
     """
-    print(f"Spouštím trénink s parametry:")
-    print(f"- ADC dir: {adc_dir}")
-    print(f"- Label dir: {label_dir}")
-    print(f"- Synthetic lesions dir: {synthetic_lesions_dir}")
-    print(f"- Output dir: {output_dir}")
-    print(f"- ADC mean atlas: {adc_mean_atlas_path}")
-    print(f"- ADC std atlas: {adc_std_atlas_path}")
-    print(f"- Počet epoch: {num_epochs}")
-    print(f"- Velikost dávky: {batch_size}")
-    
-    # Kontrola existence adresářů
-    for dir_path in [adc_dir, label_dir, synthetic_lesions_dir]:
+    # Validate directories exist
+    for dir_path, dir_name in [(adc_dir, 'ADC'), (label_dir, 'Label'), (synthetic_lesions_dir, 'Synthetic lesions')]:
         if not os.path.exists(dir_path):
-            raise ValueError(f"Adresář neexistuje: {dir_path}")
+            raise ValueError(f"{dir_name} directory not found: {dir_path}")
     
-    # Kontrola atlasů
-    if adc_mean_atlas_path is not None and not os.path.exists(adc_mean_atlas_path):
-        raise ValueError(f"ADC atlas neexistuje: {adc_mean_atlas_path}")
+    # Validate atlas paths if provided
+    if adc_mean_atlas_path and not os.path.exists(adc_mean_atlas_path):
+        raise ValueError(f"ADC mean atlas not found: {adc_mean_atlas_path}")
+    if adc_std_atlas_path and not os.path.exists(adc_std_atlas_path):
+        raise ValueError(f"ADC std atlas not found: {adc_std_atlas_path}")
     
-    if adc_std_atlas_path is not None and not os.path.exists(adc_std_atlas_path):
-        raise ValueError(f"ADC atlas směrodatných odchylek neexistuje: {adc_std_atlas_path}")
+    # Create output directory if it doesn't exist
+    os.makedirs(output_dir, exist_ok=True)
+    os.makedirs(os.path.join(output_dir, 'checkpoints'), exist_ok=True)
+    os.makedirs(os.path.join(output_dir, 'visualizations'), exist_ok=True)
     
-    # Vytvořit výstupní adresář, pokud neexistuje
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
-        print(f"Vytvořen výstupní adresář: {output_dir}")
-    
-    # Vytvořit adresáře pro checkpoint a vizualizace
-    checkpoint_dir = os.path.join(output_dir, 'checkpoints')
-    vis_dir = os.path.join(output_dir, 'visualizations')
-    
-    os.makedirs(checkpoint_dir, exist_ok=True)
-    os.makedirs(vis_dir, exist_ok=True)
-    
-    # Nastavit zařízení (GPU, pokud je k dispozici)
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Používám zařízení: {device}")
-    
-    # Vytvořit datové sady
+    # Create dataset and data loaders
     train_dataset = LesionInpaintingDataset(
-        adc_dir=adc_dir,
-        label_dir=label_dir,
+        adc_dir=adc_dir, 
+        label_dir=label_dir, 
         synthetic_lesions_dir=synthetic_lesions_dir,
-        output_dir=output_dir,
+        train=True,
+        split=0.8,
         adc_mean_atlas_path=adc_mean_atlas_path,
         adc_std_atlas_path=adc_std_atlas_path,
-        mode='train'
+        dilation_radius=dilation_radius,
+        smoothing_iterations=smoothing_iterations
     )
     
     val_dataset = LesionInpaintingDataset(
-        adc_dir=adc_dir,
-        label_dir=label_dir,
+        adc_dir=adc_dir, 
+        label_dir=label_dir, 
         synthetic_lesions_dir=synthetic_lesions_dir,
-        output_dir=output_dir,
+        train=False,
+        split=0.8,
         adc_mean_atlas_path=adc_mean_atlas_path,
         adc_std_atlas_path=adc_std_atlas_path,
-        mode='val'
+        dilation_radius=dilation_radius,
+        smoothing_iterations=smoothing_iterations
     )
     
-    # Vytvořit datové loadery
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=batch_size, 
+        shuffle=True, 
+        num_workers=4,
+        pin_memory=True
+    )
     
-    print(f"Trénovací dataset: {len(train_dataset)} vzorků")
-    print(f"Validační dataset: {len(val_dataset)} vzorků")
+    val_loader = DataLoader(
+        val_dataset, 
+        batch_size=batch_size, 
+        shuffle=False, 
+        num_workers=4,
+        pin_memory=True
+    )
     
-    # Inicializovat GAN model
-    gan_model = LesionInpaintingGAN(device=device)
+    print(f"Training dataset: {len(train_dataset)} samples")
+    print(f"Validation dataset: {len(val_dataset)} samples")
     
-    # Trénovat model
-    print("Zahajuji trénink modelu...")
+    # Initialize GAN model
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
     
-    # Metriky pro monitorování tréninku
-    best_val_loss = float('inf')
-    train_losses = []
-    val_losses = []
+    gan_model = LesionInpaintingGAN().to(device)
     
-    for epoch in range(1, num_epochs + 1):
-        print(f"\nEpocha {epoch}/{num_epochs}")
+    # Setup optimizers
+    optimizer_G = torch.optim.Adam(gan_model.generator.parameters(), lr=0.0002, betas=(0.5, 0.999))
+    optimizer_D = torch.optim.Adam(gan_model.discriminator.parameters(), lr=0.0002, betas=(0.5, 0.999))
+    
+    # Training loop
+    for epoch in range(num_epochs):
+        print(f"Epoch {epoch+1}/{num_epochs}")
         
-        # Trénink
-        gan_model.train_on_loader(train_loader)
+        # Train for one epoch
+        train_g_loss, train_d_loss = 0.0, 0.0
+        gan_model.train()
         
-        # Validace
-        val_loss = gan_model.validate(val_loader)
-        
-        # Ukládat metriky
-        train_losses.append(gan_model.last_g_loss)
-        val_losses.append(val_loss)
-        
-        # Reportovat metody
-        print(f"G loss: {gan_model.last_g_loss:.4f}, D loss: {gan_model.last_d_loss:.4f}, Val loss: {val_loss:.4f}")
-        
-        # Ukládat model na intervalu a také nejlepší model
-        if epoch % save_interval == 0:
-            checkpoint_path = os.path.join(checkpoint_dir, f"gan_epoch_{epoch}.pt")
-            gan_model.save_models(checkpoint_path)
-            print(f"Model uložen do: {checkpoint_path}")
-        
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            best_model_path = os.path.join(checkpoint_dir, "gan_best.pt")
-            gan_model.save_models(best_model_path)
-            print(f"Nový nejlepší model! Uložen jako: {best_model_path}")
-        
-        # Generovat vizualizace pro monitorování pokroku
-        if epoch % 5 == 0 or epoch == 1:
-            # Vybrat náhodný batch pro vizualizaci
-            for i, batch in enumerate(val_loader):
-                if i > 0:  # Jen první batch
-                    break
-                    
-                inputs, targets = batch['input'].to(device), batch['target'].to(device)
-                generated = gan_model.generator(inputs)
+        for batch_idx, (inputs, targets) in enumerate(train_loader):
+            # Move data to device
+            inputs = inputs.to(device)
+            targets = targets.to(device)
+            
+            # Train discriminator
+            optimizer_D.zero_grad()
+            
+            # Generate fake images
+            fake_images = gan_model.generator(inputs)
+            
+            # Real loss
+            real_validity = gan_model.discriminator(targets, inputs)
+            
+            # Fake loss
+            fake_validity = gan_model.discriminator(fake_images.detach(), inputs)
+            
+            # Discriminator loss
+            d_loss = torch.mean(fake_validity) - torch.mean(real_validity)
+            d_loss.backward()
+            optimizer_D.step()
+            
+            # Apply weight clipping to discriminator (WGAN)
+            for p in gan_model.discriminator.parameters():
+                p.data.clamp_(-0.01, 0.01)
+            
+            # Train generator every n_critic iterations
+            n_critic = 5
+            if batch_idx % n_critic == 0:
+                optimizer_G.zero_grad()
                 
-                # Denormalizovat a převést na numpy
-                input_healthy = inputs[:, 0].detach().cpu().numpy()  # Kanál 0 - zdravý mozek
-                input_mask = inputs[:, 1].detach().cpu().numpy()     # Kanál 1 - maska léze
-                target_imgs = targets.detach().cpu().numpy()
-                generated_imgs = generated.detach().cpu().numpy()
+                # Generate fake images
+                fake_images = gan_model.generator(inputs)
                 
-                # Vizualizovat jeden vzorek z batche
-                for j in range(min(3, inputs.size(0))):  # Maximálně 3 vzorky
-                    vis_path = os.path.join(vis_dir, f"epoch_{epoch}_sample_{j}.png")
-                    
-                    # Vypočítat rozdíl - mapa změn
-                    diff_map = np.abs(generated_imgs[j, 0] - input_healthy[j])
-                    
-                    # Vytvořit vizualizaci
-                    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
-                    axes = axes.flat
-                    
-                    # Najít střední řez s nejvíce lézemi
-                    lesion_sum = np.sum(input_mask[j], axis=(1, 2))
-                    middle_slice = np.argmax(lesion_sum) if np.max(lesion_sum) > 0 else input_mask[j].shape[0] // 2
-                    
-                    # Zobrazit zdravý mozek
-                    axes[0].imshow(input_healthy[j, middle_slice], cmap='gray')
-                    axes[0].set_title('Zdravý mozek (vstup)')
-                    axes[0].axis('off')
-                    
-                    # Zobrazit masku léze
-                    axes[1].imshow(input_mask[j, middle_slice], cmap='hot')
-                    axes[1].set_title('Maska léze (vstup)')
-                    axes[1].axis('off')
-                    
-                    # Zobrazit cílový výstup
-                    axes[2].imshow(target_imgs[j, 0, middle_slice], cmap='gray')
-                    axes[2].set_title('Cílový výstup')
-                    axes[2].axis('off')
-                    
-                    # Zobrazit generovaný výstup
-                    axes[3].imshow(generated_imgs[j, 0, middle_slice], cmap='gray')
-                    axes[3].set_title('Generovaný výstup')
-                    axes[3].axis('off')
-                    
-                    # Zobrazit rozdíl
-                    axes[4].imshow(diff_map[middle_slice], cmap='hot')
-                    axes[4].set_title('Mapa změn')
-                    axes[4].axis('off')
-                    
-                    # Zobrazit kombinaci (generovaný + kontura léze)
-                    axes[5].imshow(generated_imgs[j, 0, middle_slice], cmap='gray')
-                    
-                    # Přidat kontury léze
-                    from scipy import ndimage
-                    contours = ndimage.binary_dilation(input_mask[j, middle_slice] > 0.5) ^ (input_mask[j, middle_slice] > 0.5)
-                    masked_data = np.ma.masked_where(~contours, np.ones_like(contours))
-                    axes[5].imshow(masked_data, cmap='autumn', alpha=1.0)
-                    axes[5].set_title('Generovaný + kontura léze')
-                    axes[5].axis('off')
-                    
-                    plt.suptitle(f"Epoch {epoch} - Vzorek {j} - Řez {middle_slice}", fontsize=16)
-                    plt.tight_layout()
-                    plt.savefig(vis_path, dpi=150)
-                    plt.close(fig)
-                    
-                    print(f"Uložena vizualizace: {vis_path}")
+                # Adversarial loss
+                fake_validity = gan_model.discriminator(fake_images, inputs)
+                adversarial_loss = -torch.mean(fake_validity)
+                
+                # Pixel-wise loss (L1)
+                pixel_loss = F.l1_loss(fake_images, targets)
+                
+                # Content loss (focus on preserving non-lesion areas)
+                syn_lesion_mask = inputs[:, 1:2]  # Extract synthetic lesion mask
+                non_lesion_mask = 1 - syn_lesion_mask  # Invert mask to focus on non-lesion areas
+                content_loss = F.l1_loss(fake_images * non_lesion_mask, targets * non_lesion_mask)
+                
+                # Total generator loss - weighted sum of the above
+                g_loss = adversarial_loss + 10.0 * pixel_loss + 5.0 * content_loss
+                g_loss.backward()
+                optimizer_G.step()
+                
+                train_g_loss += g_loss.item()
+            
+            train_d_loss += d_loss.item()
+            
+            if batch_idx % 10 == 0:
+                print(f"Batch {batch_idx}/{len(train_loader)}: G_loss: {g_loss.item():.4f}, D_loss: {d_loss.item():.4f}")
+        
+        # Validation
+        val_g_loss, val_d_loss = 0.0, 0.0
+        gan_model.eval()
+        
+        with torch.no_grad():
+            for batch_idx, (inputs, targets) in enumerate(val_loader):
+                # Move data to device
+                inputs = inputs.to(device)
+                targets = targets.to(device)
+                
+                # Generate fake images
+                fake_images = gan_model.generator(inputs)
+                
+                # Compute losses (same as training, but without backprop)
+                real_validity = gan_model.discriminator(targets, inputs)
+                fake_validity = gan_model.discriminator(fake_images, inputs)
+                
+                d_loss = torch.mean(fake_validity) - torch.mean(real_validity)
+                
+                adversarial_loss = -torch.mean(fake_validity)
+                pixel_loss = F.l1_loss(fake_images, targets)
+                
+                syn_lesion_mask = inputs[:, 1:2]
+                non_lesion_mask = 1 - syn_lesion_mask
+                content_loss = F.l1_loss(fake_images * non_lesion_mask, targets * non_lesion_mask)
+                
+                g_loss = adversarial_loss + 10.0 * pixel_loss + 5.0 * content_loss
+                
+                val_g_loss += g_loss.item()
+                val_d_loss += d_loss.item()
+        
+        # Print epoch results
+        train_g_loss /= len(train_loader)
+        train_d_loss /= len(train_loader)
+        val_g_loss /= len(val_loader)
+        val_d_loss /= len(val_loader)
+        
+        print(f"Epoch {epoch+1}/{num_epochs}:")
+        print(f"  Train G loss: {train_g_loss:.4f}, D loss: {train_d_loss:.4f}")
+        print(f"  Val G loss: {val_g_loss:.4f}, D loss: {val_d_loss:.4f}")
+        
+        # Save model checkpoint
+        torch.save({
+            'epoch': epoch,
+            'generator_state_dict': gan_model.generator.state_dict(),
+            'discriminator_state_dict': gan_model.discriminator.state_dict(),
+            'optimizer_G_state_dict': optimizer_G.state_dict(),
+            'optimizer_D_state_dict': optimizer_D.state_dict(),
+            'train_g_loss': train_g_loss,
+            'train_d_loss': train_d_loss,
+            'val_g_loss': val_g_loss,
+            'val_d_loss': val_d_loss,
+        }, os.path.join(output_dir, 'checkpoints', f'epoch_{epoch+1}.pth'))
+        
+        # Generate and save visualizations
+        if (epoch + 1) % 5 == 0:
+            # Get a sample from validation set
+            sample_idx = np.random.randint(0, len(val_dataset))
+            sample_input, sample_target = val_dataset[sample_idx]
+            
+            sample_input = sample_input.unsqueeze(0).to(device)
+            sample_target = sample_target.unsqueeze(0).to(device)
+            
+            gan_model.eval()
+            with torch.no_grad():
+                sample_output = gan_model.generator(sample_input)
+            
+            # Convert tensors to numpy for visualization
+            input_healthy = sample_input[0, 0].cpu().numpy()
+            input_mask = sample_input[0, 1].cpu().numpy()
+            generated = sample_output[0, 0].cpu().numpy()
+            target = sample_target[0, 0].cpu().numpy()
+            
+            # Calculate change map (difference between healthy and generated)
+            change_map = np.abs(generated - input_healthy)
+            
+            # Save central slices for visualization
+            slice_idx = input_healthy.shape[0] // 2
+            
+            fig, axes = plt.subplots(1, 5, figsize=(20, 4))
+            
+            axes[0].imshow(input_healthy[slice_idx], cmap='gray')
+            axes[0].set_title('Input (Healthy)')
+            axes[0].axis('off')
+            
+            axes[1].imshow(input_mask[slice_idx], cmap='gray')
+            axes[1].set_title('Synthetic Lesion Mask')
+            axes[1].axis('off')
+            
+            axes[2].imshow(generated[slice_idx], cmap='gray')
+            axes[2].set_title('Generated')
+            axes[2].axis('off')
+            
+            axes[3].imshow(target[slice_idx], cmap='gray')
+            axes[3].set_title('Target')
+            axes[3].axis('off')
+            
+            axes[4].imshow(change_map[slice_idx], cmap='hot')
+            axes[4].set_title('Change Map')
+            axes[4].axis('off')
+            
+            plt.tight_layout()
+            plt.savefig(os.path.join(output_dir, 'visualizations', f'epoch_{epoch+1}.png'))
+            plt.close(fig)
     
-    # Uložit finální model
-    final_model_path = os.path.join(checkpoint_dir, "gan_final.pt")
-    gan_model.save_models(final_model_path)
-    print(f"Trénink dokončen. Finální model uložen jako: {final_model_path}")
-    
-    # Vytvořit a uložit graf vývoje loss funkcí
-    plt.figure(figsize=(10, 5))
-    plt.plot(train_losses, label='Train Generator Loss')
-    plt.plot(val_losses, label='Validation Loss')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.title('Training and Validation Loss')
-    plt.legend()
-    plt.grid(True)
-    plt.savefig(os.path.join(output_dir, 'loss_history.png'))
-    plt.close()
-    
-    return final_model_path
+    print("Training complete!")
 
 
 def apply_inpainting(gan_model, adc_file, synthetic_lesion_file, output_file):
     """
-    Apply the trained model to inpaint a lesion into a brain scan.
-    
-    Args:
-        gan_model: Trained LesionInpaintingGAN model
-        adc_file: Path to the ADC file (.mha)
-        synthetic_lesion_file: Path to the synthetic lesion file (.mha)
-        output_file: Path to save the output (.mha)
-    """
-    # Load ADC map
-    adc_img = sitk.ReadImage(adc_file)
-    adc_array = sitk.GetArrayFromImage(adc_img)
-    
-    # Load synthetic lesion
-    syn_lesion_img = sitk.ReadImage(synthetic_lesion_file)
-    syn_lesion_array = sitk.GetArrayFromImage(syn_lesion_img)
-    
-    # Normalize ADC to [0, 1]
-    adc_min = adc_array.min()
-    adc_max = adc_array.max()
-    adc_array_norm = (adc_array - adc_min) / (adc_max - adc_min + 1e-8)
-    
-    # Convert synthetic lesion to binary
-    syn_lesion_array = (syn_lesion_array > 0).astype(np.float32)
-    
-    # Convert to tensors
-    adc_tensor = torch.from_numpy(adc_array_norm).float().unsqueeze(0).unsqueeze(0)  # Add batch and channel dimensions
-    syn_lesion_tensor = torch.from_numpy(syn_lesion_array).float().unsqueeze(0).unsqueeze(0)
-    
-    # Generate inpainted image
-    inpainted_brain = gan_model.inference(adc_tensor, syn_lesion_tensor)
-    
-    # Convert back to numpy and denormalize
-    inpainted_array = inpainted_brain.squeeze().cpu().numpy()
-    inpainted_array = inpainted_array * (adc_max - adc_min) + adc_min
-    
-    # Create SimpleITK image (using original image as reference)
-    output_img = sitk.GetImageFromArray(inpainted_array)
-    output_img.CopyInformation(adc_img)  # Copy metadata
-    
-    # Save the output
-    sitk.WriteImage(output_img, output_file)
-
-
-def visualize_healthy_brain_creation(adc_array, label_array, healthy_brain, output_path, title=None):
-    """
-    Vizualizuje proces vytvoření zdravého mozku z původních dat s lézí.
-    
-    Args:
-        adc_array: Původní ADC data (normalizovaná 0-1)
-        label_array: Maska léze
-        healthy_brain: Vytvořený zdravý mozek
-        output_path: Cesta k uložení výstupu
-        title: Titulek pro vizualizaci
-    """
-    # Najít řezy obsahující lézi
-    lesion_slices = []
-    for z in range(label_array.shape[0]):
-        if np.any(label_array[z] > 0):
-            lesion_slices.append(z)
-    
-    if not lesion_slices:
-        print("Varování: Nenalezeny žádné řezy s lézí pro vizualizaci.")
-        return
-    
-    # Výpočet statistik změn v oblasti léze
-    mask_3d = label_array > 0
-    original_values = adc_array[mask_3d]
-    healthy_values = healthy_brain[mask_3d]
-    
-    mean_original = np.mean(original_values) if len(original_values) > 0 else 0
-    mean_healthy = np.mean(healthy_values) if len(healthy_values) > 0 else 0
-    mean_abs_diff = np.mean(np.abs(healthy_values - original_values)) if len(original_values) > 0 else 0
-    
-    stats_text = (f"Statistika oblasti léze:\n"
-                 f"Průměrná hodnota původní: {mean_original:.4f}\n"
-                 f"Průměrná hodnota zdravá: {mean_healthy:.4f}\n"
-                 f"Průměrná absolutní změna: {mean_abs_diff:.4f}")
-    
-    use_pdf = len(lesion_slices) > 15
-    
-    if use_pdf:
-        with PdfPages(output_path) as pdf:
-            for slice_batch_idx in range(0, len(lesion_slices), 15):
-                batch_slices = lesion_slices[slice_batch_idx:slice_batch_idx+15]
-                fig, axs = plt.subplots(4, len(batch_slices), figsize=(4*len(batch_slices), 16))
-                
-                # Pro případ jednoho řezu
-                if len(batch_slices) == 1:
-                    axs = axs.reshape(4, 1)
-                
-                for j, slice_idx in enumerate(batch_slices):
-                    # Původní ADC řez
-                    axs[0, j].imshow(adc_array[slice_idx], cmap='gray')
-                    axs[0, j].set_title(f'Řez {slice_idx}')
-                    axs[0, j].axis('off')
-                    
-                    # Maska léze jako překryv
-                    mask = label_array[slice_idx] > 0
-                    input_with_mask = np.stack([adc_array[slice_idx], adc_array[slice_idx], adc_array[slice_idx]], axis=2)
-                    input_with_mask[mask, 0] = 1.0  # Červený kanál
-                    input_with_mask[mask, 1] = 0.0  # Zelený kanál
-                    input_with_mask[mask, 2] = 0.0  # Modrý kanál
-                    
-                    axs[1, j].imshow(input_with_mask)
-                    axs[1, j].set_title('Označení léze')
-                    axs[1, j].axis('off')
-                    
-                    # Zdravý mozek - rekonstrukce
-                    axs[2, j].imshow(healthy_brain[slice_idx], cmap='gray')
-                    axs[2, j].set_title('Rekonstruovaný zdravý mozek')
-                    axs[2, j].axis('off')
-                    
-                    # Mapa rozdílů - co bylo změněno
-                    diff_map = np.abs(healthy_brain[slice_idx] - adc_array[slice_idx])
-                    
-                    # Vypočítat průměrnou změnu pro tento konkrétní řez v oblasti léze
-                    slice_mask = label_array[slice_idx] > 0
-                    if np.any(slice_mask):
-                        slice_orig = adc_array[slice_idx][slice_mask]
-                        slice_healthy = healthy_brain[slice_idx][slice_mask]
-                        slice_mean_change = np.mean(np.abs(slice_healthy - slice_orig))
-                        diff_title = f'Mapa změn (Δ={slice_mean_change:.4f})'
-                    else:
-                        diff_title = 'Mapa změn'
-                    
-                    axs[3, j].imshow(diff_map, cmap='hot')
-                    axs[3, j].set_title(diff_title)
-                    axs[3, j].axis('off')
-                
-                # Přidat popisky řad
-                axs[0, 0].set_ylabel('Původní ADC')
-                axs[1, 0].set_ylabel('Léze')
-                axs[2, 0].set_ylabel('Zdravý mozek')
-                axs[3, 0].set_ylabel('Změny')
-                
-                # Celkový titulek
-                if title:
-                    plt.suptitle(f"{title}\n{stats_text}")
-                else:
-                    plt.suptitle(stats_text)
-                    
-                plt.tight_layout()
                 pdf.savefig(fig, dpi=150)
                 plt.close()
         
@@ -1669,14 +1490,18 @@ def create_and_visualize_healthy_brain(adc_file, label_file, adc_mean_atlas_path
         try:
             print("### DEBUG: Creating visualization")
             # Omezit počet řezů pro vizualizaci
-            max_slices = 8  # Maximální počet řezů pro přehlednost
+            max_slices = 6  # Maximální počet řezů pro přehlednost
             if len(lesion_slices) > max_slices:
                 # Vybrat rovnoměrně rozložené řezy
                 indices = np.round(np.linspace(0, len(lesion_slices) - 1, max_slices)).astype(int)
                 lesion_slices = [lesion_slices[i] for i in indices]
                 print(f"### DEBUG: Limited visualization to {max_slices} slices: {lesion_slices}")
             
-            n_rows = 4  # 4 řádky (orig, label, healthy, diff)
+            # Počet řádků a sloupců závisí na dostupnosti metod
+            n_rows = 4  # 4 řádky pro plynulou metodu
+            if atlas_healthy_brain is not None:
+                n_rows = 5  # Přidat řádek pro atlasovou metodu
+            
             n_cols = len(lesion_slices)
             
             fig, axs = plt.subplots(n_rows, n_cols, figsize=(n_cols * 3, n_rows * 3))
@@ -1697,7 +1522,7 @@ def create_and_visualize_healthy_brain(adc_file, label_file, adc_mean_atlas_path
                 axs[1, j].set_title(f'Léze')
                 axs[1, j].axis('off')
                 
-                # Zdravý mozek
+                # Zdravý mozek - plynulá metoda
                 axs[2, j].imshow(healthy_brain[slice_idx], cmap='gray')
                 axs[2, j].set_title(f'Zdravý mozek')
                 axs[2, j].axis('off')
@@ -1728,12 +1553,20 @@ def create_and_visualize_healthy_brain(adc_file, label_file, adc_mean_atlas_path
                 axs[3, j].imshow(diff_healthy, cmap='hot', vmin=0, vmax=np.max(diff_healthy) if np.max(diff_healthy) > 0 else 1)
                 axs[3, j].set_title(diff_title)
                 axs[3, j].axis('off')
+                
+                # Pokud máme atlas, přidáme i jeho výsledek
+                if atlas_healthy_brain is not None:
+                    axs[4, j].imshow(atlas_healthy_brain[slice_idx], cmap='gray')
+                    axs[4, j].set_title(f'Zdravý mozek (atlas)')
+                    axs[4, j].axis('off')
             
             # Přidat popisky řad
             axs[0, 0].set_ylabel('Původní ADC')
             axs[1, 0].set_ylabel('Léze')
-            axs[2, 0].set_ylabel('Zdravý mozek')
-            axs[3, 0].set_ylabel('Změny')
+            axs[2, 0].set_ylabel('Zdravý mozek\n(plynulá metoda)')
+            axs[3, 0].set_ylabel('Mapa změn')
+            if atlas_healthy_brain is not None:
+                axs[4, 0].set_ylabel('Zdravý mozek\n(atlas)')
             
             # Celkový titulek
             plt.suptitle(f"Vizualizace vytvoření zdravého mozku\n{stats_text}")
@@ -2035,98 +1868,134 @@ def fix_registration_holes_standalone(registered_atlas, subject_array):
         traceback.print_exc()
         return registered_atlas  # Vrátit původní atlas, pokud oprava selže
 
+# Nová funkce pro plynulou úpravu hodnot v oblasti léze
+def create_smooth_healthy_brain(adc_array, label_array, dilation_radius=3, smoothing_iterations=5):
+    """
+    Creates a realistic healthy brain by smoothly inpainting lesion areas.
+    
+    This function replaces lesion areas with values that smoothly transition from the
+    surrounding healthy tissue, creating a more realistic appearance than simple
+    average-based replacement.
+    
+    Args:
+        adc_array (np.ndarray): The original ADC map
+        label_array (np.ndarray): Binary mask indicating lesion areas (1 = lesion)
+        dilation_radius (int): Radius for dilating the lesion mask to find boundary
+        smoothing_iterations (int): Number of smoothing iterations to apply
+        
+    Returns:
+        np.ndarray: A "healthy" version of the ADC map with lesions smoothly inpainted
+    """
+    # Make a copy of the original array to avoid modifying it
+    healthy_brain = adc_array.copy()
+    
+    # Only proceed if there are lesions
+    if not np.any(label_array):
+        return healthy_brain
+    
+    try:
+        # Create a dilated mask to find the boundary
+        dilated_mask = binary_dilation(label_array, iterations=dilation_radius)
+        
+        # Create a boundary mask (dilated area excluding the original lesion)
+        boundary_mask = dilated_mask & np.logical_not(label_array)
+        
+        # If no boundary was found, use a simple approach
+        if not np.any(boundary_mask):
+            print("Warning: No boundary found after dilation. Using fallback method.")
+            healthy_tissue_value = np.mean(adc_array[np.logical_not(label_array)])
+            healthy_brain[label_array] = healthy_tissue_value
+            return healthy_brain
+        
+        # Calculate average value in the boundary region
+        boundary_values = adc_array[boundary_mask]
+        boundary_mean = np.mean(boundary_values)
+        
+        # Initialize the lesion area with the boundary mean value
+        healthy_brain[label_array] = boundary_mean
+        
+        # Create a smoothed version by applying multiple iterations of Gaussian filtering
+        # but only inside and around the lesion
+        combined_mask = binary_dilation(label_array, iterations=dilation_radius + 2)
+        
+        # Apply iterative smoothing within the extended mask
+        for _ in range(smoothing_iterations):
+            # Create a temporary copy for this iteration
+            temp_brain = healthy_brain.copy()
+            
+            # Apply Gaussian filter to the entire brain
+            smoothed = gaussian_filter(temp_brain, sigma=1.0)
+            
+            # Replace only the lesion and nearby areas with smoothed values
+            healthy_brain[combined_mask] = smoothed[combined_mask]
+        
+        # Make a final pass to ensure values are within a reasonable range
+        # Calculate stats of healthy tissue for reference
+        healthy_mean = np.mean(adc_array[np.logical_not(label_array)])
+        healthy_std = np.std(adc_array[np.logical_not(label_array)])
+        
+        # Limit values to within 2.5 standard deviations of the healthy mean
+        min_value = healthy_mean - 2.5 * healthy_std
+        max_value = healthy_mean + 2.5 * healthy_std
+        
+        # Apply limits only to the inpainted region
+        healthy_brain[label_array] = np.clip(healthy_brain[label_array], min_value, max_value)
+        
+        return healthy_brain
+    
+    except Exception as e:
+        print(f"Error in smooth inpainting: {str(e)}")
+        # Fallback to simple replacement method
+        try:
+            healthy_tissue_value = np.mean(adc_array[np.logical_not(label_array)])
+            healthy_brain[label_array] = healthy_tissue_value
+        except:
+            print("Critical error in inpainting fallback, returning original array")
+            return adc_array
+        
+    return healthy_brain
+
 
 if __name__ == "__main__":
-    import argparse
+    parser = argparse.ArgumentParser(description="Lesion Inpainting GAN")
+    subparsers = parser.add_subparsers(dest="command")
     
-    # Vytvoříme hlavní parser pro příkazovou řádku
-    parser = argparse.ArgumentParser(description='HIE Lesion Inpainting GAN')
+    # Training parser
+    train_parser = subparsers.add_parser("train", help="Train the model")
+    train_parser.add_argument("--adc_dir", required=True, help="Directory containing ADC maps")
+    train_parser.add_argument("--label_dir", required=True, help="Directory containing lesion labels")
+    train_parser.add_argument("--synthetic_lesions_dir", required=True, help="Directory containing synthetic lesions")
+    train_parser.add_argument("--output_dir", required=True, help="Directory to save model checkpoints and results")
+    train_parser.add_argument("--adc_mean_atlas_path", help="Path to ADC mean atlas")
+    train_parser.add_argument("--adc_std_atlas_path", help="Path to ADC standard deviation atlas")
+    train_parser.add_argument("--num_epochs", type=int, default=200, help="Number of training epochs")
+    train_parser.add_argument("--batch_size", type=int, default=4, help="Batch size for training")
+    train_parser.add_argument("--dilation_radius", type=int, default=3, help="Radius for dilating lesion masks")
+    train_parser.add_argument("--smoothing_iterations", type=int, default=5, help="Number of iterations for smoothing")
     
-    # Vytvoříme podparsery pro různé příkazy (train, generate)
-    subparsers = parser.add_subparsers(dest='command', help='Command to run')
+    # Inference parser
+    infer_parser = subparsers.add_parser("infer", help="Apply trained model for inference")
+    infer_parser.add_argument("--checkpoint", required=True, help="Path to model checkpoint")
+    infer_parser.add_argument("--adc_file", required=True, help="Path to ADC file")
+    infer_parser.add_argument("--synthetic_lesion_file", required=True, help="Path to synthetic lesion file")
+    infer_parser.add_argument("--output_file", required=True, help="Path to output file")
     
-    # Parser pro příkaz "train"
-    train_parser = subparsers.add_parser('train', help='Train the HIE lesion inpainting GAN model')
-    train_parser.add_argument('--adc_dir', type=str, default="data/BONBID2023_Train/2Z_ADC",
-                       help='Directory containing ADC maps')
-    train_parser.add_argument('--label_dir', type=str, default="data/BONBID2023_Train/3LABEL",
-                       help='Directory containing lesion label masks')
-    train_parser.add_argument('--synthetic_lesions_dir', type=str, default="data/registered_lesions",
-                       help='Directory containing synthetic lesions')
-    train_parser.add_argument('--output_dir', type=str, default="output/lesion_inpainting",
-                       help='Directory to save model checkpoints and results')
-    train_parser.add_argument('--adc_mean_atlas_path', type=str, default=None,
-                       help='Path to the mean ADC atlas for healthy brain approximation')
-    train_parser.add_argument('--adc_std_atlas_path', type=str, default=None,
-                       help='Path to the standard deviation ADC atlas')
-    train_parser.add_argument('--num_epochs', type=int, default=200,
-                       help='Number of epochs to train')
-    train_parser.add_argument('--batch_size', type=int, default=4,
-                       help='Batch size for training')
-    train_parser.add_argument('--save_interval', type=int, default=5,
-                       help='Interval (in epochs) for saving model checkpoints')
-    train_parser.add_argument('--test_patient', type=str, default="MGHNICU_445-VISIT_01",
-                       help='Patient ID to use for test inference after training')
-    train_parser.add_argument('--test_lesion', type=str, default="registered_lesion_sample33.mha",
-                       help='Synthetic lesion file to use for test inference')
-    train_parser.add_argument('--device', type=str, default=None,
-                       help='Device to use for training (cuda or cpu). Uses cuda if available by default.')
-    train_parser.add_argument('--visualize_healthy_brain', action='store_true',
-                       help='Generate detailed visualizations of healthy brain creation process')
-    
-    # Parser pro příkaz "generate"
-    generate_parser = subparsers.add_parser('generate', help='Generate inpainted brain images using a trained model')
-    generate_parser.add_argument('--model_path', type=str, required=True,
-                       help='Path to trained model checkpoint (.pt file)')
-    generate_parser.add_argument('--adc_file', type=str, required=True,
-                       help='Path to ADC MHA file to inpaint')
-    generate_parser.add_argument('--lesion_file', type=str, required=True,
-                       help='Path to synthetic lesion mask MHA file')
-    generate_parser.add_argument('--output_file', type=str, required=True,
-                       help='Path where to save output inpainted MHA file')
-    generate_parser.add_argument('--device', type=str, default=None,
-                       help='Device to use for inference (cuda or cpu). Uses cuda if available by default.')
-    
-    # Také přidám novou komandu pro samostatnou vizualizaci
-    visualize_parser = subparsers.add_parser('visualize_healthy_brain', help='Visualize the process of creating healthy brain from ADC map using atlas')
-    visualize_parser.add_argument('--adc_file', type=str, required=True,
-                       help='Path to ADC MHA file (with lesion)')
-    visualize_parser.add_argument('--label_file', type=str, required=True,
-                       help='Path to lesion mask MHA file')
-    visualize_parser.add_argument('--adc_mean_atlas_path', type=str, required=True,
-                       help='Path to the mean ADC atlas')
-    visualize_parser.add_argument('--adc_std_atlas_path', type=str, default=None,
-                       help='Path to the standard deviation ADC atlas')
-    visualize_parser.add_argument('--output_file', type=str, required=True,
-                       help='Path where to save visualization')
-    
-    # Zpracujeme argumenty
     args = parser.parse_args()
     
-    # Zpracování příkazu "train"
-    if args.command == 'train':
-        print(f"Starting training with the following parameters:")
-        print(f"ADC directory: {args.adc_dir}")
-        print(f"Label directory: {args.label_dir}")
-        print(f"Synthetic lesions directory: {args.synthetic_lesions_dir}")
-        print(f"Output directory: {args.output_dir}")
+    if args.command == "train":
+        print(f"Training with the following parameters:")
+        print(f"  ADC directory: {args.adc_dir}")
+        print(f"  Label directory: {args.label_dir}")
+        print(f"  Synthetic lesions directory: {args.synthetic_lesions_dir}")
+        print(f"  Output directory: {args.output_dir}")
+        print(f"  ADC mean atlas path: {args.adc_mean_atlas_path}")
+        print(f"  ADC std atlas path: {args.adc_std_atlas_path}")
+        print(f"  Number of epochs: {args.num_epochs}")
+        print(f"  Batch size: {args.batch_size}")
+        print(f"  Dilation radius: {args.dilation_radius}")
+        print(f"  Smoothing iterations: {args.smoothing_iterations}")
         
-        if args.adc_mean_atlas_path:
-            print(f"ADC mean atlas: {args.adc_mean_atlas_path}")
-        else:
-            print("No ADC mean atlas provided, will use interpolation")
-            
-        if args.adc_std_atlas_path:
-            print(f"ADC std atlas: {args.adc_std_atlas_path}")
-        else:
-            print("No ADC std atlas provided")
-            
-        print(f"Number of epochs: {args.num_epochs}")
-        print(f"Batch size: {args.batch_size}")
-        print(f"Save interval: Every {args.save_interval} epochs")
-        
-        # Trénujeme model s argumenty z příkazové řádky
-        gan_model = train(
+        train(
             adc_dir=args.adc_dir,
             label_dir=args.label_dir,
             synthetic_lesions_dir=args.synthetic_lesions_dir,
@@ -2135,50 +2004,21 @@ if __name__ == "__main__":
             adc_std_atlas_path=args.adc_std_atlas_path,
             num_epochs=args.num_epochs,
             batch_size=args.batch_size,
-            save_interval=args.save_interval
+            dilation_radius=args.dilation_radius,
+            smoothing_iterations=args.smoothing_iterations
         )
+    elif args.command == "infer":
+        print(f"Inference with the following parameters:")
+        print(f"  Checkpoint: {args.checkpoint}")
+        print(f"  ADC file: {args.adc_file}")
+        print(f"  Synthetic lesion file: {args.synthetic_lesion_file}")
+        print(f"  Output file: {args.output_file}")
         
-        print(f"Training completed. Running inference on test patient {args.test_patient}")
-        
-        # Provádění inference s natrénovaným modelem na testovacím pacientovi
-        adc_file = os.path.join(args.adc_dir, f"Zmap_{args.test_patient}-ADC_smooth2mm_clipped10.mha")
-        synthetic_lesion_file = os.path.join(args.synthetic_lesions_dir, args.test_patient, args.test_lesion)
-        output_file = os.path.join(args.output_dir, f"{args.test_patient}_inpainted.mha")
-        
-        apply_inpainting(gan_model, adc_file, synthetic_lesion_file, output_file)
-        print(f"Inference completed. Output saved to {output_file}")
-    
-    # Zpracování příkazu "generate"
-    elif args.command == 'generate':
-        print(f"Running inference with the following parameters:")
-        print(f"Model checkpoint: {args.model_path}")
-        print(f"ADC file: {args.adc_file}")
-        print(f"Synthetic lesion file: {args.lesion_file}")
-        print(f"Output file: {args.output_file}")
-        
-        # Inicializace modelu
-        device = args.device
-        model = LesionInpaintingGAN(device=device)
-        
-        # Načtení modelu z checkpointu
-        print(f"Loading model from checkpoint: {args.model_path}")
-        epoch = model.load_models(args.model_path)
-        print(f"Loaded model from epoch {epoch}")
-        
-        # Inference - aplikace inpainting
-        print(f"Running inference...")
-        apply_inpainting(model, args.adc_file, args.lesion_file, args.output_file)
-        print(f"Inference completed. Output saved to {args.output_file}")
-    
-    # Zpracování příkazu "visualize_healthy_brain"
-    elif args.command == 'visualize_healthy_brain':
-        print(f"Visualizing healthy brain creation process for:")
-        print(f"ADC file: {args.adc_file}")
-        print(f"Lesion mask file: {args.label_file}")
-        print(f"Output file: {args.output_file}")
-        
-        # Vytvoření a vizualizace zdravého mozku
-        create_and_visualize_healthy_brain(args.adc_file, args.label_file, args.adc_mean_atlas_path, args.adc_std_atlas_path, args.output_file)
-    
+        apply_inpainting(
+            checkpoint_path=args.checkpoint,
+            adc_file=args.adc_file,
+            synthetic_lesion_file=args.synthetic_lesion_file,
+            output_file=args.output_file
+        )
     else:
         parser.print_help()
