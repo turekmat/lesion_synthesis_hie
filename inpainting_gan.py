@@ -14,6 +14,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 import matplotlib.pyplot as plt
 import argparse
 from torchvision.utils import make_grid
+from matplotlib.backends.backend_pdf import PdfPages
 
 
 class LesionInpaintingDataset(Dataset):
@@ -21,63 +22,92 @@ class LesionInpaintingDataset(Dataset):
     Dataset for HIE lesion inpainting.
     
     It pairs:
-    1. ADC maps without lesions in a specific area (truly healthy brain)
+    1. ADC maps without lesions in a specific area (truly healthy brain created using atlas)
     2. Binary masks for synthetic lesions (where to place new lesions)
     3. Ground truth ADC maps with real lesions (for learning what lesions look like)
     """
     def __init__(self, 
-                 zadc_dir,
+                 adc_dir,
                  label_dir, 
                  synthetic_lesions_dir,
+                 adc_mean_atlas_path=None,
+                 adc_std_atlas_path=None,
                  patch_size=(96, 96, 96),
                  mode='train',
                  transform=None):
         """
         Args:
-            zadc_dir: Directory with ZADC maps
+            adc_dir: Directory with ADC maps
             label_dir: Directory with lesion masks
             synthetic_lesions_dir: Directory with synthetic lesions
+            adc_mean_atlas_path: Path to the mean ADC atlas (for healthy brain approximation)
+            adc_std_atlas_path: Path to the standard deviation ADC atlas
             patch_size: Size of the patches to extract
             mode: 'train' or 'val'
             transform: Optional transform to be applied on a sample
         """
-        self.zadc_dir = zadc_dir
+        self.adc_dir = adc_dir
         self.label_dir = label_dir
         self.synthetic_lesions_dir = synthetic_lesions_dir
+        self.adc_mean_atlas_path = adc_mean_atlas_path
+        self.adc_std_atlas_path = adc_std_atlas_path
         self.patch_size = patch_size
         self.mode = mode
         self.transform = transform
         
+        # Load ADC atlases if provided
+        self.has_atlas = False
+        if adc_mean_atlas_path and os.path.exists(adc_mean_atlas_path):
+            print(f"Loading ADC mean atlas from: {adc_mean_atlas_path}")
+            self.adc_mean_atlas = sitk.ReadImage(adc_mean_atlas_path)
+            self.adc_mean_atlas_array = sitk.GetArrayFromImage(self.adc_mean_atlas)
+            
+            if adc_std_atlas_path and os.path.exists(adc_std_atlas_path):
+                print(f"Loading ADC standard deviation atlas from: {adc_std_atlas_path}")
+                self.adc_std_atlas = sitk.ReadImage(adc_std_atlas_path)
+                self.adc_std_atlas_array = sitk.GetArrayFromImage(self.adc_std_atlas)
+                self.has_atlas = True
+            else:
+                print("WARNING: ADC standard deviation atlas not provided or not found.")
+                self.adc_std_atlas = None
+                self.adc_std_atlas_array = None
+        else:
+            print("WARNING: ADC mean atlas not provided or not found. Will use simple interpolation method.")
+            self.adc_mean_atlas = None
+            self.adc_mean_atlas_array = None
+            self.adc_std_atlas = None
+            self.adc_std_atlas_array = None
+        
         # Debugging info
         print(f"\n----- Dataset Initialization ({mode}) -----")
-        print(f"ZADC directory: {zadc_dir}")
+        print(f"ADC directory: {adc_dir}")
         print(f"Label directory: {label_dir}")
         print(f"Synthetic lesions directory: {synthetic_lesions_dir}")
         
         # Verify directories exist
-        if not os.path.exists(zadc_dir):
-            print(f"WARNING: ZADC directory {zadc_dir} does not exist!")
+        if not os.path.exists(adc_dir):
+            print(f"WARNING: ADC directory {adc_dir} does not exist!")
         if not os.path.exists(label_dir):
             print(f"WARNING: Label directory {label_dir} does not exist!")
         if not os.path.exists(synthetic_lesions_dir):
             print(f"WARNING: Synthetic lesions directory {synthetic_lesions_dir} does not exist!")
         
-        # Get all ZADC files
-        self.zadc_files = sorted(glob.glob(os.path.join(zadc_dir, "*.mha")))
-        print(f"Found {len(self.zadc_files)} ZADC files")
+        # Get all ADC files
+        self.adc_files = sorted(glob.glob(os.path.join(adc_dir, "*.mha")))
+        print(f"Found {len(self.adc_files)} ADC files")
         
-        if len(self.zadc_files) == 0:
-            print(f"Contents of ZADC directory: {os.listdir(zadc_dir) if os.path.exists(zadc_dir) else 'Directory not found'}")
+        if len(self.adc_files) == 0:
+            print(f"Contents of ADC directory: {os.listdir(adc_dir) if os.path.exists(adc_dir) else 'Directory not found'}")
         
         # Filter for patients with corresponding synthetic lesions
         valid_patients = []
-        for zadc_file in self.zadc_files:
+        for adc_file in self.adc_files:
             # Extract base filename
-            base_filename = os.path.basename(zadc_file)
+            base_filename = os.path.basename(adc_file)
             
-            # Check if the filename starts with "Zmap_" and remove it
+            # Check if the filename starts with prefixes and remove them
             if base_filename.startswith("Zmap_"):
-                # Remove "Zmap_" prefix
+                # Remove prefix for ZADC files
                 base_without_prefix = base_filename[5:]  # Skip the first 5 characters "Zmap_"
             else:
                 base_without_prefix = base_filename
@@ -100,9 +130,9 @@ class LesionInpaintingDataset(Dataset):
         print(f"Found {len(self.valid_patients)} valid patients with synthetic lesions")
         
         if len(self.valid_patients) == 0:
-            # Print the first few ZADC filenames to help diagnose the issue
-            if len(self.zadc_files) > 0:
-                print(f"Sample ZADC files (first 5):")
+            # Print the first few ADC filenames to help diagnose the issue
+            if len(self.adc_files) > 0:
+                print(f"Sample ADC files (first 5):")
             
             print(f"Contents of synthetic lesions dir: {os.listdir(synthetic_lesions_dir) if os.path.exists(synthetic_lesions_dir) else 'Directory not found'}")
         
@@ -119,14 +149,14 @@ class LesionInpaintingDataset(Dataset):
         for patient in self.patients:
             print(f"\nProcessing patient: {patient}")
             
-            # Check for ZADC files (format: Zmap_MGHNICU_xxx-VISIT_xx-ADC_smooth2mm_clipped10.mha)
-            zadc_pattern = os.path.join(zadc_dir, f"Zmap_{patient}*.mha")
-            zadc_files = glob.glob(zadc_pattern)
-            if not zadc_files:
-                print(f"WARNING: No ZADC files found for pattern: {zadc_pattern}")
+            # Check for ADC files 
+            adc_pattern = os.path.join(adc_dir, f"*{patient}*.mha")
+            adc_files = glob.glob(adc_pattern)
+            if not adc_files:
+                print(f"WARNING: No ADC files found for pattern: {adc_pattern}")
                 continue
-            zadc_file = zadc_files[0]
-            print(f"Found ZADC file: {os.path.basename(zadc_file)}")
+            adc_file = adc_files[0]
+            print(f"Found ADC file: {os.path.basename(adc_file)}")
             
             # Check for label files (format: MGHNICU_xxx-VISIT_xx_lesion.mha)
             label_pattern = os.path.join(label_dir, f"{patient}_lesion.mha")
@@ -157,7 +187,7 @@ class LesionInpaintingDataset(Dataset):
             # Create sample pairs
             for syn_lesion in synthetic_lesions:
                 self.samples.append({
-                    'zadc': zadc_file,
+                    'adc': adc_file,
                     'label': label_file,
                     'synthetic_lesion': syn_lesion
                 })
@@ -170,15 +200,84 @@ class LesionInpaintingDataset(Dataset):
         
         print(f"----- End Dataset Initialization ({mode}) -----\n")
     
+    def register_atlas_to_subject(self, subject_img, subject_array, label_array):
+        """
+        Register the ADC atlas to the subject's brain, avoiding the lesion area.
+        
+        Args:
+            subject_img: SimpleITK image of the subject's brain
+            subject_array: Numpy array of the subject's brain
+            label_array: Lesion mask array
+            
+        Returns:
+            registered_atlas_array: Registered atlas as numpy array
+            registered_std_atlas_array: Registered standard deviation atlas as numpy array
+        """
+        # If no atlas is available, return None
+        if not self.has_atlas:
+            return None, None
+            
+        try:
+            from SimpleITK.SimpleITK import CenteredTransformInitializerFilter, ImageRegistrationMethod
+            from SimpleITK.SimpleITK import SimilarityTransform, Euler3DTransform, Similarity3DTransform
+            
+            # Create mask to exclude lesion area from registration
+            mask = sitk.GetImageFromArray((label_array == 0).astype(np.uint8))
+            mask.CopyInformation(subject_img)
+            
+            # Initialize registration method
+            registration_method = ImageRegistrationMethod()
+            
+            # Use normalized correlation as the similarity metric
+            registration_method.SetMetricAsCorrelation()
+            
+            # Use mask to exclude lesion area
+            registration_method.SetMetricMovingMask(mask)
+            
+            # Set optimizer
+            registration_method.SetOptimizerAsGradientDescent(learningRate=0.1, 
+                                                              numberOfIterations=100)
+            
+            # Set initial transformation as center-aligned
+            initial_transform = Similarity3DTransform()
+            center_init = CenteredTransformInitializerFilter()
+            initial_transform = center_init.Execute(subject_img, self.adc_mean_atlas, initial_transform)
+            
+            # Run registration
+            registration_transform = registration_method.Execute(subject_img, self.adc_mean_atlas, initial_transform)
+            
+            # Apply transform to atlas
+            registered_mean_atlas = sitk.Resample(self.adc_mean_atlas, subject_img, registration_transform, 
+                                             sitk.sitkLinear, 0.0, self.adc_mean_atlas.GetPixelID())
+            
+            # Apply same transform to std atlas if available
+            if self.adc_std_atlas is not None:
+                registered_std_atlas = sitk.Resample(self.adc_std_atlas, subject_img, registration_transform, 
+                                               sitk.sitkLinear, 0.0, self.adc_std_atlas.GetPixelID())
+                registered_std_atlas_array = sitk.GetArrayFromImage(registered_std_atlas)
+            else:
+                registered_std_atlas_array = None
+                
+            registered_atlas_array = sitk.GetArrayFromImage(registered_mean_atlas)
+            
+            print("Successfully registered atlas to subject")
+            return registered_atlas_array, registered_std_atlas_array
+            
+        except Exception as e:
+            print(f"Error registering atlas to subject: {e}")
+            print("Using unregistered atlas as fallback")
+            # If registration fails, use the unregistered atlas (better than nothing)
+            return self.adc_mean_atlas_array, self.adc_std_atlas_array
+    
     def __len__(self):
         return len(self.samples)
     
     def __getitem__(self, idx):
         sample = self.samples[idx]
         
-        # Load ZADC map (may contain real lesions)
-        zadc_img = sitk.ReadImage(sample['zadc'])
-        zadc_array = sitk.GetArrayFromImage(zadc_img)
+        # Load ADC map (may contain real lesions)
+        adc_img = sitk.ReadImage(sample['adc'])
+        adc_array = sitk.GetArrayFromImage(adc_img)
         
         # Load original lesion mask (real lesions)
         label_img = sitk.ReadImage(sample['label'])
@@ -188,39 +287,152 @@ class LesionInpaintingDataset(Dataset):
         syn_lesion_img = sitk.ReadImage(sample['synthetic_lesion'])
         syn_lesion_array = sitk.GetArrayFromImage(syn_lesion_img)
         
-        # Normalize ZADC to [0, 1]
-        zadc_array = (zadc_array - zadc_array.min()) / (zadc_array.max() - zadc_array.min() + 1e-8)
+        # Normalize ADC to [0, 1] for processing
+        adc_min = adc_array.min()
+        adc_max = adc_array.max()
+        adc_array_norm = (adc_array - adc_min) / (adc_max - adc_min + 1e-8)
         
         # Convert label and synthetic lesion to binary
         label_array = (label_array > 0).astype(np.float32)
         syn_lesion_array = (syn_lesion_array > 0).astype(np.float32)
         
-        # Create truly healthy brain by removing existing lesions
-        # This is a critical step: we replace lesion areas with estimated healthy tissue values
-        healthy_brain = zadc_array.copy()
+        # Create truly healthy brain by removing existing lesions using atlas or interpolation
+        healthy_brain = adc_array_norm.copy()
         
         # Find non-zero regions in the original lesion mask (existing lesions)
         real_lesion_indices = np.where(label_array > 0)
         
         if len(real_lesion_indices[0]) > 0:
-            # Calculate average intensity of surrounding non-lesion tissue
-            # First, dilate the lesion mask to create a border region
-            from scipy import ndimage
-            dilated_mask = ndimage.binary_dilation(label_array, iterations=2)
-            border_mask = dilated_mask & np.logical_not(label_array)
-            
-            # Get average intensity value in the border region
-            if np.any(border_mask):
-                border_values = zadc_array[border_mask]
-                healthy_tissue_value = np.mean(zadc_array[np.logical_not(label_array)])
+            if self.has_atlas:
+                # Use atlas-based approach for creating healthy brain
+                print("Using atlas to create healthy brain")
+                registered_atlas, registered_std_atlas = self.register_atlas_to_subject(adc_img, adc_array_norm, label_array)
+                
+                if registered_atlas is not None:
+                    # Normalize atlas to same range as our data [0, 1]
+                    atlas_min = registered_atlas.min()
+                    atlas_max = registered_atlas.max()
+                    registered_atlas_norm = (registered_atlas - atlas_min) / (atlas_max - atlas_min + 1e-8)
+                    
+                    # Calculate scaling factor to match adjacent tissue intensities
+                    # Create dilated mask for getting nearby values
+                    from scipy import ndimage
+                    dilated_mask = ndimage.binary_dilation(label_array, iterations=2)
+                    border_mask = dilated_mask & np.logical_not(label_array)
+                    
+                    if np.any(border_mask):
+                        # Get the scaling factor from the border region
+                        original_border_values = adc_array_norm[border_mask]
+                        atlas_border_values = registered_atlas_norm[border_mask]
+                        
+                        # Compute median ratio to be robust to outliers
+                        scaling_factor = np.median(original_border_values) / np.median(atlas_border_values)
+                        
+                        # Apply atlas values scaled by the factor to the lesion area
+                        healthy_brain[label_array > 0] = registered_atlas_norm[label_array > 0] * scaling_factor
+                        
+                        # Add some random variation based on std atlas if available
+                        if registered_std_atlas is not None:
+                            # Scale the std values appropriately
+                            std_norm = (registered_std_atlas - registered_std_atlas.min()) / (registered_std_atlas.max() - registered_std_atlas.min() + 1e-8)
+                            std_scaled = std_norm * scaling_factor * 0.3  # Reduce variation to 30%
+                            
+                            # Apply random variation within lesion
+                            rng = np.random.RandomState(idx)  # Use sample idx as seed for reproducibility
+                            random_variation = rng.normal(0, std_scaled[label_array > 0])
+                            healthy_brain[label_array > 0] += random_variation
+                            
+                            # Ensure values stay in valid range
+                            healthy_brain = np.clip(healthy_brain, 0, 1)
+                        
+                        print(f"Created atlas-based healthy brain. Scaling factor: {scaling_factor:.4f}")
+                        
+                        # Přidáno: Vytvořit vizualizaci zdravého mozku (pouze u každého 10. vzorku)
+                        if idx % 10 == 0:
+                            # Vytvoření cesty pro uložení vizualizace
+                            import os
+                            viz_dir = os.path.join(os.path.dirname(sample['adc']), '../healthy_brain_viz')
+                            os.makedirs(viz_dir, exist_ok=True)
+                            
+                            # Extrahovat ID pacienta ze vzorku
+                            patient_id = os.path.basename(sample['adc']).split('.')[0]
+                            viz_path = os.path.join(viz_dir, f"{patient_id}_sample_{idx}_healthy_brain_atlas.png")
+                            
+                            # Vytvořit vizualizaci
+                            visualize_healthy_brain_creation(
+                                adc_array_norm, 
+                                label_array, 
+                                healthy_brain,
+                                viz_path,
+                                title=f"Vytvoření zdravého mozku pomocí atlasu (ID: {patient_id}, vzorek: {idx})"
+                            )
+                    else:
+                        print("No border region found. Falling back to interpolation.")
+                        # Fall back to interpolation method
+                        from scipy import ndimage
+                        healthy_brain[label_array > 0] = ndimage.median_filter(adc_array_norm, size=5)[label_array > 0]
+                        
+                        # Přidáno: Vytvořit vizualizaci interpolovaného zdravého mozku (pouze u každého 10. vzorku)
+                        if idx % 10 == 0:
+                            # Vytvoření cesty pro uložení vizualizace
+                            import os
+                            viz_dir = os.path.join(os.path.dirname(sample['adc']), '../healthy_brain_viz')
+                            os.makedirs(viz_dir, exist_ok=True)
+                            
+                            # Extrahovat ID pacienta ze vzorku
+                            patient_id = os.path.basename(sample['adc']).split('.')[0]
+                            viz_path = os.path.join(viz_dir, f"{patient_id}_sample_{idx}_healthy_brain_interpolation.png")
+                            
+                            # Vytvořit vizualizaci
+                            visualize_healthy_brain_creation(
+                                adc_array_norm, 
+                                label_array, 
+                                healthy_brain,
+                                viz_path,
+                                title=f"Vytvoření zdravého mozku pomocí interpolace (ID: {patient_id}, vzorek: {idx})"
+                            )
+                else:
+                    print("Atlas registration failed. Using interpolation instead.")
+                    # Fall back to interpolation if atlas registration failed
+                    from scipy import ndimage
+                    healthy_brain[label_array > 0] = ndimage.median_filter(adc_array_norm, size=5)[label_array > 0]
             else:
-                # Fallback - use global average of non-lesion areas
-                healthy_tissue_value = np.mean(zadc_array[np.logical_not(label_array)])
-            
-            # Replace lesion areas with healthy tissue values
-            healthy_brain[label_array > 0] = healthy_tissue_value
-            
-            print(f"Removed real lesions from input brain. Avg healthy value: {healthy_tissue_value:.4f}")
+                # Use interpolation-based approach (more sophisticated than just average)
+                print("Using interpolation to create healthy brain")
+                from scipy import ndimage
+                
+                # First create a temporary copy where lesion area is NaN
+                temp_array = adc_array_norm.copy()
+                temp_array[label_array > 0] = np.nan
+                
+                # Use median filter to fill NaN areas with interpolated values
+                # This is better than simple average as it preserves edges
+                filled_array = ndimage.median_filter(np.nan_to_num(temp_array), size=5)
+                
+                # Only copy the interpolated values into the lesion area
+                healthy_brain[label_array > 0] = filled_array[label_array > 0]
+                
+                print("Created interpolation-based healthy brain")
+                
+                # Přidáno: Vytvořit vizualizaci interpolovaného zdravého mozku (pouze u každého 10. vzorku)
+                if idx % 10 == 0:
+                    # Vytvoření cesty pro uložení vizualizace
+                    import os
+                    viz_dir = os.path.join(os.path.dirname(sample['adc']), '../healthy_brain_viz')
+                    os.makedirs(viz_dir, exist_ok=True)
+                    
+                    # Extrahovat ID pacienta ze vzorku
+                    patient_id = os.path.basename(sample['adc']).split('.')[0]
+                    viz_path = os.path.join(viz_dir, f"{patient_id}_sample_{idx}_healthy_brain_interpolation.png")
+                    
+                    # Vytvořit vizualizaci
+                    visualize_healthy_brain_creation(
+                        adc_array_norm, 
+                        label_array, 
+                        healthy_brain,
+                        viz_path,
+                        title=f"Vytvoření zdravého mozku pomocí interpolace (ID: {patient_id}, vzorek: {idx})"
+                    )
         
         # Find non-zero region in the synthetic lesion
         z_indices, y_indices, x_indices = np.where(syn_lesion_array > 0)
@@ -236,29 +448,29 @@ class LesionInpaintingDataset(Dataset):
             y_start = max(0, center_y - self.patch_size[1] // 2)
             x_start = max(0, center_x - self.patch_size[2] // 2)
             
-            z_end = min(zadc_array.shape[0], z_start + self.patch_size[0])
-            y_end = min(zadc_array.shape[1], y_start + self.patch_size[1])
-            x_end = min(zadc_array.shape[2], x_start + self.patch_size[2])
+            z_end = min(adc_array_norm.shape[0], z_start + self.patch_size[0])
+            y_end = min(adc_array_norm.shape[1], y_start + self.patch_size[1])
+            x_end = min(adc_array_norm.shape[2], x_start + self.patch_size[2])
             
             # Extract patches
-            zadc_patch = zadc_array[z_start:z_end, y_start:y_end, x_start:x_end]
+            adc_patch = adc_array_norm[z_start:z_end, y_start:y_end, x_start:x_end]
             healthy_patch = healthy_brain[z_start:z_end, y_start:y_end, x_start:x_end]  # Now truly healthy
             label_patch = label_array[z_start:z_end, y_start:y_end, x_start:x_end]
             syn_lesion_patch = syn_lesion_array[z_start:z_end, y_start:y_end, x_start:x_end]
             
             # Pad if necessary to match patch_size
-            z_pad = max(0, self.patch_size[0] - zadc_patch.shape[0])
-            y_pad = max(0, self.patch_size[1] - zadc_patch.shape[1])
-            x_pad = max(0, self.patch_size[2] - zadc_patch.shape[2])
+            z_pad = max(0, self.patch_size[0] - adc_patch.shape[0])
+            y_pad = max(0, self.patch_size[1] - adc_patch.shape[1])
+            x_pad = max(0, self.patch_size[2] - adc_patch.shape[2])
             
             if z_pad > 0 or y_pad > 0 or x_pad > 0:
-                zadc_patch = np.pad(zadc_patch, ((0, z_pad), (0, y_pad), (0, x_pad)), mode='constant')
+                adc_patch = np.pad(adc_patch, ((0, z_pad), (0, y_pad), (0, x_pad)), mode='constant')
                 healthy_patch = np.pad(healthy_patch, ((0, z_pad), (0, y_pad), (0, x_pad)), mode='constant')
                 label_patch = np.pad(label_patch, ((0, z_pad), (0, y_pad), (0, x_pad)), mode='constant')
                 syn_lesion_patch = np.pad(syn_lesion_patch, ((0, z_pad), (0, y_pad), (0, x_pad)), mode='constant')
             
             # Convert to tensors
-            zadc_tensor = torch.from_numpy(zadc_patch).float().unsqueeze(0)  # Real brain with lesions
+            adc_tensor = torch.from_numpy(adc_patch).float().unsqueeze(0)  # Real brain with lesions
             healthy_tensor = torch.from_numpy(healthy_patch).float().unsqueeze(0)  # Truly healthy brain
             label_tensor = torch.from_numpy(label_patch).float().unsqueeze(0)  # Real lesion mask
             syn_lesion_tensor = torch.from_numpy(syn_lesion_patch).float().unsqueeze(0)  # Synthetic lesion mask
@@ -268,11 +480,11 @@ class LesionInpaintingDataset(Dataset):
             
             # If there's a substantial overlap between the synthetic lesion and real lesion,
             # we can use the real brain as a target. Otherwise, we need to create a hybrid target.
-            synthetic_real_overlap = np.sum(syn_lesion_patch * label_patch) / np.sum(syn_lesion_patch)
+            synthetic_real_overlap = np.sum(syn_lesion_patch * label_patch) / (np.sum(syn_lesion_patch) + 1e-8)
             
             if synthetic_real_overlap > 0.5:
                 # More than 50% overlap - we can use the real brain with its lesion as target
-                target_tensor = zadc_tensor
+                target_tensor = adc_tensor
                 print(f"Using real lesion as target (overlap: {synthetic_real_overlap:.2f})")
             else:
                 # Less overlap - create a hybrid target where we add "lesion-like" values to the healthy brain
@@ -281,16 +493,22 @@ class LesionInpaintingDataset(Dataset):
                 
                 # Calculate average intensity in real lesion areas
                 if np.sum(label_patch) > 0:
-                    lesion_value = np.mean(zadc_patch[label_patch > 0])
+                    # Use the real lesion intensities as reference
+                    lesion_value = np.median(adc_patch[label_patch > 0])
+                    std_lesion = np.std(adc_patch[label_patch > 0])
                 else:
                     # No real lesions in this patch, use a typical lesion intensity reduction
-                    # (ADC typically shows hypointensity in acute stroke)
+                    # ADC typically shows hypointensity in acute stroke
                     non_zero_mask = healthy_patch > 0.1  # Avoid background
-                    avg_healthy = np.mean(healthy_patch[non_zero_mask])
+                    avg_healthy = np.median(healthy_patch[non_zero_mask])
                     lesion_value = avg_healthy * 0.6  # Typical reduction in ADC values
+                    std_lesion = avg_healthy * 0.1  # Estimate of std deviation
                 
-                # Apply lesion-like values to the synthetic mask area
-                hybrid_target[syn_lesion_patch > 0] = lesion_value
+                # Apply lesion-like values to the synthetic mask area with some variation
+                rng = np.random.RandomState(idx + 100)  # Different seed than above
+                lesion_variation = rng.normal(lesion_value, std_lesion * 0.5, size=np.sum(syn_lesion_patch > 0))
+                hybrid_target[syn_lesion_patch > 0] = np.clip(lesion_variation, 0, 1)
+                
                 target_tensor = torch.from_numpy(hybrid_target).float().unsqueeze(0)
                 print(f"Created hybrid target (low overlap: {synthetic_real_overlap:.2f}, lesion value: {lesion_value:.4f})")
             
@@ -610,15 +828,19 @@ class LesionInpaintingGAN:
         return inpainted_brain
 
 
-def train(zadc_dir, label_dir, synthetic_lesions_dir, output_dir, num_epochs=200, batch_size=4, save_interval=5):
+def train(adc_dir, label_dir, synthetic_lesions_dir, output_dir, 
+         adc_mean_atlas_path=None, adc_std_atlas_path=None,
+         num_epochs=200, batch_size=4, save_interval=5):
     """
     Train the HIE lesion inpainting GAN.
     
     Args:
-        zadc_dir: Directory containing ZADC maps
+        adc_dir: Directory containing ADC maps
         label_dir: Directory containing lesion labels
         synthetic_lesions_dir: Directory containing synthetic lesions
         output_dir: Directory to save model checkpoints and results
+        adc_mean_atlas_path: Path to the mean ADC atlas
+        adc_std_atlas_path: Path to the standard deviation ADC atlas
         num_epochs: Number of epochs to train
         batch_size: Batch size
         save_interval: Interval (in epochs) for saving model checkpoints
@@ -627,26 +849,36 @@ def train(zadc_dir, label_dir, synthetic_lesions_dir, output_dir, num_epochs=200
     os.makedirs(output_dir, exist_ok=True)
     
     print("\n===== VALIDATING DATASET PATHS =====")
-    print(f"ZADC directory: {zadc_dir} - Exists: {os.path.exists(zadc_dir)}")
+    print(f"ADC directory: {adc_dir} - Exists: {os.path.exists(adc_dir)}")
     print(f"Label directory: {label_dir} - Exists: {os.path.exists(label_dir)}")
     print(f"Synthetic lesions directory: {synthetic_lesions_dir} - Exists: {os.path.exists(synthetic_lesions_dir)}")
+    
+    if adc_mean_atlas_path:
+        print(f"ADC mean atlas: {adc_mean_atlas_path} - Exists: {os.path.exists(adc_mean_atlas_path)}")
+    if adc_std_atlas_path:
+        print(f"ADC std atlas: {adc_std_atlas_path} - Exists: {os.path.exists(adc_std_atlas_path)}")
+    
     if os.path.exists(synthetic_lesions_dir):
         print(f"Contents of synthetic_lesions_dir: {os.listdir(synthetic_lesions_dir)[:10]}")
     print("=====================================\n")
     
     # Create datasets
     train_dataset = LesionInpaintingDataset(
-        zadc_dir=zadc_dir,
+        adc_dir=adc_dir,
         label_dir=label_dir,
         synthetic_lesions_dir=synthetic_lesions_dir,
+        adc_mean_atlas_path=adc_mean_atlas_path,
+        adc_std_atlas_path=adc_std_atlas_path,
         patch_size=(96, 96, 96),
         mode='train'
     )
     
     val_dataset = LesionInpaintingDataset(
-        zadc_dir=zadc_dir,
+        adc_dir=adc_dir,
         label_dir=label_dir,
         synthetic_lesions_dir=synthetic_lesions_dir,
+        adc_mean_atlas_path=adc_mean_atlas_path,
+        adc_std_atlas_path=adc_std_atlas_path,
         patch_size=(96, 96, 96),
         mode='val'
     )
@@ -780,7 +1012,6 @@ def train(zadc_dir, label_dir, synthetic_lesions_dir, output_dir, num_epochs=200
                     # Create multi-page PDF to store all slices if there are too many
                     use_pdf = len(lesion_slices) > 15
                     if use_pdf:
-                        from matplotlib.backends.backend_pdf import PdfPages
                         pdf_filename = os.path.join(output_dir, f'epoch_{epoch+1:03d}_sample_{i}_all_slices.pdf')
                         pdf = PdfPages(pdf_filename)
                         
@@ -952,49 +1183,218 @@ def train(zadc_dir, label_dir, synthetic_lesions_dir, output_dir, num_epochs=200
     return gan_model
 
 
-def apply_inpainting(gan_model, zadc_file, synthetic_lesion_file, output_file):
+def apply_inpainting(gan_model, adc_file, synthetic_lesion_file, output_file):
     """
     Apply the trained model to inpaint a lesion into a brain scan.
     
     Args:
         gan_model: Trained LesionInpaintingGAN model
-        zadc_file: Path to the ZADC file (.mha)
+        adc_file: Path to the ADC file (.mha)
         synthetic_lesion_file: Path to the synthetic lesion file (.mha)
         output_file: Path to save the output (.mha)
     """
-    # Load ZADC map
-    zadc_img = sitk.ReadImage(zadc_file)
-    zadc_array = sitk.GetArrayFromImage(zadc_img)
+    # Load ADC map
+    adc_img = sitk.ReadImage(adc_file)
+    adc_array = sitk.GetArrayFromImage(adc_img)
     
     # Load synthetic lesion
     syn_lesion_img = sitk.ReadImage(synthetic_lesion_file)
     syn_lesion_array = sitk.GetArrayFromImage(syn_lesion_img)
     
-    # Normalize ZADC to [0, 1]
-    zadc_min = zadc_array.min()
-    zadc_max = zadc_array.max()
-    zadc_array_norm = (zadc_array - zadc_min) / (zadc_max - zadc_min + 1e-8)
+    # Normalize ADC to [0, 1]
+    adc_min = adc_array.min()
+    adc_max = adc_array.max()
+    adc_array_norm = (adc_array - adc_min) / (adc_max - adc_min + 1e-8)
     
     # Convert synthetic lesion to binary
     syn_lesion_array = (syn_lesion_array > 0).astype(np.float32)
     
     # Convert to tensors
-    zadc_tensor = torch.from_numpy(zadc_array_norm).float().unsqueeze(0).unsqueeze(0)  # Add batch and channel dimensions
+    adc_tensor = torch.from_numpy(adc_array_norm).float().unsqueeze(0).unsqueeze(0)  # Add batch and channel dimensions
     syn_lesion_tensor = torch.from_numpy(syn_lesion_array).float().unsqueeze(0).unsqueeze(0)
     
     # Generate inpainted image
-    inpainted_brain = gan_model.inference(zadc_tensor, syn_lesion_tensor)
+    inpainted_brain = gan_model.inference(adc_tensor, syn_lesion_tensor)
     
     # Convert back to numpy and denormalize
     inpainted_array = inpainted_brain.squeeze().cpu().numpy()
-    inpainted_array = inpainted_array * (zadc_max - zadc_min) + zadc_min
+    inpainted_array = inpainted_array * (adc_max - adc_min) + adc_min
     
     # Create SimpleITK image (using original image as reference)
     output_img = sitk.GetImageFromArray(inpainted_array)
-    output_img.CopyInformation(zadc_img)  # Copy metadata
+    output_img.CopyInformation(adc_img)  # Copy metadata
     
     # Save the output
     sitk.WriteImage(output_img, output_file)
+
+
+def visualize_healthy_brain_creation(adc_array, label_array, healthy_brain, output_path, title=None):
+    """
+    Vizualizuje proces vytvoření zdravého mozku z původních dat s lézí.
+    
+    Args:
+        adc_array: Původní ADC data (normalizovaná 0-1)
+        label_array: Maska léze
+        healthy_brain: Vytvořený zdravý mozek
+        output_path: Cesta k uložení výstupu
+        title: Titulek pro vizualizaci
+    """
+    # Najít řezy obsahující lézi
+    lesion_slices = []
+    for z in range(label_array.shape[0]):
+        if np.any(label_array[z] > 0):
+            lesion_slices.append(z)
+    
+    if not lesion_slices:
+        print("Varování: Nenalezeny žádné řezy s lézí pro vizualizaci.")
+        return
+    
+    # Výpočet statistik změn v oblasti léze
+    mask_3d = label_array > 0
+    original_values = adc_array[mask_3d]
+    healthy_values = healthy_brain[mask_3d]
+    
+    mean_original = np.mean(original_values) if len(original_values) > 0 else 0
+    mean_healthy = np.mean(healthy_values) if len(healthy_values) > 0 else 0
+    mean_abs_diff = np.mean(np.abs(healthy_values - original_values)) if len(original_values) > 0 else 0
+    
+    stats_text = (f"Statistika oblasti léze:\n"
+                 f"Průměrná hodnota původní: {mean_original:.4f}\n"
+                 f"Průměrná hodnota zdravá: {mean_healthy:.4f}\n"
+                 f"Průměrná absolutní změna: {mean_abs_diff:.4f}")
+    
+    use_pdf = len(lesion_slices) > 15
+    
+    if use_pdf:
+        with PdfPages(output_path) as pdf:
+            for slice_batch_idx in range(0, len(lesion_slices), 15):
+                batch_slices = lesion_slices[slice_batch_idx:slice_batch_idx+15]
+                fig, axs = plt.subplots(4, len(batch_slices), figsize=(4*len(batch_slices), 16))
+                
+                # Pro případ jednoho řezu
+                if len(batch_slices) == 1:
+                    axs = axs.reshape(4, 1)
+                
+                for j, slice_idx in enumerate(batch_slices):
+                    # Původní ADC řez
+                    axs[0, j].imshow(adc_array[slice_idx], cmap='gray')
+                    axs[0, j].set_title(f'Řez {slice_idx}')
+                    axs[0, j].axis('off')
+                    
+                    # Maska léze jako překryv
+                    mask = label_array[slice_idx] > 0
+                    input_with_mask = np.stack([adc_array[slice_idx], adc_array[slice_idx], adc_array[slice_idx]], axis=2)
+                    input_with_mask[mask, 0] = 1.0  # Červený kanál
+                    input_with_mask[mask, 1] = 0.0  # Zelený kanál
+                    input_with_mask[mask, 2] = 0.0  # Modrý kanál
+                    
+                    axs[1, j].imshow(input_with_mask)
+                    axs[1, j].set_title('Označení léze')
+                    axs[1, j].axis('off')
+                    
+                    # Zdravý mozek - rekonstrukce
+                    axs[2, j].imshow(healthy_brain[slice_idx], cmap='gray')
+                    axs[2, j].set_title('Rekonstruovaný zdravý mozek')
+                    axs[2, j].axis('off')
+                    
+                    # Mapa rozdílů - co bylo změněno
+                    diff_map = np.abs(healthy_brain[slice_idx] - adc_array[slice_idx])
+                    
+                    # Vypočítat průměrnou změnu pro tento konkrétní řez v oblasti léze
+                    slice_mask = label_array[slice_idx] > 0
+                    if np.any(slice_mask):
+                        slice_orig = adc_array[slice_idx][slice_mask]
+                        slice_healthy = healthy_brain[slice_idx][slice_mask]
+                        slice_mean_change = np.mean(np.abs(slice_healthy - slice_orig))
+                        diff_title = f'Mapa změn (Δ={slice_mean_change:.4f})'
+                    else:
+                        diff_title = 'Mapa změn'
+                    
+                    axs[3, j].imshow(diff_map, cmap='hot')
+                    axs[3, j].set_title(diff_title)
+                    axs[3, j].axis('off')
+                
+                # Přidat popisky řad
+                axs[0, 0].set_ylabel('Původní ADC')
+                axs[1, 0].set_ylabel('Léze')
+                axs[2, 0].set_ylabel('Zdravý mozek')
+                axs[3, 0].set_ylabel('Změny')
+                
+                # Celkový titulek
+                if title:
+                    plt.suptitle(f"{title}\n{stats_text}")
+                else:
+                    plt.suptitle(stats_text)
+                    
+                plt.tight_layout()
+                pdf.savefig(fig, dpi=150)
+                plt.close()
+        
+        print(f"Uložena vizualizace tvorby zdravého mozku do PDF: {output_path}")
+    else:
+        # Jeden obrázek pro méně než 15 řezů
+        fig, axs = plt.subplots(4, len(lesion_slices), figsize=(4*len(lesion_slices), 16))
+        
+        # Pro případ jednoho řezu
+        if len(lesion_slices) == 1:
+            axs = axs.reshape(4, 1)
+        
+        for j, slice_idx in enumerate(lesion_slices):
+            # Původní ADC řez
+            axs[0, j].imshow(adc_array[slice_idx], cmap='gray')
+            axs[0, j].set_title(f'Řez {slice_idx}')
+            axs[0, j].axis('off')
+            
+            # Maska léze jako překryv
+            mask = label_array[slice_idx] > 0
+            input_with_mask = np.stack([adc_array[slice_idx], adc_array[slice_idx], adc_array[slice_idx]], axis=2)
+            input_with_mask[mask, 0] = 1.0  # Červený kanál
+            input_with_mask[mask, 1] = 0.0  # Zelený kanál
+            input_with_mask[mask, 2] = 0.0  # Modrý kanál
+            
+            axs[1, j].imshow(input_with_mask)
+            axs[1, j].set_title('Označení léze')
+            axs[1, j].axis('off')
+            
+            # Zdravý mozek - rekonstrukce
+            axs[2, j].imshow(healthy_brain[slice_idx], cmap='gray')
+            axs[2, j].set_title('Rekonstruovaný zdravý mozek')
+            axs[2, j].axis('off')
+            
+            # Mapa rozdílů - co bylo změněno
+            diff_map = np.abs(healthy_brain[slice_idx] - adc_array[slice_idx])
+            
+            # Vypočítat průměrnou změnu pro tento konkrétní řez v oblasti léze
+            slice_mask = label_array[slice_idx] > 0
+            if np.any(slice_mask):
+                slice_orig = adc_array[slice_idx][slice_mask]
+                slice_healthy = healthy_brain[slice_idx][slice_mask]
+                slice_mean_change = np.mean(np.abs(slice_healthy - slice_orig))
+                diff_title = f'Mapa změn (Δ={slice_mean_change:.4f})'
+            else:
+                diff_title = 'Mapa změn'
+            
+            axs[3, j].imshow(diff_map, cmap='hot')
+            axs[3, j].set_title(diff_title)
+            axs[3, j].axis('off')
+        
+        # Přidat popisky řad
+        axs[0, 0].set_ylabel('Původní ADC')
+        axs[1, 0].set_ylabel('Léze')
+        axs[2, 0].set_ylabel('Zdravý mozek')
+        axs[3, 0].set_ylabel('Změny')
+        
+        # Celkový titulek
+        if title:
+            plt.suptitle(f"{title}\n{stats_text}")
+        else:
+            plt.suptitle(stats_text)
+            
+        plt.tight_layout()
+        plt.savefig(output_path, dpi=150)
+        plt.close()
+        
+        print(f"Uložena vizualizace tvorby zdravého mozku: {output_path}")
 
 
 if __name__ == "__main__":
@@ -1008,14 +1408,18 @@ if __name__ == "__main__":
     
     # Parser pro příkaz "train"
     train_parser = subparsers.add_parser('train', help='Train the HIE lesion inpainting GAN model')
-    train_parser.add_argument('--zadc_dir', type=str, default="data/BONBID2023_Train/2Z_ADC",
-                       help='Directory containing ZADC maps')
+    train_parser.add_argument('--adc_dir', type=str, default="data/BONBID2023_Train/2Z_ADC",
+                       help='Directory containing ADC maps')
     train_parser.add_argument('--label_dir', type=str, default="data/BONBID2023_Train/3LABEL",
                        help='Directory containing lesion label masks')
     train_parser.add_argument('--synthetic_lesions_dir', type=str, default="data/registered_lesions",
                        help='Directory containing synthetic lesions')
     train_parser.add_argument('--output_dir', type=str, default="output/lesion_inpainting",
                        help='Directory to save model checkpoints and results')
+    train_parser.add_argument('--adc_mean_atlas_path', type=str, default=None,
+                       help='Path to the mean ADC atlas for healthy brain approximation')
+    train_parser.add_argument('--adc_std_atlas_path', type=str, default=None,
+                       help='Path to the standard deviation ADC atlas')
     train_parser.add_argument('--num_epochs', type=int, default=200,
                        help='Number of epochs to train')
     train_parser.add_argument('--batch_size', type=int, default=4,
@@ -1033,8 +1437,8 @@ if __name__ == "__main__":
     generate_parser = subparsers.add_parser('generate', help='Generate inpainted brain images using a trained model')
     generate_parser.add_argument('--model_path', type=str, required=True,
                        help='Path to trained model checkpoint (.pt file)')
-    generate_parser.add_argument('--zadc_file', type=str, required=True,
-                       help='Path to ZADC MHA file to inpaint')
+    generate_parser.add_argument('--adc_file', type=str, required=True,
+                       help='Path to ADC MHA file to inpaint')
     generate_parser.add_argument('--lesion_file', type=str, required=True,
                        help='Path to synthetic lesion mask MHA file')
     generate_parser.add_argument('--output_file', type=str, required=True,
@@ -1048,20 +1452,33 @@ if __name__ == "__main__":
     # Zpracování příkazu "train"
     if args.command == 'train':
         print(f"Starting training with the following parameters:")
-        print(f"ZADC directory: {args.zadc_dir}")
+        print(f"ADC directory: {args.adc_dir}")
         print(f"Label directory: {args.label_dir}")
         print(f"Synthetic lesions directory: {args.synthetic_lesions_dir}")
         print(f"Output directory: {args.output_dir}")
+        
+        if args.adc_mean_atlas_path:
+            print(f"ADC mean atlas: {args.adc_mean_atlas_path}")
+        else:
+            print("No ADC mean atlas provided, will use interpolation")
+            
+        if args.adc_std_atlas_path:
+            print(f"ADC std atlas: {args.adc_std_atlas_path}")
+        else:
+            print("No ADC std atlas provided")
+            
         print(f"Number of epochs: {args.num_epochs}")
         print(f"Batch size: {args.batch_size}")
         print(f"Save interval: Every {args.save_interval} epochs")
         
         # Trénujeme model s argumenty z příkazové řádky
         gan_model = train(
-            zadc_dir=args.zadc_dir,
+            adc_dir=args.adc_dir,
             label_dir=args.label_dir,
             synthetic_lesions_dir=args.synthetic_lesions_dir,
             output_dir=args.output_dir,
+            adc_mean_atlas_path=args.adc_mean_atlas_path,
+            adc_std_atlas_path=args.adc_std_atlas_path,
             num_epochs=args.num_epochs,
             batch_size=args.batch_size,
             save_interval=args.save_interval
@@ -1070,18 +1487,18 @@ if __name__ == "__main__":
         print(f"Training completed. Running inference on test patient {args.test_patient}")
         
         # Provádění inference s natrénovaným modelem na testovacím pacientovi
-        zadc_file = os.path.join(args.zadc_dir, f"Zmap_{args.test_patient}-ADC_smooth2mm_clipped10.mha")
+        adc_file = os.path.join(args.adc_dir, f"Zmap_{args.test_patient}-ADC_smooth2mm_clipped10.mha")
         synthetic_lesion_file = os.path.join(args.synthetic_lesions_dir, args.test_patient, args.test_lesion)
         output_file = os.path.join(args.output_dir, f"{args.test_patient}_inpainted.mha")
         
-        apply_inpainting(gan_model, zadc_file, synthetic_lesion_file, output_file)
+        apply_inpainting(gan_model, adc_file, synthetic_lesion_file, output_file)
         print(f"Inference completed. Output saved to {output_file}")
     
     # Zpracování příkazu "generate"
     elif args.command == 'generate':
         print(f"Running inference with the following parameters:")
         print(f"Model checkpoint: {args.model_path}")
-        print(f"ZADC file: {args.zadc_file}")
+        print(f"ADC file: {args.adc_file}")
         print(f"Synthetic lesion file: {args.lesion_file}")
         print(f"Output file: {args.output_file}")
         
@@ -1096,7 +1513,7 @@ if __name__ == "__main__":
         
         # Inference - aplikace inpainting
         print(f"Running inference...")
-        apply_inpainting(model, args.zadc_file, args.lesion_file, args.output_file)
+        apply_inpainting(model, args.adc_file, args.lesion_file, args.output_file)
         print(f"Inference completed. Output saved to {args.output_file}")
     
     else:
