@@ -54,15 +54,6 @@ class LesionInpaintingDataset(Dataset):
         print(f"Label directory: {label_dir}")
         print(f"Synthetic lesions directory: {synthetic_lesions_dir}")
         
-        # Show example glob patterns that will be used
-        print("\nFile patterns to look for:")
-        print(f"ZADC files pattern: {os.path.join(zadc_dir, 'Zmap_*.mha')}")
-        print(f"Label files pattern: {os.path.join(label_dir, '*_lesion.mha')}")
-        print(f"Synthetic lesions pattern: {os.path.join(synthetic_lesions_dir, 'PATIENT_ID', 'registered_lesion_*.mha')}")
-        print(f"Expected structure: ZADC files named 'Zmap_MGHNICU_xxx-VISIT_xx-ADC_smooth2mm_clipped10.mha'")
-        print(f"Expected structure: Label files named 'MGHNICU_xxx-VISIT_xx_lesion.mha'")
-        print(f"Expected structure: Synthetic lesions named 'registered_lesion_sampleXX.mha' in patient subdirectories\n")
-        
         # Verify directories exist
         if not os.path.exists(zadc_dir):
             print(f"WARNING: ZADC directory {zadc_dir} does not exist!")
@@ -113,8 +104,6 @@ class LesionInpaintingDataset(Dataset):
             # Print the first few ZADC filenames to help diagnose the issue
             if len(self.zadc_files) > 0:
                 print(f"Sample ZADC files (first 5):")
-                for i, file in enumerate(self.zadc_files[:5]):
-                    print(f"  {i+1}. {os.path.basename(file)}")
             
             print(f"Contents of synthetic lesions dir: {os.listdir(synthetic_lesions_dir) if os.path.exists(synthetic_lesions_dir) else 'Directory not found'}")
         
