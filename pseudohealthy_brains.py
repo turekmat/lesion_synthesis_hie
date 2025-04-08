@@ -737,10 +737,6 @@ def process_dataset(adc_dir, label_dir, output_dir, atlas_path=None, std_atlas_p
         output_path = os.path.join(pseudohealthy_dir, f"{patient_id}-PSEUDO_HEALTHY.mha")
         save_mha_file(pseudo_healthy, adc_img, output_path)
         
-        # Save the difference map
-        diff_map = np.abs(pseudo_healthy - adc_data)
-        diff_path = os.path.join(pseudohealthy_dir, f"{patient_id}-DIFF_MAP.mha")
-        save_mha_file(diff_map, adc_img, diff_path)
         
         # If visualize is enabled, create PDF visualization
         if visualize:
