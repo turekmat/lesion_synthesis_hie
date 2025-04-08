@@ -357,15 +357,8 @@ def visualize_results(adc_data, pseudo_healthy, label_data, patient_id, output_d
     vmin = np.percentile(adc_data_axial[adc_data_axial > 0], 1) if np.any(adc_data_axial > 0) else 0
     vmax = np.percentile(adc_data_axial[adc_data_axial > 0], 99) if np.any(adc_data_axial > 0) else 1
     
-    # Create a binary mask for the lesion outline
+    # Create a binary mask for the lesion
     lesion_mask = label_data_axial > 0
-    
-    # Create lesion outline using binary erosion
-    if np.any(lesion_mask):
-        eroded = ndimage.binary_erosion(lesion_mask, iterations=1)
-        lesion_outline = lesion_mask & ~eroded
-    else:
-        lesion_outline = np.zeros_like(lesion_mask)
     
     # Find which slices actually contain brain tissue (non-zero values)
     non_zero_slices = []
@@ -395,19 +388,20 @@ def visualize_results(adc_data, pseudo_healthy, label_data, patient_id, output_d
             ax2.set_title(f'Pseudo-healthy ADC (Axial Slice {z})')
             ax2.set_axis_off()
             
-            # Original ADC with lesion outline
+            # Original ADC with full lesion highlighted in red
             ax3 = fig.add_subplot(1, 3, 3)
             im3 = ax3.imshow(adc_data_axial[:, :, z], cmap='gray', vmin=vmin, vmax=vmax, aspect='equal', origin='lower')
             
-            # Overlay the lesion outline in red
-            if np.any(lesion_outline[:, :, z]):
-                # Create a mask for overlay
+            # Overlay the complete lesion in red
+            if np.any(lesion_mask[:, :, z]):
+                # Create a mask for overlay - highlight the entire lesion
                 mask = np.zeros((*adc_data_axial.shape[:2], 4))  # RGBA
                 mask[:, :, 0] = 1  # Red channel
-                mask[:, :, 3] = lesion_outline[:, :, z] * 1.0  # Alpha channel
-                ax3.imshow(mask, alpha=0.5, aspect='equal', origin='lower')
+                # Use the full lesion mask (not just the outline)
+                mask[:, :, 3] = lesion_mask[:, :, z] * 0.7  # Alpha channel, slightly transparent
+                ax3.imshow(mask, alpha=0.7, aspect='equal', origin='lower')
             
-            ax3.set_title(f'Original ADC with Lesion Outline (Axial Slice {z})')
+            ax3.set_title(f'Original ADC with Lesion Highlighted (Axial Slice {z})')
             ax3.set_axis_off()
             
             # Ensure proper layout and spacing
