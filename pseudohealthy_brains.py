@@ -374,7 +374,25 @@ def visualize_results(adc_data, pseudo_healthy, label_data, patient_id, output_d
     with PdfPages(output_path) as pdf:
         for z in non_zero_slices:
             # Create a figure with equal subplot sizes
-            fig = plt.figure(figsize=(15, 6))
+            fig = plt.figure(figsize=(15, 7))  # Increased height to accommodate text
+            
+            # Calculate statistics for this slice
+            if np.any(lesion_mask[:, :, z]):
+                # Calculate average intensities in the lesion area
+                orig_mean = np.mean(adc_data_axial[:, :, z][lesion_mask[:, :, z]])
+                pseudo_mean = np.mean(pseudo_healthy_axial[:, :, z][lesion_mask[:, :, z]])
+                diff = pseudo_mean - orig_mean
+                percent_change = (diff / orig_mean * 100) if orig_mean != 0 else 0
+                
+                # Generate statistics text
+                stats_text = (
+                    f"Lesion area statistics (Slice {z}):\n"
+                    f"Original mean intensity: {orig_mean:.2f}\n"
+                    f"Pseudo-healthy mean intensity: {pseudo_mean:.2f}\n"
+                    f"Difference: {diff:.2f} ({percent_change:.1f}%)"
+                )
+            else:
+                stats_text = f"No lesion found in this slice ({z})"
             
             # Original ADC
             ax1 = fig.add_subplot(1, 3, 1)
@@ -404,12 +422,28 @@ def visualize_results(adc_data, pseudo_healthy, label_data, patient_id, output_d
             ax3.set_title(f'Original ADC with Lesion Highlighted (Axial Slice {z})')
             ax3.set_axis_off()
             
+            # Add statistics text at the bottom of the figure
+            plt.figtext(0.5, 0.01, stats_text, ha='center', fontsize=10, 
+                        bbox={'facecolor': 'white', 'alpha': 0.8, 'pad': 5})
+            
             # Ensure proper layout and spacing
-            plt.tight_layout()
+            plt.tight_layout(rect=[0, 0.05, 1, 1])  # Adjust layout to make room for the text
             
             # Save the current figure to PDF
             pdf.savefig(fig)
             plt.close(fig)
+    
+    # Calculate overall statistics for the whole volume
+    if np.any(lesion_mask):
+        overall_orig_mean = np.mean(adc_data[label_data > 0])
+        overall_pseudo_mean = np.mean(pseudo_healthy[label_data > 0])
+        overall_diff = overall_pseudo_mean - overall_orig_mean
+        overall_percent = (overall_diff / overall_orig_mean * 100) if overall_orig_mean != 0 else 0
+        
+        print(f"\nOverall statistics for {patient_id}:")
+        print(f"Original mean in lesion area: {overall_orig_mean:.2f}")
+        print(f"Pseudo-healthy mean in same area: {overall_pseudo_mean:.2f}")
+        print(f"Difference: {overall_diff:.2f} ({overall_percent:.1f}%)")
     
     print(f"Visualization saved to {output_path}")
 
