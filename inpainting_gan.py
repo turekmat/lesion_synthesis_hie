@@ -1448,16 +1448,23 @@ def create_and_visualize_healthy_brain(adc_file, label_file, adc_mean_atlas_path
         adc_std_atlas_path: Cesta k atlasu směrodatných odchylek ADC
         output_file: Cesta pro uložení vizualizace
     """
+    # Import potřebných knihoven
+    import traceback
+    import numpy as np
+    import matplotlib.pyplot as plt
+    import SimpleITK as sitk
+    import os
+    from scipy import ndimage
+    
+    # Initialize some variables
+    adc_array = None
+    label_array = None
+    
     try:
-        # Import potřebných knihoven
-        import numpy as np
-        import matplotlib.pyplot as plt
-        import SimpleITK as sitk
-        import os
+        print("### DEBUG: Starting visualization function")
+        print(f"### DEBUG: Output will be saved to {output_file}")
         
-        print(f"Vytvářím vizualizaci zdravého mozku pro {os.path.basename(adc_file)}")
-        
-        # Vytvořit dočasný výstupní adresář
+        # Vytvořit výstupní adresář, pokud neexistuje
         output_dir = os.path.dirname(output_file)
         os.makedirs(output_dir, exist_ok=True)
         
@@ -1468,112 +1475,207 @@ def create_and_visualize_healthy_brain(adc_file, label_file, adc_mean_atlas_path
         
         if adc_mean_atlas_path and os.path.exists(adc_mean_atlas_path):
             try:
-                print(f"Načítám atlas ADC: {adc_mean_atlas_path}")
+                print(f"### DEBUG: Loading ADC atlas from {adc_mean_atlas_path}")
                 atlas_img = sitk.ReadImage(adc_mean_atlas_path)
                 adc_mean_atlas = sitk.GetArrayFromImage(atlas_img)
+                print(f"### DEBUG: Atlas loaded, shape: {adc_mean_atlas.shape}, dtype: {adc_mean_atlas.dtype}")
+                print(f"### DEBUG: Atlas min: {np.min(adc_mean_atlas)}, max: {np.max(adc_mean_atlas)}")
                 
                 if adc_std_atlas_path and os.path.exists(adc_std_atlas_path):
-                    print(f"Načítám atlas směrodatných odchylek: {adc_std_atlas_path}")
+                    print(f"### DEBUG: Loading ADC std atlas from {adc_std_atlas_path}")
                     std_atlas_img = sitk.ReadImage(adc_std_atlas_path)
                     adc_std_atlas = sitk.GetArrayFromImage(std_atlas_img)
+                    print(f"### DEBUG: Std atlas shape: {adc_std_atlas.shape}")
                 
                 has_atlas = True
             except Exception as e:
-                print(f"Chyba při načítání atlasu: {e}")
+                print(f"### ERROR: Failed to load atlas: {e}")
+                traceback.print_exc()
                 has_atlas = False
         
-        # Načíst data
-        adc_img = sitk.ReadImage(adc_file)
-        adc_array = sitk.GetArrayFromImage(adc_img)
-        
-        label_img = sitk.ReadImage(label_file)
-        label_array = sitk.GetArrayFromImage(label_img).astype(bool)
+        # Načíst ADC a label data
+        try:
+            print(f"### DEBUG: Loading ADC file: {adc_file}")
+            adc_img = sitk.ReadImage(adc_file)
+            adc_array = sitk.GetArrayFromImage(adc_img)
+            print(f"### DEBUG: ADC loaded, shape: {adc_array.shape}, dtype: {adc_array.dtype}")
+            print(f"### DEBUG: ADC min: {np.min(adc_array)}, max: {np.max(adc_array)}")
+            
+            print(f"### DEBUG: Loading label file: {label_file}")
+            label_img = sitk.ReadImage(label_file)
+            label_array = sitk.GetArrayFromImage(label_img).astype(bool)
+            print(f"### DEBUG: Label loaded, shape: {label_array.shape}, dtype: {label_array.dtype}")
+            print(f"### DEBUG: Label sum: {np.sum(label_array)} (number of voxels in lesion)")
+        except Exception as e:
+            print(f"### ERROR: Failed to load ADC or label file: {e}")
+            traceback.print_exc()
+            
+            # Create a simple error image and save it
+            plt.figure(figsize=(10, 6))
+            plt.text(0.5, 0.5, f"Error loading data:\n{str(e)}", 
+                    horizontalalignment='center', verticalalignment='center',
+                    fontsize=12)
+            plt.axis('off')
+            plt.savefig(output_file)
+            plt.close()
+            return
         
         # Naměřit statistiky o obrazu
-        adc_mean = np.mean(adc_array[adc_array > 0])
-        adc_std = np.std(adc_array[adc_array > 0])
-        
-        # Vypočítat percentily pro normalizaci
-        non_zero = adc_array[adc_array > 0]
-        p01 = np.percentile(non_zero, 1) if len(non_zero) > 0 else 0
-        p99 = np.percentile(non_zero, 99) if len(non_zero) > 0 else 1
-        
-        print(f"ADC statistika - průměr: {adc_mean:.4f}, std: {adc_std:.4f}, p01: {p01:.4f}, p99: {p99:.4f}")
+        try:
+            print("### DEBUG: Calculating image statistics")
+            non_zero_mask = adc_array > 0
+            if np.sum(non_zero_mask) > 0:
+                adc_mean = np.mean(adc_array[non_zero_mask])
+                adc_std = np.std(adc_array[non_zero_mask])
+                non_zero = adc_array[non_zero_mask]
+                p01 = np.percentile(non_zero, 1) if len(non_zero) > 0 else 0
+                p99 = np.percentile(non_zero, 99) if len(non_zero) > 0 else 1
+            else:
+                adc_mean = 0
+                adc_std = 0
+                p01 = 0
+                p99 = 1
+                print("### WARNING: No non-zero values in ADC array!")
+            
+            print(f"### DEBUG: ADC stats - mean: {adc_mean:.4f}, std: {adc_std:.4f}, p01: {p01:.4f}, p99: {p99:.4f}")
+        except Exception as e:
+            print(f"### ERROR: Failed to calculate statistics: {e}")
+            traceback.print_exc()
+            p01, p99 = 0, 1  # Default values
         
         # Normalizace ADC
-        adc_array_norm = np.copy(adc_array)
-        adc_array_norm[adc_array_norm < p01] = p01
-        adc_array_norm[adc_array_norm > p99] = p99
-        adc_array_norm = (adc_array_norm - p01) / (p99 - p01)
+        try:
+            print("### DEBUG: Normalizing ADC")
+            adc_array_norm = np.copy(adc_array)
+            adc_array_norm[adc_array_norm < p01] = p01
+            adc_array_norm[adc_array_norm > p99] = p99
+            adc_array_norm = (adc_array_norm - p01) / (p99 - p01 + 1e-8)  # Avoid division by zero
+            print(f"### DEBUG: Normalized ADC min: {np.min(adc_array_norm)}, max: {np.max(adc_array_norm)}")
+        except Exception as e:
+            print(f"### ERROR: Failed to normalize ADC: {e}")
+            traceback.print_exc()
+            # Create a normalized version anyway for fallback
+            adc_array_norm = (adc_array - np.min(adc_array)) / (np.max(adc_array) - np.min(adc_array) + 1e-8)
         
         # Vytvořit zdravý mozek
-        if has_atlas:
-            print("Vytvářím zdravý mozek pomocí atlasu...")
+        try:
+            healthy_brain = None
             
-            # Funkce pro registraci atlasu (náhrada za temp_dataset.register_atlas_to_subject)
-            registered_atlas, registered_std_atlas = register_atlas_standalone(adc_img, adc_array, adc_mean_atlas, adc_std_atlas, label_array)
-            
-            if registered_atlas is not None:
-                # Normalizovat atlas do stejného rozsahu jako ADC
-                atlas_normalized = np.copy(registered_atlas)
-                atlas_normalized[atlas_normalized < p01] = p01
-                atlas_normalized[atlas_normalized > p99] = p99
-                atlas_normalized = (atlas_normalized - p01) / (p99 - p01)
+            if has_atlas:
+                print("### DEBUG: Creating healthy brain using atlas")
                 
-                # Vypočítat poměr mezi hodnotami subjektu a atlasu v okolí léze
-                kernel = np.ones((3,3,3))
-                dilated_mask = ndimage.binary_dilation(label_array, structure=kernel, iterations=2)
-                border_mask = dilated_mask & np.logical_not(label_array)
+                # Funkce pro registraci atlasu
+                registered_atlas, registered_std_atlas = register_atlas_standalone(
+                    adc_img, adc_array, adc_mean_atlas, adc_std_atlas, label_array)
                 
-                if np.sum(border_mask) > 0:
-                    ratio = np.mean(adc_array_norm[border_mask]) / np.mean(atlas_normalized[border_mask] + 1e-6)
-                    print(f"Poměr hranic: {ratio:.4f}")
-                    ratio = np.clip(ratio, 0.5, 2.0)
+                if registered_atlas is not None:
+                    print("### DEBUG: Atlas registration successful")
+                    print(f"### DEBUG: Registered atlas shape: {registered_atlas.shape}")
+                    print(f"### DEBUG: Registered atlas min: {np.min(registered_atlas)}, max: {np.max(registered_atlas)}")
+                    
+                    # Normalizovat atlas do stejného rozsahu jako ADC
+                    atlas_normalized = np.copy(registered_atlas)
+                    atlas_normalized[atlas_normalized < p01] = p01
+                    atlas_normalized[atlas_normalized > p99] = p99
+                    atlas_normalized = (atlas_normalized - p01) / (p99 - p01 + 1e-8)
+                    
+                    # Vypočítat poměr mezi hodnotami subjektu a atlasu v okolí léze
+                    kernel = np.ones((3,3,3))
+                    dilated_mask = ndimage.binary_dilation(label_array, structure=kernel, iterations=2)
+                    border_mask = dilated_mask & np.logical_not(label_array)
+                    
+                    if np.sum(border_mask) > 0:
+                        print(f"### DEBUG: Border mask sum: {np.sum(border_mask)}")
+                        atlas_border_mean = np.mean(atlas_normalized[border_mask] + 1e-8)
+                        subject_border_mean = np.mean(adc_array_norm[border_mask])
+                        ratio = subject_border_mean / atlas_border_mean
+                        print(f"### DEBUG: Border ratio: {ratio:.4f} (subject: {subject_border_mean:.4f}, atlas: {atlas_border_mean:.4f})")
+                        ratio = np.clip(ratio, 0.5, 2.0)
+                    else:
+                        ratio = 1.0
+                        print("### DEBUG: No border found, using default ratio 1.0")
+                    
+                    # Vytvořit zdravý mozek
+                    healthy_brain = adc_array_norm.copy()
+                    healthy_brain[label_array] = atlas_normalized[label_array] * ratio
+                    
+                    print("### DEBUG: Healthy brain created using atlas registration")
                 else:
-                    ratio = 1.0
-                    print("Nenalezena žádná hranice, používám výchozí poměr 1.0")
-                
-                # Vytvořit zdravý mozek
-                healthy_brain = adc_array_norm.copy()
-                healthy_brain[label_array] = atlas_normalized[label_array] * ratio
-                
-                print("Zdravý mozek vytvořen pomocí registrace atlasu")
+                    print("### DEBUG: Atlas registration failed, using basic method")
+                    healthy_brain = create_basic_healthy_brain_standalone(adc_array_norm, label_array)
             else:
-                print("Registrace atlasu selhala, používám základní metodu")
+                print("### DEBUG: No atlas available, using basic method")
                 healthy_brain = create_basic_healthy_brain_standalone(adc_array_norm, label_array)
-        else:
-            print("Atlas není k dispozici, používám základní metodu pro vytvoření zdravého mozku")
-            healthy_brain = create_basic_healthy_brain_standalone(adc_array_norm, label_array)
+            
+            print(f"### DEBUG: Healthy brain min: {np.min(healthy_brain)}, max: {np.max(healthy_brain)}")
+        except Exception as e:
+            print(f"### ERROR: Failed to create healthy brain: {e}")
+            traceback.print_exc()
+            
+            # Create a simple healthy brain as fallback
+            healthy_brain = adc_array_norm.copy()
+            if label_array is not None and np.sum(label_array) > 0:
+                avg_value = np.mean(adc_array_norm[~label_array])
+                healthy_brain[label_array] = avg_value
         
         # Vypočítat statistiky
-        mean_orig = np.mean(adc_array_norm[label_array])
-        mean_healthy = np.mean(healthy_brain[label_array])
-        mean_change = np.mean(np.abs(healthy_brain[label_array] - adc_array_norm[label_array]))
-        median_change = np.median(np.abs(healthy_brain[label_array] - adc_array_norm[label_array]))
-        
-        stats_text = (f"Statistika oblasti léze:\n"
-                     f"Průměrná hodnota původní: {mean_orig:.4f}\n"
-                     f"Průměrná hodnota zdravá: {mean_healthy:.4f}\n"
-                     f"Průměrná absolutní změna: {mean_change:.4f}\n"
-                     f"Mediánová absolutní změna: {median_change:.4f}")
-        
-        print(stats_text)
+        try:
+            print("### DEBUG: Calculating statistics")
+            if np.sum(label_array) > 0:
+                mean_orig = np.mean(adc_array_norm[label_array])
+                mean_healthy = np.mean(healthy_brain[label_array])
+                mean_change = np.mean(np.abs(healthy_brain[label_array] - adc_array_norm[label_array]))
+                median_change = np.median(np.abs(healthy_brain[label_array] - adc_array_norm[label_array]))
+                
+                stats_text = (f"Statistika oblasti léze:\n"
+                            f"Průměrná hodnota původní: {mean_orig:.4f}\n"
+                            f"Průměrná hodnota zdravá: {mean_healthy:.4f}\n"
+                            f"Průměrná absolutní změna: {mean_change:.4f}\n"
+                            f"Mediánová absolutní změna: {median_change:.4f}")
+            else:
+                stats_text = "Statistika oblasti léze: Žádná léze nenalezena"
+            
+            print(f"### DEBUG: {stats_text}")
+        except Exception as e:
+            print(f"### ERROR: Failed to calculate statistics: {e}")
+            traceback.print_exc()
+            stats_text = "Statistiky nebylo možné vypočítat"
         
         # Najít všechny řezy, kde se vyskytuje léze
-        lesion_slices = []
-        for slice_idx in range(label_array.shape[0]):
-            if np.any(label_array[slice_idx]):
-                lesion_slices.append(slice_idx)
+        try:
+            print("### DEBUG: Finding slices with lesion")
+            lesion_slices = []
+            for slice_idx in range(label_array.shape[0]):
+                if np.any(label_array[slice_idx]):
+                    lesion_slices.append(slice_idx)
+            
+            print(f"### DEBUG: Found {len(lesion_slices)} slices with lesion")
+            
+            if len(lesion_slices) == 0:
+                print("### WARNING: No lesion found in mask!")
+                # Pokud není nalezena žádná léze, použít prostřední řez a několik okolních
+                middle_slice = label_array.shape[0] // 2
+                num_slices = min(5, label_array.shape[0])
+                start_slice = max(0, middle_slice - num_slices // 2)
+                lesion_slices = list(range(start_slice, start_slice + num_slices))
+                print(f"### DEBUG: Using slices {lesion_slices} as fallback")
+        except Exception as e:
+            print(f"### ERROR: Failed to find lesion slices: {e}")
+            traceback.print_exc()
+            # Fallback - use middle slice
+            lesion_slices = [adc_array.shape[0] // 2]
         
-        print(f"Nalezeno {len(lesion_slices)} řezů s lézí")
-        
-        if len(lesion_slices) == 0:
-            print("VAROVÁNÍ: Žádná léze nebyla nalezena v masce!")
-            lesion_slices = [label_array.shape[0] // 2]  # Použít prostřední řez jako fallback
-        
-        # Vytvořit a uložit vizualizaci
-        if len(lesion_slices) <= 15:
-            # Pro malý počet řezů vytvořit jeden obrázek
+        # Vytvořit vizualizaci
+        try:
+            print("### DEBUG: Creating visualization")
+            # Omezit počet řezů pro vizualizaci
+            max_slices = 8  # Maximální počet řezů pro přehlednost
+            if len(lesion_slices) > max_slices:
+                # Vybrat rovnoměrně rozložené řezy
+                indices = np.round(np.linspace(0, len(lesion_slices) - 1, max_slices)).astype(int)
+                lesion_slices = [lesion_slices[i] for i in indices]
+                print(f"### DEBUG: Limited visualization to {max_slices} slices: {lesion_slices}")
+            
             n_rows = 4  # 4 řádky (orig, label, healthy, diff)
             n_cols = len(lesion_slices)
             
@@ -1582,6 +1684,7 @@ def create_and_visualize_healthy_brain(adc_file, label_file, adc_mean_atlas_path
                 axs = axs.reshape(n_rows, 1)
             
             for j, slice_idx in enumerate(lesion_slices):
+                print(f"### DEBUG: Processing slice {slice_idx} (index {j})")
                 # Původní ADC
                 axs[0, j].imshow(adc_array_norm[slice_idx], cmap='gray')
                 axs[0, j].set_title(f'Řez {slice_idx}')
@@ -1602,7 +1705,7 @@ def create_and_visualize_healthy_brain(adc_file, label_file, adc_mean_atlas_path
                 # Mapa změn (rozdíl)
                 diff_healthy = np.abs(healthy_brain[slice_idx] - adc_array_norm[slice_idx])
                 if np.isnan(diff_healthy).any():
-                    print(f"VAROVÁNÍ: NaN hodnoty v mapě změn pro řez {slice_idx}")
+                    print(f"### WARNING: NaN values in difference map for slice {slice_idx}")
                     diff_healthy = np.nan_to_num(diff_healthy)
                 
                 # Vypočítat průměrnou změnu pro tento konkrétní řez v oblasti léze
@@ -1633,18 +1736,47 @@ def create_and_visualize_healthy_brain(adc_file, label_file, adc_mean_atlas_path
             axs[3, 0].set_ylabel('Změny')
             
             # Celkový titulek
-            plt.suptitle(f"Vizualizace vytvoření zdravého mozku pomocí atlasu\n{stats_text}")
-                
+            plt.suptitle(f"Vizualizace vytvoření zdravého mozku\n{stats_text}")
+            
             plt.tight_layout()
+            print(f"### DEBUG: Saving visualization to {output_file}")
             plt.savefig(output_file, dpi=150)
             plt.close()
             
-            print(f"Uložena kompletní vizualizace tvorby zdravého mozku: {output_file}")
-        
+            print(f"### DEBUG: Visualization saved successfully to {output_file}")
+        except Exception as e:
+            print(f"### ERROR: Failed to create visualization: {e}")
+            traceback.print_exc()
+            
+            # Create a simple error image and save it
+            try:
+                plt.figure(figsize=(10, 6))
+                plt.text(0.5, 0.5, f"Error creating visualization:\n{str(e)}", 
+                        horizontalalignment='center', verticalalignment='center',
+                        fontsize=12)
+                plt.axis('off')
+                plt.savefig(output_file)
+                plt.close()
+                print(f"### DEBUG: Saved error message to {output_file}")
+            except Exception as e2:
+                print(f"### ERROR: Even failed to save error message: {e2}")
+    
     except Exception as e:
-        print(f"Chyba při vytváření vizualizace: {e}")
-        import traceback
+        print(f"### ERROR: Unexpected error in create_and_visualize_healthy_brain: {e}")
         traceback.print_exc()
+        
+        # Final fallback - save an error message
+        try:
+            plt.figure(figsize=(10, 6))
+            plt.text(0.5, 0.5, f"Unexpected error:\n{str(e)}", 
+                   horizontalalignment='center', verticalalignment='center', 
+                   fontsize=12)
+            plt.axis('off')
+            plt.savefig(output_file)
+            plt.close()
+            print(f"### DEBUG: Saved unexpected error message to {output_file}")
+        except:
+            print("### ERROR: Could not save error visualization, giving up.")
 
 # Samostatná funkce pro vytvoření základního zdravého mozku (nezávislá na třídě)
 def create_basic_healthy_brain_standalone(adc_normalized, label_array):
