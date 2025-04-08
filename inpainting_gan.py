@@ -218,55 +218,99 @@ class LesionInpaintingDataset(Dataset):
             return None, None
             
         try:
-            from SimpleITK.SimpleITK import CenteredTransformInitializerFilter, ImageRegistrationMethod
-            from SimpleITK.SimpleITK import SimilarityTransform, Euler3DTransform, Similarity3DTransform
+            import SimpleITK as sitk
             
-            # Create mask to exclude lesion area from registration
-            mask = sitk.GetImageFromArray((label_array == 0).astype(np.uint8))
-            mask.CopyInformation(subject_img)
+            # Získat velikost dat subjektu
+            subject_size = subject_array.shape
+            atlas_size = self.adc_mean_atlas_array.shape
             
-            # Initialize registration method
-            registration_method = ImageRegistrationMethod()
+            print(f"Subject size: {subject_size}, Atlas size: {atlas_size}")
             
-            # Use normalized correlation as the similarity metric
-            registration_method.SetMetricAsCorrelation()
-            
-            # Use mask to exclude lesion area
-            registration_method.SetMetricMovingMask(mask)
-            
-            # Set optimizer
-            registration_method.SetOptimizerAsGradientDescent(learningRate=0.1, 
-                                                              numberOfIterations=100)
-            
-            # Set initial transformation as center-aligned
-            initial_transform = Similarity3DTransform()
-            center_init = CenteredTransformInitializerFilter()
-            initial_transform = center_init.Execute(subject_img, self.adc_mean_atlas, initial_transform)
-            
-            # Run registration
-            registration_transform = registration_method.Execute(subject_img, self.adc_mean_atlas, initial_transform)
-            
-            # Apply transform to atlas
-            registered_mean_atlas = sitk.Resample(self.adc_mean_atlas, subject_img, registration_transform, 
-                                             sitk.sitkLinear, 0.0, self.adc_mean_atlas.GetPixelID())
-            
-            # Apply same transform to std atlas if available
-            if self.adc_std_atlas is not None:
-                registered_std_atlas = sitk.Resample(self.adc_std_atlas, subject_img, registration_transform, 
-                                               sitk.sitkLinear, 0.0, self.adc_std_atlas.GetPixelID())
-                registered_std_atlas_array = sitk.GetArrayFromImage(registered_std_atlas)
-            else:
-                registered_std_atlas_array = None
+            # Pokud rozměry atlasu a subjektu neodpovídají, použijeme resample
+            if subject_size != atlas_size:
+                print(f"Atlas and subject have different sizes. Resampling atlas to match subject...")
                 
-            registered_atlas_array = sitk.GetArrayFromImage(registered_mean_atlas)
+                # Vytvořit identickou transformaci
+                identity = sitk.Transform(3, sitk.sitkIdentity)
+                
+                # Resample atlasu na velikost subjektu
+                reference_image = subject_img
+                
+                # Resample mean atlas
+                resampled_mean_atlas = sitk.Resample(
+                    self.adc_mean_atlas, 
+                    reference_image, 
+                    identity, 
+                    sitk.sitkLinear,
+                    0.0,
+                    self.adc_mean_atlas.GetPixelID()
+                )
+                
+                registered_atlas_array = sitk.GetArrayFromImage(resampled_mean_atlas)
+                print(f"Atlas resampled to size: {registered_atlas_array.shape}")
+                
+                # Resample std atlas if available
+                if self.adc_std_atlas is not None:
+                    resampled_std_atlas = sitk.Resample(
+                        self.adc_std_atlas, 
+                        reference_image, 
+                        identity, 
+                        sitk.sitkLinear,
+                        0.0,
+                        self.adc_std_atlas.GetPixelID()
+                    )
+                    registered_std_atlas_array = sitk.GetArrayFromImage(resampled_std_atlas)
+                else:
+                    registered_std_atlas_array = None
+                
+                print("Successfully resampled atlas to match subject size")
+                return registered_atlas_array, registered_std_atlas_array
             
-            print("Successfully registered atlas to subject")
-            return registered_atlas_array, registered_std_atlas_array
+            # Pokud pokročilá registrace selže, použijeme základní resample
+            print("Advanced registration not implemented correctly. Using basic resampling.")
+            # Vrátit původní hodnoty atlasu
+            return self.adc_mean_atlas_array, self.adc_std_atlas_array
             
         except Exception as e:
             print(f"Error registering atlas to subject: {e}")
             print("Using unregistered atlas as fallback")
-            # If registration fails, use the unregistered atlas (better than nothing)
+            
+            # Zkusit alespoň základní převzorkování
+            try:
+                import SimpleITK as sitk
+                
+                # Získat velikost dat subjektu
+                subject_size = subject_array.shape
+                atlas_size = self.adc_mean_atlas_array.shape
+                
+                print(f"Fallback: Subject size: {subject_size}, Atlas size: {atlas_size}")
+                
+                # Pokud rozměry atlasu a subjektu neodpovídají, použijeme základní převzorkování
+                if subject_size != atlas_size:
+                    from scipy import ndimage
+                    
+                    # Použít jednoduchý resize pomocí scipy
+                    zoom_factors = (subject_size[0] / atlas_size[0], 
+                                    subject_size[1] / atlas_size[1],
+                                    subject_size[2] / atlas_size[2])
+                    
+                    print(f"Using scipy zoom with factors: {zoom_factors}")
+                    
+                    # Resize mean atlas
+                    resized_mean_atlas = ndimage.zoom(self.adc_mean_atlas_array, zoom_factors, order=1)
+                    
+                    # Resize std atlas if available
+                    if self.adc_std_atlas_array is not None:
+                        resized_std_atlas = ndimage.zoom(self.adc_std_atlas_array, zoom_factors, order=1)
+                    else:
+                        resized_std_atlas = None
+                    
+                    print(f"Successfully resized atlas to size: {resized_mean_atlas.shape}")
+                    return resized_mean_atlas, resized_std_atlas
+            except Exception as resize_error:
+                print(f"Error during fallback resize: {resize_error}")
+            
+            # If all fails, return the unregistered atlas (better than nothing)
             return self.adc_mean_atlas_array, self.adc_std_atlas_array
     
     def __len__(self):
@@ -1397,6 +1441,264 @@ def visualize_healthy_brain_creation(adc_array, label_array, healthy_brain, outp
         print(f"Uložena vizualizace tvorby zdravého mozku: {output_path}")
 
 
+def create_and_visualize_healthy_brain(adc_file, label_file, adc_mean_atlas_path, adc_std_atlas_path, output_file):
+    """
+    Vytvoří a vizualizuje proces tvorby zdravého mozku z ADC mapy s lézí za použití atlasu.
+    
+    Args:
+        adc_file: Cesta k ADC souboru (.mha)
+        label_file: Cesta k souboru s maskou léze (.mha)
+        adc_mean_atlas_path: Cesta k průměrnému ADC atlasu
+        adc_std_atlas_path: Cesta k atlasu směrodatných odchylek (volitelné)
+        output_file: Cesta k výstupnímu souboru
+    """
+    print("Načítání dat...")
+    
+    # Načtení ADC mapy
+    adc_img = sitk.ReadImage(adc_file)
+    adc_array = sitk.GetArrayFromImage(adc_img)
+    
+    # Načtení masky léze
+    label_img = sitk.ReadImage(label_file)
+    label_array = sitk.GetArrayFromImage(label_img)
+    
+    # Normalizace ADC do [0, 1]
+    adc_min = adc_array.min()
+    adc_max = adc_array.max()
+    adc_array_norm = (adc_array - adc_min) / (adc_max - adc_min + 1e-8)
+    
+    # Převod masky léze na binární
+    label_array = (label_array > 0).astype(np.float32)
+    
+    # Načtení a registrace atlasu
+    print("Načítání a registrace atlasu...")
+    has_atlas = False
+    
+    # Načtení atlasů
+    if adc_mean_atlas_path and os.path.exists(adc_mean_atlas_path):
+        print(f"Načítání průměrného ADC atlasu: {adc_mean_atlas_path}")
+        adc_mean_atlas = sitk.ReadImage(adc_mean_atlas_path)
+        adc_mean_atlas_array = sitk.GetArrayFromImage(adc_mean_atlas)
+        
+        if adc_std_atlas_path and os.path.exists(adc_std_atlas_path):
+            print(f"Načítání atlasu směrodatných odchylek: {adc_std_atlas_path}")
+            adc_std_atlas = sitk.ReadImage(adc_std_atlas_path)
+            adc_std_atlas_array = sitk.GetArrayFromImage(adc_std_atlas)
+            has_atlas = True
+        else:
+            print("VAROVÁNÍ: Atlas směrodatných odchylek nenalezen.")
+            adc_std_atlas = None
+            adc_std_atlas_array = None
+    else:
+        print("VAROVÁNÍ: Průměrný ADC atlas nenalezen.")
+        return
+    
+    try:
+        # Získání velikostí obrazů
+        subject_size = adc_array.shape
+        atlas_size = adc_mean_atlas_array.shape
+        
+        print(f"Velikost ADC subjektu: {subject_size}, Velikost atlasu: {atlas_size}")
+        
+        # Pokud velikosti nesouhlasí, použijeme resample
+        if subject_size != atlas_size:
+            print("Atlas a subjekt mají různé velikosti. Provádím resampling atlasu...")
+            
+            # Buď pomocí SimpleITK nebo alternativně scipy
+            try:
+                # SimpleITK metoda
+                identity = sitk.Transform(3, sitk.sitkIdentity)
+                resampled_mean_atlas = sitk.Resample(
+                    adc_mean_atlas, 
+                    adc_img, 
+                    identity, 
+                    sitk.sitkLinear,
+                    0.0,
+                    adc_mean_atlas.GetPixelID()
+                )
+                
+                registered_atlas_array = sitk.GetArrayFromImage(resampled_mean_atlas)
+                
+                if adc_std_atlas is not None:
+                    resampled_std_atlas = sitk.Resample(
+                        adc_std_atlas, 
+                        adc_img, 
+                        identity, 
+                        sitk.sitkLinear,
+                        0.0,
+                        adc_std_atlas.GetPixelID()
+                    )
+                    registered_std_atlas_array = sitk.GetArrayFromImage(resampled_std_atlas)
+                else:
+                    registered_std_atlas_array = None
+                
+                print(f"Atlas převzorkován na velikost: {registered_atlas_array.shape}")
+            except Exception as e:
+                print(f"Chyba při použití SimpleITK: {e}")
+                print("Používám scipy zoom jako alternativu...")
+                
+                # Scipy metoda
+                from scipy import ndimage
+                
+                zoom_factors = (subject_size[0] / atlas_size[0], 
+                               subject_size[1] / atlas_size[1],
+                               subject_size[2] / atlas_size[2])
+                
+                print(f"Použití scipy zoom s faktory: {zoom_factors}")
+                
+                registered_atlas_array = ndimage.zoom(adc_mean_atlas_array, zoom_factors, order=1)
+                
+                if adc_std_atlas_array is not None:
+                    registered_std_atlas_array = ndimage.zoom(adc_std_atlas_array, zoom_factors, order=1)
+                else:
+                    registered_std_atlas_array = None
+                
+                print(f"Atlas převzorkován na velikost: {registered_atlas_array.shape}")
+        else:
+            registered_atlas_array = adc_mean_atlas_array
+            registered_std_atlas_array = adc_std_atlas_array
+        
+        # Vytvoření zdravého mozku (nahrazení léze atlasovými hodnotami)
+        print("Vytváření zdravého mozku...")
+        healthy_brain = adc_array_norm.copy()
+        
+        # Normalizace atlasu
+        atlas_min = registered_atlas_array.min()
+        atlas_max = registered_atlas_array.max()
+        registered_atlas_norm = (registered_atlas_array - atlas_min) / (atlas_max - atlas_min + 1e-8)
+        
+        # Výpočet škálovacího faktoru
+        from scipy import ndimage
+        dilated_mask = ndimage.binary_dilation(label_array, iterations=2)
+        border_mask = dilated_mask & np.logical_not(label_array)
+        
+        if np.any(border_mask):
+            # Získání škálovacího faktoru z oblasti hranice
+            original_border_values = adc_array_norm[border_mask]
+            atlas_border_values = registered_atlas_norm[border_mask]
+            
+            # Výpočet poměru mediánů pro robustnost
+            scaling_factor = np.median(original_border_values) / np.median(atlas_border_values)
+            
+            # Aplikace atlasových hodnot škálovaných faktorem do oblasti léze
+            healthy_brain[label_array > 0] = registered_atlas_norm[label_array > 0] * scaling_factor
+            
+            # Přidání některé náhodné variace na základě atlasu std, pokud je k dispozici
+            if registered_std_atlas_array is not None:
+                # Škálování std hodnot
+                std_norm = (registered_std_atlas_array - registered_std_atlas_array.min()) / (registered_std_atlas_array.max() - registered_std_atlas_array.min() + 1e-8)
+                std_scaled = std_norm * scaling_factor * 0.3  # Snížení variace na 30%
+                
+                # Aplikace náhodné variace v oblasti léze
+                rng = np.random.RandomState(42)  # Použití fixního seedu pro reprodukovatelnost
+                random_variation = rng.normal(0, std_scaled[label_array > 0])
+                healthy_brain[label_array > 0] += random_variation
+                
+                # Zajištění hodnot v platném rozsahu
+                healthy_brain = np.clip(healthy_brain, 0, 1)
+            
+            print(f"Vytvořen zdravý mozek s použitím atlasu. Škálovací faktor: {scaling_factor:.4f}")
+        else:
+            print("Nenalezena žádná hranice léze. Používám interpolaci...")
+            
+            # Použití interpolace jako záložní metody
+            temp_array = adc_array_norm.copy()
+            temp_array[label_array > 0] = np.nan
+            filled_array = ndimage.median_filter(np.nan_to_num(temp_array), size=5)
+            healthy_brain[label_array > 0] = filled_array[label_array > 0]
+        
+        # Vizualizace
+        print("Vytvářím vizualizaci...")
+        visualize_healthy_brain_creation(adc_array_norm, label_array, healthy_brain, output_file,
+                                        title="Vytvoření zdravého mozku pomocí atlasu")
+        
+        # Zobrazení přesných řezů s lézí - detailní pohled
+        # Najít řezy obsahující lézi
+        lesion_slices = []
+        for z in range(label_array.shape[0]):
+            if np.any(label_array[z] > 0):
+                lesion_slices.append(z)
+        
+        # Středový řez s lézí
+        if lesion_slices:
+            mid_slice_idx = lesion_slices[len(lesion_slices) // 2]  # Vyberu prostřední řez s lézí
+            
+            # Vytvořit detailní vizualizaci pro jeden řez s porovnáním atlasu
+            fig, axs = plt.subplots(2, 3, figsize=(15, 10))
+            
+            # První řádek - ADC řez, atlas řez, rozdíl
+            axs[0, 0].imshow(adc_array_norm[mid_slice_idx], cmap='gray')
+            axs[0, 0].set_title(f'Původní ADC (řez {mid_slice_idx})')
+            axs[0, 0].axis('off')
+            
+            axs[0, 1].imshow(registered_atlas_norm[mid_slice_idx], cmap='gray')
+            axs[0, 1].set_title('Registrovaný atlas')
+            axs[0, 1].axis('off')
+            
+            diff_atlas = np.abs(adc_array_norm[mid_slice_idx] - registered_atlas_norm[mid_slice_idx])
+            axs[0, 2].imshow(diff_atlas, cmap='hot')
+            axs[0, 2].set_title('Rozdíl ADC vs. atlas')
+            axs[0, 2].axis('off')
+            
+            # Druhý řádek - maska léze, zdravý mozek, rozdíl
+            # Maska léze jako překryv
+            mask = label_array[mid_slice_idx] > 0
+            input_with_mask = np.stack([adc_array_norm[mid_slice_idx], 
+                                       adc_array_norm[mid_slice_idx], 
+                                       adc_array_norm[mid_slice_idx]], axis=2)
+            input_with_mask[mask, 0] = 1.0  # Červený kanál
+            input_with_mask[mask, 1] = 0.0  # Zelený kanál
+            input_with_mask[mask, 2] = 0.0  # Modrý kanál
+            
+            axs[1, 0].imshow(input_with_mask)
+            axs[1, 0].set_title('ADC s označením léze')
+            axs[1, 0].axis('off')
+            
+            axs[1, 1].imshow(healthy_brain[mid_slice_idx], cmap='gray')
+            axs[1, 1].set_title('Zdravý mozek (bez léze)')
+            axs[1, 1].axis('off')
+            
+            diff_healthy = np.abs(adc_array_norm[mid_slice_idx] - healthy_brain[mid_slice_idx])
+            im = axs[1, 2].imshow(diff_healthy, cmap='hot')
+            axs[1, 2].set_title('Mapa změn')
+            axs[1, 2].axis('off')
+            
+            # Přidat colorbar pro mapu změn
+            cbar = fig.colorbar(im, ax=axs[1, 2], fraction=0.046, pad=0.04)
+            cbar.set_label('Absolutní rozdíl intenzity')
+            
+            # Výpočet statistik pro oblast léze
+            mask_3d = label_array > 0
+            original_values = adc_array_norm[mask_3d]
+            healthy_values = healthy_brain[mask_3d]
+            
+            mean_original = np.mean(original_values) if len(original_values) > 0 else 0
+            mean_healthy = np.mean(healthy_values) if len(healthy_values) > 0 else 0
+            mean_abs_diff = np.mean(np.abs(healthy_values - original_values)) if len(original_values) > 0 else 0
+            median_diff = np.median(np.abs(healthy_values - original_values)) if len(original_values) > 0 else 0
+            
+            stats_text = (f"Statistika oblasti léze:\n"
+                          f"Průměrná hodnota původní: {mean_original:.4f}\n"
+                          f"Průměrná hodnota zdravá: {mean_healthy:.4f}\n"
+                          f"Průměrná absolutní změna: {mean_abs_diff:.4f}\n"
+                          f"Mediánová absolutní změna: {median_diff:.4f}")
+            
+            plt.suptitle(f"Detailní srovnání atlasové metody pro řez {mid_slice_idx}\n{stats_text}")
+            plt.tight_layout()
+            
+            # Uložit detail jako druhou vizualizaci
+            detail_output = os.path.splitext(output_file)[0] + "_detail.png"
+            plt.savefig(detail_output, dpi=150)
+            plt.close()
+            
+            print(f"Detailní vizualizace uložena jako: {detail_output}")
+        
+    except Exception as e:
+        print(f"Chyba při vytváření vizualizace: {e}")
+        import traceback
+        traceback.print_exc()
+
+
 if __name__ == "__main__":
     import argparse
     
@@ -1432,6 +1734,8 @@ if __name__ == "__main__":
                        help='Synthetic lesion file to use for test inference')
     train_parser.add_argument('--device', type=str, default=None,
                        help='Device to use for training (cuda or cpu). Uses cuda if available by default.')
+    train_parser.add_argument('--visualize_healthy_brain', action='store_true',
+                       help='Generate detailed visualizations of healthy brain creation process')
     
     # Parser pro příkaz "generate"
     generate_parser = subparsers.add_parser('generate', help='Generate inpainted brain images using a trained model')
@@ -1445,6 +1749,19 @@ if __name__ == "__main__":
                        help='Path where to save output inpainted MHA file')
     generate_parser.add_argument('--device', type=str, default=None,
                        help='Device to use for inference (cuda or cpu). Uses cuda if available by default.')
+    
+    # Také přidám novou komandu pro samostatnou vizualizaci
+    visualize_parser = subparsers.add_parser('visualize_healthy_brain', help='Visualize the process of creating healthy brain from ADC map using atlas')
+    visualize_parser.add_argument('--adc_file', type=str, required=True,
+                       help='Path to ADC MHA file (with lesion)')
+    visualize_parser.add_argument('--label_file', type=str, required=True,
+                       help='Path to lesion mask MHA file')
+    visualize_parser.add_argument('--adc_mean_atlas_path', type=str, required=True,
+                       help='Path to the mean ADC atlas')
+    visualize_parser.add_argument('--adc_std_atlas_path', type=str, default=None,
+                       help='Path to the standard deviation ADC atlas')
+    visualize_parser.add_argument('--output_file', type=str, required=True,
+                       help='Path where to save visualization')
     
     # Zpracujeme argumenty
     args = parser.parse_args()
@@ -1515,6 +1832,16 @@ if __name__ == "__main__":
         print(f"Running inference...")
         apply_inpainting(model, args.adc_file, args.lesion_file, args.output_file)
         print(f"Inference completed. Output saved to {args.output_file}")
+    
+    # Zpracování příkazu "visualize_healthy_brain"
+    elif args.command == 'visualize_healthy_brain':
+        print(f"Visualizing healthy brain creation process for:")
+        print(f"ADC file: {args.adc_file}")
+        print(f"Lesion mask file: {args.label_file}")
+        print(f"Output file: {args.output_file}")
+        
+        # Vytvoření a vizualizace zdravého mozku
+        create_and_visualize_healthy_brain(args.adc_file, args.label_file, args.adc_mean_atlas_path, args.adc_std_atlas_path, args.output_file)
     
     else:
         parser.print_help()
