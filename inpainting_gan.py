@@ -207,15 +207,15 @@ class LesionInpaintingDataset(Dataset):
             # First, dilate the lesion mask to create a border region
             from scipy import ndimage
             dilated_mask = ndimage.binary_dilation(label_array, iterations=2)
-            border_mask = dilated_mask & ~label_array  # Border around lesion but not lesion itself
+            border_mask = dilated_mask & np.logical_not(label_array)
             
             # Get average intensity value in the border region
             if np.any(border_mask):
                 border_values = zadc_array[border_mask]
-                healthy_tissue_value = np.mean(border_values)
+                healthy_tissue_value = np.mean(zadc_array[np.logical_not(label_array)])
             else:
                 # Fallback - use global average of non-lesion areas
-                healthy_tissue_value = np.mean(zadc_array[~label_array])
+                healthy_tissue_value = np.mean(zadc_array[np.logical_not(label_array)])
             
             # Replace lesion areas with healthy tissue values
             healthy_brain[label_array > 0] = healthy_tissue_value
