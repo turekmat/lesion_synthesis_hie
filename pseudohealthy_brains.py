@@ -14,6 +14,7 @@ import torch
 from scipy.ndimage import gaussian_filter
 from matplotlib.backends.backend_pdf import PdfPages
 import matplotlib.gridspec as gridspec
+import ants  # Přidání importu ANTs
 
 
 def load_mha_file(file_path):
@@ -329,6 +330,182 @@ def create_pseudo_healthy_brain(adc_data, label_data):
     return pseudo_healthy
 
 
+def create_pseudo_healthy_brain_with_atlas(adc_data, label_data, atlas_path):
+    """
+    Create a pseudo-healthy brain using normative atlas registration with ANTs.
+    
+    Args:
+        adc_data: Original ADC map data (numpy array)
+        label_data: Lesion mask data (numpy array)
+        atlas_path: Path to normative atlas
+    
+    Returns:
+        Pseudo-healthy brain data with lesions replaced using atlas values
+    """
+    # Create a copy of the ADC data for the result
+    pseudo_healthy = adc_data.copy()
+    
+    # Find voxels that belong to the lesion
+    lesion_mask = label_data > 0
+    
+    if not np.any(lesion_mask):
+        print("No lesion found in the label data")
+        return pseudo_healthy
+    
+    print("Performing atlas-based lesion replacement with ANTs registration...")
+    
+    # Convert numpy arrays to ANTs images for registration
+    # Create temporary files for the ANTs registration
+    temp_dir = Path("temp_registration")
+    temp_dir.mkdir(exist_ok=True)
+    
+    # Save the ADC and label data as temporary files for ANTs processing
+    temp_adc_path = temp_dir / "temp_adc.nii.gz"
+    temp_label_path = temp_dir / "temp_label.nii.gz"
+    temp_result_path = temp_dir / "temp_result.nii.gz"
+    
+    # Use SimpleITK to create and save temporary files with proper orientation
+    temp_adc_sitk = sitk.GetImageFromArray(adc_data)
+    sitk.WriteImage(temp_adc_sitk, str(temp_adc_path))
+    
+    temp_label_sitk = sitk.GetImageFromArray(label_data.astype(np.uint8))
+    sitk.WriteImage(temp_label_sitk, str(temp_label_path))
+    
+    # Load ADC and atlas into ANTs format
+    adc_ant = ants.image_read(str(temp_adc_path))
+    atlas_ant = ants.image_read(str(atlas_path))
+    label_ant = ants.image_read(str(temp_label_path))
+    
+    # Normalize intensities for better registration
+    print("Normalizing images for registration...")
+    atlas_ant = ants.iMath(atlas_ant, "Normalize")
+    
+    # For ADC: normalize to [0,1] range
+    adc_np = adc_ant.numpy()
+    adc_min, adc_max = adc_np.min(), adc_np.max()
+    normalized_adc_np = (adc_np - adc_min) / (adc_max - adc_min)
+    adc_ant_norm = ants.from_numpy(
+        normalized_adc_np,
+        origin=adc_ant.origin,
+        spacing=adc_ant.spacing,
+        direction=adc_ant.direction
+    )
+    
+    try:
+        # SPRÁVNÝ POSTUP: Registrovat PACIENTA NA ATLAS (opačně než předtím)
+        print("Performing affine registration of patient to atlas...")
+        init_reg = ants.registration(
+            fixed=atlas_ant,    # Atlas je nyní fixed image
+            moving=adc_ant_norm,  # Pacientský mozek je moving image 
+            type_of_transform='Affine',
+            verbose=False
+        )
+        
+        print("Performing SyN registration...")
+        reg = ants.registration(
+            fixed=atlas_ant, 
+            moving=adc_ant_norm,
+            type_of_transform='SyN',
+            initial_transform=init_reg['fwdtransforms'][0],
+            reg_iterations=[50, 30, 20],
+            verbose=False
+        )
+        
+        # Aplikace transformace na pacientský ADC
+        print("Applying transformation to patient ADC...")
+        registered_adc = ants.apply_transforms(
+            fixed=atlas_ant,
+            moving=adc_ant_norm,
+            transformlist=reg['fwdtransforms'],
+            interpolator='linear',
+            verbose=False
+        )
+        
+        # Transformace léze do prostoru atlasu
+        print("Transforming lesion mask to atlas space...")
+        registered_lesion = ants.apply_transforms(
+            fixed=atlas_ant,
+            moving=label_ant,
+            transformlist=reg['fwdtransforms'],
+            interpolator='nearestNeighbor',  # Důležité pro binární masku!
+            verbose=False
+        )
+        
+        # Převod do numpy pro další zpracování
+        registered_lesion_np = registered_lesion.numpy() > 0
+        atlas_np = atlas_ant.numpy()
+        
+        # Nyní v prostoru atlasu extrahuji hodnoty pro léze
+        print("Extracting normative values from atlas in lesion area...")
+        
+        # Získání hodnot z atlasu pro všechny voxely v transformované lézi
+        atlas_values_in_lesion = atlas_np[registered_lesion_np]
+        
+        if len(atlas_values_in_lesion) > 0:
+            # Výpočet statistik (průměrná hodnota v atlasu pro oblast léze)
+            atlas_mean = np.mean(atlas_values_in_lesion)
+            atlas_std = np.std(atlas_values_in_lesion)
+            
+            print(f"Atlas normative values in lesion area: mean={atlas_mean:.2f}, std={atlas_std:.2f}")
+            
+            # Vytvoření přechodové masky pro původní lézi
+            transition_mask = create_smooth_transition_mask(lesion_mask, sigma=3.0)
+            
+            # Komponenty léze v původním prostoru pacienta
+            labeled_lesions, num_lesions = ndimage.label(lesion_mask)
+            
+            # Generování šumu pro přirozený vzhled
+            noise = generate_perlin_noise(adc_data.shape, scale=5.0, octaves=3)
+            
+            # Zpracování každé komponenty léze zvlášť
+            for lesion_idx in range(1, num_lesions + 1):
+                current_lesion = labeled_lesions == lesion_idx
+                
+                # Souřadnice voxelů v aktuální lézi
+                current_coords = np.where(current_lesion)
+                current_coords = list(zip(current_coords[0], current_coords[1], current_coords[2]))
+                
+                # Aplikace normativních hodnot z atlasu s přechodem
+                for x, y, z in current_coords:
+                    # Váha přechodu
+                    weight = transition_mask[x, y, z]
+                    
+                    # Přidání šumu pro přirozenější vzhled (10% průměrné hodnoty)
+                    noise_scale = 0.1 * atlas_mean
+                    noisy_value = atlas_mean + (noise[x, y, z] - 0.5) * noise_scale
+                    
+                    # Škálování zpět do původního rozsahu hodnot pacientského obrazu
+                    scaled_value = noisy_value * (adc_max - adc_min) + adc_min
+                    
+                    # Plynulý přechod mezi původní a novou hodnotou
+                    pseudo_healthy[x, y, z] = (1 - weight) * adc_data[x, y, z] + weight * scaled_value
+        
+        else:
+            print("Warning: No lesion voxels found in registered space. Using original method.")
+            return create_pseudo_healthy_brain(adc_data, label_data)
+        
+        print("Atlas-based lesion replacement completed")
+        
+    except Exception as e:
+        print(f"Error during atlas registration: {e}")
+        print("Falling back to symmetric replacement method...")
+        return create_pseudo_healthy_brain(adc_data, label_data)
+    
+    finally:
+        # Clean up temporary files
+        try:
+            if temp_adc_path.exists():
+                temp_adc_path.unlink()
+            if temp_label_path.exists():
+                temp_label_path.unlink()
+            if temp_result_path.exists():
+                temp_result_path.unlink()
+        except Exception as e:
+            print(f"Warning: Could not clean up temporary files: {e}")
+    
+    return pseudo_healthy
+
+
 def visualize_results(adc_data, pseudo_healthy, label_data, patient_id, output_dir):
     """
     Create a PDF visualization showing original ADC, pseudo-healthy ADC, and lesion outline
@@ -448,7 +625,7 @@ def visualize_results(adc_data, pseudo_healthy, label_data, patient_id, output_d
     print(f"Visualization saved to {output_path}")
 
 
-def process_dataset(adc_dir, label_dir, output_dir, percentage=50, visualize=False):
+def process_dataset(adc_dir, label_dir, output_dir, atlas_path=None, percentage=50, visualize=False):
     """
     Process the entire dataset, selecting the lower X% by lesion volume
     but processing them in random order for better comparisons
@@ -487,8 +664,11 @@ def process_dataset(adc_dir, label_dir, output_dir, percentage=50, visualize=Fal
         adc_data, adc_img = load_mha_file(adc_path)
         label_data, _ = load_mha_file(label_path)
         
-        # Create pseudo-healthy brain
-        pseudo_healthy = create_pseudo_healthy_brain(adc_data, label_data)
+        # Create pseudo-healthy brain using atlas if available, otherwise use symmetry
+        if atlas_path:
+            pseudo_healthy = create_pseudo_healthy_brain_with_atlas(adc_data, label_data, atlas_path)
+        else:
+            pseudo_healthy = create_pseudo_healthy_brain(adc_data, label_data)
         
         if visualize:
             # Generate visualization instead of saving files
@@ -512,6 +692,8 @@ def main():
                         help='Directory containing label maps')
     parser.add_argument('--output_dir', type=str, default='data/pseudo_healthy', 
                         help='Directory to save results')
+    parser.add_argument('--atlas_path', type=str, default=None,
+                        help='Path to normative atlas file')
     parser.add_argument('--percentage', type=int, default=50, 
                         help='Process lower X% of cases by lesion volume')
     parser.add_argument('--visualize', action='store_true',
@@ -519,7 +701,7 @@ def main():
     
     args = parser.parse_args()
     
-    process_dataset(args.adc_dir, args.label_dir, args.output_dir, args.percentage, args.visualize)
+    process_dataset(args.adc_dir, args.label_dir, args.output_dir, args.atlas_path, args.percentage, args.visualize)
 
 
 if __name__ == "__main__":
