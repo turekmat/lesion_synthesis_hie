@@ -30,342 +30,371 @@ class LesionInpaintingDataset(Dataset):
                  adc_dir,
                  label_dir, 
                  synthetic_lesions_dir,
+                 output_dir,
                  adc_mean_atlas_path=None,
                  adc_std_atlas_path=None,
                  patch_size=(96, 96, 96),
                  mode='train',
                  transform=None):
         """
+        Inicializuje dataset pro inpainting lézí.
+        
         Args:
-            adc_dir: Directory with ADC maps
-            label_dir: Directory with lesion masks
-            synthetic_lesions_dir: Directory with synthetic lesions
-            adc_mean_atlas_path: Path to the mean ADC atlas (for healthy brain approximation)
-            adc_std_atlas_path: Path to the standard deviation ADC atlas
-            patch_size: Size of the patches to extract
-            mode: 'train' or 'val'
-            transform: Optional transform to be applied on a sample
+            adc_dir: Adresář s ADC mapami
+            label_dir: Adresář s maskami reálných lézí
+            synthetic_lesions_dir: Adresář se syntetickými lézemi
+            output_dir: Adresář pro ukládání výsledků
+            adc_mean_atlas_path: Cesta k průměrnému ADC atlasu (volitelné)
+            adc_std_atlas_path: Cesta k atlasu směrodatných odchylek ADC (volitelné)
+            patch_size: Velikost výstupního patche (pro trénink)
+            mode: 'train' nebo 'validation'
+            transform: Transformace aplikované na data
         """
         self.adc_dir = adc_dir
         self.label_dir = label_dir
         self.synthetic_lesions_dir = synthetic_lesions_dir
-        self.adc_mean_atlas_path = adc_mean_atlas_path
-        self.adc_std_atlas_path = adc_std_atlas_path
+        self.output_dir = output_dir
         self.patch_size = patch_size
         self.mode = mode
         self.transform = transform
         
-        # Load ADC atlases if provided
+        # Načíst atlasy, pokud jsou k dispozici
         self.has_atlas = False
-        if adc_mean_atlas_path and os.path.exists(adc_mean_atlas_path):
-            print(f"Loading ADC mean atlas from: {adc_mean_atlas_path}")
-            self.adc_mean_atlas = sitk.ReadImage(adc_mean_atlas_path)
-            self.adc_mean_atlas_array = sitk.GetArrayFromImage(self.adc_mean_atlas)
-            
-            if adc_std_atlas_path and os.path.exists(adc_std_atlas_path):
-                print(f"Loading ADC standard deviation atlas from: {adc_std_atlas_path}")
-                self.adc_std_atlas = sitk.ReadImage(adc_std_atlas_path)
-                self.adc_std_atlas_array = sitk.GetArrayFromImage(self.adc_std_atlas)
-                self.has_atlas = True
-            else:
-                print("WARNING: ADC standard deviation atlas not provided or not found.")
-                self.adc_std_atlas = None
-                self.adc_std_atlas_array = None
-        else:
-            print("WARNING: ADC mean atlas not provided or not found. Will use simple interpolation method.")
-            self.adc_mean_atlas = None
-            self.adc_mean_atlas_array = None
-            self.adc_std_atlas = None
-            self.adc_std_atlas_array = None
+        self.adc_mean_atlas = None
+        self.adc_std_atlas = None
         
-        # Debugging info
-        print(f"\n----- Dataset Initialization ({mode}) -----")
-        print(f"ADC directory: {adc_dir}")
-        print(f"Label directory: {label_dir}")
-        print(f"Synthetic lesions directory: {synthetic_lesions_dir}")
-        
-        # Verify directories exist
-        if not os.path.exists(adc_dir):
-            print(f"WARNING: ADC directory {adc_dir} does not exist!")
-        if not os.path.exists(label_dir):
-            print(f"WARNING: Label directory {label_dir} does not exist!")
-        if not os.path.exists(synthetic_lesions_dir):
-            print(f"WARNING: Synthetic lesions directory {synthetic_lesions_dir} does not exist!")
-        
-        # Get all ADC files
-        self.adc_files = sorted(glob.glob(os.path.join(adc_dir, "*.mha")))
-        print(f"Found {len(self.adc_files)} ADC files")
-        
-        if len(self.adc_files) == 0:
-            print(f"Contents of ADC directory: {os.listdir(adc_dir) if os.path.exists(adc_dir) else 'Directory not found'}")
-        
-        # Filter for patients with corresponding synthetic lesions
-        valid_patients = []
-        for adc_file in self.adc_files:
-            # Extract base filename
-            base_filename = os.path.basename(adc_file)
-            
-            # Check if the filename starts with prefixes and remove them
-            if base_filename.startswith("Zmap_"):
-                # Remove prefix for ZADC files
-                base_without_prefix = base_filename[5:]  # Skip the first 5 characters "Zmap_"
-            else:
-                base_without_prefix = base_filename
-            
-            # Extract the patient ID from the first two segments
-            parts = base_without_prefix.split('-')
-            if len(parts) >= 2:
-                patient_id = parts[0] + '-' + parts[1]
+        if adc_mean_atlas_path is not None and os.path.exists(adc_mean_atlas_path):
+            try:
+                # Načíst atlas průměrných hodnot ADC
+                print(f"Načítám průměrný ADC atlas: {adc_mean_atlas_path}")
+                atlas_img = sitk.ReadImage(adc_mean_atlas_path)
+                self.adc_mean_atlas = sitk.GetArrayFromImage(atlas_img)
                 
-                # Check if corresponding synthetic lesion directory exists
-                synthetic_dir = os.path.join(synthetic_lesions_dir, patient_id)
-                if os.path.exists(synthetic_dir):
-                    valid_patients.append(patient_id)
+                # Kontrola, zda atlas obsahuje NaN hodnoty
+                if np.isnan(self.adc_mean_atlas).any():
+                    print("VAROVÁNÍ: Průměrný atlas obsahuje NaN hodnoty, nahrazuji nulami")
+                    self.adc_mean_atlas = np.nan_to_num(self.adc_mean_atlas)
+                
+                self.has_atlas = True
+                print(f"Atlas načten, velikost: {self.adc_mean_atlas.shape}")
+                
+                # Vytvořit adresář pro vizualizace registrace
+                os.makedirs(os.path.join(self.output_dir, 'registration_vis'), exist_ok=True)
+                
+                # Načíst atlas směrodatných odchylek, pokud existuje
+                if adc_std_atlas_path is not None and os.path.exists(adc_std_atlas_path):
+                    print(f"Načítám atlas směrodatných odchylek ADC: {adc_std_atlas_path}")
+                    std_atlas_img = sitk.ReadImage(adc_std_atlas_path)
+                    self.adc_std_atlas = sitk.GetArrayFromImage(std_atlas_img)
+                    
+                    # Kontrola, zda atlas směrodatných odchylek obsahuje NaN hodnoty
+                    if np.isnan(self.adc_std_atlas).any():
+                        print("VAROVÁNÍ: Atlas směrodatných odchylek obsahuje NaN hodnoty, nahrazuji nulami")
+                        self.adc_std_atlas = np.nan_to_num(self.adc_std_atlas)
+                        
+                    print(f"Atlas směrodatných odchylek načten, velikost: {self.adc_std_atlas.shape}")
                 else:
-                    print(f"No synthetic lesions found for patient {patient_id} at {synthetic_dir}")
-            else:
-                print(f"Could not extract patient ID from filename: {base_filename}")
-        
-        self.valid_patients = valid_patients
-        print(f"Found {len(self.valid_patients)} valid patients with synthetic lesions")
-        
-        if len(self.valid_patients) == 0:
-            # Print the first few ADC filenames to help diagnose the issue
-            if len(self.adc_files) > 0:
-                print(f"Sample ADC files (first 5):")
-            
-            print(f"Contents of synthetic lesions dir: {os.listdir(synthetic_lesions_dir) if os.path.exists(synthetic_lesions_dir) else 'Directory not found'}")
-        
-        # Split into train/val
-        if mode == 'train':
-            self.patients = self.valid_patients[:int(0.8 * len(self.valid_patients))]
+                    print("Atlas směrodatných odchylek není k dispozici")
+            except Exception as e:
+                print(f"Chyba při načítání atlasů: {e}")
+                self.has_atlas = False
         else:
-            self.patients = self.valid_patients[int(0.8 * len(self.valid_patients)):]
+            print("Atlas ADC není k dispozici, bude použita základní metoda vytváření zdravého mozku")
         
-        print(f"Using {len(self.patients)} patients for {mode} mode")
+        # Najít všechny soubory ADC map a masek lézí
+        adc_pattern = os.path.join(adc_dir, "*.nii.gz")
+        label_pattern = os.path.join(label_dir, "*.nii.gz")
         
-        # Create patient-synthetic lesion pairs
-        self.samples = []
-        for patient in self.patients:
-            print(f"\nProcessing patient: {patient}")
-            
-            # Check for ADC files 
-            adc_pattern = os.path.join(adc_dir, f"*{patient}*.mha")
-            adc_files = glob.glob(adc_pattern)
-            if not adc_files:
-                print(f"WARNING: No ADC files found for pattern: {adc_pattern}")
-                continue
-            adc_file = adc_files[0]
-            print(f"Found ADC file: {os.path.basename(adc_file)}")
-            
-            # Check for label files (format: MGHNICU_xxx-VISIT_xx_lesion.mha)
-            label_pattern = os.path.join(label_dir, f"{patient}_lesion.mha")
-            label_files = glob.glob(label_pattern)
-            if not label_files:
-                print(f"WARNING: No label files found for pattern: {label_pattern}")
-                # Try alternative pattern with wildcard
-                alt_label_pattern = os.path.join(label_dir, f"{patient}*lesion.mha")
-                label_files = glob.glob(alt_label_pattern)
-                if not label_files:
-                    print(f"WARNING: No label files found for alternative pattern: {alt_label_pattern}")
-                    continue
-            label_file = label_files[0]
-            print(f"Found label file: {os.path.basename(label_file)}")
-            
-            # Check for synthetic lesions (format: .../MGHNICU_xxx-VISIT_xx/registered_lesion_sampleXX.mha)
-            syn_pattern = os.path.join(synthetic_lesions_dir, patient, "registered_lesion_*.mha")
-            synthetic_lesions = glob.glob(syn_pattern)
-            if not synthetic_lesions:
-                print(f"WARNING: No synthetic lesions found for pattern: {syn_pattern}")
-                print(f"Does directory exist? {os.path.exists(os.path.join(synthetic_lesions_dir, patient))}")
-                if os.path.exists(os.path.join(synthetic_lesions_dir, patient)):
-                    print(f"Contents of patient directory: {os.listdir(os.path.join(synthetic_lesions_dir, patient))}")
-                continue
-            
-            print(f"Found {len(synthetic_lesions)} synthetic lesions")
-            
-            # Create sample pairs
-            for syn_lesion in synthetic_lesions:
-                self.samples.append({
-                    'adc': adc_file,
-                    'label': label_file,
-                    'synthetic_lesion': syn_lesion
-                })
+        adc_files = sorted(glob.glob(adc_pattern))
+        label_files = sorted(glob.glob(label_pattern))
         
-        print(f"Created {len(self.samples)} samples for {mode} mode")
+        # Extrahovat ID pacientů z názvů souborů ADC
+        self.adc_files = {}
+        for f in adc_files:
+            patient_id = os.path.basename(f).split(".")[0]  # Předpokládáme formát ID.nii.gz
+            self.adc_files[patient_id] = f
         
-        if len(self.samples) == 0:
-            print(f"ERROR: No valid samples could be created for {mode} mode!")
-            print("Please check data paths and ensure the directory structure matches expected patterns")
+        # Přiřadit soubory masek k ID pacientů
+        self.label_files = {}
+        for f in label_files:
+            patient_id = os.path.basename(f).split(".")[0]
+            if patient_id in self.adc_files:  # Jen pacienti, kteří mají ADC
+                self.label_files[patient_id] = f
         
-        print(f"----- End Dataset Initialization ({mode}) -----\n")
+        # Zkontrolovat, kteří pacienti mají syntetické léze
+        valid_patient_ids = []
+        for patient_id in self.adc_files.keys():
+            if patient_id in self.label_files:
+                synth_dir = os.path.join(synthetic_lesions_dir, patient_id)
+                if os.path.exists(synth_dir):
+                    lesion_files = glob.glob(os.path.join(synth_dir, "*.nii.gz"))
+                    if len(lesion_files) > 0:
+                        valid_patient_ids.append(patient_id)
+        
+        print(f"Nalezeno {len(valid_patient_ids)} platných pacientů s ADC, maskami lézí a syntetickými lézemi")
+        
+        # Rozdělit data na trénovací a validační množinu
+        np.random.seed(42)  # Pro reprodukovatelné rozdělení
+        np.random.shuffle(valid_patient_ids)
+        split_idx = int(len(valid_patient_ids) * 0.8)  # 80% trénovací, 20% validační
+        
+        if mode == 'train':
+            self.patient_ids = valid_patient_ids[:split_idx]
+        else:  # validation
+            self.patient_ids = valid_patient_ids[split_idx:]
+        
+        print(f"Používám {len(self.patient_ids)} pacientů pro {mode}")
+        
+        # Vytvořit páry vzorků (pacient_id, synth_lesion_id)
+        self.sample_pairs = []
+        for patient_id in self.patient_ids:
+            synth_dir = os.path.join(synthetic_lesions_dir, patient_id)
+            lesion_files = glob.glob(os.path.join(synth_dir, "*.nii.gz"))
+            for lesion_file in lesion_files:
+                # Extrahovat ID syntetické léze z názvu souboru
+                lesion_id = os.path.basename(lesion_file).split(".")[0]
+                self.sample_pairs.append((patient_id, lesion_id))
+        
+        print(f"Vytvořeno {len(self.sample_pairs)} trénovacích/validačních párů")
     
     def register_atlas_to_subject(self, subject_img, subject_array, label_array):
         """
-        Register the ADC atlas to the subject's brain, avoiding the lesion area.
+        Registruje atlas k danému subjektu, vyhýbá se oblasti s lézemi.
         
         Args:
-            subject_img: SimpleITK image of the subject's brain
-            subject_array: Numpy array of the subject's brain
-            label_array: Lesion mask array
+            subject_img: SimpleITK obraz subjektu
+            subject_array: numpy pole subjektu
+            label_array: maska léze
             
         Returns:
-            registered_atlas_array: Registered atlas as numpy array
-            registered_std_atlas_array: Registered standard deviation atlas as numpy array
+            registered_atlas: registrovaný atlas
+            registered_std_atlas: registrovaný atlas směrodatných odchylek
         """
-        # If no atlas is available, return None
         if not self.has_atlas:
+            print("Atlas není k dispozici pro registraci.")
             return None, None
-            
+        
         try:
-            # Získat velikost dat subjektu
+            print("Registruji atlas k subjektu...")
+            
+            # Kontrola velikosti atlasu a subjektu
             subject_size = subject_array.shape
-            atlas_size = self.adc_mean_atlas_array.shape
+            atlas_size = self.adc_mean_atlas.shape
             
-            print(f"Subject size: {subject_size}, Atlas size: {atlas_size}")
+            print(f"Velikost subjektu: {subject_size}, velikost atlasu: {atlas_size}")
             
-            # Metoda 1: Zkusíme SimpleITK registraci
+            # Ověříme, že atlas není prázdný nebo obsahuje NaN hodnoty
+            if np.isnan(self.adc_mean_atlas).any():
+                print("VAROVÁNÍ: Atlas obsahuje NaN hodnoty!")
+                self.adc_mean_atlas = np.nan_to_num(self.adc_mean_atlas)
+            
+            # Zkusíme použít SimpleITK pro registraci
             try:
-                import SimpleITK as sitk
-                print("Používám SimpleITK pro registraci atlasu...")
+                print("Používám SimpleITK pro registraci...")
                 
-                # Pokud rozměry atlasu a subjektu neodpovídají, použijeme resample
-                if subject_size != atlas_size:
-                    print(f"Atlas and subject have different sizes. Resampling atlas to match subject...")
+                # Vytvořit masku, kde není léze (používáme jako oblast zájmu)
+                valid_mask = np.logical_not(label_array).astype(np.float32)
+                
+                # Konvertovat masku na SimpleITK obraz
+                mask_img = sitk.GetImageFromArray(valid_mask)
+                mask_img.CopyInformation(subject_img)
+                
+                # Nastavit orientaci atlasu stejně jako subjekt
+                atlas_img = sitk.GetImageFromArray(self.adc_mean_atlas)
+                
+                # Zkopírovat metadata z předmětu do atlasu
+                atlas_img.SetSpacing(subject_img.GetSpacing())
+                atlas_img.SetOrigin(subject_img.GetOrigin())
+                atlas_img.SetDirection(subject_img.GetDirection())
+                
+                # Nejprve musíme provést resample atlasu na stejnou velikost jako subjekt
+                resampler = sitk.ResampleImageFilter()
+                resampler.SetReferenceImage(subject_img)
+                resampler.SetInterpolator(sitk.sitkLinear)
+                resampler.SetDefaultPixelValue(0)
+                atlas_img_resampled = resampler.Execute(atlas_img)
+                
+                print("Resampled atlas to subject dimensions")
+                
+                # Provést registraci pomocí SimpleElastix
+                elastixImageFilter = sitk.ElastixImageFilter()
+                elastixImageFilter.SetFixedImage(subject_img)
+                elastixImageFilter.SetMovingImage(atlas_img_resampled)
+                elastixImageFilter.SetFixedMask(mask_img)  # Použít masku k vynechání lézí
+                
+                # Nastavení parametrů registrace
+                parameterMap = sitk.GetDefaultParameterMap('affine')
+                elastixImageFilter.SetParameterMap(parameterMap)
+                
+                # Provést registraci
+                try:
+                    elastixImageFilter.Execute()
+                    registered_atlas_img = elastixImageFilter.GetResultImage()
                     
-                    # Vytvořit identickou transformaci
-                    identity = sitk.Transform(3, sitk.sitkIdentity)
+                    # Konvertovat zpět na numpy pole
+                    registered_atlas = sitk.GetArrayFromImage(registered_atlas_img)
                     
-                    # Resample atlasu na velikost subjektu
-                    reference_image = subject_img
-                    
-                    # Resample mean atlas
-                    resampled_mean_atlas = sitk.Resample(
-                        self.adc_mean_atlas, 
-                        reference_image, 
-                        identity, 
-                        sitk.sitkLinear,
-                        0.0,
-                        self.adc_mean_atlas.GetPixelID()
-                    )
-                    
-                    registered_atlas_array = sitk.GetArrayFromImage(resampled_mean_atlas)
-                    print(f"Atlas resampled to size: {registered_atlas_array.shape}")
-                    
-                    # Resample std atlas if available
+                    # Pokud máme atlas směrodatných odchylek, registrujeme i ten
                     if self.adc_std_atlas is not None:
-                        resampled_std_atlas = sitk.Resample(
-                            self.adc_std_atlas, 
-                            reference_image, 
-                            identity, 
-                            sitk.sitkLinear,
-                            0.0,
-                            self.adc_std_atlas.GetPixelID()
-                        )
-                        registered_std_atlas_array = sitk.GetArrayFromImage(resampled_std_atlas)
-                    else:
-                        registered_std_atlas_array = None
-                    
-                    # Kontrola velikosti
-                    if registered_atlas_array.shape != subject_size:
-                        print(f"VAROVÁNÍ: Velikost registrovaného atlasu {registered_atlas_array.shape} se neshoduje s velikostí subjektu {subject_size}")
-                        raise ValueError("Nekonzistentní velikosti po registraci")
-                    
-                    # Kontrola NaN hodnot
-                    if np.any(np.isnan(registered_atlas_array)):
-                        print("VAROVÁNÍ: NaN hodnoty v registrovaném atlasu, nahrazuji mediánem")
-                        nan_mask = np.isnan(registered_atlas_array)
-                        non_nan_values = registered_atlas_array[~nan_mask]
-                        if len(non_nan_values) > 0:
-                            median_value = np.median(non_nan_values)
-                            registered_atlas_array[nan_mask] = median_value
-                    
-                    print("Successfully resampled atlas to match subject size")
-                    return registered_atlas_array, registered_std_atlas_array
-                else:
-                    # Pokud mají stejnou velikost, není třeba resample
-                    print("Atlas and subject have the same size. No resampling needed.")
-                    return self.adc_mean_atlas_array, self.adc_std_atlas_array
-                
-            except Exception as sitk_error:
-                print(f"SimpleITK registration failed with error: {sitk_error}")
-                print("Falling back to scipy ndimage method...")
-                
-            # Metoda 2: Pokud SimpleITK selže, použijeme scipy ndimage
-            from scipy import ndimage
-            
-            # Výpočet faktorů pro zoom
-            zoom_factors = (subject_size[0] / atlas_size[0], 
-                            subject_size[1] / atlas_size[1],
-                            subject_size[2] / atlas_size[2])
-            
-            # Kontrola extrémních hodnot
-            if max(zoom_factors) > 10 or min(zoom_factors) < 0.1:
-                print(f"WARNING: Extreme zoom factors: {zoom_factors}")
-                print("Adjusting factors to reasonable range...")
-                zoom_factors = tuple(min(max(factor, 0.1), 10.0) for factor in zoom_factors)
-                print(f"Adjusted factors: {zoom_factors}")
-            
-            print(f"Using scipy zoom with factors: {zoom_factors}")
-            
-            # Resize mean atlas
-            try:
-                resized_mean_atlas = ndimage.zoom(self.adc_mean_atlas_array, zoom_factors, order=1, mode='nearest')
-                
-                # Kontrola, zda výsledek má správnou velikost
-                if resized_mean_atlas.shape != subject_size:
-                    print(f"VAROVÁNÍ: Velikost výsledku {resized_mean_atlas.shape} se neshoduje s velikostí subjektu {subject_size}")
-                    # Další ořezání nebo doplnění pro zajištění správné velikosti
-                    pad_width = [(max(0, target - current), max(0, target - current)) 
-                                for target, current in zip(subject_size, resized_mean_atlas.shape)]
-                    resized_mean_atlas = np.pad(resized_mean_atlas, pad_width, mode='constant')
-                    resized_mean_atlas = resized_mean_atlas[:subject_size[0], :subject_size[1], :subject_size[2]]
-                
-                # Kontrola NaN hodnot
-                if np.any(np.isnan(resized_mean_atlas)):
-                    print("VAROVÁNÍ: NaN hodnoty v registrovaném atlasu, nahrazuji mediánem")
-                    nan_mask = np.isnan(resized_mean_atlas)
-                    non_nan_values = resized_mean_atlas[~nan_mask]
-                    if len(non_nan_values) > 0:
-                        median_value = np.median(non_nan_values)
-                        resized_mean_atlas[nan_mask] = median_value
-                
-                # Resize std atlas if available
-                if self.adc_std_atlas_array is not None:
-                    resized_std_atlas = ndimage.zoom(self.adc_std_atlas_array, zoom_factors, order=1, mode='nearest')
-                    # Upravení velikosti, pokud je potřeba
-                    if resized_std_atlas.shape != subject_size:
-                        pad_width = [(max(0, target - current), max(0, target - current)) 
-                                    for target, current in zip(subject_size, resized_std_atlas.shape)]
-                        resized_std_atlas = np.pad(resized_std_atlas, pad_width, mode='constant')
-                        resized_std_atlas = resized_std_atlas[:subject_size[0], :subject_size[1], :subject_size[2]]
+                        std_atlas_img = sitk.GetImageFromArray(self.adc_std_atlas)
+                        std_atlas_img.CopyInformation(atlas_img)
                         
-                    # Kontrola NaN hodnot
-                    if np.any(np.isnan(resized_std_atlas)):
-                        print("VAROVÁNÍ: NaN hodnoty v registrovaném atlasu std, nahrazuji mediánem")
-                        nan_mask = np.isnan(resized_std_atlas)
-                        non_nan_values = resized_std_atlas[~nan_mask]
-                        if len(non_nan_values) > 0:
-                            median_value = np.median(non_nan_values)
-                            resized_std_atlas[nan_mask] = median_value
+                        # Nastavit transformaci z předchozí registrace
+                        transformixImageFilter = sitk.TransformixImageFilter()
+                        transformixImageFilter.SetMovingImage(std_atlas_img)
+                        transformixImageFilter.SetTransformParameterMap(elastixImageFilter.GetTransformParameterMap())
+                        transformixImageFilter.Execute()
+                        
+                        registered_std_atlas_img = transformixImageFilter.GetResultImage()
+                        registered_std_atlas = sitk.GetArrayFromImage(registered_std_atlas_img)
+                    else:
+                        registered_std_atlas = None
+                        
+                    print("SimpleITK registrace úspěšná")
+                    
+                    # Zkontrolujeme výsledek registrace na díry (black spots)
+                    registered_atlas = self.fix_registration_holes(registered_atlas, subject_array)
+                    
+                    return registered_atlas, registered_std_atlas
+                
+                except Exception as e:
+                    print(f"SimpleITK registrace selhala: {e}")
+                    # Pokračujeme k záložní metodě
+            
+            except Exception as e:
+                print(f"Chyba při použití SimpleITK pro registraci: {e}")
+            
+            # Záložní metoda: použít scipy pro jednoduchou registraci
+            print("Používám scipy resample jako záložní metodu registrace...")
+            
+            # Vytvořit nový atlas s velikostí subjektu
+            registered_atlas = np.zeros_like(subject_array)
+            
+            # Vypočítat faktory zoomu pro každou dimenzi
+            zoom_factors = (subject_size[0] / atlas_size[0],
+                           subject_size[1] / atlas_size[1],
+                           subject_size[2] / atlas_size[2])
+            
+            # Použít scipy zoom pro resize
+            from scipy import ndimage
+            resized_atlas = ndimage.zoom(self.adc_mean_atlas, zoom_factors, order=1)
+            
+            # Oříznout nebo doplnit, pokud velikosti nejsou přesně stejné
+            if resized_atlas.shape != subject_array.shape:
+                print(f"Po resample se velikosti neshodují: subjekt {subject_array.shape} vs atlas {resized_atlas.shape}")
+                
+                # Vytvořit nové pole správné velikosti
+                registered_atlas = np.zeros_like(subject_array)
+                
+                # Vypočítat minimální společné rozměry
+                min_shape = [min(subject_array.shape[i], resized_atlas.shape[i]) for i in range(3)]
+                
+                # Zkopírovat dostupná data
+                registered_atlas[:min_shape[0], :min_shape[1], :min_shape[2]] = \
+                    resized_atlas[:min_shape[0], :min_shape[1], :min_shape[2]]
+            else:
+                registered_atlas = resized_atlas
+            
+            # Registrovat standardní odchylku, pokud je k dispozici
+            if self.adc_std_atlas is not None:
+                resized_std_atlas = ndimage.zoom(self.adc_std_atlas, zoom_factors, order=1)
+                
+                if resized_std_atlas.shape != subject_array.shape:
+                    registered_std_atlas = np.zeros_like(subject_array)
+                    min_shape = [min(subject_array.shape[i], resized_std_atlas.shape[i]) for i in range(3)]
+                    registered_std_atlas[:min_shape[0], :min_shape[1], :min_shape[2]] = \
+                        resized_std_atlas[:min_shape[0], :min_shape[1], :min_shape[2]]
                 else:
-                    resized_std_atlas = None
-                
-                print(f"Successfully resized atlas to size: {resized_mean_atlas.shape}")
-                return resized_mean_atlas, resized_std_atlas
-                
-            except Exception as resize_error:
-                print(f"Error during scipy resize: {resize_error}")
-                print("Unable to register atlas properly. Returning original atlas as fallback.")
-                return self.adc_mean_atlas_array, self.adc_std_atlas_array
-                
+                    registered_std_atlas = resized_std_atlas
+            else:
+                registered_std_atlas = None
+            
+            print("Scipy registrace dokončena")
+            
+            # Zkontrolujeme výsledek registrace na díry (black spots)
+            registered_atlas = self.fix_registration_holes(registered_atlas, subject_array)
+            
+            return registered_atlas, registered_std_atlas
+            
         except Exception as e:
-            print(f"Error registering atlas to subject: {e}")
-            print("Using unregistered atlas as fallback")
-            return self.adc_mean_atlas_array, self.adc_std_atlas_array
+            print(f"Registrace atlasu selhala: {e}")
+            return None, None
+    
+    def fix_registration_holes(self, registered_atlas, subject_array):
+        """
+        Opraví díry v registrovaném atlasu pomocí interpolace a prahování.
+        
+        Args:
+            registered_atlas: Registrovaný atlas s možnými dírami
+            subject_array: Původní obraz subjektu pro referenci
+            
+        Returns:
+            Opravený registrovaný atlas bez děr
+        """
+        print("Kontroluji a opravuji díry v registrovaném atlasu...")
+        
+        # Vytvořit kopii atlasu
+        fixed_atlas = registered_atlas.copy()
+        
+        # Identifikovat díry (příliš nízké hodnoty v oblastech, kde subjekt má signál)
+        # Předpokládáme, že díry mají hodnotu 0 nebo blízko 0
+        # a objevují se tam, kde subjekt má nenulový signál
+        subject_mask = subject_array > 0.01
+        hole_mask = (fixed_atlas < 0.01) & subject_mask
+        
+        if np.sum(hole_mask) > 0:
+            print(f"Nalezeno {np.sum(hole_mask)} voxelů s dírami")
+            
+            # Použít morfologické operace k identifikaci malých děr
+            from scipy import ndimage
+            # Dilatace a následná eroze může vyplnit malé díry
+            filled_mask = ndimage.binary_closing(~hole_mask, structure=np.ones((3,3,3)), iterations=2)
+            
+            # Interpolovat hodnoty pomocí okolí
+            # Způsob 1: Použít medián filtr pro vyplnění děr
+            temp_atlas = fixed_atlas.copy()
+            temp_atlas[hole_mask] = np.nan  # Označit díry jako NaN
+            
+            # Vytvořit masku pro median filtr (pouze neNaN hodnoty)
+            median_filtered = ndimage.median_filter(np.nan_to_num(temp_atlas), size=5)
+            
+            # Pouze nahradit hodnoty v dírách
+            fixed_atlas[hole_mask] = median_filtered[hole_mask]
+            
+            # Způsob 2: Pro větší díry použít vzdálenostně váženou interpolaci
+            from scipy.interpolate import griddata
+            
+            # Pro každý řez zvlášť (pro efektivitu)
+            for z in range(fixed_atlas.shape[0]):
+                slice_holes = hole_mask[z]
+                if np.sum(slice_holes) > 0:
+                    # Získat souřadnice známých bodů a jejich hodnoty
+                    y_known, x_known = np.where(~slice_holes)
+                    values_known = fixed_atlas[z, y_known, x_known]
+                    
+                    # Souřadnice bodů k interpolaci (díry)
+                    y_holes, x_holes = np.where(slice_holes)
+                    
+                    if len(y_known) > 0 and len(y_holes) > 0:
+                        # Připravit body pro interpolaci
+                        points = np.column_stack((y_known, x_known))
+                        holes = np.column_stack((y_holes, x_holes))
+                        
+                        # Interpolovat hodnoty
+                        try:
+                            interpolated = griddata(points, values_known, holes, method='linear', fill_value=np.mean(values_known))
+                            fixed_atlas[z, y_holes, x_holes] = interpolated
+                        except Exception as e:
+                            print(f"Interpolace selhala pro řez {z}: {e}")
+            
+            print("Díry v atlasu byly opraveny")
+        else:
+            print("Žádné díry v atlasu nebyly nalezeny")
+        
+        return fixed_atlas
     
     def __len__(self):
-        return len(self.samples)
+        return len(self.sample_pairs)
     
     def __getitem__(self, idx):
         """
@@ -982,44 +1011,65 @@ def train(adc_dir, label_dir, synthetic_lesions_dir, output_dir,
          adc_mean_atlas_path=None, adc_std_atlas_path=None,
          num_epochs=200, batch_size=4, save_interval=5):
     """
-    Train the HIE lesion inpainting GAN.
+    Trénuje model pro inpainting lézí.
     
     Args:
-        adc_dir: Directory containing ADC maps
-        label_dir: Directory containing lesion labels
-        synthetic_lesions_dir: Directory containing synthetic lesions
-        output_dir: Directory to save model checkpoints and results
-        adc_mean_atlas_path: Path to the mean ADC atlas
-        adc_std_atlas_path: Path to the standard deviation ADC atlas
-        num_epochs: Number of epochs to train
-        batch_size: Batch size
-        save_interval: Interval (in epochs) for saving model checkpoints
+        adc_dir: Adresář s ADC mapami
+        label_dir: Adresář s maskami lézí
+        synthetic_lesions_dir: Adresář se syntetickými lézemi
+        output_dir: Adresář pro ukládání výsledků
+        adc_mean_atlas_path: Cesta k průměrnému ADC atlasu
+        adc_std_atlas_path: Cesta k atlasu směrodatných odchylek ADC
+        num_epochs: Počet trénovacích epoch
+        batch_size: Velikost dávky
+        save_interval: Interval (v epochách) pro ukládání kontrolních bodů
     """
-    # Create output directory
-    os.makedirs(output_dir, exist_ok=True)
+    print(f"Spouštím trénink s parametry:")
+    print(f"- ADC dir: {adc_dir}")
+    print(f"- Label dir: {label_dir}")
+    print(f"- Synthetic lesions dir: {synthetic_lesions_dir}")
+    print(f"- Output dir: {output_dir}")
+    print(f"- ADC mean atlas: {adc_mean_atlas_path}")
+    print(f"- ADC std atlas: {adc_std_atlas_path}")
+    print(f"- Počet epoch: {num_epochs}")
+    print(f"- Velikost dávky: {batch_size}")
     
-    print("\n===== VALIDATING DATASET PATHS =====")
-    print(f"ADC directory: {adc_dir} - Exists: {os.path.exists(adc_dir)}")
-    print(f"Label directory: {label_dir} - Exists: {os.path.exists(label_dir)}")
-    print(f"Synthetic lesions directory: {synthetic_lesions_dir} - Exists: {os.path.exists(synthetic_lesions_dir)}")
+    # Kontrola existence adresářů
+    for dir_path in [adc_dir, label_dir, synthetic_lesions_dir]:
+        if not os.path.exists(dir_path):
+            raise ValueError(f"Adresář neexistuje: {dir_path}")
     
-    if adc_mean_atlas_path:
-        print(f"ADC mean atlas: {adc_mean_atlas_path} - Exists: {os.path.exists(adc_mean_atlas_path)}")
-    if adc_std_atlas_path:
-        print(f"ADC std atlas: {adc_std_atlas_path} - Exists: {os.path.exists(adc_std_atlas_path)}")
+    # Kontrola atlasů
+    if adc_mean_atlas_path is not None and not os.path.exists(adc_mean_atlas_path):
+        raise ValueError(f"ADC atlas neexistuje: {adc_mean_atlas_path}")
     
-    if os.path.exists(synthetic_lesions_dir):
-        print(f"Contents of synthetic_lesions_dir: {os.listdir(synthetic_lesions_dir)[:10]}")
-    print("=====================================\n")
+    if adc_std_atlas_path is not None and not os.path.exists(adc_std_atlas_path):
+        raise ValueError(f"ADC atlas směrodatných odchylek neexistuje: {adc_std_atlas_path}")
     
-    # Create datasets
+    # Vytvořit výstupní adresář, pokud neexistuje
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+        print(f"Vytvořen výstupní adresář: {output_dir}")
+    
+    # Vytvořit adresáře pro checkpoint a vizualizace
+    checkpoint_dir = os.path.join(output_dir, 'checkpoints')
+    vis_dir = os.path.join(output_dir, 'visualizations')
+    
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    os.makedirs(vis_dir, exist_ok=True)
+    
+    # Nastavit zařízení (GPU, pokud je k dispozici)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Používám zařízení: {device}")
+    
+    # Vytvořit datové sady
     train_dataset = LesionInpaintingDataset(
         adc_dir=adc_dir,
         label_dir=label_dir,
         synthetic_lesions_dir=synthetic_lesions_dir,
+        output_dir=output_dir,
         adc_mean_atlas_path=adc_mean_atlas_path,
         adc_std_atlas_path=adc_std_atlas_path,
-        patch_size=(96, 96, 96),
         mode='train'
     )
     
@@ -1027,310 +1077,150 @@ def train(adc_dir, label_dir, synthetic_lesions_dir, output_dir,
         adc_dir=adc_dir,
         label_dir=label_dir,
         synthetic_lesions_dir=synthetic_lesions_dir,
+        output_dir=output_dir,
         adc_mean_atlas_path=adc_mean_atlas_path,
         adc_std_atlas_path=adc_std_atlas_path,
-        patch_size=(96, 96, 96),
         mode='val'
     )
     
-    # Check if datasets have samples
-    if len(train_dataset) == 0:
-        raise ValueError(
-            "Training dataset is empty! Cannot continue with training.\n"
-            "Please check the following:\n"
-            "1. The directories exist and contain the expected files\n"
-            "2. The file naming conventions match those expected in the code\n"
-            "3. The synthetic_lesions_dir has subdirectories named after patients\n"
-            "4. Each patient directory contains synthetic lesion MHA files"
-        )
+    # Vytvořit datové loadery
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
     
-    if len(val_dataset) == 0:
-        print("WARNING: Validation dataset is empty. Training will continue without validation.")
-        val_dataset = None
+    print(f"Trénovací dataset: {len(train_dataset)} vzorků")
+    print(f"Validační dataset: {len(val_dataset)} vzorků")
     
-    # Create data loaders
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=4,
-        pin_memory=True
-    )
+    # Inicializovat GAN model
+    gan_model = LesionInpaintingGAN(device=device)
     
-    val_loader = None
-    if val_dataset is not None and len(val_dataset) > 0:
-        val_loader = DataLoader(
-            val_dataset,
-            batch_size=batch_size,
-            shuffle=False,
-            num_workers=4,
-            pin_memory=True
-        )
+    # Trénovat model
+    print("Zahajuji trénink modelu...")
     
-    # Initialize model
-    gan_model = LesionInpaintingGAN(img_shape=(96, 96, 96))
-    
-    # Training loop
+    # Metriky pro monitorování tréninku
+    best_val_loss = float('inf')
     train_losses = []
     val_losses = []
     
-    for epoch in range(num_epochs):
-        print(f"Epoch {epoch+1}/{num_epochs}")
+    for epoch in range(1, num_epochs + 1):
+        print(f"\nEpocha {epoch}/{num_epochs}")
         
-        # Training
-        epoch_losses = {
-            'g_loss': 0,
-            'adv_loss': 0,
-            'l1_loss': 0,
-            'context_loss': 0,
-            'd_loss': 0
-        }
+        # Trénink
+        gan_model.train_on_loader(train_loader)
         
-        pbar = tqdm(train_loader)
-        for batch in pbar:
-            losses = gan_model.train_step(batch)
-            
-            # Update progress bar
-            pbar.set_description(f"G: {losses['g_loss']:.4f}, D: {losses['d_loss']:.4f}")
-            
-            # Accumulate losses
-            for key in epoch_losses:
-                epoch_losses[key] += losses[key]
+        # Validace
+        val_loss = gan_model.validate(val_loader)
         
-        # Average losses
-        for key in epoch_losses:
-            epoch_losses[key] /= len(train_loader)
+        # Ukládat metriky
+        train_losses.append(gan_model.last_g_loss)
+        val_losses.append(val_loss)
         
-        train_losses.append(epoch_losses)
+        # Reportovat metody
+        print(f"G loss: {gan_model.last_g_loss:.4f}, D loss: {gan_model.last_d_loss:.4f}, Val loss: {val_loss:.4f}")
         
-        # Validation
-        if val_loader is not None:
-            print("Validating...")
-            val_epoch_losses = gan_model.validate(val_loader)
-            val_losses.append(val_epoch_losses)
-            print(f"Validation - G: {val_epoch_losses['g_loss']:.4f}, D: {val_epoch_losses['d_loss']:.4f}")
+        # Ukládat model na intervalu a také nejlepší model
+        if epoch % save_interval == 0:
+            checkpoint_path = os.path.join(checkpoint_dir, f"gan_epoch_{epoch}.pt")
+            gan_model.save_models(checkpoint_path)
+            print(f"Model uložen do: {checkpoint_path}")
         
-        # Update learning rates
-        gan_model.scheduler_G.step()
-        gan_model.scheduler_D.step()
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_model_path = os.path.join(checkpoint_dir, "gan_best.pt")
+            gan_model.save_models(best_model_path)
+            print(f"Nový nejlepší model! Uložen jako: {best_model_path}")
         
-        # Save checkpoint based on specified save_interval
-        if (epoch + 1) % save_interval == 0:
-            gan_model.save_models(output_dir, epoch + 1)
-        
-        # Generate visualizations after each epoch
-        if val_loader is not None:
-            with torch.no_grad():
-                # Get a sample from validation set
-                val_sample = next(iter(val_loader))
-                input_data = val_sample['input'].to(gan_model.device)
-                real_brain = val_sample['target'].to(gan_model.device)
-                synthetic_mask = val_sample['synthetic_mask'].to(gan_model.device)
+        # Generovat vizualizace pro monitorování pokroku
+        if epoch % 5 == 0 or epoch == 1:
+            # Vybrat náhodný batch pro vizualizaci
+            for i, batch in enumerate(val_loader):
+                if i > 0:  # Jen první batch
+                    break
+                    
+                inputs, targets = batch['input'].to(device), batch['target'].to(device)
+                generated = gan_model.generator(inputs)
                 
-                # Generate inpainted image
-                fake_brain = gan_model.generator(input_data)
+                # Denormalizovat a převést na numpy
+                input_healthy = inputs[:, 0].detach().cpu().numpy()  # Kanál 0 - zdravý mozek
+                input_mask = inputs[:, 1].detach().cpu().numpy()     # Kanál 1 - maska léze
+                target_imgs = targets.detach().cpu().numpy()
+                generated_imgs = generated.detach().cpu().numpy()
                 
-                # Create detailed visualizations for each sample
-                for i in range(min(2, input_data.shape[0])):
-                    # Get current sample data
-                    input_vol = input_data[i, 0].cpu().numpy()
-                    mask_vol = synthetic_mask[i, 0].cpu().numpy()
-                    real_vol = real_brain[i, 0].cpu().numpy()
-                    fake_vol = fake_brain[i, 0].cpu().numpy()
+                # Vizualizovat jeden vzorek z batche
+                for j in range(min(3, inputs.size(0))):  # Maximálně 3 vzorky
+                    vis_path = os.path.join(vis_dir, f"epoch_{epoch}_sample_{j}.png")
                     
-                    # Find slices containing the lesion
-                    lesion_slices = []
-                    for z in range(mask_vol.shape[0]):
-                        if np.any(mask_vol[z] > 0):
-                            lesion_slices.append(z)
+                    # Vypočítat rozdíl - mapa změn
+                    diff_map = np.abs(generated_imgs[j, 0] - input_healthy[j])
                     
-                    if not lesion_slices:
-                        # If no lesion found, use middle slices
-                        mid_slice = mask_vol.shape[0] // 2
-                        lesion_slices = list(range(max(0, mid_slice-5), min(mask_vol.shape[0], mid_slice+6)))
+                    # Vytvořit vizualizaci
+                    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+                    axes = axes.flat
                     
-                    # We want ALL slices with lesion content
-                    print(f"Visualizing all {len(lesion_slices)} slices with lesion content")
+                    # Najít střední řez s nejvíce lézemi
+                    lesion_sum = np.sum(input_mask[j], axis=(1, 2))
+                    middle_slice = np.argmax(lesion_sum) if np.max(lesion_sum) > 0 else input_mask[j].shape[0] // 2
                     
-                    # Calculate overall change in lesion area
-                    lesion_area_values_before = input_vol[mask_vol > 0]
-                    lesion_area_values_after = fake_vol[mask_vol > 0]
-                    mean_value_before = np.mean(lesion_area_values_before) if len(lesion_area_values_before) > 0 else 0
-                    mean_value_after = np.mean(lesion_area_values_after) if len(lesion_area_values_after) > 0 else 0
-                    mean_abs_change = np.mean(np.abs(lesion_area_values_after - lesion_area_values_before)) if len(lesion_area_values_before) > 0 else 0
+                    # Zobrazit zdravý mozek
+                    axes[0].imshow(input_healthy[j, middle_slice], cmap='gray')
+                    axes[0].set_title('Zdravý mozek (vstup)')
+                    axes[0].axis('off')
                     
-                    # Create multi-page PDF to store all slices if there are too many
-                    use_pdf = len(lesion_slices) > 15
-                    if use_pdf:
-                        pdf_filename = os.path.join(output_dir, f'epoch_{epoch+1:03d}_sample_{i}_all_slices.pdf')
-                        pdf = PdfPages(pdf_filename)
-                        
-                        # Create multiple figures with max 15 slices per figure
-                        for slice_batch_idx in range(0, len(lesion_slices), 15):
-                            batch_slices = lesion_slices[slice_batch_idx:slice_batch_idx+15]
-                            fig, axes = plt.subplots(4, len(batch_slices), figsize=(4*len(batch_slices), 16))
-                            
-                            # If only one slice, reshape axes for indexing
-                            if len(batch_slices) == 1:
-                                axes = axes.reshape(4, 1)
-                                
-                            for j, slice_idx in enumerate(batch_slices):
-                                # Process slice as before...
-                                # Create overlay of input with lesion mask for visualization
-                                input_with_mask = np.stack([input_vol[slice_idx], input_vol[slice_idx], input_vol[slice_idx]], axis=2)
-                                # Add red overlay for lesion
-                                mask_overlay = mask_vol[slice_idx] > 0
-                                input_with_mask[mask_overlay, 0] = 1.0  # Red channel
-                                input_with_mask[mask_overlay, 1] = 0.0  # Green channel
-                                input_with_mask[mask_overlay, 2] = 0.0  # Blue channel
-                                
-                                # Calculate changes for this particular slice
-                                slice_mask = mask_vol[slice_idx] > 0
-                                if np.any(slice_mask):
-                                    slice_before = input_vol[slice_idx][slice_mask]
-                                    slice_after = fake_vol[slice_idx][slice_mask]
-                                    slice_mean_change = np.mean(np.abs(slice_after - slice_before))
-                                    slice_title = f'Slice {slice_idx} (Δ={slice_mean_change:.4f})'
-                                else:
-                                    slice_title = f'Slice {slice_idx}'
-                                
-                                # Create difference map between fake and input to show changes
-                                diff_map = np.abs(fake_vol[slice_idx] - input_vol[slice_idx])
-                                
-                                # Plot each slice
-                                axes[0, j].imshow(input_vol[slice_idx], cmap='gray')
-                                axes[0, j].set_title(slice_title)
-                                axes[0, j].axis('off')
-                                
-                                axes[1, j].imshow(input_with_mask)
-                                axes[1, j].set_title(f'Lesion Overlay')
-                                axes[1, j].axis('off')
-                                
-                                axes[2, j].imshow(fake_vol[slice_idx], cmap='gray')
-                                axes[2, j].set_title(f'Generated')
-                                axes[2, j].axis('off')
-                                
-                                # Show difference map - where changes were made
-                                axes[3, j].imshow(diff_map, cmap='hot')
-                                axes[3, j].set_title(f'Change Map')
-                                axes[3, j].axis('off')
-                            
-                            # Add row labels
-                            axes[0, 0].set_ylabel('Input Volume')
-                            axes[1, 0].set_ylabel('Lesion Location')
-                            axes[2, 0].set_ylabel('Generated Result')
-                            axes[3, 0].set_ylabel('Change Heatmap')
-                            
-                            # Add overall statistics to the figure
-                            plt.suptitle(f'Epoch {epoch+1} - G:{epoch_losses["g_loss"]:.4f}, D:{epoch_losses["d_loss"]:.4f}\n'
-                                         f'Mean value in lesion area: Before={mean_value_before:.4f}, After={mean_value_after:.4f}, Change={mean_abs_change:.4f}')
-                            
-                            plt.tight_layout()
-                            pdf.savefig(fig)
-                            plt.close()
-                            
-                        pdf.close()
-                        print(f"Saved all {len(lesion_slices)} slices to {pdf_filename}")
-                    else:
-                        # If few enough slices, just create one image
-                        num_slices = len(lesion_slices)
-                        fig, axes = plt.subplots(4, num_slices, figsize=(4*num_slices, 16))
-                        
-                        # If only one slice, reshape axes for indexing
-                        if num_slices == 1:
-                            axes = axes.reshape(4, 1)
-                        
-                        for j, slice_idx in enumerate(lesion_slices):
-                            # Create overlay of input with lesion mask for visualization
-                            input_with_mask = np.stack([input_vol[slice_idx], input_vol[slice_idx], input_vol[slice_idx]], axis=2)
-                            # Add red overlay for lesion
-                            mask_overlay = mask_vol[slice_idx] > 0
-                            input_with_mask[mask_overlay, 0] = 1.0  # Red channel
-                            input_with_mask[mask_overlay, 1] = 0.0  # Green channel
-                            input_with_mask[mask_overlay, 2] = 0.0  # Blue channel
-                            
-                            # Calculate changes for this particular slice
-                            slice_mask = mask_vol[slice_idx] > 0
-                            if np.any(slice_mask):
-                                slice_before = input_vol[slice_idx][slice_mask]
-                                slice_after = fake_vol[slice_idx][slice_mask]
-                                slice_mean_change = np.mean(np.abs(slice_after - slice_before))
-                                slice_title = f'Slice {slice_idx} (Δ={slice_mean_change:.4f})'
-                            else:
-                                slice_title = f'Slice {slice_idx}'
-                            
-                            # Create difference map between fake and input to show changes
-                            diff_map = np.abs(fake_vol[slice_idx] - input_vol[slice_idx])
-                            
-                            # Plot each slice
-                            axes[0, j].imshow(input_vol[slice_idx], cmap='gray')
-                            axes[0, j].set_title(slice_title)
-                            axes[0, j].axis('off')
-                            
-                            axes[1, j].imshow(input_with_mask)
-                            axes[1, j].set_title(f'Lesion Overlay')
-                            axes[1, j].axis('off')
-                            
-                            axes[2, j].imshow(fake_vol[slice_idx], cmap='gray')
-                            axes[2, j].set_title(f'Generated')
-                            axes[2, j].axis('off')
-                            
-                            # Show difference map - where changes were made
-                            axes[3, j].imshow(diff_map, cmap='hot')
-                            axes[3, j].set_title(f'Change Map')
-                            axes[3, j].axis('off')
-                        
-                        # Add row labels
-                        if num_slices > 0:
-                            axes[0, 0].set_ylabel('Input Volume')
-                            axes[1, 0].set_ylabel('Lesion Location')
-                            axes[2, 0].set_ylabel('Generated Result')
-                            axes[3, 0].set_ylabel('Change Heatmap')
-                        
-                        # Add overall statistics to the figure
-                        plt.suptitle(f'Epoch {epoch+1} - G:{epoch_losses["g_loss"]:.4f}, D:{epoch_losses["d_loss"]:.4f}\n'
-                                     f'Mean value in lesion area: Before={mean_value_before:.4f}, After={mean_value_after:.4f}, Change={mean_abs_change:.4f}')
-                        
-                        # Save with epoch number and sample number
-                        plt.tight_layout()
-                        plt.savefig(os.path.join(output_dir, f'epoch_{epoch+1:03d}_sample_{i}_full_volume.png'), dpi=150)
-                        plt.close()
+                    # Zobrazit masku léze
+                    axes[1].imshow(input_mask[j, middle_slice], cmap='hot')
+                    axes[1].set_title('Maska léze (vstup)')
+                    axes[1].axis('off')
+                    
+                    # Zobrazit cílový výstup
+                    axes[2].imshow(target_imgs[j, 0, middle_slice], cmap='gray')
+                    axes[2].set_title('Cílový výstup')
+                    axes[2].axis('off')
+                    
+                    # Zobrazit generovaný výstup
+                    axes[3].imshow(generated_imgs[j, 0, middle_slice], cmap='gray')
+                    axes[3].set_title('Generovaný výstup')
+                    axes[3].axis('off')
+                    
+                    # Zobrazit rozdíl
+                    axes[4].imshow(diff_map[middle_slice], cmap='hot')
+                    axes[4].set_title('Mapa změn')
+                    axes[4].axis('off')
+                    
+                    # Zobrazit kombinaci (generovaný + kontura léze)
+                    axes[5].imshow(generated_imgs[j, 0, middle_slice], cmap='gray')
+                    
+                    # Přidat kontury léze
+                    from scipy import ndimage
+                    contours = ndimage.binary_dilation(input_mask[j, middle_slice] > 0.5) ^ (input_mask[j, middle_slice] > 0.5)
+                    masked_data = np.ma.masked_where(~contours, np.ones_like(contours))
+                    axes[5].imshow(masked_data, cmap='autumn', alpha=1.0)
+                    axes[5].set_title('Generovaný + kontura léze')
+                    axes[5].axis('off')
+                    
+                    plt.suptitle(f"Epoch {epoch} - Vzorek {j} - Řez {middle_slice}", fontsize=16)
+                    plt.tight_layout()
+                    plt.savefig(vis_path, dpi=150)
+                    plt.close(fig)
+                    
+                    print(f"Uložena vizualizace: {vis_path}")
     
-    # Plot training curves
-    plt.figure(figsize=(12, 8))
+    # Uložit finální model
+    final_model_path = os.path.join(checkpoint_dir, "gan_final.pt")
+    gan_model.save_models(final_model_path)
+    print(f"Trénink dokončen. Finální model uložen jako: {final_model_path}")
     
-    # Generator losses
-    plt.subplot(2, 1, 1)
-    plt.plot([loss['g_loss'] for loss in train_losses], label='G Total Loss (Train)')
-    plt.plot([loss['adv_loss'] for loss in train_losses], label='G Adversarial Loss (Train)')
-    plt.plot([loss['l1_loss'] for loss in train_losses], label='G L1 Loss (Train)')
-    plt.plot([loss['context_loss'] for loss in train_losses], label='G Context Loss (Train)')
-    
-    if val_losses:
-        plt.plot([loss['g_loss'] for loss in val_losses], '--', label='G Total Loss (Val)')
-    
-    plt.legend()
-    plt.title('Generator Losses')
+    # Vytvořit a uložit graf vývoje loss funkcí
+    plt.figure(figsize=(10, 5))
+    plt.plot(train_losses, label='Train Generator Loss')
+    plt.plot(val_losses, label='Validation Loss')
     plt.xlabel('Epoch')
     plt.ylabel('Loss')
-    
-    # Discriminator losses
-    plt.subplot(2, 1, 2)
-    plt.plot([loss['d_loss'] for loss in train_losses], label='D Loss (Train)')
-    
-    if val_losses:
-        plt.plot([loss['d_loss'] for loss in val_losses], '--', label='D Loss (Val)')
-    
+    plt.title('Training and Validation Loss')
     plt.legend()
-    plt.title('Discriminator Losses')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, 'training_curves.png'))
+    plt.grid(True)
+    plt.savefig(os.path.join(output_dir, 'loss_history.png'))
     plt.close()
     
-    return gan_model
+    return final_model_path
 
 
 def apply_inpainting(gan_model, adc_file, synthetic_lesion_file, output_file):
@@ -1549,233 +1439,141 @@ def visualize_healthy_brain_creation(adc_array, label_array, healthy_brain, outp
 
 def create_and_visualize_healthy_brain(adc_file, label_file, adc_mean_atlas_path, adc_std_atlas_path, output_file):
     """
-    Vytvoří a vizualizuje proces tvorby zdravého mozku z ADC mapy s lézí za použití atlasu.
+    Vytvoří a vizualizuje zdravý mozek pomocí atlasu.
     
     Args:
-        adc_file: Cesta k ADC souboru (.mha)
-        label_file: Cesta k souboru s maskou léze (.mha)
+        adc_file: Cesta k ADC souboru
+        label_file: Cesta k souboru s maskou léze
         adc_mean_atlas_path: Cesta k průměrnému ADC atlasu
-        adc_std_atlas_path: Cesta k atlasu směrodatných odchylek (volitelné)
-        output_file: Cesta k výstupnímu souboru
+        adc_std_atlas_path: Cesta k atlasu směrodatných odchylek ADC
+        output_file: Cesta pro uložení vizualizace
     """
-    print("Načítání dat...")
-    
-    # Načtení ADC mapy
-    adc_img = sitk.ReadImage(adc_file)
-    adc_array = sitk.GetArrayFromImage(adc_img)
-    
-    # Načtení masky léze
-    label_img = sitk.ReadImage(label_file)
-    label_array = sitk.GetArrayFromImage(label_img)
-    
-    # Normalizace ADC do [0, 1]
-    adc_min = adc_array.min()
-    adc_max = adc_array.max()
-    adc_array_norm = (adc_array - adc_min) / (adc_max - adc_min + 1e-8)
-    
-    # Převod masky léze na binární
-    label_array = (label_array > 0).astype(np.float32)
-    
-    # Načtení atlasů
-    print("Načítání atlasů...")
-    if adc_mean_atlas_path and os.path.exists(adc_mean_atlas_path):
-        print(f"Načítání průměrného ADC atlasu: {adc_mean_atlas_path}")
-        try:
-            adc_mean_atlas = sitk.ReadImage(adc_mean_atlas_path)
-            adc_mean_atlas_array = sitk.GetArrayFromImage(adc_mean_atlas)
-            
-            if adc_std_atlas_path and os.path.exists(adc_std_atlas_path):
-                print(f"Načítání atlasu směrodatných odchylek: {adc_std_atlas_path}")
-                adc_std_atlas = sitk.ReadImage(adc_std_atlas_path)
-                adc_std_atlas_array = sitk.GetArrayFromImage(adc_std_atlas)
-            else:
-                print("VAROVÁNÍ: Atlas směrodatných odchylek nenalezen.")
-                adc_std_atlas = None
-                adc_std_atlas_array = None
-                
-            has_atlas = True
-        except Exception as e:
-            print(f"Chyba při načítání atlasů: {e}")
-            has_atlas = False
-    else:
-        print("VAROVÁNÍ: Průměrný ADC atlas nenalezen.")
-        return
-    
     try:
-        # Transformace atlasu na velikost pacienta
-        print("Registrace atlasu k subjektu...")
-        subject_size = adc_array.shape
-        atlas_size = adc_mean_atlas_array.shape
+        print(f"Vytvářím vizualizaci zdravého mozku pro {os.path.basename(adc_file)}")
         
-        print(f"Velikost ADC subjektu: {subject_size}, Velikost atlasu: {atlas_size}")
+        # Vytvořit dočasný výstupní adresář
+        output_dir = os.path.dirname(output_file)
+        os.makedirs(output_dir, exist_ok=True)
         
-        # Použití vylepšené metody převzorkování s kontrolou poměrů
-        try:
-            from scipy import ndimage
-            
-            # Vypočítáme poměry rozměrů pro převzorkování
-            zoom_factors = (subject_size[0] / atlas_size[0], 
-                           subject_size[1] / atlas_size[1],
-                           subject_size[2] / atlas_size[2])
-            
-            print(f"Použití scipy zoom s faktory: {zoom_factors}")
-            
-            # Kontrola, zda nejsou faktory zoom příliš extrémní
-            if max(zoom_factors) > 10 or min(zoom_factors) < 0.1:
-                print(f"VAROVÁNÍ: Extrémní faktory pro zoom: {zoom_factors}")
-                print("Upravuji faktory, aby byly v rozumném rozsahu...")
-                zoom_factors = tuple(min(max(factor, 0.1), 10.0) for factor in zoom_factors)
-                print(f"Upravené faktory: {zoom_factors}")
-            
-            # Registrace průměrného atlasu
-            registered_atlas_array = ndimage.zoom(adc_mean_atlas_array, zoom_factors, order=1, mode='nearest')
-            
-            # Kontrola, zda výsledek má správnou velikost
-            if registered_atlas_array.shape != subject_size:
-                print(f"VAROVÁNÍ: Velikost registrovaného atlasu {registered_atlas_array.shape} se neshoduje s velikostí subjektu {subject_size}")
-                # Další ořezání nebo doplnění pro zajištění správné velikosti
-                pad_width = [(max(0, target - current), max(0, target - current)) 
-                            for target, current in zip(subject_size, registered_atlas_array.shape)]
-                registered_atlas_array = np.pad(registered_atlas_array, pad_width, mode='constant')
-                registered_atlas_array = registered_atlas_array[:subject_size[0], :subject_size[1], :subject_size[2]]
-            
-            # Registrace atlasu standardních odchylek, pokud existuje
-            if adc_std_atlas_array is not None:
-                registered_std_atlas_array = ndimage.zoom(adc_std_atlas_array, zoom_factors, order=1, mode='nearest')
-                # Upravení velikosti, pokud je potřeba
-                if registered_std_atlas_array.shape != subject_size:
-                    pad_width = [(max(0, target - current), max(0, target - current)) 
-                                for target, current in zip(subject_size, registered_std_atlas_array.shape)]
-                    registered_std_atlas_array = np.pad(registered_std_atlas_array, pad_width, mode='constant')
-                    registered_std_atlas_array = registered_std_atlas_array[:subject_size[0], :subject_size[1], :subject_size[2]]
-            else:
-                registered_std_atlas_array = None
-            
-            print(f"Atlas úspěšně registrován na velikost: {registered_atlas_array.shape}")
-        except Exception as e:
-            print(f"Chyba při registraci atlasu: {e}")
-            print("Není možné pokračovat bez správně registrovaného atlasu.")
-            return
+        # Načíst atlas, pokud existuje
+        has_atlas = False
+        adc_mean_atlas = None
+        adc_std_atlas = None
         
-        # Vytvoření zdravého mozku
-        print("Vytváření zdravého mozku...")
-        healthy_brain = adc_array_norm.copy()
-        
-        # Normalizace atlasu
-        atlas_min = np.nanmin(registered_atlas_array)
-        atlas_max = np.nanmax(registered_atlas_array)
-        registered_atlas_norm = (registered_atlas_array - atlas_min) / (atlas_max - atlas_min + 1e-8)
-        
-        # Vytvoření masky okraje léze
-        from scipy import ndimage
-        dilated_mask = ndimage.binary_dilation(label_array, iterations=2)
-        border_mask = dilated_mask & np.logical_not(label_array)
-        
-        # Výpočet škálovacího faktoru pro atlas
-        if np.any(border_mask):
-            # Získání hodnot na hranici léze
-            original_border_values = adc_array_norm[border_mask]
-            atlas_border_values = registered_atlas_norm[border_mask]
-            
-            # Odstranění případných NaN hodnot
-            original_border_values = original_border_values[~np.isnan(original_border_values)]
-            atlas_border_values = atlas_border_values[~np.isnan(atlas_border_values)]
-            
-            if len(original_border_values) > 0 and len(atlas_border_values) > 0:
-                # Výpočet mediánu pro robustnost
-                orig_median = np.median(original_border_values)
-                atlas_median = np.median(atlas_border_values)
+        if adc_mean_atlas_path and os.path.exists(adc_mean_atlas_path):
+            try:
+                print(f"Načítám atlas ADC: {adc_mean_atlas_path}")
+                atlas_img = sitk.ReadImage(adc_mean_atlas_path)
+                adc_mean_atlas = sitk.GetArrayFromImage(atlas_img)
                 
-                # Výpočet škálovacího faktoru, ošetření dělení nulou
-                if atlas_median > 1e-6:
-                    scaling_factor = orig_median / atlas_median
+                if adc_std_atlas_path and os.path.exists(adc_std_atlas_path):
+                    print(f"Načítám atlas směrodatných odchylek: {adc_std_atlas_path}")
+                    std_atlas_img = sitk.ReadImage(adc_std_atlas_path)
+                    adc_std_atlas = sitk.GetArrayFromImage(std_atlas_img)
+                
+                has_atlas = True
+            except Exception as e:
+                print(f"Chyba při načítání atlasu: {e}")
+                has_atlas = False
+        
+        # Načíst data
+        adc_img = sitk.ReadImage(adc_file)
+        adc_array = sitk.GetArrayFromImage(adc_img)
+        
+        label_img = sitk.ReadImage(label_file)
+        label_array = sitk.GetArrayFromImage(label_img).astype(bool)
+        
+        # Naměřit statistiky o obrazu
+        adc_mean = np.mean(adc_array[adc_array > 0])
+        adc_std = np.std(adc_array[adc_array > 0])
+        
+        # Vypočítat percentily pro normalizaci
+        non_zero = adc_array[adc_array > 0]
+        p01 = np.percentile(non_zero, 1) if len(non_zero) > 0 else 0
+        p99 = np.percentile(non_zero, 99) if len(non_zero) > 0 else 1
+        
+        print(f"ADC statistika - průměr: {adc_mean:.4f}, std: {adc_std:.4f}, p01: {p01:.4f}, p99: {p99:.4f}")
+        
+        # Normalizace ADC
+        adc_array_norm = np.copy(adc_array)
+        adc_array_norm[adc_array_norm < p01] = p01
+        adc_array_norm[adc_array_norm > p99] = p99
+        adc_array_norm = (adc_array_norm - p01) / (p99 - p01)
+        
+        # Vytvořit zdravý mozek
+        if has_atlas:
+            print("Vytvářím zdravý mozek pomocí atlasu...")
+            
+            # Vytvořit dočasný LesionInpaintingDataset pro použití jeho metod
+            temp_dataset = LesionInpaintingDataset(
+                adc_dir=os.path.dirname(adc_file),
+                label_dir=os.path.dirname(label_file),
+                synthetic_lesions_dir="",
+                output_dir=output_dir,
+                adc_mean_atlas_path=adc_mean_atlas_path,
+                adc_std_atlas_path=adc_std_atlas_path
+            )
+            
+            # Použít registraci atlasu
+            registered_atlas, registered_std_atlas = temp_dataset.register_atlas_to_subject(adc_img, adc_array, label_array)
+            
+            if registered_atlas is not None:
+                # Normalizovat atlas do stejného rozsahu jako ADC
+                atlas_normalized = np.copy(registered_atlas)
+                atlas_normalized[atlas_normalized < p01] = p01
+                atlas_normalized[atlas_normalized > p99] = p99
+                atlas_normalized = (atlas_normalized - p01) / (p99 - p01)
+                
+                # Vypočítat poměr mezi hodnotami subjektu a atlasu v okolí léze
+                kernel = np.ones((3,3,3))
+                dilated_mask = ndimage.binary_dilation(label_array, structure=kernel, iterations=2)
+                border_mask = dilated_mask & np.logical_not(label_array)
+                
+                if np.sum(border_mask) > 0:
+                    ratio = np.mean(adc_array_norm[border_mask]) / np.mean(atlas_normalized[border_mask] + 1e-6)
+                    print(f"Poměr hranic: {ratio:.4f}")
+                    ratio = np.clip(ratio, 0.5, 2.0)
                 else:
-                    scaling_factor = 1.0
-                    print("VAROVÁNÍ: Mediánová hodnota atlasu blízká nule, používám scaling_factor=1.0")
+                    ratio = 1.0
+                    print("Nenalezena žádná hranice, používám výchozí poměr 1.0")
                 
-                print(f"Škálovací faktor pro atlas: {scaling_factor:.4f}")
+                # Vytvořit zdravý mozek
+                healthy_brain = adc_array_norm.copy()
+                healthy_brain[label_array] = atlas_normalized[label_array] * ratio
                 
-                # Aplikace atlasových hodnot do oblasti léze
-                mask_indices = np.where(label_array > 0)
-                if len(mask_indices[0]) > 0:
-                    # Kontrola, zda nejsou v atlasu NaN hodnoty v oblasti léze
-                    atlas_values = registered_atlas_norm[mask_indices]
-                    nan_indices = np.isnan(atlas_values)
-                    
-                    if np.any(nan_indices):
-                        print(f"VAROVÁNÍ: {np.sum(nan_indices)} NaN hodnot v atlasu v oblasti léze, nahrazuji mediánem")
-                        atlas_values[nan_indices] = atlas_median
-                    
-                    # Aplikace škálovaných hodnot
-                    healthy_brain[mask_indices] = atlas_values * scaling_factor
-                    
-                    # Kontrola, zda nejsou ve výsledku NaN hodnoty
-                    if np.any(np.isnan(healthy_brain)):
-                        print("VAROVÁNÍ: NaN hodnoty ve výsledném 'zdravém mozku', nahrazuji mediánem")
-                        nan_mask = np.isnan(healthy_brain)
-                        healthy_brain[nan_mask] = orig_median
-                    
-                    # Zajištění hodnot v platném rozsahu
-                    healthy_brain = np.clip(healthy_brain, 0, 1)
-                    
-                    print("Úspěšně vytvořen zdravý mozek s použitím atlasu")
-                else:
-                    print("VAROVÁNÍ: Žádné voxely v masce léze")
+                print("Zdravý mozek vytvořen pomocí registrace atlasu")
             else:
-                print("VAROVÁNÍ: Prázdné hodnoty na hranici léze, použiji interpolaci")
-                # Fallback na interpolaci
-                temp_array = adc_array_norm.copy()
-                temp_array[label_array > 0] = np.nan
-                filled_array = ndimage.median_filter(np.nan_to_num(temp_array), size=5)
-                healthy_brain[label_array > 0] = filled_array[label_array > 0]
+                print("Registrace atlasu selhala, používám základní metodu")
+                healthy_brain = create_basic_healthy_brain(adc_array_norm, label_array)
         else:
-            print("VAROVÁNÍ: Žádná hranice léze nenalezena, použiji interpolaci")
-            # Fallback na interpolaci
-            temp_array = adc_array_norm.copy()
-            temp_array[label_array > 0] = np.nan
-            filled_array = ndimage.median_filter(np.nan_to_num(temp_array), size=5)
-            healthy_brain[label_array > 0] = filled_array[label_array > 0]
+            print("Atlas není k dispozici, používám základní metodu pro vytvoření zdravého mozku")
+            healthy_brain = create_basic_healthy_brain(adc_array_norm, label_array)
         
-        # Výpočet statistik změn v oblasti léze
-        mask_3d = label_array > 0
-        if np.any(mask_3d):
-            original_values = adc_array_norm[mask_3d]
-            healthy_values = healthy_brain[mask_3d]
-            
-            # Odstranění případných NaN hodnot
-            valid_mask = ~np.isnan(original_values) & ~np.isnan(healthy_values)
-            original_values = original_values[valid_mask]
-            healthy_values = healthy_values[valid_mask]
-            
-            if len(original_values) > 0:
-                mean_original = np.mean(original_values)
-                mean_healthy = np.mean(healthy_values)
-                mean_abs_diff = np.mean(np.abs(healthy_values - original_values))
-                median_abs_diff = np.median(np.abs(healthy_values - original_values))
-                
-                stats_text = (f"Statistika oblasti léze:\n"
-                              f"Průměrná hodnota původní: {mean_original:.4f}\n"
-                              f"Průměrná hodnota zdravá: {mean_healthy:.4f}\n"
-                              f"Průměrná absolutní změna: {mean_abs_diff:.4f}\n"
-                              f"Mediánová absolutní změna: {median_abs_diff:.4f}")
-            else:
-                stats_text = "Statistika oblasti léze: Nedostatek platných dat"
-        else:
-            stats_text = "Statistika oblasti léze: Žádné voxely v masce léze"
+        # Vypočítat statistiky
+        mean_orig = np.mean(adc_array_norm[label_array])
+        mean_healthy = np.mean(healthy_brain[label_array])
+        mean_change = np.mean(np.abs(healthy_brain[label_array] - adc_array_norm[label_array]))
+        median_change = np.median(np.abs(healthy_brain[label_array] - adc_array_norm[label_array]))
         
-        # Vizualizace
-        print("Vytvářím vizualizaci...")
+        stats_text = (f"Statistika oblasti léze:\n"
+                     f"Průměrná hodnota původní: {mean_orig:.4f}\n"
+                     f"Průměrná hodnota zdravá: {mean_healthy:.4f}\n"
+                     f"Průměrná absolutní změna: {mean_change:.4f}\n"
+                     f"Mediánová absolutní změna: {median_change:.4f}")
         
-        # Najít řezy obsahující lézi
+        print(stats_text)
+        
+        # Najít všechny řezy, kde se vyskytuje léze
         lesion_slices = []
-        for z in range(label_array.shape[0]):
-            if np.any(label_array[z] > 0):
-                lesion_slices.append(z)
+        for slice_idx in range(label_array.shape[0]):
+            if np.any(label_array[slice_idx]):
+                lesion_slices.append(slice_idx)
         
-        if not lesion_slices:
-            print("VAROVÁNÍ: Nenalezeny žádné řezy s lézí pro vizualizaci.")
-            # Použijeme prostřední řez jako zálohu
-            lesion_slices = [label_array.shape[0] // 2]
+        print(f"Nalezeno {len(lesion_slices)} řezů s lézí")
+        
+        if len(lesion_slices) == 0:
+            print("VAROVÁNÍ: Žádná léze nebyla nalezena v masce!")
+            lesion_slices = [label_array.shape[0] // 2]  # Použít prostřední řez jako fallback
         
         # Středový řez s lézí
         mid_slice_idx = lesion_slices[len(lesion_slices) // 2]
