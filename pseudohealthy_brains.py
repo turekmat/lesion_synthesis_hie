@@ -330,14 +330,15 @@ def create_pseudo_healthy_brain(adc_data, label_data):
     return pseudo_healthy
 
 
-def create_pseudo_healthy_brain_with_atlas(adc_data, label_data, atlas_path):
+def create_pseudo_healthy_brain_with_atlas(adc_data, label_data, atlas_path, std_atlas_path=None):
     """
     Create a pseudo-healthy brain using normative atlas registration with ANTs.
     
     Args:
         adc_data: Original ADC map data (numpy array)
         label_data: Lesion mask data (numpy array)
-        atlas_path: Path to normative atlas
+        atlas_path: Path to normative atlas (mean values)
+        std_atlas_path: Path to normative atlas of standard deviations (optional)
     
     Returns:
         Pseudo-healthy brain data with lesions replaced using atlas values
@@ -375,6 +376,12 @@ def create_pseudo_healthy_brain_with_atlas(adc_data, label_data, atlas_path):
     adc_ant = ants.image_read(str(temp_adc_path))
     atlas_ant = ants.image_read(str(atlas_path))
     label_ant = ants.image_read(str(temp_label_path))
+    
+    # Pokud je k dispozici std atlas, načteme ho také
+    std_atlas_ant = None
+    if std_atlas_path:
+        print(f"Loading standard deviation atlas from {std_atlas_path}")
+        std_atlas_ant = ants.image_read(str(std_atlas_path))
     
     # Normalize intensities for better registration
     print("Normalizing images for registration...")
@@ -435,6 +442,11 @@ def create_pseudo_healthy_brain_with_atlas(adc_data, label_data, atlas_path):
         registered_lesion_np = registered_lesion.numpy() > 0
         atlas_np = atlas_ant.numpy()
         
+        # Pokud je k dispozici std atlas, získáme ho jako numpy pole
+        std_atlas_np = None
+        if std_atlas_ant is not None:
+            std_atlas_np = std_atlas_ant.numpy()
+        
         # Nyní v prostoru atlasu extrahuji hodnoty pro léze
         print("Extracting normative values from atlas in lesion area...")
         
@@ -444,9 +456,18 @@ def create_pseudo_healthy_brain_with_atlas(adc_data, label_data, atlas_path):
         if len(atlas_values_in_lesion) > 0:
             # Výpočet statistik (průměrná hodnota v atlasu pro oblast léze)
             atlas_mean = np.mean(atlas_values_in_lesion)
-            atlas_std = np.std(atlas_values_in_lesion)
             
-            print(f"Atlas normative values in lesion area: mean={atlas_mean:.2f}, std={atlas_std:.2f}")
+            # Pokud máme std atlas, použijeme hodnoty z něj přímo pro každý voxel
+            # jinak vypočítáme směrodatnou odchylku z hodnot v lézi
+            if std_atlas_np is not None:
+                print("Using standard deviation values from provided std atlas")
+                std_values_in_lesion = std_atlas_np[registered_lesion_np]
+                atlas_std_global = np.mean(std_values_in_lesion)  # Průměrná hodnota směrodatné odchylky
+                print(f"Atlas normative values in lesion area: mean={atlas_mean:.2f}, mean std={atlas_std_global:.2f}")
+            else:
+                # Pokud nemáme std atlas, spočítáme směrodatnou odchylku z hodnot v lézi
+                atlas_std_global = np.std(atlas_values_in_lesion)
+                print(f"Atlas normative values in lesion area: mean={atlas_mean:.2f}, std={atlas_std_global:.2f}")
             
             # Vytvoření přechodové masky pro původní lézi
             transition_mask = create_smooth_transition_mask(lesion_mask, sigma=3.0)
@@ -461,6 +482,24 @@ def create_pseudo_healthy_brain_with_atlas(adc_data, label_data, atlas_path):
             for lesion_idx in range(1, num_lesions + 1):
                 current_lesion = labeled_lesions == lesion_idx
                 
+                # Transformace masky aktuální léze do prostoru atlasu
+                current_lesion_ant = ants.from_numpy(
+                    current_lesion.astype(np.float32),
+                    origin=label_ant.origin,
+                    spacing=label_ant.spacing,
+                    direction=label_ant.direction
+                )
+                
+                registered_current_lesion = ants.apply_transforms(
+                    fixed=atlas_ant,
+                    moving=current_lesion_ant,
+                    transformlist=reg['fwdtransforms'],
+                    interpolator='nearestNeighbor',
+                    verbose=False
+                )
+                
+                registered_current_lesion_np = registered_current_lesion.numpy() > 0.5
+                
                 # Souřadnice voxelů v aktuální lézi
                 current_coords = np.where(current_lesion)
                 current_coords = list(zip(current_coords[0], current_coords[1], current_coords[2]))
@@ -470,9 +509,23 @@ def create_pseudo_healthy_brain_with_atlas(adc_data, label_data, atlas_path):
                     # Váha přechodu
                     weight = transition_mask[x, y, z]
                     
-                    # Přidání šumu pro přirozenější vzhled (10% průměrné hodnoty)
-                    noise_scale = 0.1 * atlas_mean
-                    noisy_value = atlas_mean + (noise[x, y, z] - 0.5) * noise_scale
+                    # ZMĚNA: Přidání šumu škálovaného podle směrodatné odchylky z atlasu
+                    if std_atlas_np is not None:
+                        # Najít odpovídající voxel v registrované lézi
+                        idx = np.argwhere(registered_current_lesion_np)
+                        if len(idx) > 0:
+                            # Použít lokální směrodatnou odchylku z atlasu std pro tento voxel léze
+                            # Pro jednodušší implementaci použijeme průměrnou hodnotu std z transformované oblasti léze
+                            noise_scale = atlas_std_global
+                        else:
+                            # Fallback, pokud není voxel v registrované lézi
+                            noise_scale = atlas_std_global
+                    else:
+                        # Pokud nemáme std atlas, použijeme globální směrodatnou odchylku
+                        noise_scale = atlas_std_global
+                    
+                    # Škálování šumu směrodatnou odchylkou
+                    noisy_value = atlas_mean + (noise[x, y, z] - 0.5) * 2 * noise_scale  # *2 pro využití celého rozsahu
                     
                     # Škálování zpět do původního rozsahu hodnot pacientského obrazu
                     scaled_value = noisy_value * (adc_max - adc_min) + adc_min
@@ -625,13 +678,20 @@ def visualize_results(adc_data, pseudo_healthy, label_data, patient_id, output_d
     print(f"Visualization saved to {output_path}")
 
 
-def process_dataset(adc_dir, label_dir, output_dir, atlas_path=None, percentage=50, visualize=False):
+def process_dataset(adc_dir, label_dir, output_dir, atlas_path=None, std_atlas_path=None, percentage=50, visualize=False):
     """
     Process the entire dataset, selecting the lower X% by lesion volume
     but processing them in random order for better comparisons
     """
-    # Create output directory if it doesn't exist
-    os.makedirs(output_dir, exist_ok=True)
+    # Create output directories
+    pseudohealthy_dir = os.path.join(output_dir, "pseudohealthy")
+    os.makedirs(pseudohealthy_dir, exist_ok=True)
+    
+    # If visualization is enabled, create visualization directory
+    visualization_dir = None
+    if visualize:
+        visualization_dir = os.path.join(output_dir, "visualization")
+        os.makedirs(visualization_dir, exist_ok=True)
     
     # Calculate lesion volumes and select the lower X%
     volumes = calculate_lesion_volumes(label_dir, adc_dir)
@@ -650,6 +710,9 @@ def process_dataset(adc_dir, label_dir, output_dir, atlas_path=None, percentage=
     print(f"Total patients: {num_patients}")
     print(f"Including {num_to_include} patients with the smallest lesion volumes ({percentage}%)")
     print(f"Processing in random order for better comparison")
+    print(f"Saving pseudo-healthy data to: {pseudohealthy_dir}")
+    if visualize:
+        print(f"Saving visualizations to: {visualization_dir}")
     
     # Process selected patients in random order
     for patient in tqdm(selected_volumes):
@@ -666,22 +729,22 @@ def process_dataset(adc_dir, label_dir, output_dir, atlas_path=None, percentage=
         
         # Create pseudo-healthy brain using atlas if available, otherwise use symmetry
         if atlas_path:
-            pseudo_healthy = create_pseudo_healthy_brain_with_atlas(adc_data, label_data, atlas_path)
+            pseudo_healthy = create_pseudo_healthy_brain_with_atlas(adc_data, label_data, atlas_path, std_atlas_path)
         else:
             pseudo_healthy = create_pseudo_healthy_brain(adc_data, label_data)
         
+        # Always save the pseudo-healthy and difference map files
+        output_path = os.path.join(pseudohealthy_dir, f"{patient_id}-PSEUDO_HEALTHY.mha")
+        save_mha_file(pseudo_healthy, adc_img, output_path)
+        
+        # Save the difference map
+        diff_map = np.abs(pseudo_healthy - adc_data)
+        diff_path = os.path.join(pseudohealthy_dir, f"{patient_id}-DIFF_MAP.mha")
+        save_mha_file(diff_map, adc_img, diff_path)
+        
+        # If visualize is enabled, create PDF visualization
         if visualize:
-            # Generate visualization instead of saving files
-            visualize_results(adc_data, pseudo_healthy, label_data, patient_id, output_dir)
-        else:
-            # Save result files
-            output_path = os.path.join(output_dir, f"{patient_id}-PSEUDO_HEALTHY.mha")
-            save_mha_file(pseudo_healthy, adc_img, output_path)
-            
-            # Optional: Save a difference map to visualize changes
-            diff_map = np.abs(pseudo_healthy - adc_data)
-            diff_path = os.path.join(output_dir, f"{patient_id}-DIFF_MAP.mha")
-            save_mha_file(diff_map, adc_img, diff_path)
+            visualize_results(adc_data, pseudo_healthy, label_data, patient_id, visualization_dir)
 
 
 def main():
@@ -693,7 +756,9 @@ def main():
     parser.add_argument('--output_dir', type=str, default='data/pseudo_healthy', 
                         help='Directory to save results')
     parser.add_argument('--atlas_path', type=str, default=None,
-                        help='Path to normative atlas file')
+                        help='Path to normative atlas file with mean values')
+    parser.add_argument('--std_atlas_path', type=str, default=None,
+                        help='Path to normative atlas file with standard deviation values (must be in same space as mean atlas)')
     parser.add_argument('--percentage', type=int, default=50, 
                         help='Process lower X% of cases by lesion volume')
     parser.add_argument('--visualize', action='store_true',
@@ -701,7 +766,7 @@ def main():
     
     args = parser.parse_args()
     
-    process_dataset(args.adc_dir, args.label_dir, args.output_dir, args.atlas_path, args.percentage, args.visualize)
+    process_dataset(args.adc_dir, args.label_dir, args.output_dir, args.atlas_path, args.std_atlas_path, args.percentage, args.visualize)
 
 
 if __name__ == "__main__":
