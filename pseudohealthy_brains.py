@@ -38,12 +38,16 @@ def save_mha_file(data, reference_image, output_path):
 
 def calculate_lesion_volumes(label_dir, adc_dir):
     """
-    Calculate lesion volumes for all patients and return them sorted
+    Calculate lesion volumes for all patients and return them sorted.
+    Ignores cases with empty label maps (zero lesion volume).
     """
     volumes = []
     
     # List all label files
     label_files = [f for f in os.listdir(label_dir) if f.endswith('_lesion.mha')]
+    
+    non_empty_count = 0
+    empty_count = 0
     
     for label_file in label_files:
         # Extract patient ID
@@ -62,12 +66,21 @@ def calculate_lesion_volumes(label_dir, adc_dir):
         # Calculate lesion volume (number of voxels with value > 0)
         lesion_volume = np.sum(label_data > 0)
         
+        # Skip cases with empty label maps (no lesions)
+        if lesion_volume == 0:
+            print(f"Skipping {patient_id} - empty label map (no lesions)")
+            empty_count += 1
+            continue
+        
         volumes.append({
             'patient_id': patient_id,
             'volume': lesion_volume,
             'label_file': label_file,
             'adc_file': adc_file
         })
+        non_empty_count += 1
+    
+    print(f"Found {non_empty_count} cases with lesions and skipped {empty_count} cases with empty label maps")
     
     # Sort by volume
     volumes.sort(key=lambda x: x['volume'])
