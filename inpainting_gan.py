@@ -218,359 +218,465 @@ class LesionInpaintingDataset(Dataset):
             return None, None
             
         try:
-            import SimpleITK as sitk
-            
             # Získat velikost dat subjektu
             subject_size = subject_array.shape
             atlas_size = self.adc_mean_atlas_array.shape
             
             print(f"Subject size: {subject_size}, Atlas size: {atlas_size}")
             
-            # Pokud rozměry atlasu a subjektu neodpovídají, použijeme resample
-            if subject_size != atlas_size:
-                print(f"Atlas and subject have different sizes. Resampling atlas to match subject...")
+            # Metoda 1: Zkusíme SimpleITK registraci
+            try:
+                import SimpleITK as sitk
+                print("Používám SimpleITK pro registraci atlasu...")
                 
-                # Vytvořit identickou transformaci
-                identity = sitk.Transform(3, sitk.sitkIdentity)
-                
-                # Resample atlasu na velikost subjektu
-                reference_image = subject_img
-                
-                # Resample mean atlas
-                resampled_mean_atlas = sitk.Resample(
-                    self.adc_mean_atlas, 
-                    reference_image, 
-                    identity, 
-                    sitk.sitkLinear,
-                    0.0,
-                    self.adc_mean_atlas.GetPixelID()
-                )
-                
-                registered_atlas_array = sitk.GetArrayFromImage(resampled_mean_atlas)
-                print(f"Atlas resampled to size: {registered_atlas_array.shape}")
-                
-                # Resample std atlas if available
-                if self.adc_std_atlas is not None:
-                    resampled_std_atlas = sitk.Resample(
-                        self.adc_std_atlas, 
+                # Pokud rozměry atlasu a subjektu neodpovídají, použijeme resample
+                if subject_size != atlas_size:
+                    print(f"Atlas and subject have different sizes. Resampling atlas to match subject...")
+                    
+                    # Vytvořit identickou transformaci
+                    identity = sitk.Transform(3, sitk.sitkIdentity)
+                    
+                    # Resample atlasu na velikost subjektu
+                    reference_image = subject_img
+                    
+                    # Resample mean atlas
+                    resampled_mean_atlas = sitk.Resample(
+                        self.adc_mean_atlas, 
                         reference_image, 
                         identity, 
                         sitk.sitkLinear,
                         0.0,
-                        self.adc_std_atlas.GetPixelID()
+                        self.adc_mean_atlas.GetPixelID()
                     )
-                    registered_std_atlas_array = sitk.GetArrayFromImage(resampled_std_atlas)
+                    
+                    registered_atlas_array = sitk.GetArrayFromImage(resampled_mean_atlas)
+                    print(f"Atlas resampled to size: {registered_atlas_array.shape}")
+                    
+                    # Resample std atlas if available
+                    if self.adc_std_atlas is not None:
+                        resampled_std_atlas = sitk.Resample(
+                            self.adc_std_atlas, 
+                            reference_image, 
+                            identity, 
+                            sitk.sitkLinear,
+                            0.0,
+                            self.adc_std_atlas.GetPixelID()
+                        )
+                        registered_std_atlas_array = sitk.GetArrayFromImage(resampled_std_atlas)
+                    else:
+                        registered_std_atlas_array = None
+                    
+                    # Kontrola velikosti
+                    if registered_atlas_array.shape != subject_size:
+                        print(f"VAROVÁNÍ: Velikost registrovaného atlasu {registered_atlas_array.shape} se neshoduje s velikostí subjektu {subject_size}")
+                        raise ValueError("Nekonzistentní velikosti po registraci")
+                    
+                    # Kontrola NaN hodnot
+                    if np.any(np.isnan(registered_atlas_array)):
+                        print("VAROVÁNÍ: NaN hodnoty v registrovaném atlasu, nahrazuji mediánem")
+                        nan_mask = np.isnan(registered_atlas_array)
+                        non_nan_values = registered_atlas_array[~nan_mask]
+                        if len(non_nan_values) > 0:
+                            median_value = np.median(non_nan_values)
+                            registered_atlas_array[nan_mask] = median_value
+                    
+                    print("Successfully resampled atlas to match subject size")
+                    return registered_atlas_array, registered_std_atlas_array
                 else:
-                    registered_std_atlas_array = None
+                    # Pokud mají stejnou velikost, není třeba resample
+                    print("Atlas and subject have the same size. No resampling needed.")
+                    return self.adc_mean_atlas_array, self.adc_std_atlas_array
                 
-                print("Successfully resampled atlas to match subject size")
-                return registered_atlas_array, registered_std_atlas_array
+            except Exception as sitk_error:
+                print(f"SimpleITK registration failed with error: {sitk_error}")
+                print("Falling back to scipy ndimage method...")
+                
+            # Metoda 2: Pokud SimpleITK selže, použijeme scipy ndimage
+            from scipy import ndimage
             
-            # Pokud pokročilá registrace selže, použijeme základní resample
-            print("Advanced registration not implemented correctly. Using basic resampling.")
-            # Vrátit původní hodnoty atlasu
-            return self.adc_mean_atlas_array, self.adc_std_atlas_array
+            # Výpočet faktorů pro zoom
+            zoom_factors = (subject_size[0] / atlas_size[0], 
+                            subject_size[1] / atlas_size[1],
+                            subject_size[2] / atlas_size[2])
             
+            # Kontrola extrémních hodnot
+            if max(zoom_factors) > 10 or min(zoom_factors) < 0.1:
+                print(f"WARNING: Extreme zoom factors: {zoom_factors}")
+                print("Adjusting factors to reasonable range...")
+                zoom_factors = tuple(min(max(factor, 0.1), 10.0) for factor in zoom_factors)
+                print(f"Adjusted factors: {zoom_factors}")
+            
+            print(f"Using scipy zoom with factors: {zoom_factors}")
+            
+            # Resize mean atlas
+            try:
+                resized_mean_atlas = ndimage.zoom(self.adc_mean_atlas_array, zoom_factors, order=1, mode='nearest')
+                
+                # Kontrola, zda výsledek má správnou velikost
+                if resized_mean_atlas.shape != subject_size:
+                    print(f"VAROVÁNÍ: Velikost výsledku {resized_mean_atlas.shape} se neshoduje s velikostí subjektu {subject_size}")
+                    # Další ořezání nebo doplnění pro zajištění správné velikosti
+                    pad_width = [(max(0, target - current), max(0, target - current)) 
+                                for target, current in zip(subject_size, resized_mean_atlas.shape)]
+                    resized_mean_atlas = np.pad(resized_mean_atlas, pad_width, mode='constant')
+                    resized_mean_atlas = resized_mean_atlas[:subject_size[0], :subject_size[1], :subject_size[2]]
+                
+                # Kontrola NaN hodnot
+                if np.any(np.isnan(resized_mean_atlas)):
+                    print("VAROVÁNÍ: NaN hodnoty v registrovaném atlasu, nahrazuji mediánem")
+                    nan_mask = np.isnan(resized_mean_atlas)
+                    non_nan_values = resized_mean_atlas[~nan_mask]
+                    if len(non_nan_values) > 0:
+                        median_value = np.median(non_nan_values)
+                        resized_mean_atlas[nan_mask] = median_value
+                
+                # Resize std atlas if available
+                if self.adc_std_atlas_array is not None:
+                    resized_std_atlas = ndimage.zoom(self.adc_std_atlas_array, zoom_factors, order=1, mode='nearest')
+                    # Upravení velikosti, pokud je potřeba
+                    if resized_std_atlas.shape != subject_size:
+                        pad_width = [(max(0, target - current), max(0, target - current)) 
+                                    for target, current in zip(subject_size, resized_std_atlas.shape)]
+                        resized_std_atlas = np.pad(resized_std_atlas, pad_width, mode='constant')
+                        resized_std_atlas = resized_std_atlas[:subject_size[0], :subject_size[1], :subject_size[2]]
+                        
+                    # Kontrola NaN hodnot
+                    if np.any(np.isnan(resized_std_atlas)):
+                        print("VAROVÁNÍ: NaN hodnoty v registrovaném atlasu std, nahrazuji mediánem")
+                        nan_mask = np.isnan(resized_std_atlas)
+                        non_nan_values = resized_std_atlas[~nan_mask]
+                        if len(non_nan_values) > 0:
+                            median_value = np.median(non_nan_values)
+                            resized_std_atlas[nan_mask] = median_value
+                else:
+                    resized_std_atlas = None
+                
+                print(f"Successfully resized atlas to size: {resized_mean_atlas.shape}")
+                return resized_mean_atlas, resized_std_atlas
+                
+            except Exception as resize_error:
+                print(f"Error during scipy resize: {resize_error}")
+                print("Unable to register atlas properly. Returning original atlas as fallback.")
+                return self.adc_mean_atlas_array, self.adc_std_atlas_array
+                
         except Exception as e:
             print(f"Error registering atlas to subject: {e}")
             print("Using unregistered atlas as fallback")
-            
-            # Zkusit alespoň základní převzorkování
-            try:
-                import SimpleITK as sitk
-                
-                # Získat velikost dat subjektu
-                subject_size = subject_array.shape
-                atlas_size = self.adc_mean_atlas_array.shape
-                
-                print(f"Fallback: Subject size: {subject_size}, Atlas size: {atlas_size}")
-                
-                # Pokud rozměry atlasu a subjektu neodpovídají, použijeme základní převzorkování
-                if subject_size != atlas_size:
-                    from scipy import ndimage
-                    
-                    # Použít jednoduchý resize pomocí scipy
-                    zoom_factors = (subject_size[0] / atlas_size[0], 
-                                    subject_size[1] / atlas_size[1],
-                                    subject_size[2] / atlas_size[2])
-                    
-                    print(f"Using scipy zoom with factors: {zoom_factors}")
-                    
-                    # Resize mean atlas
-                    resized_mean_atlas = ndimage.zoom(self.adc_mean_atlas_array, zoom_factors, order=1)
-                    
-                    # Resize std atlas if available
-                    if self.adc_std_atlas_array is not None:
-                        resized_std_atlas = ndimage.zoom(self.adc_std_atlas_array, zoom_factors, order=1)
-                    else:
-                        resized_std_atlas = None
-                    
-                    print(f"Successfully resized atlas to size: {resized_mean_atlas.shape}")
-                    return resized_mean_atlas, resized_std_atlas
-            except Exception as resize_error:
-                print(f"Error during fallback resize: {resize_error}")
-            
-            # If all fails, return the unregistered atlas (better than nothing)
             return self.adc_mean_atlas_array, self.adc_std_atlas_array
     
     def __len__(self):
         return len(self.samples)
     
     def __getitem__(self, idx):
-        sample = self.samples[idx]
+        """
+        Get a sample from the dataset.
         
-        # Load ADC map (may contain real lesions)
-        adc_img = sitk.ReadImage(sample['adc'])
-        adc_array = sitk.GetArrayFromImage(adc_img)
+        Args:
+            idx: Index of the sample
+            
+        Returns:
+            Dictionary with input, target, and metadata
+        """
+        # Get patient ID and synthetic lesion ID
+        patient_id, synth_lesion_id = self.sample_pairs[idx]
         
-        # Load original lesion mask (real lesions)
-        label_img = sitk.ReadImage(sample['label'])
-        label_array = sitk.GetArrayFromImage(label_img)
+        # Construct file paths
+        adc_path = self.adc_files[patient_id]
+        label_path = self.label_files[patient_id]
+        synth_lesion_path = os.path.join(self.synthetic_lesions_dir, patient_id, f"{synth_lesion_id}.nii.gz")
         
-        # Load synthetic lesion (where we want to place a lesion)
-        syn_lesion_img = sitk.ReadImage(sample['synthetic_lesion'])
-        syn_lesion_array = sitk.GetArrayFromImage(syn_lesion_img)
-        
-        # Normalize ADC to [0, 1] for processing
-        adc_min = adc_array.min()
-        adc_max = adc_array.max()
-        adc_array_norm = (adc_array - adc_min) / (adc_max - adc_min + 1e-8)
-        
-        # Convert label and synthetic lesion to binary
-        label_array = (label_array > 0).astype(np.float32)
-        syn_lesion_array = (syn_lesion_array > 0).astype(np.float32)
-        
-        # Create truly healthy brain by removing existing lesions using atlas or interpolation
-        healthy_brain = adc_array_norm.copy()
-        
-        # Find non-zero regions in the original lesion mask (existing lesions)
-        real_lesion_indices = np.where(label_array > 0)
-        
-        if len(real_lesion_indices[0]) > 0:
-            if self.has_atlas:
-                # Use atlas-based approach for creating healthy brain
-                print("Using atlas to create healthy brain")
-                registered_atlas, registered_std_atlas = self.register_atlas_to_subject(adc_img, adc_array_norm, label_array)
-                
-                if registered_atlas is not None:
-                    # Normalize atlas to same range as our data [0, 1]
-                    atlas_min = registered_atlas.min()
-                    atlas_max = registered_atlas.max()
-                    registered_atlas_norm = (registered_atlas - atlas_min) / (atlas_max - atlas_min + 1e-8)
-                    
-                    # Calculate scaling factor to match adjacent tissue intensities
-                    # Create dilated mask for getting nearby values
-                    from scipy import ndimage
-                    dilated_mask = ndimage.binary_dilation(label_array, iterations=2)
-                    border_mask = dilated_mask & np.logical_not(label_array)
-                    
-                    if np.any(border_mask):
-                        # Get the scaling factor from the border region
-                        original_border_values = adc_array_norm[border_mask]
-                        atlas_border_values = registered_atlas_norm[border_mask]
-                        
-                        # Compute median ratio to be robust to outliers
-                        scaling_factor = np.median(original_border_values) / np.median(atlas_border_values)
-                        
-                        # Apply atlas values scaled by the factor to the lesion area
-                        healthy_brain[label_array > 0] = registered_atlas_norm[label_array > 0] * scaling_factor
-                        
-                        # Add some random variation based on std atlas if available
-                        if registered_std_atlas is not None:
-                            # Scale the std values appropriately
-                            std_norm = (registered_std_atlas - registered_std_atlas.min()) / (registered_std_atlas.max() - registered_std_atlas.min() + 1e-8)
-                            std_scaled = std_norm * scaling_factor * 0.3  # Reduce variation to 30%
-                            
-                            # Apply random variation within lesion
-                            rng = np.random.RandomState(idx)  # Use sample idx as seed for reproducibility
-                            random_variation = rng.normal(0, std_scaled[label_array > 0])
-                            healthy_brain[label_array > 0] += random_variation
-                            
-                            # Ensure values stay in valid range
-                            healthy_brain = np.clip(healthy_brain, 0, 1)
-                        
-                        print(f"Created atlas-based healthy brain. Scaling factor: {scaling_factor:.4f}")
-                        
-                        # Přidáno: Vytvořit vizualizaci zdravého mozku (pouze u každého 10. vzorku)
-                        if idx % 10 == 0:
-                            # Vytvoření cesty pro uložení vizualizace
-                            import os
-                            viz_dir = os.path.join(os.path.dirname(sample['adc']), '../healthy_brain_viz')
-                            os.makedirs(viz_dir, exist_ok=True)
-                            
-                            # Extrahovat ID pacienta ze vzorku
-                            patient_id = os.path.basename(sample['adc']).split('.')[0]
-                            viz_path = os.path.join(viz_dir, f"{patient_id}_sample_{idx}_healthy_brain_atlas.png")
-                            
-                            # Vytvořit vizualizaci
-                            visualize_healthy_brain_creation(
-                                adc_array_norm, 
-                                label_array, 
-                                healthy_brain,
-                                viz_path,
-                                title=f"Vytvoření zdravého mozku pomocí atlasu (ID: {patient_id}, vzorek: {idx})"
-                            )
-                    else:
-                        print("No border region found. Falling back to interpolation.")
-                        # Fall back to interpolation method
-                        from scipy import ndimage
-                        healthy_brain[label_array > 0] = ndimage.median_filter(adc_array_norm, size=5)[label_array > 0]
-                        
-                        # Přidáno: Vytvořit vizualizaci interpolovaného zdravého mozku (pouze u každého 10. vzorku)
-                        if idx % 10 == 0:
-                            # Vytvoření cesty pro uložení vizualizace
-                            import os
-                            viz_dir = os.path.join(os.path.dirname(sample['adc']), '../healthy_brain_viz')
-                            os.makedirs(viz_dir, exist_ok=True)
-                            
-                            # Extrahovat ID pacienta ze vzorku
-                            patient_id = os.path.basename(sample['adc']).split('.')[0]
-                            viz_path = os.path.join(viz_dir, f"{patient_id}_sample_{idx}_healthy_brain_interpolation.png")
-                            
-                            # Vytvořit vizualizaci
-                            visualize_healthy_brain_creation(
-                                adc_array_norm, 
-                                label_array, 
-                                healthy_brain,
-                                viz_path,
-                                title=f"Vytvoření zdravého mozku pomocí interpolace (ID: {patient_id}, vzorek: {idx})"
-                            )
-                else:
-                    print("Atlas registration failed. Using interpolation instead.")
-                    # Fall back to interpolation if atlas registration failed
-                    from scipy import ndimage
-                    healthy_brain[label_array > 0] = ndimage.median_filter(adc_array_norm, size=5)[label_array > 0]
-            else:
-                # Use interpolation-based approach (more sophisticated than just average)
-                print("Using interpolation to create healthy brain")
-                from scipy import ndimage
-                
-                # First create a temporary copy where lesion area is NaN
-                temp_array = adc_array_norm.copy()
-                temp_array[label_array > 0] = np.nan
-                
-                # Use median filter to fill NaN areas with interpolated values
-                # This is better than simple average as it preserves edges
-                filled_array = ndimage.median_filter(np.nan_to_num(temp_array), size=5)
-                
-                # Only copy the interpolated values into the lesion area
-                healthy_brain[label_array > 0] = filled_array[label_array > 0]
-                
-                print("Created interpolation-based healthy brain")
-                
-                # Přidáno: Vytvořit vizualizaci interpolovaného zdravého mozku (pouze u každého 10. vzorku)
-                if idx % 10 == 0:
-                    # Vytvoření cesty pro uložení vizualizace
-                    import os
-                    viz_dir = os.path.join(os.path.dirname(sample['adc']), '../healthy_brain_viz')
-                    os.makedirs(viz_dir, exist_ok=True)
-                    
-                    # Extrahovat ID pacienta ze vzorku
-                    patient_id = os.path.basename(sample['adc']).split('.')[0]
-                    viz_path = os.path.join(viz_dir, f"{patient_id}_sample_{idx}_healthy_brain_interpolation.png")
-                    
-                    # Vytvořit vizualizaci
-                    visualize_healthy_brain_creation(
-                        adc_array_norm, 
-                        label_array, 
-                        healthy_brain,
-                        viz_path,
-                        title=f"Vytvoření zdravého mozku pomocí interpolace (ID: {patient_id}, vzorek: {idx})"
-                    )
-        
-        # Find non-zero region in the synthetic lesion
-        z_indices, y_indices, x_indices = np.where(syn_lesion_array > 0)
-        
-        if len(z_indices) > 0:
-            # Extract a patch centered on the synthetic lesion
-            center_z = (z_indices.min() + z_indices.max()) // 2
-            center_y = (y_indices.min() + y_indices.max()) // 2
-            center_x = (x_indices.min() + x_indices.max()) // 2
+        # Load ADC and label files
+        try:
+            adc_img = sitk.ReadImage(adc_path)
+            adc_array = sitk.GetArrayFromImage(adc_img)
             
-            # Calculate the patch boundaries
-            z_start = max(0, center_z - self.patch_size[0] // 2)
-            y_start = max(0, center_y - self.patch_size[1] // 2)
-            x_start = max(0, center_x - self.patch_size[2] // 2)
+            label_img = sitk.ReadImage(label_path)
+            label_array = sitk.GetArrayFromImage(label_img).astype(bool)
             
-            z_end = min(adc_array_norm.shape[0], z_start + self.patch_size[0])
-            y_end = min(adc_array_norm.shape[1], y_start + self.patch_size[1])
-            x_end = min(adc_array_norm.shape[2], x_start + self.patch_size[2])
-            
-            # Extract patches
-            adc_patch = adc_array_norm[z_start:z_end, y_start:y_end, x_start:x_end]
-            healthy_patch = healthy_brain[z_start:z_end, y_start:y_end, x_start:x_end]  # Now truly healthy
-            label_patch = label_array[z_start:z_end, y_start:y_end, x_start:x_end]
-            syn_lesion_patch = syn_lesion_array[z_start:z_end, y_start:y_end, x_start:x_end]
-            
-            # Pad if necessary to match patch_size
-            z_pad = max(0, self.patch_size[0] - adc_patch.shape[0])
-            y_pad = max(0, self.patch_size[1] - adc_patch.shape[1])
-            x_pad = max(0, self.patch_size[2] - adc_patch.shape[2])
-            
-            if z_pad > 0 or y_pad > 0 or x_pad > 0:
-                adc_patch = np.pad(adc_patch, ((0, z_pad), (0, y_pad), (0, x_pad)), mode='constant')
-                healthy_patch = np.pad(healthy_patch, ((0, z_pad), (0, y_pad), (0, x_pad)), mode='constant')
-                label_patch = np.pad(label_patch, ((0, z_pad), (0, y_pad), (0, x_pad)), mode='constant')
-                syn_lesion_patch = np.pad(syn_lesion_patch, ((0, z_pad), (0, y_pad), (0, x_pad)), mode='constant')
-            
-            # Convert to tensors
-            adc_tensor = torch.from_numpy(adc_patch).float().unsqueeze(0)  # Real brain with lesions
-            healthy_tensor = torch.from_numpy(healthy_patch).float().unsqueeze(0)  # Truly healthy brain
-            label_tensor = torch.from_numpy(label_patch).float().unsqueeze(0)  # Real lesion mask
-            syn_lesion_tensor = torch.from_numpy(syn_lesion_patch).float().unsqueeze(0)  # Synthetic lesion mask
-            
-            # Combined input: TRULY healthy brain and synthetic lesion mask
-            input_tensor = torch.cat([healthy_tensor, syn_lesion_tensor], dim=0)
-            
-            # If there's a substantial overlap between the synthetic lesion and real lesion,
-            # we can use the real brain as a target. Otherwise, we need to create a hybrid target.
-            synthetic_real_overlap = np.sum(syn_lesion_patch * label_patch) / (np.sum(syn_lesion_patch) + 1e-8)
-            
-            if synthetic_real_overlap > 0.5:
-                # More than 50% overlap - we can use the real brain with its lesion as target
-                target_tensor = adc_tensor
-                print(f"Using real lesion as target (overlap: {synthetic_real_overlap:.2f})")
-            else:
-                # Less overlap - create a hybrid target where we add "lesion-like" values to the healthy brain
-                # in the area of the synthetic mask
-                hybrid_target = healthy_patch.copy()
-                
-                # Calculate average intensity in real lesion areas
-                if np.sum(label_patch) > 0:
-                    # Use the real lesion intensities as reference
-                    lesion_value = np.median(adc_patch[label_patch > 0])
-                    std_lesion = np.std(adc_patch[label_patch > 0])
-                else:
-                    # No real lesions in this patch, use a typical lesion intensity reduction
-                    # ADC typically shows hypointensity in acute stroke
-                    non_zero_mask = healthy_patch > 0.1  # Avoid background
-                    avg_healthy = np.median(healthy_patch[non_zero_mask])
-                    lesion_value = avg_healthy * 0.6  # Typical reduction in ADC values
-                    std_lesion = avg_healthy * 0.1  # Estimate of std deviation
-                
-                # Apply lesion-like values to the synthetic mask area with some variation
-                rng = np.random.RandomState(idx + 100)  # Different seed than above
-                lesion_variation = rng.normal(lesion_value, std_lesion * 0.5, size=np.sum(syn_lesion_patch > 0))
-                hybrid_target[syn_lesion_patch > 0] = np.clip(lesion_variation, 0, 1)
-                
-                target_tensor = torch.from_numpy(hybrid_target).float().unsqueeze(0)
-                print(f"Created hybrid target (low overlap: {synthetic_real_overlap:.2f}, lesion value: {lesion_value:.4f})")
-            
+            synthetic_lesion_img = sitk.ReadImage(synth_lesion_path)
+            synthetic_lesion_array = sitk.GetArrayFromImage(synthetic_lesion_img).astype(bool)
+        except Exception as e:
+            print(f"Error loading data for patient {patient_id}, lesion {synth_lesion_id}: {e}")
+            # Return empty sample in case of error
             return {
-                'input': input_tensor,  # Truly healthy brain + synthetic lesion mask
-                'target': target_tensor,  # Brain with real or simulated lesion
-                'original_mask': label_tensor,  # Original lesion mask
-                'synthetic_mask': syn_lesion_tensor  # Synthetic lesion mask
+                "input": torch.zeros((2, 32, 32, 32)),
+                "target": torch.zeros((1, 32, 32, 32)),
+                "metadata": {
+                    "patient_id": patient_id,
+                    "synthetic_lesion_id": synth_lesion_id,
+                    "error": str(e)
+                }
             }
+            
+        # Naměřit statistiky o obrazu
+        adc_mean = np.mean(adc_array[adc_array > 0])  # Průměr nenulových hodnot
+        adc_std = np.std(adc_array[adc_array > 0])    # Směrodatná odchylka nenulových hodnot
+        
+        # Vypočítat percentily pro detekci outlierů
+        non_zero = adc_array[adc_array > 0]
+        p01 = np.percentile(non_zero, 1) if len(non_zero) > 0 else 0
+        p99 = np.percentile(non_zero, 99) if len(non_zero) > 0 else 1
+        
+        print(f"ADC stats - mean: {adc_mean:.4f}, std: {adc_std:.4f}, p01: {p01:.4f}, p99: {p99:.4f}")
+        
+        # Normalizace ADC obrazu pomocí percentilů
+        adc_normalized = np.copy(adc_array)
+        adc_normalized[adc_normalized < p01] = p01  # Oříznout spodní outliers
+        adc_normalized[adc_normalized > p99] = p99  # Oříznout horní outliers
+        adc_normalized = (adc_normalized - p01) / (p99 - p01)  # Normalizace na [0,1]
+        
+        # Vytvořit "skutečně zdravý mozek" pomocí atlasu ADC nebo jednoduchého nahrazení hodnot
+        if self.has_atlas:
+            print("Creating healthy brain using registered ADC atlas...")
+            
+            # Registrovat atlas k subjektu
+            registered_atlas, registered_std_atlas = self.register_atlas_to_subject(adc_img, adc_array, label_array)
+            
+            # Kontrola registrace
+            if registered_atlas is not None:
+                # Normalizace registrovaného atlasu do stejného rozsahu jako ADC
+                atlas_normalized = np.copy(registered_atlas)
+                atlas_normalized[atlas_normalized < p01] = p01
+                atlas_normalized[atlas_normalized > p99] = p99
+                atlas_normalized = (atlas_normalized - p01) / (p99 - p01)
+                
+                # Vytvořit masku dilací existujících lézí
+                kernel = np.ones((3,3,3))
+                dilated_mask = ndimage.binary_dilation(label_array, structure=kernel, iterations=2)
+                
+                # Vytvořit hranici okolo léze (dilated - original)
+                border_mask = dilated_mask & np.logical_not(label_array)
+                
+                # Vypočítat poměr mezi hodnotami subjektu a atlasu v hranici
+                if np.sum(border_mask) > 0:
+                    ratio = np.mean(adc_normalized[border_mask]) / np.mean(atlas_normalized[border_mask] + 1e-6)
+                    print(f"Border ratio: {ratio:.4f}")
+                    # Omezit extrémní hodnoty poměru
+                    ratio = np.clip(ratio, 0.5, 2.0)
+                else:
+                    ratio = 1.0
+                    print("No border found, using default ratio 1.0")
+                
+                # Upravit atlas podle poměru a vytvořit zdravý mozek
+                healthy_brain = adc_normalized.copy()
+                
+                # Použít atlas pouze v oblasti léze
+                healthy_brain[label_array] = atlas_normalized[label_array] * ratio
+                
+                # Vytvořit diagnostickou vizualizaci procesu
+                create_registration_visualization(
+                    adc_normalized, 
+                    atlas_normalized, 
+                    label_array, 
+                    healthy_brain,
+                    ratio,
+                    os.path.join(self.output_dir, 'registration_vis', f"{patient_id}_{synth_lesion_id}_registration.png")
+                )
+                
+                print("Healthy brain created using atlas registration")
+            else:
+                print("Atlas registration failed, falling back to basic method")
+                # Fallback metoda - jednoduchá náhrada lézí
+                healthy_brain = self.create_basic_healthy_brain(adc_normalized, label_array)
         else:
-            # Fallback if no lesion is found (should be rare)
-            dummy_tensor = torch.zeros((1, *self.patch_size))
-            return {
-                'input': torch.cat([dummy_tensor, dummy_tensor], dim=0),
-                'target': dummy_tensor,
-                'original_mask': dummy_tensor,
-                'synthetic_mask': dummy_tensor
+            # Pokud nemáme atlas, použijeme základní metodu
+            print("No atlas available, using basic healthy brain creation")
+            healthy_brain = self.create_basic_healthy_brain(adc_normalized, label_array)
+        
+        # Vypočítat překryv mezi existující a syntetickou lézí
+        overlap = np.logical_and(label_array, synthetic_lesion_array)
+        overlap_percentage = np.sum(overlap) / np.sum(synthetic_lesion_array) if np.sum(synthetic_lesion_array) > 0 else 0
+        print(f"Overlap percentage: {overlap_percentage:.4f}")
+        
+        # Určit cílový výstup
+        if overlap_percentage > 0.5:
+            # Pokud je překryv významný, použijeme původní ADC jako cíl (obsahující reálnou lézi)
+            target = adc_normalized
+            print("Using original ADC as target (high overlap)")
+        else:
+            # Jinak vytvoříme hybridní cíl
+            target = self.create_target_with_synthetic_lesion(healthy_brain, synthetic_lesion_array, adc_normalized)
+            print("Using hybrid target with synthetic lesion")
+        
+        # Spojit zdravý mozek a syntetickou lézi jako vstup pro model
+        model_input = np.stack([healthy_brain, synthetic_lesion_array.astype(np.float32)], axis=0)
+        model_target = target[np.newaxis, ...]  # Add channel dimension
+        
+        # Konvertovat na tensory
+        input_tensor = torch.from_numpy(model_input.astype(np.float32))
+        target_tensor = torch.from_numpy(model_target.astype(np.float32))
+        
+        return {
+            "input": input_tensor,
+            "target": target_tensor,
+            "metadata": {
+                "patient_id": patient_id,
+                "synthetic_lesion_id": synth_lesion_id,
+                "overlap_percentage": overlap_percentage
             }
+        }
+
+# Přidat pomocnou funkci pro vytvoření základního zdravého mozku
+def create_basic_healthy_brain(self, adc_normalized, label_array):
+    """Vytvoří jednoduchý model zdravého mozku pomocí průměrných hodnot zdravé tkáně."""
+    # Rozšířit masku léze pomocí dilace pro lepší zachycení oblasti
+    kernel = np.ones((3,3,3))
+    dilated_mask = ndimage.binary_dilation(label_array, structure=kernel, iterations=2)
+    
+    # Vytvořit hranici okolo léze (dilated - original)
+    border_mask = dilated_mask & np.logical_not(label_array)
+    
+    # Vypočítat průměrnou hodnotu zdravé tkáně v okolí léze
+    if np.sum(border_mask) > 10:
+        healthy_tissue_value = np.mean(adc_normalized[border_mask])
+        print(f"Using border healthy tissue value: {healthy_tissue_value:.4f}")
+    else:
+        # Fallback: použít průměrnou hodnotu všech voxelů mimo lézi
+        healthy_tissue_value = np.mean(adc_normalized[np.logical_not(label_array)])
+        print(f"Using global healthy tissue value: {healthy_tissue_value:.4f}")
+    
+    # Vytvořit zdravý mozek nahrazením oblasti léze
+    healthy_brain = adc_normalized.copy()
+    healthy_brain[label_array] = healthy_tissue_value
+    
+    return healthy_brain
+
+# Přidat funkci pro vytvoření cílového obrazu se syntetickou lézí
+def create_target_with_synthetic_lesion(self, healthy_brain, synthetic_lesion_array, original_adc):
+    """Vytvoří cílový obraz s vloženou syntetickou lézí."""
+    target = healthy_brain.copy()
+    
+    # Vypočítat průměrnou intenzitu skutečných lézí
+    avg_lesion_intensity = np.mean(original_adc[original_adc < 0.3])  # Předpokládáme, že léze mají nízkou intenzitu
+    
+    if np.isnan(avg_lesion_intensity) or avg_lesion_intensity < 0.01:
+        # Fallback - použít fixní intenzitu
+        avg_lesion_intensity = 0.2
+        print(f"Using default lesion intensity: {avg_lesion_intensity:.4f}")
+    else:
+        print(f"Using measured lesion intensity: {avg_lesion_intensity:.4f}")
+    
+    # Přidat náhodnou variabilitu k intenzitě léze
+    lesion_intensity = avg_lesion_intensity * np.random.uniform(0.8, 1.2)
+    
+    # Přidat syntetickou lézi s realistickou intenzitou
+    target[synthetic_lesion_array] = lesion_intensity
+    
+    return target
+
+# Přidat funkci pro vizualizaci procesu registrace
+def create_registration_visualization(adc, atlas, mask, healthy, ratio, output_path):
+    """Vytvoří vizualizaci procesu registrace atlasu a tvorby zdravého mozku."""
+    try:
+        import matplotlib.pyplot as plt
+        import matplotlib.gridspec as gridspec
+        from matplotlib.colors import LinearSegmentedColormap
+        import os
+        
+        # Vytvořit adresář pro výstup, pokud neexistuje
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        
+        # Najít střední řez s nejvíce maskou
+        mask_sum_per_slice = np.sum(mask, axis=(1, 2))
+        middle_slice = np.argmax(mask_sum_per_slice) if np.max(mask_sum_per_slice) > 0 else mask.shape[0] // 2
+        
+        # Vytvořit barevnou mapu pro rozdíl
+        diff_cmap = LinearSegmentedColormap.from_list('diff', ['blue', 'white', 'red'], N=256)
+        
+        # Vypočítat rozdíl
+        diff = adc - atlas
+        diff_norm = np.clip(diff + 0.5, 0, 1)  # Normalizace rozdílu pro vizualizaci
+        
+        # Vytvořit obrázek
+        fig = plt.figure(figsize=(15, 10))
+        gs = gridspec.GridSpec(2, 4, figure=fig)
+        
+        # První řada
+        ax1 = fig.add_subplot(gs[0, 0])
+        ax1.imshow(adc[middle_slice], cmap='gray')
+        ax1.set_title('Původní ADC')
+        ax1.axis('off')
+        
+        ax2 = fig.add_subplot(gs[0, 1])
+        ax2.imshow(atlas[middle_slice], cmap='gray')
+        ax2.set_title(f'Registrovaný atlas')
+        ax2.axis('off')
+        
+        ax3 = fig.add_subplot(gs[0, 2])
+        ax3.imshow(diff_norm[middle_slice], cmap=diff_cmap)
+        ax3.set_title(f'Rozdíl (ADC - Atlas)')
+        ax3.axis('off')
+        
+        ax4 = fig.add_subplot(gs[0, 3])
+        ax4.imshow(healthy[middle_slice], cmap='gray')
+        ax4.set_title(f'Výsledný "zdravý mozek"')
+        ax4.axis('off')
+        
+        # Druhá řada
+        # Zobrazit ADC s maskou
+        ax5 = fig.add_subplot(gs[1, 0])
+        ax5.imshow(adc[middle_slice], cmap='gray')
+        masked = np.ma.masked_where(~mask[middle_slice], np.ones_like(adc[middle_slice]))
+        ax5.imshow(masked, cmap='autumn', alpha=0.5)
+        ax5.set_title('ADC s maskou léze')
+        ax5.axis('off')
+        
+        # Zobrazit atlas s maskou
+        ax6 = fig.add_subplot(gs[1, 1])
+        ax6.imshow(atlas[middle_slice], cmap='gray')
+        ax6.imshow(masked, cmap='autumn', alpha=0.5)
+        ax6.set_title('Atlas s maskou léze')
+        ax6.axis('off')
+        
+        # Zobrazit hodnoty intenzit podél řádky
+        ax7 = fig.add_subplot(gs[1, 2:])
+        # Najít řádek s nejvíce maskou
+        mask_sum_per_row = np.sum(mask[middle_slice], axis=1)
+        middle_row = np.argmax(mask_sum_per_row) if np.max(mask_sum_per_row) > 0 else mask.shape[1] // 2
+        
+        # Vykreslit profily intenzit
+        ax7.plot(adc[middle_slice, middle_row, :], 'b-', label='ADC')
+        ax7.plot(atlas[middle_slice, middle_row, :] * ratio, 'g-', label=f'Atlas (scaled by {ratio:.2f})')
+        ax7.plot(healthy[middle_slice, middle_row, :], 'r--', label='Zdravý mozek')
+        
+        # Zvýraznit oblast léze
+        mask_indices = np.where(mask[middle_slice, middle_row, :])[0]
+        if len(mask_indices) > 0:
+            min_idx, max_idx = np.min(mask_indices), np.max(mask_indices)
+            ax7.axvspan(min_idx, max_idx, color='gray', alpha=0.3, label='Oblast léze')
+        
+        ax7.set_title('Intenzity podél řádky')
+        ax7.set_xlabel('Pozice (voxel)')
+        ax7.set_ylabel('Normalizovaná intenzita')
+        ax7.legend()
+        ax7.grid(True)
+        
+        # Statistiky v horní části
+        adc_in_mask = adc[mask]
+        atlas_in_mask = atlas[mask]
+        healthy_in_mask = healthy[mask]
+        
+        # Výpočet statistik
+        adc_mean = np.mean(adc_in_mask) if len(adc_in_mask) > 0 else float('nan')
+        atlas_mean = np.mean(atlas_in_mask) if len(atlas_in_mask) > 0 else float('nan')
+        healthy_mean = np.mean(healthy_in_mask) if len(healthy_in_mask) > 0 else float('nan')
+        diff_mean = np.mean(np.abs(adc_in_mask - atlas_in_mask)) if len(adc_in_mask) > 0 else float('nan')
+        
+        plt.suptitle(
+            f'Registrace atlasu a vytvoření zdravého mozku\n'
+            f'Statistiky v oblasti léze - '
+            f'ADC: {adc_mean:.4f}, Atlas: {atlas_mean:.4f}, '
+            f'Zdravý: {healthy_mean:.4f}, Rozdíl: {diff_mean:.4f}, Poměr: {ratio:.4f}',
+            fontsize=12
+        )
+        
+        plt.tight_layout()
+        plt.savefig(output_path, dpi=150)
+        plt.close(fig)
+        print(f"Registration visualization saved to {output_path}")
+        
+    except Exception as e:
+        print(f"Error creating registration visualization: {e}")
 
 
 class PatchGANDiscriminator(nn.Module):
@@ -1470,228 +1576,440 @@ def create_and_visualize_healthy_brain(adc_file, label_file, adc_mean_atlas_path
     # Převod masky léze na binární
     label_array = (label_array > 0).astype(np.float32)
     
-    # Načtení a registrace atlasu
-    print("Načítání a registrace atlasu...")
-    has_atlas = False
-    
     # Načtení atlasů
+    print("Načítání atlasů...")
     if adc_mean_atlas_path and os.path.exists(adc_mean_atlas_path):
         print(f"Načítání průměrného ADC atlasu: {adc_mean_atlas_path}")
-        adc_mean_atlas = sitk.ReadImage(adc_mean_atlas_path)
-        adc_mean_atlas_array = sitk.GetArrayFromImage(adc_mean_atlas)
-        
-        if adc_std_atlas_path and os.path.exists(adc_std_atlas_path):
-            print(f"Načítání atlasu směrodatných odchylek: {adc_std_atlas_path}")
-            adc_std_atlas = sitk.ReadImage(adc_std_atlas_path)
-            adc_std_atlas_array = sitk.GetArrayFromImage(adc_std_atlas)
+        try:
+            adc_mean_atlas = sitk.ReadImage(adc_mean_atlas_path)
+            adc_mean_atlas_array = sitk.GetArrayFromImage(adc_mean_atlas)
+            
+            if adc_std_atlas_path and os.path.exists(adc_std_atlas_path):
+                print(f"Načítání atlasu směrodatných odchylek: {adc_std_atlas_path}")
+                adc_std_atlas = sitk.ReadImage(adc_std_atlas_path)
+                adc_std_atlas_array = sitk.GetArrayFromImage(adc_std_atlas)
+            else:
+                print("VAROVÁNÍ: Atlas směrodatných odchylek nenalezen.")
+                adc_std_atlas = None
+                adc_std_atlas_array = None
+                
             has_atlas = True
-        else:
-            print("VAROVÁNÍ: Atlas směrodatných odchylek nenalezen.")
-            adc_std_atlas = None
-            adc_std_atlas_array = None
+        except Exception as e:
+            print(f"Chyba při načítání atlasů: {e}")
+            has_atlas = False
     else:
         print("VAROVÁNÍ: Průměrný ADC atlas nenalezen.")
         return
     
     try:
-        # Získání velikostí obrazů
+        # Transformace atlasu na velikost pacienta
+        print("Registrace atlasu k subjektu...")
         subject_size = adc_array.shape
         atlas_size = adc_mean_atlas_array.shape
         
         print(f"Velikost ADC subjektu: {subject_size}, Velikost atlasu: {atlas_size}")
         
-        # Pokud velikosti nesouhlasí, použijeme resample
-        if subject_size != atlas_size:
-            print("Atlas a subjekt mají různé velikosti. Provádím resampling atlasu...")
+        # Použití vylepšené metody převzorkování s kontrolou poměrů
+        try:
+            from scipy import ndimage
             
-            # Buď pomocí SimpleITK nebo alternativně scipy
-            try:
-                # SimpleITK metoda
-                identity = sitk.Transform(3, sitk.sitkIdentity)
-                resampled_mean_atlas = sitk.Resample(
-                    adc_mean_atlas, 
-                    adc_img, 
-                    identity, 
-                    sitk.sitkLinear,
-                    0.0,
-                    adc_mean_atlas.GetPixelID()
-                )
-                
-                registered_atlas_array = sitk.GetArrayFromImage(resampled_mean_atlas)
-                
-                if adc_std_atlas is not None:
-                    resampled_std_atlas = sitk.Resample(
-                        adc_std_atlas, 
-                        adc_img, 
-                        identity, 
-                        sitk.sitkLinear,
-                        0.0,
-                        adc_std_atlas.GetPixelID()
-                    )
-                    registered_std_atlas_array = sitk.GetArrayFromImage(resampled_std_atlas)
-                else:
-                    registered_std_atlas_array = None
-                
-                print(f"Atlas převzorkován na velikost: {registered_atlas_array.shape}")
-            except Exception as e:
-                print(f"Chyba při použití SimpleITK: {e}")
-                print("Používám scipy zoom jako alternativu...")
-                
-                # Scipy metoda
-                from scipy import ndimage
-                
-                zoom_factors = (subject_size[0] / atlas_size[0], 
-                               subject_size[1] / atlas_size[1],
-                               subject_size[2] / atlas_size[2])
-                
-                print(f"Použití scipy zoom s faktory: {zoom_factors}")
-                
-                registered_atlas_array = ndimage.zoom(adc_mean_atlas_array, zoom_factors, order=1)
-                
-                if adc_std_atlas_array is not None:
-                    registered_std_atlas_array = ndimage.zoom(adc_std_atlas_array, zoom_factors, order=1)
-                else:
-                    registered_std_atlas_array = None
-                
-                print(f"Atlas převzorkován na velikost: {registered_atlas_array.shape}")
-        else:
-            registered_atlas_array = adc_mean_atlas_array
-            registered_std_atlas_array = adc_std_atlas_array
+            # Vypočítáme poměry rozměrů pro převzorkování
+            zoom_factors = (subject_size[0] / atlas_size[0], 
+                           subject_size[1] / atlas_size[1],
+                           subject_size[2] / atlas_size[2])
+            
+            print(f"Použití scipy zoom s faktory: {zoom_factors}")
+            
+            # Kontrola, zda nejsou faktory zoom příliš extrémní
+            if max(zoom_factors) > 10 or min(zoom_factors) < 0.1:
+                print(f"VAROVÁNÍ: Extrémní faktory pro zoom: {zoom_factors}")
+                print("Upravuji faktory, aby byly v rozumném rozsahu...")
+                zoom_factors = tuple(min(max(factor, 0.1), 10.0) for factor in zoom_factors)
+                print(f"Upravené faktory: {zoom_factors}")
+            
+            # Registrace průměrného atlasu
+            registered_atlas_array = ndimage.zoom(adc_mean_atlas_array, zoom_factors, order=1, mode='nearest')
+            
+            # Kontrola, zda výsledek má správnou velikost
+            if registered_atlas_array.shape != subject_size:
+                print(f"VAROVÁNÍ: Velikost registrovaného atlasu {registered_atlas_array.shape} se neshoduje s velikostí subjektu {subject_size}")
+                # Další ořezání nebo doplnění pro zajištění správné velikosti
+                pad_width = [(max(0, target - current), max(0, target - current)) 
+                            for target, current in zip(subject_size, registered_atlas_array.shape)]
+                registered_atlas_array = np.pad(registered_atlas_array, pad_width, mode='constant')
+                registered_atlas_array = registered_atlas_array[:subject_size[0], :subject_size[1], :subject_size[2]]
+            
+            # Registrace atlasu standardních odchylek, pokud existuje
+            if adc_std_atlas_array is not None:
+                registered_std_atlas_array = ndimage.zoom(adc_std_atlas_array, zoom_factors, order=1, mode='nearest')
+                # Upravení velikosti, pokud je potřeba
+                if registered_std_atlas_array.shape != subject_size:
+                    pad_width = [(max(0, target - current), max(0, target - current)) 
+                                for target, current in zip(subject_size, registered_std_atlas_array.shape)]
+                    registered_std_atlas_array = np.pad(registered_std_atlas_array, pad_width, mode='constant')
+                    registered_std_atlas_array = registered_std_atlas_array[:subject_size[0], :subject_size[1], :subject_size[2]]
+            else:
+                registered_std_atlas_array = None
+            
+            print(f"Atlas úspěšně registrován na velikost: {registered_atlas_array.shape}")
+        except Exception as e:
+            print(f"Chyba při registraci atlasu: {e}")
+            print("Není možné pokračovat bez správně registrovaného atlasu.")
+            return
         
-        # Vytvoření zdravého mozku (nahrazení léze atlasovými hodnotami)
+        # Vytvoření zdravého mozku
         print("Vytváření zdravého mozku...")
         healthy_brain = adc_array_norm.copy()
         
         # Normalizace atlasu
-        atlas_min = registered_atlas_array.min()
-        atlas_max = registered_atlas_array.max()
+        atlas_min = np.nanmin(registered_atlas_array)
+        atlas_max = np.nanmax(registered_atlas_array)
         registered_atlas_norm = (registered_atlas_array - atlas_min) / (atlas_max - atlas_min + 1e-8)
         
-        # Výpočet škálovacího faktoru
+        # Vytvoření masky okraje léze
         from scipy import ndimage
         dilated_mask = ndimage.binary_dilation(label_array, iterations=2)
         border_mask = dilated_mask & np.logical_not(label_array)
         
+        # Výpočet škálovacího faktoru pro atlas
         if np.any(border_mask):
-            # Získání škálovacího faktoru z oblasti hranice
+            # Získání hodnot na hranici léze
             original_border_values = adc_array_norm[border_mask]
             atlas_border_values = registered_atlas_norm[border_mask]
             
-            # Výpočet poměru mediánů pro robustnost
-            scaling_factor = np.median(original_border_values) / np.median(atlas_border_values)
+            # Odstranění případných NaN hodnot
+            original_border_values = original_border_values[~np.isnan(original_border_values)]
+            atlas_border_values = atlas_border_values[~np.isnan(atlas_border_values)]
             
-            # Aplikace atlasových hodnot škálovaných faktorem do oblasti léze
-            healthy_brain[label_array > 0] = registered_atlas_norm[label_array > 0] * scaling_factor
-            
-            # Přidání některé náhodné variace na základě atlasu std, pokud je k dispozici
-            if registered_std_atlas_array is not None:
-                # Škálování std hodnot
-                std_norm = (registered_std_atlas_array - registered_std_atlas_array.min()) / (registered_std_atlas_array.max() - registered_std_atlas_array.min() + 1e-8)
-                std_scaled = std_norm * scaling_factor * 0.3  # Snížení variace na 30%
+            if len(original_border_values) > 0 and len(atlas_border_values) > 0:
+                # Výpočet mediánu pro robustnost
+                orig_median = np.median(original_border_values)
+                atlas_median = np.median(atlas_border_values)
                 
-                # Aplikace náhodné variace v oblasti léze
-                rng = np.random.RandomState(42)  # Použití fixního seedu pro reprodukovatelnost
-                random_variation = rng.normal(0, std_scaled[label_array > 0])
-                healthy_brain[label_array > 0] += random_variation
+                # Výpočet škálovacího faktoru, ošetření dělení nulou
+                if atlas_median > 1e-6:
+                    scaling_factor = orig_median / atlas_median
+                else:
+                    scaling_factor = 1.0
+                    print("VAROVÁNÍ: Mediánová hodnota atlasu blízká nule, používám scaling_factor=1.0")
                 
-                # Zajištění hodnot v platném rozsahu
-                healthy_brain = np.clip(healthy_brain, 0, 1)
-            
-            print(f"Vytvořen zdravý mozek s použitím atlasu. Škálovací faktor: {scaling_factor:.4f}")
+                print(f"Škálovací faktor pro atlas: {scaling_factor:.4f}")
+                
+                # Aplikace atlasových hodnot do oblasti léze
+                mask_indices = np.where(label_array > 0)
+                if len(mask_indices[0]) > 0:
+                    # Kontrola, zda nejsou v atlasu NaN hodnoty v oblasti léze
+                    atlas_values = registered_atlas_norm[mask_indices]
+                    nan_indices = np.isnan(atlas_values)
+                    
+                    if np.any(nan_indices):
+                        print(f"VAROVÁNÍ: {np.sum(nan_indices)} NaN hodnot v atlasu v oblasti léze, nahrazuji mediánem")
+                        atlas_values[nan_indices] = atlas_median
+                    
+                    # Aplikace škálovaných hodnot
+                    healthy_brain[mask_indices] = atlas_values * scaling_factor
+                    
+                    # Kontrola, zda nejsou ve výsledku NaN hodnoty
+                    if np.any(np.isnan(healthy_brain)):
+                        print("VAROVÁNÍ: NaN hodnoty ve výsledném 'zdravém mozku', nahrazuji mediánem")
+                        nan_mask = np.isnan(healthy_brain)
+                        healthy_brain[nan_mask] = orig_median
+                    
+                    # Zajištění hodnot v platném rozsahu
+                    healthy_brain = np.clip(healthy_brain, 0, 1)
+                    
+                    print("Úspěšně vytvořen zdravý mozek s použitím atlasu")
+                else:
+                    print("VAROVÁNÍ: Žádné voxely v masce léze")
+            else:
+                print("VAROVÁNÍ: Prázdné hodnoty na hranici léze, použiji interpolaci")
+                # Fallback na interpolaci
+                temp_array = adc_array_norm.copy()
+                temp_array[label_array > 0] = np.nan
+                filled_array = ndimage.median_filter(np.nan_to_num(temp_array), size=5)
+                healthy_brain[label_array > 0] = filled_array[label_array > 0]
         else:
-            print("Nenalezena žádná hranice léze. Používám interpolaci...")
-            
-            # Použití interpolace jako záložní metody
+            print("VAROVÁNÍ: Žádná hranice léze nenalezena, použiji interpolaci")
+            # Fallback na interpolaci
             temp_array = adc_array_norm.copy()
             temp_array[label_array > 0] = np.nan
             filled_array = ndimage.median_filter(np.nan_to_num(temp_array), size=5)
             healthy_brain[label_array > 0] = filled_array[label_array > 0]
         
+        # Výpočet statistik změn v oblasti léze
+        mask_3d = label_array > 0
+        if np.any(mask_3d):
+            original_values = adc_array_norm[mask_3d]
+            healthy_values = healthy_brain[mask_3d]
+            
+            # Odstranění případných NaN hodnot
+            valid_mask = ~np.isnan(original_values) & ~np.isnan(healthy_values)
+            original_values = original_values[valid_mask]
+            healthy_values = healthy_values[valid_mask]
+            
+            if len(original_values) > 0:
+                mean_original = np.mean(original_values)
+                mean_healthy = np.mean(healthy_values)
+                mean_abs_diff = np.mean(np.abs(healthy_values - original_values))
+                median_abs_diff = np.median(np.abs(healthy_values - original_values))
+                
+                stats_text = (f"Statistika oblasti léze:\n"
+                              f"Průměrná hodnota původní: {mean_original:.4f}\n"
+                              f"Průměrná hodnota zdravá: {mean_healthy:.4f}\n"
+                              f"Průměrná absolutní změna: {mean_abs_diff:.4f}\n"
+                              f"Mediánová absolutní změna: {median_abs_diff:.4f}")
+            else:
+                stats_text = "Statistika oblasti léze: Nedostatek platných dat"
+        else:
+            stats_text = "Statistika oblasti léze: Žádné voxely v masce léze"
+        
         # Vizualizace
         print("Vytvářím vizualizaci...")
-        visualize_healthy_brain_creation(adc_array_norm, label_array, healthy_brain, output_file,
-                                        title="Vytvoření zdravého mozku pomocí atlasu")
         
-        # Zobrazení přesných řezů s lézí - detailní pohled
         # Najít řezy obsahující lézi
         lesion_slices = []
         for z in range(label_array.shape[0]):
             if np.any(label_array[z] > 0):
                 lesion_slices.append(z)
         
+        if not lesion_slices:
+            print("VAROVÁNÍ: Nenalezeny žádné řezy s lézí pro vizualizaci.")
+            # Použijeme prostřední řez jako zálohu
+            lesion_slices = [label_array.shape[0] // 2]
+        
         # Středový řez s lézí
-        if lesion_slices:
-            mid_slice_idx = lesion_slices[len(lesion_slices) // 2]  # Vyberu prostřední řez s lézí
+        mid_slice_idx = lesion_slices[len(lesion_slices) // 2]
+        
+        # Detailní vizualizace jednoho řezu
+        fig, axs = plt.subplots(2, 3, figsize=(15, 10))
             
-            # Vytvořit detailní vizualizaci pro jeden řez s porovnáním atlasu
-            fig, axs = plt.subplots(2, 3, figsize=(15, 10))
+        # První řádek - ADC řez, atlas řez, rozdíl
+        axs[0, 0].imshow(adc_array_norm[mid_slice_idx], cmap='gray', vmin=0, vmax=1)
+        axs[0, 0].set_title(f'Původní ADC (řez {mid_slice_idx})')
+        axs[0, 0].axis('off')
+        
+        # Zobrazení registrovaného atlasu s ošetřením NaN hodnot
+        atlas_display = np.copy(registered_atlas_norm[mid_slice_idx])
+        if np.any(np.isnan(atlas_display)):
+            print(f"VAROVÁNÍ: NaN hodnoty v zobrazení atlasu, nahrazuji nulami")
+            atlas_display = np.nan_to_num(atlas_display)
+        
+        axs[0, 1].imshow(atlas_display, cmap='gray', vmin=0, vmax=1)
+        axs[0, 1].set_title('Registrovaný atlas')
+        axs[0, 1].axis('off')
+        
+        # Rozdíl také s ošetřením NaN hodnot
+        diff_atlas = np.abs(adc_array_norm[mid_slice_idx] - atlas_display)
+        if np.any(np.isnan(diff_atlas)):
+            diff_atlas = np.nan_to_num(diff_atlas)
+        
+        axs[0, 2].imshow(diff_atlas, cmap='hot', vmin=0, vmax=1)
+        axs[0, 2].set_title('Rozdíl ADC vs. atlas')
+        axs[0, 2].axis('off')
+        
+        # Druhý řádek - maska léze, zdravý mozek, rozdíl
+        # Maska léze jako překryv
+        mask = label_array[mid_slice_idx] > 0
+        input_with_mask = np.stack([adc_array_norm[mid_slice_idx], 
+                                   adc_array_norm[mid_slice_idx], 
+                                   adc_array_norm[mid_slice_idx]], axis=2)
+        input_with_mask[mask, 0] = 1.0  # Červený kanál
+        input_with_mask[mask, 1] = 0.0  # Zelený kanál
+        input_with_mask[mask, 2] = 0.0  # Modrý kanál
+        
+        axs[1, 0].imshow(input_with_mask)
+        axs[1, 0].set_title('ADC s označením léze')
+        axs[1, 0].axis('off')
+        
+        # Zdravý mozek - zajištění, že nemá NaN hodnoty
+        healthy_display = np.copy(healthy_brain[mid_slice_idx])
+        if np.any(np.isnan(healthy_display)):
+            healthy_display = np.nan_to_num(healthy_display)
+        
+        axs[1, 1].imshow(healthy_display, cmap='gray', vmin=0, vmax=1)
+        axs[1, 1].set_title('Zdravý mozek (bez léze)')
+        axs[1, 1].axis('off')
+        
+        # Mapa změn - rozdíl mezi původním a zdravým mozkem
+        diff_healthy = np.abs(adc_array_norm[mid_slice_idx] - healthy_display)
+        if np.any(np.isnan(diff_healthy)):
+            diff_healthy = np.nan_to_num(diff_healthy)
+        
+        im = axs[1, 2].imshow(diff_healthy, cmap='hot', vmin=0, vmax=np.max(diff_healthy) if np.max(diff_healthy) > 0 else 1)
+        axs[1, 2].set_title('Mapa změn')
+        axs[1, 2].axis('off')
+        
+        # Přidat colorbar pro mapu změn
+        cbar = fig.colorbar(im, ax=axs[1, 2], fraction=0.046, pad=0.04)
+        cbar.set_label('Absolutní rozdíl intenzity')
+        
+        plt.suptitle(f"Detailní srovnání atlasové metody pro řez {mid_slice_idx}\n{stats_text}")
+        plt.tight_layout()
+        
+        # Uložit detail jako druhou vizualizaci
+        detail_output = os.path.splitext(output_file)[0] + "_detail.png"
+        plt.savefig(detail_output, dpi=150)
+        plt.close()
+        
+        print(f"Detailní vizualizace uložena jako: {detail_output}")
+        
+        # Vytvořit vizualizaci pro všechny řezy s lézí
+        use_pdf = len(lesion_slices) > 15
+        
+        if use_pdf:
+            with PdfPages(output_file) as pdf:
+                for slice_batch_idx in range(0, len(lesion_slices), 15):
+                    batch_slices = lesion_slices[slice_batch_idx:slice_batch_idx+15]
+                    fig, axs = plt.subplots(4, len(batch_slices), figsize=(4*len(batch_slices), 16))
+                    
+                    # Pro případ jednoho řezu
+                    if len(batch_slices) == 1:
+                        axs = axs.reshape(4, 1)
+                    
+                    for j, slice_idx in enumerate(batch_slices):
+                        # Původní ADC řez
+                        axs[0, j].imshow(adc_array_norm[slice_idx], cmap='gray', vmin=0, vmax=1)
+                        axs[0, j].set_title(f'Řez {slice_idx}')
+                        axs[0, j].axis('off')
+                        
+                        # Maska léze jako překryv
+                        mask = label_array[slice_idx] > 0
+                        input_with_mask = np.stack([adc_array_norm[slice_idx], 
+                                                  adc_array_norm[slice_idx], 
+                                                  adc_array_norm[slice_idx]], axis=2)
+                        input_with_mask[mask, 0] = 1.0  # Červený kanál
+                        input_with_mask[mask, 1] = 0.0  # Zelený kanál
+                        input_with_mask[mask, 2] = 0.0  # Modrý kanál
+                        
+                        axs[1, j].imshow(input_with_mask)
+                        axs[1, j].set_title('Označení léze')
+                        axs[1, j].axis('off')
+                        
+                        # Zobrazit zdravý mozek
+                        healthy_display = np.copy(healthy_brain[slice_idx])
+                        if np.any(np.isnan(healthy_display)):
+                            healthy_display = np.nan_to_num(healthy_display)
+                        
+                        axs[2, j].imshow(healthy_display, cmap='gray', vmin=0, vmax=1)
+                        axs[2, j].set_title('Zdravý mozek')
+                        axs[2, j].axis('off')
+                        
+                        # Mapa změn
+                        diff_healthy = np.abs(adc_array_norm[slice_idx] - healthy_display)
+                        if np.any(np.isnan(diff_healthy)):
+                            diff_healthy = np.nan_to_num(diff_healthy)
+                        
+                        # Vypočítat průměrnou změnu pro tento konkrétní řez v oblasti léze
+                        slice_mask = label_array[slice_idx] > 0
+                        if np.any(slice_mask):
+                            slice_orig = adc_array_norm[slice_idx][slice_mask]
+                            slice_healthy = healthy_brain[slice_idx][slice_mask]
+                            # Ošetření NaN hodnot
+                            valid_mask = ~np.isnan(slice_orig) & ~np.isnan(slice_healthy)
+                            if np.any(valid_mask):
+                                slice_orig = slice_orig[valid_mask]
+                                slice_healthy = slice_healthy[valid_mask]
+                                slice_mean_change = np.mean(np.abs(slice_healthy - slice_orig))
+                                diff_title = f'Mapa změn (Δ={slice_mean_change:.4f})'
+                            else:
+                                diff_title = 'Mapa změn (chybí data)'
+                        else:
+                            diff_title = 'Mapa změn'
+                        
+                        axs[3, j].imshow(diff_healthy, cmap='hot', vmin=0, vmax=np.max(diff_healthy) if np.max(diff_healthy) > 0 else 1)
+                        axs[3, j].set_title(diff_title)
+                        axs[3, j].axis('off')
+                    
+                    # Přidat popisky řad
+                    axs[0, 0].set_ylabel('Původní ADC')
+                    axs[1, 0].set_ylabel('Léze')
+                    axs[2, 0].set_ylabel('Zdravý mozek')
+                    axs[3, 0].set_ylabel('Změny')
+                    
+                    # Celkový titulek
+                    plt.suptitle(f"Vizualizace vytvoření zdravého mozku pomocí atlasu\n{stats_text}")
+                        
+                    plt.tight_layout()
+                    pdf.savefig(fig, dpi=150)
+                    plt.close()
             
-            # První řádek - ADC řez, atlas řez, rozdíl
-            axs[0, 0].imshow(adc_array_norm[mid_slice_idx], cmap='gray')
-            axs[0, 0].set_title(f'Původní ADC (řez {mid_slice_idx})')
-            axs[0, 0].axis('off')
+            print(f"Uložena kompletní vizualizace tvorby zdravého mozku do PDF: {output_file}")
+        else:
+            # Jeden obrázek pro méně než 15 řezů
+            fig, axs = plt.subplots(4, len(lesion_slices), figsize=(4*len(lesion_slices), 16))
             
-            axs[0, 1].imshow(registered_atlas_norm[mid_slice_idx], cmap='gray')
-            axs[0, 1].set_title('Registrovaný atlas')
-            axs[0, 1].axis('off')
+            # Pro případ jednoho řezu
+            if len(lesion_slices) == 1:
+                axs = axs.reshape(4, 1)
             
-            diff_atlas = np.abs(adc_array_norm[mid_slice_idx] - registered_atlas_norm[mid_slice_idx])
-            axs[0, 2].imshow(diff_atlas, cmap='hot')
-            axs[0, 2].set_title('Rozdíl ADC vs. atlas')
-            axs[0, 2].axis('off')
+            for j, slice_idx in enumerate(lesion_slices):
+                # Původní ADC řez
+                axs[0, j].imshow(adc_array_norm[slice_idx], cmap='gray', vmin=0, vmax=1)
+                axs[0, j].set_title(f'Řez {slice_idx}')
+                axs[0, j].axis('off')
+                
+                # Maska léze jako překryv
+                mask = label_array[slice_idx] > 0
+                input_with_mask = np.stack([adc_array_norm[slice_idx], 
+                                          adc_array_norm[slice_idx], 
+                                          adc_array_norm[slice_idx]], axis=2)
+                input_with_mask[mask, 0] = 1.0  # Červený kanál
+                input_with_mask[mask, 1] = 0.0  # Zelený kanál
+                input_with_mask[mask, 2] = 0.0  # Modrý kanál
+                
+                axs[1, j].imshow(input_with_mask)
+                axs[1, j].set_title('Označení léze')
+                axs[1, j].axis('off')
+                
+                # Zobrazit zdravý mozek
+                healthy_display = np.copy(healthy_brain[slice_idx])
+                if np.any(np.isnan(healthy_display)):
+                    healthy_display = np.nan_to_num(healthy_display)
+                
+                axs[2, j].imshow(healthy_display, cmap='gray', vmin=0, vmax=1)
+                axs[2, j].set_title('Zdravý mozek')
+                axs[2, j].axis('off')
+                
+                # Mapa změn
+                diff_healthy = np.abs(adc_array_norm[slice_idx] - healthy_display)
+                if np.any(np.isnan(diff_healthy)):
+                    diff_healthy = np.nan_to_num(diff_healthy)
+                
+                # Vypočítat průměrnou změnu pro tento konkrétní řez v oblasti léze
+                slice_mask = label_array[slice_idx] > 0
+                if np.any(slice_mask):
+                    slice_orig = adc_array_norm[slice_idx][slice_mask]
+                    slice_healthy = healthy_brain[slice_idx][slice_mask]
+                    # Ošetření NaN hodnot
+                    valid_mask = ~np.isnan(slice_orig) & ~np.isnan(slice_healthy)
+                    if np.any(valid_mask):
+                        slice_orig = slice_orig[valid_mask]
+                        slice_healthy = slice_healthy[valid_mask]
+                        slice_mean_change = np.mean(np.abs(slice_healthy - slice_orig))
+                        diff_title = f'Mapa změn (Δ={slice_mean_change:.4f})'
+                    else:
+                        diff_title = 'Mapa změn (chybí data)'
+                else:
+                    diff_title = 'Mapa změn'
+                
+                axs[3, j].imshow(diff_healthy, cmap='hot', vmin=0, vmax=np.max(diff_healthy) if np.max(diff_healthy) > 0 else 1)
+                axs[3, j].set_title(diff_title)
+                axs[3, j].axis('off')
             
-            # Druhý řádek - maska léze, zdravý mozek, rozdíl
-            # Maska léze jako překryv
-            mask = label_array[mid_slice_idx] > 0
-            input_with_mask = np.stack([adc_array_norm[mid_slice_idx], 
-                                       adc_array_norm[mid_slice_idx], 
-                                       adc_array_norm[mid_slice_idx]], axis=2)
-            input_with_mask[mask, 0] = 1.0  # Červený kanál
-            input_with_mask[mask, 1] = 0.0  # Zelený kanál
-            input_with_mask[mask, 2] = 0.0  # Modrý kanál
+            # Přidat popisky řad
+            axs[0, 0].set_ylabel('Původní ADC')
+            axs[1, 0].set_ylabel('Léze')
+            axs[2, 0].set_ylabel('Zdravý mozek')
+            axs[3, 0].set_ylabel('Změny')
             
-            axs[1, 0].imshow(input_with_mask)
-            axs[1, 0].set_title('ADC s označením léze')
-            axs[1, 0].axis('off')
-            
-            axs[1, 1].imshow(healthy_brain[mid_slice_idx], cmap='gray')
-            axs[1, 1].set_title('Zdravý mozek (bez léze)')
-            axs[1, 1].axis('off')
-            
-            diff_healthy = np.abs(adc_array_norm[mid_slice_idx] - healthy_brain[mid_slice_idx])
-            im = axs[1, 2].imshow(diff_healthy, cmap='hot')
-            axs[1, 2].set_title('Mapa změn')
-            axs[1, 2].axis('off')
-            
-            # Přidat colorbar pro mapu změn
-            cbar = fig.colorbar(im, ax=axs[1, 2], fraction=0.046, pad=0.04)
-            cbar.set_label('Absolutní rozdíl intenzity')
-            
-            # Výpočet statistik pro oblast léze
-            mask_3d = label_array > 0
-            original_values = adc_array_norm[mask_3d]
-            healthy_values = healthy_brain[mask_3d]
-            
-            mean_original = np.mean(original_values) if len(original_values) > 0 else 0
-            mean_healthy = np.mean(healthy_values) if len(healthy_values) > 0 else 0
-            mean_abs_diff = np.mean(np.abs(healthy_values - original_values)) if len(original_values) > 0 else 0
-            median_diff = np.median(np.abs(healthy_values - original_values)) if len(original_values) > 0 else 0
-            
-            stats_text = (f"Statistika oblasti léze:\n"
-                          f"Průměrná hodnota původní: {mean_original:.4f}\n"
-                          f"Průměrná hodnota zdravá: {mean_healthy:.4f}\n"
-                          f"Průměrná absolutní změna: {mean_abs_diff:.4f}\n"
-                          f"Mediánová absolutní změna: {median_diff:.4f}")
-            
-            plt.suptitle(f"Detailní srovnání atlasové metody pro řez {mid_slice_idx}\n{stats_text}")
+            # Celkový titulek
+            plt.suptitle(f"Vizualizace vytvoření zdravého mozku pomocí atlasu\n{stats_text}")
+                
             plt.tight_layout()
-            
-            # Uložit detail jako druhou vizualizaci
-            detail_output = os.path.splitext(output_file)[0] + "_detail.png"
-            plt.savefig(detail_output, dpi=150)
+            plt.savefig(output_file, dpi=150)
             plt.close()
             
-            print(f"Detailní vizualizace uložena jako: {detail_output}")
+            print(f"Uložena kompletní vizualizace tvorby zdravého mozku: {output_file}")
         
     except Exception as e:
         print(f"Chyba při vytváření vizualizace: {e}")
