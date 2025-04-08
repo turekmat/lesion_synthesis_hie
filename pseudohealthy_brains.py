@@ -417,6 +417,7 @@ def visualize_results(adc_data, pseudo_healthy, label_data, patient_id, output_d
 def process_dataset(adc_dir, label_dir, output_dir, percentage=50, visualize=False):
     """
     Process the entire dataset, selecting the lower X% by lesion volume
+    but processing them in random order for better comparisons
     """
     # Create output directory if it doesn't exist
     os.makedirs(output_dir, exist_ok=True)
@@ -428,12 +429,19 @@ def process_dataset(adc_dir, label_dir, output_dir, percentage=50, visualize=Fal
     num_patients = len(volumes)
     num_to_include = int(num_patients * percentage / 100)
     
+    # Select only the bottom X% by volume (smallest lesions)
+    selected_volumes = volumes[:num_to_include]
+    
+    # Randomly shuffle the selected volumes to process them in random order
+    np.random.seed(42)  # For reproducibility
+    np.random.shuffle(selected_volumes)
+    
     print(f"Total patients: {num_patients}")
     print(f"Including {num_to_include} patients with the smallest lesion volumes ({percentage}%)")
+    print(f"Processing in random order for better comparison")
     
-    # Process selected patients
-    for i in tqdm(range(num_to_include)):
-        patient = volumes[i]
+    # Process selected patients in random order
+    for patient in tqdm(selected_volumes):
         patient_id = patient['patient_id']
         
         print(f"\nProcessing {patient_id} (lesion volume: {patient['volume']} voxels)")
