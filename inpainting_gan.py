@@ -190,10 +190,6 @@ class LesionInpaintingDataset(Dataset):
         target_h = ((h + patch_size - 1) // patch_size) * patch_size
         target_w = ((w + patch_size - 1) // patch_size) * patch_size
         
-        # Pokud je zadána cílová velikost, použít ji
-        if self.target_size:
-            target_d, target_h, target_w = self.target_size
-        
         # Vypočítat padding pro každý rozměr
         pad_d = max(0, target_d - d)
         pad_h = max(0, target_h - h)
@@ -1244,13 +1240,14 @@ def train_model(args):
     
     # Nastavit cílovou velikost pro zpracování
     target_size = (target_d, target_h, target_w)
-    print(f"Původní velikost dat: {sample_data.shape}")
+    print(f"Původní velikost dat prvního vzorku: {sample_data.shape}")
     print(f"Zaokrouhleno na násobky {patch_size}: {target_size}")
+    print(f"Tato velikost bude použita pro inicializaci modelu, ale dataset bude dynamicky zpracovávat každý vzorek individuálně.")
     
     if args.target_size:
         # Použít zadanou cílovou velikost, pokud je specifikována
         target_size = tuple(map(int, args.target_size.split(',')))
-        print(f"Použita ručně specifikovaná cílová velikost: {target_size}")
+        print(f"Použita ručně specifikovaná cílová velikost pro model: {target_size}")
     
     # Definovat transformace pro augmentaci dat (pouze pro tréninkovou část)
     train_transforms = None
@@ -1334,7 +1331,6 @@ def train_model(args):
         lesion_mask_dir=args.lesion_mask_dir,
         norm_range=(0, 1),
         crop_foreground=args.crop_foreground,
-        target_size=target_size,
         transform=train_transforms
     )
     
@@ -1375,7 +1371,6 @@ def train_model(args):
             lesion_mask_dir=args.lesion_mask_dir,
             norm_range=(0, 1),
             crop_foreground=args.crop_foreground,
-            target_size=target_size,
             transform=None  # bez augmentací pro validaci
         )
         
@@ -1545,12 +1540,15 @@ def generate_inpainted_brain(model, pseudo_healthy_path, lesion_mask_path, outpu
     # Uložit původní tvar pro pozdější obnovení
     original_shape = ph_data.shape
     
-    # Doplnit na nejbližší násobek 32 pro každý rozměr
+    # Dynamicky doplnit na nejbližší násobek 32 pro každý rozměr
     d, h, w = ph_data.shape
     patch_size = 32
     target_d = ((d + patch_size - 1) // patch_size) * patch_size
     target_h = ((h + patch_size - 1) // patch_size) * patch_size
     target_w = ((w + patch_size - 1) // patch_size) * patch_size
+    
+    print(f"Původní velikost dat: {original_shape}")
+    print(f"Paddovaná velikost pro inference: ({target_d}, {target_h}, {target_w})")
     
     # Pad data
     pad_d = max(0, target_d - d)
