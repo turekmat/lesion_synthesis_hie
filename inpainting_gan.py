@@ -1238,19 +1238,16 @@ class LesionInpaintingTrainer:
         with torch.no_grad():
             fake_adc = self.model.generator(pseudo_healthy, lesion_mask)
         
-        # Vypočítat metriky
-        # Počítáme SSIM v oblasti léze
-        ssim_val = self.model.ssim_loss(fake_adc * lesion_mask, real_adc * lesion_mask).item()
-        
-        # Počítáme MAE (mean absolute error) v oblasti léze
-        masked_fake = fake_adc * lesion_mask
-        masked_real = real_adc * lesion_mask
-        mae_val = torch.sum(torch.abs(masked_fake - masked_real)) / (torch.sum(lesion_mask) + 1e-8)
-        mae_val = mae_val.item()
-
         # Vytvořit kombinovaný výsledek (pseudo-zdravý + vygenerovaná léze)
         # Kombinujeme pseudo-zdravý obraz a generovanou ADC mapu v oblasti léze
         inpainted_adc = pseudo_healthy * (1 - lesion_mask) + fake_adc * lesion_mask
+        
+        # Vypočítat metriky mezi reálnou ADC mapou a inpainted výsledkem (celý objem)
+        # Počítáme SSIM pro celý objem
+        ssim_val = self.model.ssim_loss(inpainted_adc, real_adc).item()
+        
+        # Počítáme MAE (mean absolute error) pro celý objem
+        mae_val = F.l1_loss(inpainted_adc, real_adc).item()
         
         # Cesta k výstupnímu PDF souboru
         pdf_filename = f"epoch_{epoch}_patient_{patient_id}_full_volume.pdf"
