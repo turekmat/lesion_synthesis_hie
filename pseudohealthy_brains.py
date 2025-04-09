@@ -654,6 +654,104 @@ def visualize_results(adc_data, pseudo_healthy, label_data, patient_id, output_d
     output_path = os.path.join(output_dir, f"{patient_id}_visualization.pdf")
     print(f"Creating visualization PDF: {output_path}")
     
+    # Inicializace proměnných, které se používají později
+    atlas_data_axial = None
+    registered_lesion_axial = None
+    
+    # Prepare atlas data if path is provided
+    if atlas_path is not None and np.any(label_data > 0):
+        print("Preparing atlas visualization data...")
+        # We need to register the lesion to the atlas space similarly as in create_pseudo_healthy_brain_with_atlas
+        # Create temporary directory for registration
+        temp_dir = Path("temp_visualization")
+        temp_dir.mkdir(exist_ok=True)
+        
+        # Save temporary files for ANTs processing
+        temp_adc_path = temp_dir / "temp_viz_adc.nii.gz"
+        temp_label_path = temp_dir / "temp_viz_label.nii.gz"
+        
+        # Use SimpleITK to save temporary files
+        temp_adc_sitk = sitk.GetImageFromArray(adc_data)
+        sitk.WriteImage(temp_adc_sitk, str(temp_adc_path))
+        
+        temp_label_sitk = sitk.GetImageFromArray(label_data.astype(np.uint8))
+        sitk.WriteImage(temp_label_sitk, str(temp_label_path))
+        
+        try:
+            # Load images in ANTs format
+            adc_ant = ants.image_read(str(temp_adc_path))
+            atlas_ant = ants.image_read(str(atlas_path))
+            label_ant = ants.image_read(str(temp_label_path))
+            
+            # Normalize images for better registration
+            atlas_ant = ants.iMath(atlas_ant, "Normalize")
+            
+            # Normalize ADC to [0,1] range
+            adc_np = adc_ant.numpy()
+            adc_min, adc_max = adc_np.min(), adc_np.max()
+            normalized_adc_np = (adc_np - adc_min) / (adc_max - adc_min)
+            adc_ant_norm = ants.from_numpy(
+                normalized_adc_np,
+                origin=adc_ant.origin,
+                spacing=adc_ant.spacing,
+                direction=adc_ant.direction
+            )
+            
+            # Perform registration in the same way as in create_pseudo_healthy_brain_with_atlas
+            print("Performing registration for visualization...")
+            # Affine registration
+            init_reg = ants.registration(
+                fixed=atlas_ant,
+                moving=adc_ant_norm,
+                type_of_transform='Affine',
+                verbose=False
+            )
+            
+            # SyN registration
+            reg = ants.registration(
+                fixed=atlas_ant,
+                moving=adc_ant_norm,
+                type_of_transform='SyN',
+                initial_transform=init_reg['fwdtransforms'][0],
+                reg_iterations=[50, 30, 20],
+                verbose=False
+            )
+            
+            # Transform lesion mask to atlas space
+            registered_lesion = ants.apply_transforms(
+                fixed=atlas_ant,
+                moving=label_ant,
+                transformlist=reg['fwdtransforms'],
+                interpolator='nearestNeighbor',
+                verbose=False
+            )
+            
+            # Convert atlas and registered lesion to numpy arrays
+            atlas_np = atlas_ant.numpy()
+            registered_lesion_np = registered_lesion.numpy() > 0
+            
+            # Transpose atlas data for correct orientation in visualization
+            atlas_data_axial = np.transpose(atlas_np, (1, 2, 0))
+            registered_lesion_axial = np.transpose(registered_lesion_np, (1, 2, 0))
+            
+        except Exception as e:
+            print(f"Error during registration for visualization: {e}")
+            atlas_data_axial = None
+            registered_lesion_axial = None
+            
+        finally:
+            # Clean up temporary files
+            try:
+                if temp_adc_path.exists():
+                    temp_adc_path.unlink()
+                if temp_label_path.exists():
+                    temp_label_path.unlink()
+                # Remove the temporary directory if it's empty
+                if len(list(temp_dir.iterdir())) == 0:
+                    temp_dir.rmdir()
+            except Exception as e:
+                print(f"Warning: Could not clean up temporary visualization files: {e}")
+    
     # SimpleITK returns data in [z,y,x] order, we need to transpose for correct orientation
     # Transpose to get proper axial view (top-down view)
     adc_data_axial = np.transpose(adc_data, (1, 2, 0))
