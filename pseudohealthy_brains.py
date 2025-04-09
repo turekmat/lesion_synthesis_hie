@@ -287,13 +287,16 @@ def create_pseudo_healthy_brain(adc_data, label_data):
     
     # Poměr, jak moc se chceme přiblížit k referenčním hodnotám
     # 0 = zůstat na původní hodnotě, 1 = plně dosáhnout referenční hodnoty
-    TARGET_RATIO = 1.0  # Zvýšeno z 0.95 na 1.0 pro maximální přiblížení k cílovým hodnotám
+    TARGET_RATIO = 1.0  # Maximální přiblížení k cílovým hodnotám
     
     # Hranice mezi vnitřkem léze a okrajem
-    EDGE_THRESHOLD = 0.12  # Sníženo z 0.15 na 0.12 pro ještě ostřejší přechod na okraji
+    EDGE_THRESHOLD = 0.10  # Sníženo z 0.12 na 0.10 pro výraznější přechod na okraji
     
     # Koeficient pro okrajový přechod
-    EDGE_BLEND_FACTOR = 0.8  # Zvýšeno z 0.7 na 0.8 pro silnější přechod na okrajích
+    EDGE_BLEND_FACTOR = 0.85  # Zvýšeno z 0.8 na 0.85 pro silnější přechod na okrajích
+    
+    # Dodatečný faktor pro zvýšení offsetu
+    BOOST_FACTOR = 1.2  # Zvýší celý offset o 20% pro větší efekt
     
     # Process each connected component (lesion) separately
     for lesion_idx in range(1, num_lesions + 1):
@@ -330,7 +333,9 @@ def create_pseudo_healthy_brain(adc_data, label_data):
                 
                 # Vypočítáme offset mezi referenční hodnotou a průměrnou hodnotou v lézi
                 offset = avg_value - lesion_mean
-                print(f"Offset value: {offset:.2f} (Lesion mean: {lesion_mean:.2f}, Target mean: {avg_value:.2f})")
+                # Aplikujeme boost faktor pro zvýšení efektu
+                offset = offset * BOOST_FACTOR
+                print(f"Offset value: {offset:.2f} (Lesion mean: {lesion_mean:.2f}, Target mean: {avg_value:.2f}, Boosted by: {BOOST_FACTOR})")
                 
                 # Generate Perlin noise with a smaller scale for local variations
                 noise = generate_perlin_noise(shape, scale=5.0, octaves=3)
@@ -364,11 +369,11 @@ def create_pseudo_healthy_brain(adc_data, label_data):
                         
                         # Aplikujeme přenos s kvadratickou funkcí pro plynulejší přechod
                         # Ale navíc přidáme závislost na vzdálenosti od okraje
-                        blend_ratio = TARGET_RATIO * (1 - 0.7 * (1 - normalized_weight) * (1 - normalized_weight))
+                        blend_ratio = TARGET_RATIO * (1 - 0.5 * (1 - normalized_weight) * (1 - normalized_weight))
                         
                         # Využití vzdálenosti od okraje pro plynulejší přechod uvnitř léze
                         # Upravená funkce pro ještě silnější efekt v centru
-                        dist_factor = 0.7 + 0.3 * normalized_dist[x, y, z] ** 0.5  # Exponenciální křivka pro silnější efekt, posunutý základ
+                        dist_factor = 0.8 + 0.2 * normalized_dist[x, y, z] ** 0.5  # Zvýšení základu na 0.8 pro větší efekt
                         
                         # Aplikujeme offset s ohledem na lokální odchylku
                         pseudo_healthy[x, y, z] = lesion_mean + local_deviation + blend_ratio * dist_factor * offset + noise_value
@@ -412,7 +417,9 @@ def create_pseudo_healthy_brain(adc_data, label_data):
                 
                 # Vypočítáme offset mezi referenční hodnotou a průměrnou hodnotou v lézi
                 offset = avg_ring_value - lesion_mean
-                print(f"Offset value: {offset:.2f} (Lesion mean: {lesion_mean:.2f}, Target mean: {avg_ring_value:.2f})")
+                # Aplikujeme boost faktor pro zvýšení efektu
+                offset = offset * BOOST_FACTOR
+                print(f"Offset value: {offset:.2f} (Lesion mean: {lesion_mean:.2f}, Target mean: {avg_ring_value:.2f}, Boosted by: {BOOST_FACTOR})")
                 
                 # Generate noise for the lesion area
                 noise = generate_perlin_noise(shape, scale=5.0, octaves=3)
@@ -449,11 +456,11 @@ def create_pseudo_healthy_brain(adc_data, label_data):
                         normalized_weight = (weight - EDGE_THRESHOLD) / (1 - EDGE_THRESHOLD)
                         
                         # Aplikujeme přenos s kvadratickou funkcí pro plynulejší přechod
-                        blend_ratio = TARGET_RATIO * (1 - 0.7 * (1 - normalized_weight) * (1 - normalized_weight))
+                        blend_ratio = TARGET_RATIO * (1 - 0.5 * (1 - normalized_weight) * (1 - normalized_weight))
                         
                         # Využití vzdálenosti od okraje pro plynulejší přechod uvnitř léze
                         # Upravená funkce pro ještě silnější efekt v centru
-                        dist_factor = 0.7 + 0.3 * normalized_dist[x, y, z] ** 0.5  # Exponenciální křivka pro silnější efekt, posunutý základ
+                        dist_factor = 0.8 + 0.2 * normalized_dist[x, y, z] ** 0.5  # Zvýšení základu na 0.8 pro větší efekt
                         
                         # Aplikujeme offset s ohledem na lokální odchylku
                         pseudo_healthy[x, y, z] = lesion_mean + local_deviation + blend_ratio * dist_factor * offset + noise_value
@@ -660,13 +667,16 @@ def create_pseudo_healthy_brain_with_atlas(adc_data, label_data, atlas_path, std
             noise = generate_perlin_noise(adc_data.shape, scale=5.0, octaves=3)
             
             # Poměr, jak moc se chceme přiblížit k referenčním hodnotám
-            TARGET_RATIO = 1.0  # Zvýšeno z 0.95 na 1.0 pro maximální přiblížení k cílovým hodnotám
+            TARGET_RATIO = 1.0  # Maximální přiblížení k cílovým hodnotám
             
             # Hranice mezi vnitřkem léze a okrajem
-            EDGE_THRESHOLD = 0.12  # Sníženo z 0.15 na 0.12 pro ještě ostřejší přechod na okraji
+            EDGE_THRESHOLD = 0.10  # Sníženo z 0.12 na 0.10 pro výraznější přechod na okraji
             
             # Koeficient pro okrajový přechod
-            EDGE_BLEND_FACTOR = 0.8  # Zvýšeno z 0.7 na 0.8 pro silnější přechod na okrajích
+            EDGE_BLEND_FACTOR = 0.85  # Zvýšeno z 0.8 na 0.85 pro silnější přechod na okrajích
+            
+            # Dodatečný faktor pro zvýšení offsetu
+            BOOST_FACTOR = 1.2  # Zvýší celý offset o 20% pro větší efekt
             
             # Zpracování každé komponenty léze zvlášť
             for lesion_idx in range(1, num_lesions + 1):
@@ -722,7 +732,9 @@ def create_pseudo_healthy_brain_with_atlas(adc_data, label_data, atlas_path, std
                         
                         # Vypočítáme offset mezi referenční hodnotou a průměrnou hodnotou v lézi
                         offset = avg_ring_value - lesion_mean
-                        print(f"Offset value: {offset:.2f} (Lesion mean: {lesion_mean:.2f}, Target mean: {avg_ring_value:.2f})")
+                        # Aplikujeme boost faktor pro zvýšení efektu
+                        offset = offset * BOOST_FACTOR
+                        print(f"Offset value: {offset:.2f} (Lesion mean: {lesion_mean:.2f}, Target mean: {avg_ring_value:.2f}, Boosted by: {BOOST_FACTOR})")
                         
                         # Vytvoříme mapu vzdálenosti od okraje léze (distance transform)
                         # Hodnoty uvnitř léze budou větší čím dále od okraje
@@ -752,11 +764,11 @@ def create_pseudo_healthy_brain_with_atlas(adc_data, label_data, atlas_path, std
                                 normalized_weight = (weight - EDGE_THRESHOLD) / (1 - EDGE_THRESHOLD)
                                 
                                 # Aplikujeme přenos s kvadratickou funkcí pro plynulejší přechod
-                                blend_ratio = TARGET_RATIO * (1 - 0.7 * (1 - normalized_weight) * (1 - normalized_weight))
+                                blend_ratio = TARGET_RATIO * (1 - 0.5 * (1 - normalized_weight) * (1 - normalized_weight))
                                 
                                 # Využití vzdálenosti od okraje pro plynulejší přechod uvnitř léze
                                 # Upravená funkce pro ještě silnější efekt v centru
-                                dist_factor = 0.7 + 0.3 * normalized_dist[x, y, z] ** 0.5  # Exponenciální křivka pro silnější efekt, posunutý základ
+                                dist_factor = 0.8 + 0.2 * normalized_dist[x, y, z] ** 0.5  # Zvýšení základu na 0.8 pro větší efekt
                                 
                                 # Aplikujeme offset s ohledem na lokální odchylku
                                 pseudo_healthy[x, y, z] = lesion_mean + local_deviation + blend_ratio * dist_factor * offset + noise_value
@@ -790,7 +802,9 @@ def create_pseudo_healthy_brain_with_atlas(adc_data, label_data, atlas_path, std
                 
                 # Vypočítáme offset mezi referenční hodnotou a průměrnou hodnotou v lézi
                 offset = current_atlas_mean - lesion_mean
-                print(f"Offset value: {offset:.2f} (Lesion mean: {lesion_mean:.2f}, Target mean: {current_atlas_mean:.2f})")
+                # Aplikujeme boost faktor pro zvýšení efektu
+                offset = offset * BOOST_FACTOR
+                print(f"Offset value: {offset:.2f} (Lesion mean: {lesion_mean:.2f}, Target mean: {current_atlas_mean:.2f}, Boosted by: {BOOST_FACTOR})")
                 
                 # Vytvoříme mapu vzdálenosti od okraje léze (distance transform)
                 # Hodnoty uvnitř léze budou větší čím dále od okraje
@@ -825,11 +839,11 @@ def create_pseudo_healthy_brain_with_atlas(adc_data, label_data, atlas_path, std
                         normalized_weight = (weight - EDGE_THRESHOLD) / (1 - EDGE_THRESHOLD)
                         
                         # Aplikujeme přenos s kvadratickou funkcí pro plynulejší přechod
-                        blend_ratio = TARGET_RATIO * (1 - 0.7 * (1 - normalized_weight) * (1 - normalized_weight))
+                        blend_ratio = TARGET_RATIO * (1 - 0.5 * (1 - normalized_weight) * (1 - normalized_weight))
                         
                         # Využití vzdálenosti od okraje pro plynulejší přechod uvnitř léze
                         # Upravená funkce pro ještě silnější efekt v centru
-                        dist_factor = 0.7 + 0.3 * normalized_dist[x, y, z] ** 0.5  # Exponenciální křivka pro silnější efekt, posunutý základ
+                        dist_factor = 0.8 + 0.2 * normalized_dist[x, y, z] ** 0.5  # Zvýšení základu na 0.8 pro větší efekt
                         
                         # Aplikujeme offset s ohledem na lokální odchylku
                         pseudo_healthy[x, y, z] = lesion_mean + local_deviation + blend_ratio * dist_factor * offset + noise_value
