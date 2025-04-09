@@ -321,26 +321,37 @@ def create_pseudo_healthy_brain(adc_data, label_data):
                 # Apply the average value with noise to the lesion area with smooth transition
                 for x, y, z in current_coords:
                     # Apply transition weight (pouze pro okraje)
-                    edge_weight = edge_transition_mask[x, y, z]
+                    weight = edge_transition_mask[x, y, z]
                     
                     # Add noise scaled to about 10% of the avg_value for texture
-                    noise_scale = 0.1 * avg_value
+                    noise_scale = 0.08 * avg_value  # Trochu menší šum pro přirozenější texturu
                     noisy_value = avg_value + (noise[x, y, z] - 0.5) * noise_scale
                     
-                    # NOVÝ PŘÍSTUP: Výpočet finální hodnoty
-                    # Ve vnitřku léze (váha > 0.5) chceme hodnotu velmi blízkou referenční 
-                    # Na okrajích (váha < 0.5) chceme plynulý přechod
-                    if edge_weight > 0.5:
+                    # VYLEPŠENÝ PŘÍSTUP: Strmější přechod k referenčním hodnotám
+                    if weight > 0.15:  # Posuneme hranici z 0.5 na 0.3 pro větší oblast přímého nahrazení
                         # Vnitřek léze - přímé nahrazení referenční hodnotou (s šumem)
-                        # Místo interpolace s původní hodnotou použijeme přímo referenční hodnotu
-                        pseudo_healthy[x, y, z] = noisy_value
+                        
+                        # Exponenciální škálování vnitřku léze - zajistí plynulejší přechod
+                        # ale zároveň větší vliv cílové hodnoty
+                        inner_weight = np.exp((weight - 0.3) * 3) - 1  # Exponenciální škálování
+                        inner_weight = np.clip(inner_weight, 0, 1)  # Omezení na [0, 1]
+                        
+                        # Posuneme se blíže k referenční hodnotě i ve vnitřku léze
+                        # čím blíže ke středu léze, tím více se blížíme k pure referenční hodnotě
+                        inner_mix = 0.95 * inner_weight + 0.05  # Minimálně 5% původní hodnoty pro stabilitu
+                        pseudo_healthy[x, y, z] = (1 - inner_mix) * adc_data[x, y, z] + inner_mix * noisy_value
                     else:
                         # Okraj léze - plynulý přechod do okolní tkáně
-                        # Na okrajích použijeme interpolaci s dvojnásobnou váhou pro referenční hodnotu
-                        # aby přechod byl plynulý, ale zároveň se rychleji blížil k referenční hodnotě
-                        edge_weight_boosted = edge_weight * 2  # Posílení efektu pro rychlejší přechod
+                        # Použijeme trojnásobnou váhu pro strmější přechod
+                        edge_weight_boosted = weight * 3  # Zvýšíme násobič z 2 na 3
                         edge_weight_boosted = min(edge_weight_boosted, 1.0)  # Omezení na max 1.0
-                        pseudo_healthy[x, y, z] = (1 - edge_weight_boosted) * adc_data[x, y, z] + edge_weight_boosted * noisy_value
+                        
+                        # Exponenciální škálování pro okraje - zajistí rychlejší přechod
+                        boost_exp = np.exp(edge_weight_boosted * 1.5) - 1  # Exponenciální škálování
+                        boost_exp = boost_exp / (np.exp(1.5) - 1)  # Normalizace na [0, 1]
+                        boost_exp = np.clip(boost_exp, 0, 0.95)  # Omezení na [0, 0.95]
+                        
+                        pseudo_healthy[x, y, z] = (1 - boost_exp) * adc_data[x, y, z] + boost_exp * noisy_value
             
         else:
             # Case 2: Symmetric lesion present - use normative approach
@@ -371,21 +382,27 @@ def create_pseudo_healthy_brain(adc_data, label_data):
                 
                 for x, y, z in current_coords:
                     # Apply transition weight (pouze pro okraje)
-                    edge_weight = edge_transition_mask[x, y, z]
+                    weight = edge_transition_mask[x, y, z]
                     
-                    # Add noise scaled to about 10% of the avg_value
-                    noise_scale = 0.1 * avg_ring_value
+                    # Add noise scaled to about 8% of the avg_value
+                    noise_scale = 0.08 * avg_ring_value
                     noisy_value = avg_ring_value + (noise[x, y, z] - 0.5) * noise_scale
                     
-                    # NOVÝ PŘÍSTUP: stejně jako v předchozím případě
-                    if edge_weight > 0.5:
-                        # Vnitřek léze - přímé nahrazení referenční hodnotou (s šumem)
-                        pseudo_healthy[x, y, z] = noisy_value
+                    # VYLEPŠENÝ PŘÍSTUP: stejně jako v předchozím případě
+                    if weight > 0.3:  # Posuneme hranici z 0.5 na 0.3
+                        # Vnitřek léze - exponenciální škálování
+                        inner_weight = np.exp((weight - 0.3) * 3) - 1
+                        inner_weight = np.clip(inner_weight, 0, 1)
+                        inner_mix = 0.95 * inner_weight + 0.05
+                        pseudo_healthy[x, y, z] = (1 - inner_mix) * adc_data[x, y, z] + inner_mix * noisy_value
                     else:
-                        # Okraj léze - plynulý přechod do okolní tkáně
-                        edge_weight_boosted = edge_weight * 2
+                        # Okraj léze - plynulý přechod s exponenciálním škálováním
+                        edge_weight_boosted = weight * 3
                         edge_weight_boosted = min(edge_weight_boosted, 1.0)
-                        pseudo_healthy[x, y, z] = (1 - edge_weight_boosted) * adc_data[x, y, z] + edge_weight_boosted * noisy_value
+                        boost_exp = np.exp(edge_weight_boosted * 1.5) - 1
+                        boost_exp = boost_exp / (np.exp(1.5) - 1)
+                        boost_exp = np.clip(boost_exp, 0, 0.95)
+                        pseudo_healthy[x, y, z] = (1 - boost_exp) * adc_data[x, y, z] + boost_exp * noisy_value
     
     return pseudo_healthy, reference_values
 
@@ -606,21 +623,27 @@ def create_pseudo_healthy_brain_with_atlas(adc_data, label_data, atlas_path, std
                         
                         for x, y, z in current_coords:
                             # Apply transition weight (pouze pro okraje)
-                            edge_weight = edge_transition_mask[x, y, z]
+                            weight = edge_transition_mask[x, y, z]
                             
-                            # Přidáme šum škálovaný na cca 10% průměrné hodnoty
-                            noise_scale = 0.1 * avg_ring_value
+                            # Přidáme šum škálovaný na cca 8% průměrné hodnoty
+                            noise_scale = 0.08 * avg_ring_value
                             noisy_value = avg_ring_value + (noise[x, y, z] - 0.5) * 2 * noise_scale
                             
-                            # NOVÝ PŘÍSTUP: Výpočet finální hodnoty
-                            if edge_weight > 0.5:
-                                # Vnitřek léze - přímé nahrazení referenční hodnotou (s šumem)
-                                pseudo_healthy[x, y, z] = noisy_value
+                            # VYLEPŠENÝ PŘÍSTUP: Strmější přechod k referenčním hodnotám
+                            if weight > 0.3:  # Posuneme hranici z 0.5 na 0.3
+                                # Vnitřek léze - exponenciální škálování
+                                inner_weight = np.exp((weight - 0.3) * 3) - 1
+                                inner_weight = np.clip(inner_weight, 0, 1)
+                                inner_mix = 0.95 * inner_weight + 0.05
+                                pseudo_healthy[x, y, z] = (1 - inner_mix) * adc_data[x, y, z] + inner_mix * noisy_value
                             else:
-                                # Okraj léze - plynulý přechod do okolní tkáně
-                                edge_weight_boosted = edge_weight * 2
+                                # Okraj léze - plynulý přechod s exponenciálním škálováním
+                                edge_weight_boosted = weight * 3
                                 edge_weight_boosted = min(edge_weight_boosted, 1.0)
-                                pseudo_healthy[x, y, z] = (1 - edge_weight_boosted) * adc_data[x, y, z] + edge_weight_boosted * noisy_value
+                                boost_exp = np.exp(edge_weight_boosted * 1.5) - 1
+                                boost_exp = boost_exp / (np.exp(1.5) - 1)
+                                boost_exp = np.clip(boost_exp, 0, 0.95)
+                                pseudo_healthy[x, y, z] = (1 - boost_exp) * adc_data[x, y, z] + boost_exp * noisy_value
                     
                     # Uložíme referenční hodnotu z prstence
                     if np.any(ring_mask):
@@ -638,7 +661,7 @@ def create_pseudo_healthy_brain_with_atlas(adc_data, label_data, atlas_path, std
                 # Aplikace normativních hodnot z atlasu s přechodem
                 for x, y, z in current_coords:
                     # Apply transition weight (pouze pro okraje)
-                    edge_weight = edge_transition_mask[x, y, z]
+                    weight = edge_transition_mask[x, y, z]
                     
                     # ZMĚNA: Přidání šumu škálovaného podle směrodatné odchylky z atlasu
                     if std_atlas_np is not None:
@@ -661,15 +684,21 @@ def create_pseudo_healthy_brain_with_atlas(adc_data, label_data, atlas_path, std
                     # Škálování zpět do původního rozsahu hodnot pacientského obrazu
                     scaled_value = noisy_value * (adc_max - adc_min) + adc_min
                     
-                    # NOVÝ PŘÍSTUP: Výpočet finální hodnoty
-                    if edge_weight > 0.5:
-                        # Vnitřek léze - přímé nahrazení referenční hodnotou (s šumem)
-                        pseudo_healthy[x, y, z] = scaled_value
+                    # VYLEPŠENÝ PŘÍSTUP: Strmější přechod k referenčním hodnotám
+                    if weight > 0.3:  # Posuneme hranici z 0.5 na 0.3
+                        # Vnitřek léze - exponenciální škálování
+                        inner_weight = np.exp((weight - 0.3) * 3) - 1
+                        inner_weight = np.clip(inner_weight, 0, 1)
+                        inner_mix = 0.95 * inner_weight + 0.05
+                        pseudo_healthy[x, y, z] = (1 - inner_mix) * adc_data[x, y, z] + inner_mix * scaled_value
                     else:
-                        # Okraj léze - plynulý přechod do okolní tkáně
-                        edge_weight_boosted = edge_weight * 2
+                        # Okraj léze - plynulý přechod s exponenciálním škálováním
+                        edge_weight_boosted = weight * 3
                         edge_weight_boosted = min(edge_weight_boosted, 1.0)
-                        pseudo_healthy[x, y, z] = (1 - edge_weight_boosted) * adc_data[x, y, z] + edge_weight_boosted * scaled_value
+                        boost_exp = np.exp(edge_weight_boosted * 1.5) - 1
+                        boost_exp = boost_exp / (np.exp(1.5) - 1)
+                        boost_exp = np.clip(boost_exp, 0, 0.95)
+                        pseudo_healthy[x, y, z] = (1 - boost_exp) * adc_data[x, y, z] + boost_exp * scaled_value
         
         else:
             print("Warning: No valid lesion voxels found in registered space. Using original method.")
