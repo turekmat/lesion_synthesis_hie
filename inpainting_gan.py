@@ -178,16 +178,17 @@ class LesionInpaintingDataset(Dataset):
     
     def _pad_to_power_of_2(self, data):
         """
-        Doplní každý rozměr na nejbližší vyšší mocninu 2
-        Toto je důležité pro správné fungování SwinUNETR
+        Doplní každý rozměr na nejbližší násobek 32 (patch size pro SwinUNETR).
+        Pokud je rozměr již násobkem 32, zůstává beze změny.
         """
         # Získat aktuální rozměry
         d, h, w = data.shape
         
-        # Najít nejbližší vyšší mocninu 2 pro každý rozměr
-        target_d = 2 ** np.ceil(np.log2(d)).astype(int)
-        target_h = 2 ** np.ceil(np.log2(h)).astype(int)
-        target_w = 2 ** np.ceil(np.log2(w)).astype(int)
+        # Najít nejbližší vyšší násobek 32 pro každý rozměr, pokud již není násobkem 32
+        patch_size = 32
+        target_d = ((d + patch_size - 1) // patch_size) * patch_size
+        target_h = ((h + patch_size - 1) // patch_size) * patch_size
+        target_w = ((w + patch_size - 1) // patch_size) * patch_size
         
         # Pokud je zadána cílová velikost, použít ji
         if self.target_size:
@@ -1234,16 +1235,17 @@ def train_model(args):
     sample_img = sitk.ReadImage(str(sample_file))
     sample_data = sitk.GetArrayFromImage(sample_img)
     
-    # Zjistíme nejbližší vyšší mocninu 2 pro každý rozměr
+    # Zjistíme nejbližší násobek 32 pro každý rozměr
     d, h, w = sample_data.shape
-    target_d = 2 ** np.ceil(np.log2(d)).astype(int)
-    target_h = 2 ** np.ceil(np.log2(h)).astype(int)
-    target_w = 2 ** np.ceil(np.log2(w)).astype(int)
+    patch_size = 32
+    target_d = ((d + patch_size - 1) // patch_size) * patch_size
+    target_h = ((h + patch_size - 1) // patch_size) * patch_size
+    target_w = ((w + patch_size - 1) // patch_size) * patch_size
     
     # Nastavit cílovou velikost pro zpracování
     target_size = (target_d, target_h, target_w)
     print(f"Původní velikost dat: {sample_data.shape}")
-    print(f"Zaokrouhleno na mocniny 2: {target_size}")
+    print(f"Zaokrouhleno na násobky {patch_size}: {target_size}")
     
     if args.target_size:
         # Použít zadanou cílovou velikost, pokud je specifikována
@@ -1543,11 +1545,12 @@ def generate_inpainted_brain(model, pseudo_healthy_path, lesion_mask_path, outpu
     # Uložit původní tvar pro pozdější obnovení
     original_shape = ph_data.shape
     
-    # Doplnit mocninou 2 každý rozměr
+    # Doplnit na nejbližší násobek 32 pro každý rozměr
     d, h, w = ph_data.shape
-    target_d = 2 ** np.ceil(np.log2(d)).astype(int)
-    target_h = 2 ** np.ceil(np.log2(h)).astype(int)
-    target_w = 2 ** np.ceil(np.log2(w)).astype(int)
+    patch_size = 32
+    target_d = ((d + patch_size - 1) // patch_size) * patch_size
+    target_h = ((h + patch_size - 1) // patch_size) * patch_size
+    target_w = ((w + patch_size - 1) // patch_size) * patch_size
     
     # Pad data
     pad_d = max(0, target_d - d)
@@ -1734,9 +1737,10 @@ def main():
         sample_img = sitk.ReadImage(args.inference_input)
         sample_data = sitk.GetArrayFromImage(sample_img)
         d, h, w = sample_data.shape
-        target_d = 2 ** np.ceil(np.log2(d)).astype(int)
-        target_h = 2 ** np.ceil(np.log2(h)).astype(int)
-        target_w = 2 ** np.ceil(np.log2(w)).astype(int)
+        patch_size = 32
+        target_d = ((d + patch_size - 1) // patch_size) * patch_size
+        target_h = ((h + patch_size - 1) // patch_size) * patch_size
+        target_w = ((w + patch_size - 1) // patch_size) * patch_size
         target_size = (target_d, target_h, target_w)
         
         # Inicializovat model s odpovídající velikostí
