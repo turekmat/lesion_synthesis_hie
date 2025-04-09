@@ -271,10 +271,10 @@ def apply_smoothing_postprocessing(pseudo_healthy, lesion_mask, sigma_spatial=1.
     dist_map = ndimage.distance_transform_edt(lesion_mask) - ndimage.distance_transform_edt(~lesion_mask)
     
     # Apply Gaussian smoothing to the distance map to create a smooth transition mask
-    smooth_dist = gaussian_filter(dist_map, sigma=3.0)
+    smooth_dist = gaussian_filter(dist_map, sigma=3.5)  # Zvýšeno z 3.0 na 3.5 pro jemnější přechody
     
     # Create a transition mask in range [0, 1] with smoother sigmoid function
-    transition_mask = 1.0 / (1.0 + np.exp(-smooth_dist / 1.5))
+    transition_mask = 1.0 / (1.0 + np.exp(-smooth_dist / 1.8))  # Zvýšeno z 1.5 na 1.8 pro plynulejší přechod
     
     # Progressive smoothing with decreasing impact
     for i in range(iterations):
@@ -285,12 +285,16 @@ def apply_smoothing_postprocessing(pseudo_healthy, lesion_mask, sigma_spatial=1.
         smoothed = gaussian_filter(result, sigma=current_sigma)
         
         # Blend smoothed with original using the transition mask and iteration-dependent weighting
-        blend_factor = 0.8 * (iterations - i) / iterations  # Decreasing blend factor
+        blend_factor = 0.85 * (iterations - i) / iterations  # Zvýšeno z 0.8 na 0.85
         
         # Apply the blend only in the dilated mask region with gradient weighting
         idx = dilated_mask
         result[idx] = result[idx] * (1 - blend_factor * transition_mask[idx]) + \
                      smoothed[idx] * (blend_factor * transition_mask[idx])
+    
+    # Další, závěrečné vyhlazení pro celou oblast se sníženou vahou
+    final_smoothed = gaussian_filter(result, sigma=0.8)
+    result[dilated_mask] = result[dilated_mask] * 0.85 + final_smoothed[dilated_mask] * 0.15
     
     return result
 
@@ -336,7 +340,7 @@ def create_pseudo_healthy_brain(adc_data, label_data):
     
     # Poměr, jak moc se chceme přiblížit k referenčním hodnotám
     # 0 = zůstat na původní hodnotě, 1 = plně dosáhnout referenční hodnoty
-    TARGET_RATIO = 1.0  # Maximální přiblížení k cílovým hodnotám
+    TARGET_RATIO = 0.8  # Sníženo z 1.0 pro jemnější přechod k cílové hodnotě
     
     # Hranice mezi vnitřkem léze a okrajem
     EDGE_THRESHOLD = 0.08  # Sníženo pro rozšíření přechodové oblasti
@@ -345,7 +349,7 @@ def create_pseudo_healthy_brain(adc_data, label_data):
     EDGE_BLEND_FACTOR = 0.7  # Sníženo pro jemnější přechod na okrajích
     
     # Dodatečný faktor pro zvýšení offsetu
-    BOOST_FACTOR = 1.2  # Zvýší celý offset o 20% pro větší efekt
+    BOOST_FACTOR = 0.85  # Sníženo z 1.2 na 0.85 pro méně výrazný efekt
     
     # Process each connected component (lesion) separately
     for lesion_idx in range(1, num_lesions + 1):
@@ -454,7 +458,7 @@ def create_pseudo_healthy_brain(adc_data, label_data):
                 
                 # DŮLEŽITÁ ZMĚNA: Zvýšíme hodnotu z prstence o 10%, aby byl větší efekt
                 # Typicky jsou hodnoty prstence nízké, protože jsme na okraji tkáně
-                avg_ring_value = avg_ring_value * 1.1
+                avg_ring_value = avg_ring_value * 1.03  # Sníženo z 1.1 na 1.03 (3% navýšení místo 10%)
                 
                 # Uložíme tuto hodnotu jako referenční pro celou lézi
                 reference_values[current_lesion] = avg_ring_value
@@ -532,9 +536,9 @@ def create_pseudo_healthy_brain(adc_data, label_data):
     # Apply post-processing for smoother transitions
     print("Applying post-processing smoothing for more natural transitions...")
     pseudo_healthy = apply_smoothing_postprocessing(pseudo_healthy, lesion_mask, 
-                                                  sigma_spatial=1.5, 
-                                                  iterations=3, 
-                                                  blur_margin=5)
+                                                  sigma_spatial=1.8,  # Zvýšeno z 1.5 na 1.8
+                                                  iterations=4,       # Zvýšeno z 3 na 4
+                                                  blur_margin=7)      # Zvýšeno z 5 na 7
     
     return pseudo_healthy, reference_values
 
@@ -722,7 +726,7 @@ def create_pseudo_healthy_brain_with_atlas(adc_data, label_data, atlas_path, std
             noise = generate_perlin_noise(adc_data.shape, scale=5.0, octaves=3)
             
             # Poměr, jak moc se chceme přiblížit k referenčním hodnotám
-            TARGET_RATIO = 1.0  # Maximální přiblížení k cílovým hodnotám
+            TARGET_RATIO = 0.8  # Sníženo z 1.0 pro jemnější přechod k cílové hodnotě
             
             # Hranice mezi vnitřkem léze a okrajem
             EDGE_THRESHOLD = 0.08  # Sníženo pro rozšíření přechodové oblasti
@@ -731,7 +735,7 @@ def create_pseudo_healthy_brain_with_atlas(adc_data, label_data, atlas_path, std
             EDGE_BLEND_FACTOR = 0.7  # Sníženo pro jemnější přechod na okrajích
             
             # Dodatečný faktor pro zvýšení offsetu
-            BOOST_FACTOR = 1.2  # Zvýší celý offset o 20% pro větší efekt
+            BOOST_FACTOR = 0.85  # Sníženo z 1.2 na 0.85 pro méně výrazný efekt
             
             # Zpracování každé komponenty léze zvlášť
             for lesion_idx in range(1, num_lesions + 1):
@@ -839,7 +843,7 @@ def create_pseudo_healthy_brain_with_atlas(adc_data, label_data, atlas_path, std
                         
                         # DŮLEŽITÁ ZMĚNA: Zvýšíme hodnotu z prstence o 10%, aby byl větší efekt
                         # Typicky jsou hodnoty prstence nízké, protože jsme na okraji tkáně
-                        avg_ring_value = avg_ring_value * 1.1
+                        avg_ring_value = avg_ring_value * 1.03  # Sníženo z 1.1 na 1.03 (3% navýšení místo 10%)
                         
                         # Aplikujeme průměrnou hodnotu prstence s šumem na oblast léze
                         current_coords = np.where(current_lesion)
@@ -996,9 +1000,9 @@ def create_pseudo_healthy_brain_with_atlas(adc_data, label_data, atlas_path, std
     # Apply post-processing for smoother transitions
     print("Applying post-processing smoothing for more natural transitions...")
     pseudo_healthy = apply_smoothing_postprocessing(pseudo_healthy, lesion_mask, 
-                                                  sigma_spatial=1.5, 
-                                                  iterations=3, 
-                                                  blur_margin=5)
+                                                  sigma_spatial=1.8,  # Zvýšeno z 1.5 na 1.8
+                                                  iterations=4,       # Zvýšeno z 3 na 4
+                                                  blur_margin=7)      # Zvýšeno z 5 na 7
     
     return pseudo_healthy, reference_values
 
