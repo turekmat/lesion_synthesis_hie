@@ -289,7 +289,7 @@ class Generator(nn.Module):
         in_channels=2,  # 1 pro pseudo-zdravý + 1 pro masku léze
         out_channels=1,  # 1 pro ADC mapu
         base_filters=64,
-        depth=5,
+        depth=4,  # Snížíme hloubku pro lepší stabilitu s různými vstupy
         min_size=32
     ):
         super().__init__()
@@ -297,103 +297,106 @@ class Generator(nn.Module):
         # Přidáme kontrolu minimální velikosti vstupu
         self.min_input_size = min_size
         
-        # Encoder - první konvoluce bez normalizace
-        self.encoder_layers = nn.ModuleList()
+        # Maximální počet filtrů pro zabránění OOM
+        max_filters = 512
         
-        # První vrstva s menším kernelem a stride=1 pro lepší zpracování malých vstupů
-        self.encoder_layers.append(
+        # Encoder - ukládáme přímo konvoluční bloky a jejich výstupní počty kanálů
+        self.enc_blocks = nn.ModuleList()
+        self.enc_channels = []
+        
+        # První vrstva enkodéru - bez normalizace a s menším kernelem
+        self.enc_blocks.append(
             nn.Sequential(
                 nn.Conv3d(in_channels, base_filters, kernel_size=3, stride=1, padding=1),
                 nn.LeakyReLU(0.2, inplace=True)
             )
         )
+        self.enc_channels.append(base_filters)
         
-        # Přidat zbytek enkodéru
-        current_filters = base_filters
+        # Zbytek enkodéru - dvojnásobíme počet filtrů s každou úrovní
+        in_c = base_filters
         for i in range(1, depth):
-            # Od druhé vrstvy použijeme standardní parametry
-            stride = 2
-            kernel_size = 4
-            
-            self.encoder_layers.append(
+            out_c = min(in_c * 2, max_filters)
+            self.enc_blocks.append(
                 nn.Sequential(
-                    nn.Conv3d(
-                        current_filters, 
-                        current_filters * 2, 
-                        kernel_size=kernel_size, 
-                        stride=stride, 
-                        padding=1,
-                        bias=False
-                    ),
-                    nn.BatchNorm3d(current_filters * 2),
+                    nn.Conv3d(in_c, out_c, kernel_size=4, stride=2, padding=1, bias=False),
+                    nn.BatchNorm3d(out_c),
                     nn.LeakyReLU(0.2, inplace=True)
                 )
             )
-            current_filters *= 2
+            self.enc_channels.append(out_c)
+            in_c = out_c
         
-        # Decoder s přeskočenými spojeními
-        self.decoder_layers = nn.ModuleList()
-        # Dodatečné konvoluční vrstvy pro zpracování spojených feature map
-        self.decoder_conv_layers = nn.ModuleList()
-        
-        for i in range(depth - 1):
-            # Pro největší hloubku použijeme menší kernel
-            kernel_size = 3 if i == 0 else 4
-            
-            if i == 0:  # Nejhlubší vrstva bez přeskočeného spojení
-                self.decoder_layers.append(
-                    nn.Sequential(
-                        nn.ConvTranspose3d(
-                            current_filters, 
-                            current_filters // 2,
-                            kernel_size=kernel_size, 
-                            stride=2, 
-                            padding=1,
-                            bias=False
-                        ),
-                        nn.BatchNorm3d(current_filters // 2),
-                        nn.ReLU(inplace=True)
-                    )
-                )
-                self.decoder_conv_layers.append(None)  # Nejhlubší vrstva nemá přeskočené spojení
-            else:  # Ostatní vrstvy s přeskočeným spojením
-                self.decoder_layers.append(
-                    nn.Sequential(
-                        nn.ConvTranspose3d(
-                            current_filters, 
-                            current_filters // 2,
-                            kernel_size=kernel_size, 
-                            stride=2, 
-                            padding=1,
-                            bias=False
-                        ),
-                        nn.BatchNorm3d(current_filters // 2),
-                        nn.ReLU(inplace=True)
-                    )
-                )
-                # Přidat konvoluční vrstvu pro zpracování spojených feature map
-                self.decoder_conv_layers.append(
-                    nn.Sequential(
-                        nn.Conv3d(
-                            current_filters,  # current_filters // 2 + current_filters // 2
-                            current_filters // 2,
-                            kernel_size=3,
-                            stride=1,
-                            padding=1,
-                            bias=False
-                        ),
-                        nn.BatchNorm3d(current_filters // 2),
-                        nn.ReLU(inplace=True)
-                    )
-                )
-            current_filters //= 2
-        
-        # Finální konvoluce
-        self.final_conv = nn.Sequential(
-            nn.Conv3d(current_filters, out_channels, kernel_size=3, padding=1),
-            nn.Tanh()  # Normalizovaný výstup v rozmezí [-1, 1]
+        # Bottleneck - mostní vrstva bez downsamplingu
+        self.bottleneck = nn.Sequential(
+            nn.Conv3d(in_c, in_c, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm3d(in_c),
+            nn.LeakyReLU(0.2, inplace=True)
         )
         
+        # Decoder - dekonvoluční bloky a jejich výstupní kanály
+        self.dec_blocks = nn.ModuleList()
+        self.dec_channels = []
+        
+        # Po každé dekonvoluci následuje konvoluce pro zpracování konkatenovaných funkcí
+        for i in range(depth - 1, -1, -1):
+            if i == depth - 1:  # První dekodér (zpracovává bottleneck)
+                # Vstup: bottleneck features
+                # Výstup: polovina kanálů
+                dec_in = in_c
+                dec_out = self.enc_channels[i]
+                
+                self.dec_blocks.append(
+                    nn.Sequential(
+                        nn.ConvTranspose3d(dec_in, dec_out, kernel_size=4, stride=2, padding=1, bias=False),
+                        nn.BatchNorm3d(dec_out),
+                        nn.ReLU(inplace=True)
+                    )
+                )
+                self.dec_channels.append(dec_out)
+            else:
+                # Vstup: předchozí decoder (dec_channels[depth-i-2]) + skip connection (enc_channels[i])
+                # Výstup: odpovídající encoder s polovičním počtem kanálů nebo méně
+                if i > 0:
+                    dec_in = self.dec_channels[-1] + self.enc_channels[i]
+                    dec_out = self.enc_channels[i-1]
+                    
+                    # Vrstva s transponovanou konvolucí a následnou úpravou kanálů
+                    self.dec_blocks.append(
+                        nn.Sequential(
+                            # Nejprve zredukujeme kanály z konkatenace
+                            nn.Conv3d(dec_in, self.dec_channels[-1], kernel_size=3, stride=1, padding=1, bias=False),
+                            nn.BatchNorm3d(self.dec_channels[-1]),
+                            nn.ReLU(inplace=True),
+                            # Pak provedeme up-sampling 
+                            nn.ConvTranspose3d(self.dec_channels[-1], dec_out, kernel_size=4, stride=2, padding=1, bias=False),
+                            nn.BatchNorm3d(dec_out),
+                            nn.ReLU(inplace=True)
+                        )
+                    )
+                    self.dec_channels.append(dec_out)
+                else:
+                    # Poslední dekódovací vrstva - vstup je předchozí výstup + první enkodér
+                    dec_in = self.dec_channels[-1] + self.enc_channels[0]
+                    dec_out = base_filters // 2  # Half of initial filters
+                    
+                    # Poslední decoder
+                    self.dec_blocks.append(
+                        nn.Sequential(
+                            # Zredukujeme počet kanálů po konkatenaci s prvním enkodérem
+                            nn.Conv3d(dec_in, base_filters, kernel_size=3, stride=1, padding=1, bias=False),
+                            nn.BatchNorm3d(base_filters),
+                            nn.ReLU(inplace=True)
+                        )
+                    )
+                    self.dec_channels.append(base_filters)
+        
+        # Finální konvoluce pro generování výstupu 
+        self.final_conv = nn.Sequential(
+            nn.Conv3d(self.dec_channels[-1], out_channels, kernel_size=3, padding=1),
+            nn.Tanh()  # Normalizovaný výstup v rozmezí [-1, 1]
+        )
+    
     def forward(self, pseudo_healthy, lesion_mask):
         """
         Forward pass generátoru
@@ -415,38 +418,35 @@ class Generator(nn.Module):
         # Spojit vstupy pro generátor
         x = torch.cat([pseudo_healthy, lesion_mask], dim=1)
         
-        # Uložit výstupy enkodéru pro přeskočená spojení
-        skip_connections = []
+        # Encoder - uložíme všechny výstupy pro skip connections
+        enc_features = []
+        for block in self.enc_blocks:
+            x = block(x)
+            enc_features.append(x)
         
-        # Encoder
-        for encoder in self.encoder_layers:
-            x = encoder(x)
-            skip_connections.append(x)
-        
-        # Odstranit nejhlubší vrstvu, která nebude mít přeskočené spojení
-        skip_connections.pop()
+        # Bottleneck
+        x = self.bottleneck(x)
         
         # Decoder s přeskočenými spojeními
-        for i, decoder in enumerate(self.decoder_layers):
-            x = decoder(x)
-            
-            # Přidat přeskočené spojení, kromě poslední vrstvy enkodéru
-            if i < len(skip_connections):
-                skip = skip_connections[-(i+1)]
+        for i, block in enumerate(self.dec_blocks):
+            # Pro všechny vrstvy kromě poslední provádíme konkatenaci
+            if i > 0:  # První decoder nemá skip connection (zpracovává bottleneck)
+                # Index feature mapy z enkodéru, kterou chceme použít pro skip connection
+                # Jdeme od konce k začátku
+                skip_idx = len(enc_features) - i - 1
+                skip = enc_features[skip_idx]
                 
-                # Zajistit, že velikosti jsou kompatibilní pro konkatenaci
+                # Interpolace, pokud je potřeba
                 if x.shape[2:] != skip.shape[2:]:
-                    # Interpolace pro zajištění stejné velikosti
                     x = F.interpolate(x, size=skip.shape[2:], mode='trilinear', align_corners=False)
                 
-                # Spojit feature mapy
+                # Konkatenace se skip connection
                 x = torch.cat([x, skip], dim=1)
-                
-                # Použít dodatečnou konvoluci pro redukci počtu kanálů po konkatenaci
-                if self.decoder_conv_layers[i] is not None:
-                    x = self.decoder_conv_layers[i](x)
+            
+            # Aplikujeme decoder blok
+            x = block(x)
         
-        # Finální konvoluce pro generování ADC mapy
+        # Finální konvoluce
         x = self.final_conv(x)
         
         return x
