@@ -285,6 +285,11 @@ def create_pseudo_healthy_brain(adc_data, label_data):
     # Ukládáme referenční hodnoty pro každou lézi
     reference_values = np.zeros_like(lesion_mask, dtype=np.float32)
     
+    # Poměr, jak moc se chceme přiblížit k referenčním hodnotám
+    # 0 = zůstat na původní hodnotě, 1 = plně dosáhnout referenční hodnoty
+    # NASTAVÍME VELMI VYSOKOU HODNOTU, PROTOŽE PŘEDCHOZÍ POKUSY BYLY PŘÍLIŠ SLABÉ
+    TARGET_RATIO = 0.85  # 85% cesty směrem k referenční hodnotě
+    
     # Process each connected component (lesion) separately
     for lesion_idx in range(1, num_lesions + 1):
         current_lesion = labeled_lesions == lesion_idx
@@ -317,35 +322,22 @@ def create_pseudo_healthy_brain(adc_data, label_data):
                 # Generate Perlin noise with a smaller scale for local variations
                 noise = generate_perlin_noise(shape, scale=5.0, octaves=3)
                 
-                # Apply the average value with noise to the lesion area with smooth transition
+                # PŘÍMOČARÝ PŘÍSTUP PRO APLIKACI HODNOT
                 for x, y, z in current_coords:
-                    # Add noise scaled to about 6% of the avg_value for texture
-                    noise_scale = 0.06 * avg_value  # Menší šum pro přirozenější texturu
+                    # Přidáme šum škálovaný na cca 5% průměrné hodnoty (méně šumu)
+                    noise_scale = 0.05 * avg_value
                     noisy_value = avg_value + (noise[x, y, z] - 0.5) * noise_scale
                     
-                    # Apply transition weight
+                    # Přímočaré nahrazení s vysokým poměrem k referenční hodnotě
                     weight = edge_transition_mask[x, y, z]
                     
-                    # SUPER OSTRÝ EXPONENCIÁLNÍ PŘÍSTUP:
-                    if weight > 0.1:  # Velmi nízká hranice pro vnitřek léze
-                        # Vnitřek léze - velmi silná exponenciála
-                        # Použijeme mnohem silnější exponenciálu (power 6 místo 3)
-                        # Tím dostaneme mnohem ostřejší přechod
-                        inner_weight = np.exp((weight - 0.1) * 6) - 1  # Zesílená exponenciála
-                        
-                        # Normalizace na [0,1] s podstatně vyšším maximem
-                        inner_weight = inner_weight / (np.exp(0.9 * 6) - 1)
-                        inner_weight = np.clip(inner_weight, 0, 1)
-                        
-                        # Výrazně silnější efekt referenčních hodnot - 98% místo 95%
-                        inner_mix = 0.98 * inner_weight + 0.02  # Pouze 2% původní hodnoty pro stabilitu
-                        pseudo_healthy[x, y, z] = (1 - inner_mix) * adc_data[x, y, z] + inner_mix * noisy_value
+                    if weight > 0.15:
+                        # Vnitřek léze - silné nahrazení
+                        pseudo_healthy[x, y, z] = (1 - TARGET_RATIO) * adc_data[x, y, z] + TARGET_RATIO * noisy_value
                     else:
-                        # Okraj léze - silnější přechod i zde
-                        # Používáme také exponenciálu pro plynulejší, ale strmější přechod
-                        edge_weight_boosted = (weight / 0.1) ** 3  # Kubická funkce pro rychlejší náběh
-                        edge_weight_boosted = min(edge_weight_boosted, 1.0)  # Omezení na max 1.0
-                        pseudo_healthy[x, y, z] = (1 - edge_weight_boosted * 0.6) * adc_data[x, y, z] + edge_weight_boosted * 0.6 * noisy_value
+                        # Okraj léze - plynulý přechod (lineární)
+                        edge_ratio = (weight / 0.15) * TARGET_RATIO * 0.7
+                        pseudo_healthy[x, y, z] = (1 - edge_ratio) * adc_data[x, y, z] + edge_ratio * noisy_value
             
         else:
             # Case 2: Symmetric lesion present - use normative approach
@@ -364,6 +356,10 @@ def create_pseudo_healthy_brain(adc_data, label_data):
                 avg_ring_value = np.mean(ring_values)
                 print(f"Average value from dilated ring: {avg_ring_value:.2f}")
                 
+                # DŮLEŽITÁ ZMĚNA: Zvýšíme hodnotu z prstence o 10%, aby byl větší efekt
+                # Typicky jsou hodnoty prstence nízké, protože jsme na okraji tkáně
+                avg_ring_value = avg_ring_value * 1.1
+                
                 # Uložíme tuto hodnotu jako referenční pro celou lézi
                 reference_values[current_lesion] = avg_ring_value
                 
@@ -374,25 +370,22 @@ def create_pseudo_healthy_brain(adc_data, label_data):
                 current_coords = np.where(current_lesion)
                 current_coords = list(zip(current_coords[0], current_coords[1], current_coords[2]))
                 
+                # PŘÍMOČARÝ PŘÍSTUP PRO APLIKACI HODNOT
                 for x, y, z in current_coords:
-                    # Add noise scaled to about 6% of the avg_value
-                    noise_scale = 0.06 * avg_ring_value
+                    # Přidáme šum škálovaný na cca 5% průměrné hodnoty (méně šumu)
+                    noise_scale = 0.05 * avg_ring_value
                     noisy_value = avg_ring_value + (noise[x, y, z] - 0.5) * noise_scale
                     
-                    # Apply transition weight
+                    # Přímočaré nahrazení s vysokým poměrem k referenční hodnotě
                     weight = edge_transition_mask[x, y, z]
                     
-                    # SUPER OSTRÝ EXPONENCIÁLNÍ PŘÍSTUP - stejný jako výše
-                    if weight > 0.1:
-                        inner_weight = np.exp((weight - 0.1) * 6) - 1
-                        inner_weight = inner_weight / (np.exp(0.9 * 6) - 1)
-                        inner_weight = np.clip(inner_weight, 0, 1)
-                        inner_mix = 0.98 * inner_weight + 0.02
-                        pseudo_healthy[x, y, z] = (1 - inner_mix) * adc_data[x, y, z] + inner_mix * noisy_value
+                    if weight > 0.15:
+                        # Vnitřek léze - silné nahrazení
+                        pseudo_healthy[x, y, z] = (1 - TARGET_RATIO) * adc_data[x, y, z] + TARGET_RATIO * noisy_value
                     else:
-                        edge_weight_boosted = (weight / 0.1) ** 3
-                        edge_weight_boosted = min(edge_weight_boosted, 1.0)
-                        pseudo_healthy[x, y, z] = (1 - edge_weight_boosted * 0.6) * adc_data[x, y, z] + edge_weight_boosted * 0.6 * noisy_value
+                        # Okraj léze - plynulý přechod (lineární)
+                        edge_ratio = (weight / 0.15) * TARGET_RATIO * 0.7
+                        pseudo_healthy[x, y, z] = (1 - edge_ratio) * adc_data[x, y, z] + edge_ratio * noisy_value
     
     return pseudo_healthy, reference_values
 
@@ -454,13 +447,20 @@ def create_pseudo_healthy_brain_with_atlas(adc_data, label_data, atlas_path, std
         print(f"Loading standard deviation atlas from {std_atlas_path}")
         std_atlas_ant = ants.image_read(str(std_atlas_path))
     
+    # For ADC: get original range for denormalization later
+    adc_np = adc_ant.numpy()
+    adc_min, adc_max = adc_np.min(), adc_np.max()
+    
+    # DŮLEŽITÁ ZMĚNA: Uložíme si také originální hodnoty atlasu před normalizací
+    atlas_np_original = atlas_ant.numpy().copy()
+    atlas_min, atlas_max = atlas_np_original.min(), atlas_np_original.max()
+    print(f"Atlas original range: min={atlas_min:.2f}, max={atlas_max:.2f}")
+    
     # Normalize intensities for better registration
     print("Normalizing images for registration...")
     atlas_ant = ants.iMath(atlas_ant, "Normalize")
     
     # For ADC: normalize to [0,1] range
-    adc_np = adc_ant.numpy()
-    adc_min, adc_max = adc_np.min(), adc_np.max()
     normalized_adc_np = (adc_np - adc_min) / (adc_max - adc_min)
     adc_ant_norm = ants.from_numpy(
         normalized_adc_np,
@@ -521,13 +521,16 @@ def create_pseudo_healthy_brain_with_atlas(adc_data, label_data, atlas_path, std
         # Nyní v prostoru atlasu extrahuji hodnoty pro léze
         print("Extracting normative values from atlas in lesion area...")
         
-        # Získání hodnot z atlasu pro všechny voxely v transformované lézi
-        # NOVÁ ÚPRAVA: Filtruji nulové hodnoty z atlasu v oblasti léze
-        valid_atlas_mask = (atlas_np > 0) & registered_lesion_np
+        # DŮLEŽITÁ ZMĚNA: Získání hodnot z původního (nenormalizovaného) atlasu
+        # Používáme atlas_np_original místo atlas_np pro získání reálných hodnot ADC
+        valid_atlas_mask = (atlas_np_original > 0) & registered_lesion_np
         if np.any(valid_atlas_mask):
             # Použijeme pouze nenulové hodnoty z atlasu pro nahrazování
-            atlas_values_in_lesion = atlas_np[valid_atlas_mask]
+            atlas_values_in_lesion = atlas_np_original[valid_atlas_mask]
             print(f"Found {len(atlas_values_in_lesion)} valid non-zero atlas values in the registered lesion area")
+            
+            # Zobrazit statistiku původních hodnot atlasu v oblasti léze
+            print(f"Atlas original values in lesion area: min={atlas_values_in_lesion.min():.2f}, max={atlas_values_in_lesion.max():.2f}, mean={np.mean(atlas_values_in_lesion):.2f}")
         else:
             # Pokud nejsou k dispozici žádné nenulové hodnoty, musíme použít jinou metodu
             print("Warning: No non-zero atlas values found in the registered lesion area.")
@@ -537,6 +540,9 @@ def create_pseudo_healthy_brain_with_atlas(adc_data, label_data, atlas_path, std
         if len(atlas_values_in_lesion) > 0:
             # Výpočet statistik (průměrná hodnota v atlasu pro oblast léze)
             atlas_mean = np.mean(atlas_values_in_lesion)
+            
+            # DŮLEŽITÁ ZMĚNA: Ujistíme se, že atlas_mean má hodnotu v původním rozsahu ADC
+            print(f"Atlas normative mean in lesion area (original scale): {atlas_mean:.2f}")
             
             # Pokud máme std atlas, použijeme hodnoty z něj přímo pro každý voxel
             # jinak vypočítáme směrodatnou odchylku z hodnot v lézi
@@ -566,6 +572,11 @@ def create_pseudo_healthy_brain_with_atlas(adc_data, label_data, atlas_path, std
             # Generování šumu pro přirozený vzhled
             noise = generate_perlin_noise(adc_data.shape, scale=5.0, octaves=3)
             
+            # Poměr, jak moc se chceme přiblížit k referenčním hodnotám
+            # 0 = zůstat na původní hodnotě, 1 = plně dosáhnout referenční hodnoty
+            # NASTAVÍME VELMI VYSOKOU HODNOTU, PROTOŽE PŘEDCHOZÍ POKUSY BYLY PŘÍLIŠ SLABÉ
+            TARGET_RATIO = 0.85  # 85% cesty směrem k referenční hodnotě
+            
             # Zpracování každé komponenty léze zvlášť
             for lesion_idx in range(1, num_lesions + 1):
                 current_lesion = labeled_lesions == lesion_idx
@@ -589,7 +600,7 @@ def create_pseudo_healthy_brain_with_atlas(adc_data, label_data, atlas_path, std
                 registered_current_lesion_np = registered_current_lesion.numpy() > 0.5
                 
                 # NOVÁ ÚPRAVA: Kontrola, jestli jsou v atlasu nenulové hodnoty pro tuto lézi
-                valid_lesion_atlas_mask = (atlas_np > 0) & registered_current_lesion_np
+                valid_lesion_atlas_mask = (atlas_np_original > 0) & registered_current_lesion_np
                 if not np.any(valid_lesion_atlas_mask):
                     print(f"Warning: No non-zero atlas values for lesion component {lesion_idx}.")
                     print("Using alternative method for this lesion component...")
@@ -606,29 +617,32 @@ def create_pseudo_healthy_brain_with_atlas(adc_data, label_data, atlas_path, std
                         ring_values = adc_data[ring_mask]
                         avg_ring_value = np.mean(ring_values)
                         
+                        # DŮLEŽITÁ ZMĚNA: Zvýšíme hodnotu z prstence o 10%, aby byl větší efekt
+                        # Typicky jsou hodnoty prstence nízké, protože jsme na okraji tkáně
+                        avg_ring_value = avg_ring_value * 1.1
+                        
                         # Aplikujeme průměrnou hodnotu prstence s šumem na oblast léze
                         current_coords = np.where(current_lesion)
                         current_coords = list(zip(current_coords[0], current_coords[1], current_coords[2]))
                         
+                        # PŘÍMOČARÝ PŘÍSTUP PRO APLIKACI HODNOT
                         for x, y, z in current_coords:
-                            # Přidáme šum škálovaný na cca 6% průměrné hodnoty
-                            noise_scale = 0.06 * avg_ring_value
+                            # Přidáme šum škálovaný na cca 5% průměrné hodnoty (méně šumu)
+                            noise_scale = 0.05 * avg_ring_value
                             noisy_value = avg_ring_value + (noise[x, y, z] - 0.5) * 2 * noise_scale
                             
-                            # Apply transition weight
+                            # Přímočaré nahrazení s vysokým poměrem k referenční hodnotě
+                            # Pro vnitřek léze (weight > 0.15) použijeme TARGET_RATIO přímo
+                            # Pro okraje (weight <= 0.15) použijeme lineární poměr od 0 do TARGET_RATIO*0.7
                             weight = edge_transition_mask[x, y, z]
                             
-                            # SUPER OSTRÝ EXPONENCIÁLNÍ PŘÍSTUP
-                            if weight > 0.1:
-                                inner_weight = np.exp((weight - 0.1) * 6) - 1
-                                inner_weight = inner_weight / (np.exp(0.9 * 6) - 1)
-                                inner_weight = np.clip(inner_weight, 0, 1)
-                                inner_mix = 0.98 * inner_weight + 0.02
-                                pseudo_healthy[x, y, z] = (1 - inner_mix) * adc_data[x, y, z] + inner_mix * noisy_value
+                            if weight > 0.15:
+                                # Vnitřek léze - silné nahrazení
+                                pseudo_healthy[x, y, z] = (1 - TARGET_RATIO) * adc_data[x, y, z] + TARGET_RATIO * noisy_value
                             else:
-                                edge_weight_boosted = (weight / 0.1) ** 3
-                                edge_weight_boosted = min(edge_weight_boosted, 1.0)
-                                pseudo_healthy[x, y, z] = (1 - edge_weight_boosted * 0.6) * adc_data[x, y, z] + edge_weight_boosted * 0.6 * noisy_value
+                                # Okraj léze - plynulý přechod (lineární)
+                                edge_ratio = (weight / 0.15) * TARGET_RATIO * 0.7
+                                pseudo_healthy[x, y, z] = (1 - edge_ratio) * adc_data[x, y, z] + edge_ratio * noisy_value
                     
                     # Uložíme referenční hodnotu z prstence
                     if np.any(ring_mask):
@@ -640,31 +654,34 @@ def create_pseudo_healthy_brain_with_atlas(adc_data, label_data, atlas_path, std
                 current_coords = np.where(current_lesion)
                 current_coords = list(zip(current_coords[0], current_coords[1], current_coords[2]))
                 
-                # Uložíme referenční hodnotu z atlasu
-                reference_values[current_lesion] = atlas_mean
+                # DŮLEŽITÁ ZMĚNA: Získáme skutečnou průměrnou hodnotu atlasu v této konkrétní lézi
+                atlas_values_in_current_lesion = atlas_np_original[valid_lesion_atlas_mask]
+                if len(atlas_values_in_current_lesion) > 0:
+                    current_atlas_mean = np.mean(atlas_values_in_current_lesion)
+                else:
+                    current_atlas_mean = atlas_mean
                 
-                # Aplikace normativních hodnot z atlasu s přechodem
+                # Uložíme referenční hodnotu z atlasu
+                reference_values[current_lesion] = current_atlas_mean
+                
+                print(f"Lesion component {lesion_idx}: Atlas reference value = {current_atlas_mean:.2f}")
+                
+                # PŘÍMOČARÝ PŘÍSTUP PRO APLIKACI HODNOT
                 for x, y, z in current_coords:
-                    # Škálování šumu směrodatnou odchylkou
-                    noisy_value = atlas_mean + (noise[x, y, z] - 0.5) * 2 * noise_scale
+                    # Přidáme šum škálovaný na cca 5% průměrné hodnoty (méně šumu)
+                    noise_scale = 0.05 * current_atlas_mean
+                    noisy_value = current_atlas_mean + (noise[x, y, z] - 0.5) * 2 * noise_scale
                     
-                    # Škálování zpět do původního rozsahu hodnot pacientského obrazu
-                    scaled_value = noisy_value * (adc_max - adc_min) + adc_min
-                    
-                    # Apply transition weight
+                    # Přímočaré nahrazení s vysokým poměrem k referenční hodnotě
                     weight = edge_transition_mask[x, y, z]
                     
-                    # SUPER OSTRÝ EXPONENCIÁLNÍ PŘÍSTUP
-                    if weight > 0.1:
-                        inner_weight = np.exp((weight - 0.1) * 6) - 1
-                        inner_weight = inner_weight / (np.exp(0.9 * 6) - 1)
-                        inner_weight = np.clip(inner_weight, 0, 1)
-                        inner_mix = 0.98 * inner_weight + 0.02
-                        pseudo_healthy[x, y, z] = (1 - inner_mix) * adc_data[x, y, z] + inner_mix * scaled_value
+                    if weight > 0.15:
+                        # Vnitřek léze - silné nahrazení
+                        pseudo_healthy[x, y, z] = (1 - TARGET_RATIO) * adc_data[x, y, z] + TARGET_RATIO * noisy_value
                     else:
-                        edge_weight_boosted = (weight / 0.1) ** 3
-                        edge_weight_boosted = min(edge_weight_boosted, 1.0)
-                        pseudo_healthy[x, y, z] = (1 - edge_weight_boosted * 0.6) * adc_data[x, y, z] + edge_weight_boosted * 0.6 * scaled_value
+                        # Okraj léze - plynulý přechod (lineární)
+                        edge_ratio = (weight / 0.15) * TARGET_RATIO * 0.7
+                        pseudo_healthy[x, y, z] = (1 - edge_ratio) * adc_data[x, y, z] + edge_ratio * noisy_value
         
         else:
             print("Warning: No valid lesion voxels found in registered space. Using original method.")
