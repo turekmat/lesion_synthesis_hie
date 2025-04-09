@@ -276,8 +276,9 @@ def create_pseudo_healthy_brain(adc_data, label_data):
         if lesion_mask[sym_x, sym_y, sym_z]:
             has_symmetric_lesion[x, y, z] = True
     
-    # Create smooth transition mask - použijeme vyšší hodnotu strength (0.9) pro větší vliv referenčních hodnot
-    transition_mask = create_smooth_transition_mask_v2(lesion_mask, sigma=3.0, strength=2.5)
+    # Create smooth transition mask pro okraje lézí
+    # Použijeme klasickou masku s nižším sigma pro lepší hrany
+    edge_transition_mask = create_smooth_transition_mask(lesion_mask, sigma=2.0)
     
     # Get connected components in the lesion
     labeled_lesions, num_lesions = ndimage.label(lesion_mask)
@@ -319,15 +320,27 @@ def create_pseudo_healthy_brain(adc_data, label_data):
                 
                 # Apply the average value with noise to the lesion area with smooth transition
                 for x, y, z in current_coords:
-                    # Apply transition weight
-                    weight = transition_mask[x, y, z]
+                    # Apply transition weight (pouze pro okraje)
+                    edge_weight = edge_transition_mask[x, y, z]
                     
-                    # Add noise scaled to about 10% of the avg_value
+                    # Add noise scaled to about 10% of the avg_value for texture
                     noise_scale = 0.1 * avg_value
                     noisy_value = avg_value + (noise[x, y, z] - 0.5) * noise_scale
                     
-                    # ZMĚNA: Umožníme větší vliv referenční hodnoty (noisy_value) místo původní hodnoty
-                    pseudo_healthy[x, y, z] = (1 - weight) * adc_data[x, y, z] + weight * noisy_value
+                    # NOVÝ PŘÍSTUP: Výpočet finální hodnoty
+                    # Ve vnitřku léze (váha > 0.5) chceme hodnotu velmi blízkou referenční 
+                    # Na okrajích (váha < 0.5) chceme plynulý přechod
+                    if edge_weight > 0.5:
+                        # Vnitřek léze - přímé nahrazení referenční hodnotou (s šumem)
+                        # Místo interpolace s původní hodnotou použijeme přímo referenční hodnotu
+                        pseudo_healthy[x, y, z] = noisy_value
+                    else:
+                        # Okraj léze - plynulý přechod do okolní tkáně
+                        # Na okrajích použijeme interpolaci s dvojnásobnou váhou pro referenční hodnotu
+                        # aby přechod byl plynulý, ale zároveň se rychleji blížil k referenční hodnotě
+                        edge_weight_boosted = edge_weight * 2  # Posílení efektu pro rychlejší přechod
+                        edge_weight_boosted = min(edge_weight_boosted, 1.0)  # Omezení na max 1.0
+                        pseudo_healthy[x, y, z] = (1 - edge_weight_boosted) * adc_data[x, y, z] + edge_weight_boosted * noisy_value
             
         else:
             # Case 2: Symmetric lesion present - use normative approach
@@ -357,15 +370,22 @@ def create_pseudo_healthy_brain(adc_data, label_data):
                 current_coords = list(zip(current_coords[0], current_coords[1], current_coords[2]))
                 
                 for x, y, z in current_coords:
-                    # Apply transition weight
-                    weight = transition_mask[x, y, z]
+                    # Apply transition weight (pouze pro okraje)
+                    edge_weight = edge_transition_mask[x, y, z]
                     
                     # Add noise scaled to about 10% of the avg_value
                     noise_scale = 0.1 * avg_ring_value
                     noisy_value = avg_ring_value + (noise[x, y, z] - 0.5) * noise_scale
                     
-                    # ZMĚNA: Umožníme větší vliv referenční hodnoty (noisy_value) místo původní hodnoty
-                    pseudo_healthy[x, y, z] = (1 - weight) * adc_data[x, y, z] + weight * noisy_value
+                    # NOVÝ PŘÍSTUP: stejně jako v předchozím případě
+                    if edge_weight > 0.5:
+                        # Vnitřek léze - přímé nahrazení referenční hodnotou (s šumem)
+                        pseudo_healthy[x, y, z] = noisy_value
+                    else:
+                        # Okraj léze - plynulý přechod do okolní tkáně
+                        edge_weight_boosted = edge_weight * 2
+                        edge_weight_boosted = min(edge_weight_boosted, 1.0)
+                        pseudo_healthy[x, y, z] = (1 - edge_weight_boosted) * adc_data[x, y, z] + edge_weight_boosted * noisy_value
     
     return pseudo_healthy, reference_values
 
@@ -530,8 +550,9 @@ def create_pseudo_healthy_brain_with_atlas(adc_data, label_data, atlas_path, std
                 atlas_std_global = np.std(atlas_values_in_lesion)
                 print(f"Atlas normative values in lesion area: mean={atlas_mean:.2f}, std={atlas_std_global:.2f}")
             
-            # Vytvoření přechodové masky pro původní lézi - použijeme vyšší hodnotu strength (0.9) pro větší vliv atlasu
-            transition_mask = create_smooth_transition_mask_v2(lesion_mask, sigma=3.0, strength=2.5)
+            # Vytvoření přechodové masky pro původní lézi
+            # Použijeme klasickou masku s nižším sigma pro lepší hrany
+            edge_transition_mask = create_smooth_transition_mask(lesion_mask, sigma=2.0)
             
             # Komponenty léze v původním prostoru pacienta
             labeled_lesions, num_lesions = ndimage.label(lesion_mask)
@@ -584,15 +605,22 @@ def create_pseudo_healthy_brain_with_atlas(adc_data, label_data, atlas_path, std
                         current_coords = list(zip(current_coords[0], current_coords[1], current_coords[2]))
                         
                         for x, y, z in current_coords:
-                            # Váha přechodu
-                            weight = transition_mask[x, y, z]
+                            # Apply transition weight (pouze pro okraje)
+                            edge_weight = edge_transition_mask[x, y, z]
                             
                             # Přidáme šum škálovaný na cca 10% průměrné hodnoty
                             noise_scale = 0.1 * avg_ring_value
                             noisy_value = avg_ring_value + (noise[x, y, z] - 0.5) * 2 * noise_scale
                             
-                            # Plynulý přechod mezi původní a novou hodnotou
-                            pseudo_healthy[x, y, z] = (1 - weight) * adc_data[x, y, z] + weight * noisy_value
+                            # NOVÝ PŘÍSTUP: Výpočet finální hodnoty
+                            if edge_weight > 0.5:
+                                # Vnitřek léze - přímé nahrazení referenční hodnotou (s šumem)
+                                pseudo_healthy[x, y, z] = noisy_value
+                            else:
+                                # Okraj léze - plynulý přechod do okolní tkáně
+                                edge_weight_boosted = edge_weight * 2
+                                edge_weight_boosted = min(edge_weight_boosted, 1.0)
+                                pseudo_healthy[x, y, z] = (1 - edge_weight_boosted) * adc_data[x, y, z] + edge_weight_boosted * noisy_value
                     
                     # Uložíme referenční hodnotu z prstence
                     if np.any(ring_mask):
@@ -609,8 +637,8 @@ def create_pseudo_healthy_brain_with_atlas(adc_data, label_data, atlas_path, std
                 
                 # Aplikace normativních hodnot z atlasu s přechodem
                 for x, y, z in current_coords:
-                    # Váha přechodu
-                    weight = transition_mask[x, y, z]
+                    # Apply transition weight (pouze pro okraje)
+                    edge_weight = edge_transition_mask[x, y, z]
                     
                     # ZMĚNA: Přidání šumu škálovaného podle směrodatné odchylky z atlasu
                     if std_atlas_np is not None:
@@ -633,8 +661,15 @@ def create_pseudo_healthy_brain_with_atlas(adc_data, label_data, atlas_path, std
                     # Škálování zpět do původního rozsahu hodnot pacientského obrazu
                     scaled_value = noisy_value * (adc_max - adc_min) + adc_min
                     
-                    # ZMĚNA: Umožníme větší vliv referenční hodnoty (scaled_value) místo původní hodnoty
-                    pseudo_healthy[x, y, z] = (1 - weight) * adc_data[x, y, z] + weight * scaled_value
+                    # NOVÝ PŘÍSTUP: Výpočet finální hodnoty
+                    if edge_weight > 0.5:
+                        # Vnitřek léze - přímé nahrazení referenční hodnotou (s šumem)
+                        pseudo_healthy[x, y, z] = scaled_value
+                    else:
+                        # Okraj léze - plynulý přechod do okolní tkáně
+                        edge_weight_boosted = edge_weight * 2
+                        edge_weight_boosted = min(edge_weight_boosted, 1.0)
+                        pseudo_healthy[x, y, z] = (1 - edge_weight_boosted) * adc_data[x, y, z] + edge_weight_boosted * scaled_value
         
         else:
             print("Warning: No valid lesion voxels found in registered space. Using original method.")
