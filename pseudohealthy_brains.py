@@ -246,6 +246,55 @@ def create_smooth_transition_mask_v2(binary_mask, sigma=2.0, strength=2.5):
     return transition_mask
 
 
+def apply_smoothing_postprocessing(pseudo_healthy, lesion_mask, sigma_spatial=1.5, iterations=2, blur_margin=5):
+    """
+    Applies advanced smoothing to the lesion area and its boundary for more natural transitions.
+    
+    Args:
+        pseudo_healthy: The pseudo-healthy brain data after initial replacement
+        lesion_mask: Original lesion mask
+        sigma_spatial: Gaussian blur sigma parameter
+        iterations: Number of iterations for the progressive smoothing
+        blur_margin: How far outside the lesion to apply blurring (in voxels)
+        
+    Returns:
+        Smoothed pseudo-healthy brain data
+    """
+    # Make a copy to avoid modifying the original
+    result = pseudo_healthy.copy()
+    
+    # Create a dilated mask to include the margin around the lesion
+    dilated_mask = ndimage.binary_dilation(lesion_mask, iterations=blur_margin)
+    
+    # Create a distance map from lesion boundary (both inside and outside)
+    # Distance is 0 at boundary, positive inside lesion, negative outside
+    dist_map = ndimage.distance_transform_edt(lesion_mask) - ndimage.distance_transform_edt(~lesion_mask)
+    
+    # Apply Gaussian smoothing to the distance map to create a smooth transition mask
+    smooth_dist = gaussian_filter(dist_map, sigma=3.0)
+    
+    # Create a transition mask in range [0, 1] with smoother sigmoid function
+    transition_mask = 1.0 / (1.0 + np.exp(-smooth_dist / 1.5))
+    
+    # Progressive smoothing with decreasing impact
+    for i in range(iterations):
+        # Calculate current smoothing parameters
+        current_sigma = sigma_spatial * (iterations - i) / iterations
+        
+        # Apply Gaussian filter to the whole image
+        smoothed = gaussian_filter(result, sigma=current_sigma)
+        
+        # Blend smoothed with original using the transition mask and iteration-dependent weighting
+        blend_factor = 0.8 * (iterations - i) / iterations  # Decreasing blend factor
+        
+        # Apply the blend only in the dilated mask region with gradient weighting
+        idx = dilated_mask
+        result[idx] = result[idx] * (1 - blend_factor * transition_mask[idx]) + \
+                     smoothed[idx] * (blend_factor * transition_mask[idx])
+    
+    return result
+
+
 def create_pseudo_healthy_brain(adc_data, label_data):
     """
     Create a pseudo-healthy brain from ADC and label data by replacing lesions
@@ -479,6 +528,13 @@ def create_pseudo_healthy_brain(adc_data, label_data):
                 reference_values[current_lesion] = avg_ring_value
             
             continue  # Přeskočíme normální zpracování pomocí atlasu pro tuto komponentu
+    
+    # Apply post-processing for smoother transitions
+    print("Applying post-processing smoothing for more natural transitions...")
+    pseudo_healthy = apply_smoothing_postprocessing(pseudo_healthy, lesion_mask, 
+                                                  sigma_spatial=1.5, 
+                                                  iterations=3, 
+                                                  blur_margin=5)
     
     return pseudo_healthy, reference_values
 
@@ -936,6 +992,13 @@ def create_pseudo_healthy_brain_with_atlas(adc_data, label_data, atlas_path, std
                 temp_result_path.unlink()
         except Exception as e:
             print(f"Warning: Could not clean up temporary files: {e}")
+    
+    # Apply post-processing for smoother transitions
+    print("Applying post-processing smoothing for more natural transitions...")
+    pseudo_healthy = apply_smoothing_postprocessing(pseudo_healthy, lesion_mask, 
+                                                  sigma_spatial=1.5, 
+                                                  iterations=3, 
+                                                  blur_margin=5)
     
     return pseudo_healthy, reference_values
 
