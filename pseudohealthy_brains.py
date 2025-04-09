@@ -229,7 +229,7 @@ def create_pseudo_healthy_brain(adc_data, label_data):
     
     if not np.any(lesion_mask):
         print("No lesion found in the label data")
-        return pseudo_healthy
+        return pseudo_healthy, None  # Vrátíme None jako referenční hodnoty
     
     # Get shape of the data
     shape = adc_data.shape
@@ -252,6 +252,9 @@ def create_pseudo_healthy_brain(adc_data, label_data):
     
     # Get connected components in the lesion
     labeled_lesions, num_lesions = ndimage.label(lesion_mask)
+    
+    # Ukládáme referenční hodnoty pro každou lézi
+    reference_values = np.zeros_like(lesion_mask, dtype=np.float32)
     
     # Process each connected component (lesion) separately
     for lesion_idx in range(1, num_lesions + 1):
@@ -277,6 +280,10 @@ def create_pseudo_healthy_brain(adc_data, label_data):
             if symmetric_values:
                 # Calculate average value from symmetric healthy regions
                 avg_value = np.mean(symmetric_values)
+                print(f"Average value from symmetric regions: {avg_value:.2f}")
+                
+                # Uložíme tuto hodnotu jako referenční pro celou lézi
+                reference_values[current_lesion] = avg_value
                 
                 # Generate Perlin noise with a smaller scale for local variations
                 noise = generate_perlin_noise(shape, scale=5.0, octaves=3)
@@ -308,6 +315,10 @@ def create_pseudo_healthy_brain(adc_data, label_data):
                 # Calculate the mean value in the ring
                 ring_values = adc_data[ring_mask]
                 avg_ring_value = np.mean(ring_values)
+                print(f"Average value from dilated ring: {avg_ring_value:.2f}")
+                
+                # Uložíme tuto hodnotu jako referenční pro celou lézi
+                reference_values[current_lesion] = avg_ring_value
                 
                 # Generate noise for the lesion area
                 noise = generate_perlin_noise(shape, scale=5.0, octaves=3)
@@ -327,7 +338,7 @@ def create_pseudo_healthy_brain(adc_data, label_data):
                     # Blend between original and new value based on the transition mask
                     pseudo_healthy[x, y, z] = (1 - weight) * adc_data[x, y, z] + weight * noisy_value
     
-    return pseudo_healthy
+    return pseudo_healthy, reference_values
 
 
 def create_pseudo_healthy_brain_with_atlas(adc_data, label_data, atlas_path, std_atlas_path=None):
@@ -342,6 +353,7 @@ def create_pseudo_healthy_brain_with_atlas(adc_data, label_data, atlas_path, std
     
     Returns:
         Pseudo-healthy brain data with lesions replaced using atlas values
+        Reference values (from atlas) used for replacement
     """
     # Create a copy of the ADC data for the result
     pseudo_healthy = adc_data.copy()
@@ -351,7 +363,7 @@ def create_pseudo_healthy_brain_with_atlas(adc_data, label_data, atlas_path, std
     
     if not np.any(lesion_mask):
         print("No lesion found in the label data")
-        return pseudo_healthy
+        return pseudo_healthy, None
     
     print("Performing atlas-based lesion replacement with ANTs registration...")
     
@@ -371,6 +383,9 @@ def create_pseudo_healthy_brain_with_atlas(adc_data, label_data, atlas_path, std
     
     temp_label_sitk = sitk.GetImageFromArray(label_data.astype(np.uint8))
     sitk.WriteImage(temp_label_sitk, str(temp_label_path))
+    
+    # Vytvoříme pole pro referenční hodnoty
+    reference_values = np.zeros_like(adc_data, dtype=np.float32)
     
     # Load ADC and atlas into ANTs format
     adc_ant = ants.image_read(str(temp_adc_path))
@@ -550,11 +565,18 @@ def create_pseudo_healthy_brain_with_atlas(adc_data, label_data, atlas_path, std
                             # Plynulý přechod mezi původní a novou hodnotou
                             pseudo_healthy[x, y, z] = (1 - weight) * adc_data[x, y, z] + weight * noisy_value
                     
+                    # Uložíme referenční hodnotu z prstence
+                    if np.any(ring_mask):
+                        reference_values[current_lesion] = avg_ring_value
+                    
                     continue  # Přeskočíme normální zpracování pomocí atlasu pro tuto komponentu
                 
                 # Souřadnice voxelů v aktuální lézi
                 current_coords = np.where(current_lesion)
                 current_coords = list(zip(current_coords[0], current_coords[1], current_coords[2]))
+                
+                # Uložíme referenční hodnotu z atlasu
+                reference_values[current_lesion] = atlas_mean
                 
                 # Aplikace normativních hodnot z atlasu s přechodem
                 for x, y, z in current_coords:
@@ -608,13 +630,13 @@ def create_pseudo_healthy_brain_with_atlas(adc_data, label_data, atlas_path, std
         except Exception as e:
             print(f"Warning: Could not clean up temporary files: {e}")
     
-    return pseudo_healthy
+    return pseudo_healthy, reference_values
 
 
-def visualize_results(adc_data, pseudo_healthy, label_data, patient_id, output_dir):
+def visualize_results(adc_data, pseudo_healthy, label_data, patient_id, output_dir, atlas_path=None, std_atlas_path=None, reference_values=None):
     """
-    Create a PDF visualization showing original ADC, pseudo-healthy ADC, and lesion outline
-    for all slices of the brain.
+    Create a PDF visualization showing original ADC, pseudo-healthy ADC, lesion outline,
+    and the normative atlas slice used for replacing the lesion.
     
     Args:
         adc_data: Original ADC map data
@@ -622,6 +644,9 @@ def visualize_results(adc_data, pseudo_healthy, label_data, patient_id, output_d
         label_data: Lesion mask data
         patient_id: Patient identifier for naming the output
         output_dir: Directory to save the PDF visualization
+        atlas_path: Path to the normative atlas (optional, for showing where values came from)
+        std_atlas_path: Path to the standard deviation atlas (optional)
+        reference_values: Reference values used for replacing lesions (optional)
     """
     # Create output directory if it doesn't exist
     os.makedirs(output_dir, exist_ok=True)
@@ -634,6 +659,11 @@ def visualize_results(adc_data, pseudo_healthy, label_data, patient_id, output_d
     adc_data_axial = np.transpose(adc_data, (1, 2, 0))
     pseudo_healthy_axial = np.transpose(pseudo_healthy, (1, 2, 0))
     label_data_axial = np.transpose(label_data, (1, 2, 0))
+    
+    # Transponujeme také referenční hodnoty, pokud existují
+    reference_values_axial = None
+    if reference_values is not None:
+        reference_values_axial = np.transpose(reference_values, (1, 2, 0))
     
     # Calculate value limits for consistent display
     vmin = np.percentile(adc_data_axial[adc_data_axial > 0], 1) if np.any(adc_data_axial > 0) else 0
@@ -661,17 +691,39 @@ def visualize_results(adc_data, pseudo_healthy, label_data, patient_id, output_d
             # Calculate statistics for this slice
             if np.any(lesion_mask[:, :, z]):
                 # Calculate average intensities in the lesion area
+                lesion_voxels_count = np.sum(lesion_mask[:, :, z])
                 orig_mean = np.mean(adc_data_axial[:, :, z][lesion_mask[:, :, z]])
                 pseudo_mean = np.mean(pseudo_healthy_axial[:, :, z][lesion_mask[:, :, z]])
                 diff = pseudo_mean - orig_mean
                 percent_change = (diff / orig_mean * 100) if orig_mean != 0 else 0
                 
+                # Reference value statistics
+                reference_value_str = ""
+                if reference_values_axial is not None:
+                    # Filtrujeme nenulové referenční hodnoty v oblasti léze
+                    ref_values_in_lesion = reference_values_axial[:, :, z][lesion_mask[:, :, z]]
+                    ref_values_in_lesion = ref_values_in_lesion[ref_values_in_lesion > 0]
+                    if len(ref_values_in_lesion) > 0:
+                        ref_mean = np.mean(ref_values_in_lesion)
+                        reference_value_str = f"\nReference value (target): {ref_mean:.2f}"
+                
+                # Atlas statistics if available
+                atlas_mean_str = ""
+                atlas_voxels_count_str = ""
+                if atlas_data_axial is not None and registered_lesion_axial is not None:
+                    if np.any(registered_lesion_axial[:, :, z]):
+                        atlas_voxels_count = np.sum(registered_lesion_axial[:, :, z])
+                        atlas_mean = np.mean(atlas_data_axial[:, :, z][registered_lesion_axial[:, :, z]])
+                        atlas_mean_str = f"\nAtlas mean intensity in lesion area: {atlas_mean:.2f}"
+                        atlas_voxels_count_str = f"\nAtlas lesion area size: {atlas_voxels_count} voxels"
+                
                 # Generate statistics text
                 stats_text = (
                     f"Lesion area statistics (Slice {z}):\n"
+                    f"Lesion area size: {lesion_voxels_count} voxels\n"
                     f"Original mean intensity: {orig_mean:.2f}\n"
-                    f"Pseudo-healthy mean intensity: {pseudo_mean:.2f}\n"
-                    f"Difference: {diff:.2f} ({percent_change:.1f}%)"
+                    f"Pseudo-healthy mean intensity: {pseudo_mean:.2f}{reference_value_str}\n"
+                    f"Difference: {diff:.2f} ({percent_change:.1f}%){atlas_mean_str}{atlas_voxels_count_str}"
                 )
             else:
                 stats_text = f"No lesion found in this slice ({z})"
@@ -717,15 +769,36 @@ def visualize_results(adc_data, pseudo_healthy, label_data, patient_id, output_d
     
     # Calculate overall statistics for the whole volume
     if np.any(lesion_mask):
+        total_lesion_voxels = np.sum(label_data > 0)
         overall_orig_mean = np.mean(adc_data[label_data > 0])
         overall_pseudo_mean = np.mean(pseudo_healthy[label_data > 0])
         overall_diff = overall_pseudo_mean - overall_orig_mean
         overall_percent = (overall_diff / overall_orig_mean * 100) if overall_orig_mean != 0 else 0
         
+        # Reference value statistics for whole volume
+        overall_reference_str = ""
+        if reference_values is not None:
+            # Filtrujeme nenulové referenční hodnoty v lézi
+            ref_values_in_lesion = reference_values[label_data > 0]
+            ref_values_in_lesion = ref_values_in_lesion[ref_values_in_lesion > 0]
+            if len(ref_values_in_lesion) > 0:
+                overall_ref_mean = np.mean(ref_values_in_lesion)
+                overall_reference_str = f"\nReference mean (target): {overall_ref_mean:.2f}"
+        
         print(f"\nOverall statistics for {patient_id}:")
+        print(f"Total lesion size: {total_lesion_voxels} voxels")
         print(f"Original mean in lesion area: {overall_orig_mean:.2f}")
-        print(f"Pseudo-healthy mean in same area: {overall_pseudo_mean:.2f}")
+        print(f"Pseudo-healthy mean in same area: {overall_pseudo_mean:.2f}{overall_reference_str}")
         print(f"Difference: {overall_diff:.2f} ({overall_percent:.1f}%)")
+        
+        # Atlas statistics if available
+        if atlas_path is not None and registered_lesion_np is not None:
+            if np.any(registered_lesion_np):
+                atlas_total_voxels = np.sum(registered_lesion_np)
+                atlas_np = atlas_ant.numpy()
+                atlas_mean_in_lesion = np.mean(atlas_np[registered_lesion_np])
+                print(f"Atlas mean in lesion area: {atlas_mean_in_lesion:.2f}")
+                print(f"Atlas registered lesion size: {atlas_total_voxels} voxels")
     
     print(f"Visualization saved to {output_path}")
 
@@ -781,9 +854,9 @@ def process_dataset(adc_dir, label_dir, output_dir, atlas_path=None, std_atlas_p
         
         # Create pseudo-healthy brain using atlas if available, otherwise use symmetry
         if atlas_path:
-            pseudo_healthy = create_pseudo_healthy_brain_with_atlas(adc_data, label_data, atlas_path, std_atlas_path)
+            pseudo_healthy, reference_values = create_pseudo_healthy_brain_with_atlas(adc_data, label_data, atlas_path, std_atlas_path)
         else:
-            pseudo_healthy = create_pseudo_healthy_brain(adc_data, label_data)
+            pseudo_healthy, reference_values = create_pseudo_healthy_brain(adc_data, label_data)
         
         # Always save the pseudo-healthy and difference map files
         output_path = os.path.join(pseudohealthy_dir, f"{patient_id}-PSEUDO_HEALTHY.mha")
@@ -792,7 +865,7 @@ def process_dataset(adc_dir, label_dir, output_dir, atlas_path=None, std_atlas_p
         
         # If visualize is enabled, create PDF visualization
         if visualize:
-            visualize_results(adc_data, pseudo_healthy, label_data, patient_id, visualization_dir)
+            visualize_results(adc_data, pseudo_healthy, label_data, patient_id, visualization_dir, atlas_path, std_atlas_path, reference_values)
 
 
 def main():

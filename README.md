@@ -115,3 +115,153 @@ The primary use case is data augmentation for training segmentation models (such
 ## License
 
 [Include your license information here]
+
+# HIE BONBID Lesion Synthesis
+
+Tento projekt implementuje pokročilé metody pro syntézu a inpainting lézí HIE (Hypoxic-Ischemic Encephalopathy) v mozku pomocí MRI snímků z datasetu BONBID.
+
+## Přehled implementovaných metod
+
+### 1. Inpainting lézí pomocí CGAN s SwinUNETR
+
+Nejnovější implementací je metoda pro inpainting lézí do pseudo-zdravých mozků pomocí Conditional GAN (CGAN) s architekturou SwinUNETR jako generátorem. Tato metoda je implementována v souboru `inpainting_gan.py`.
+
+Hlavní výhody této metody:
+
+- Využívá state-of-the-art architekturu SwinUNETR, která kombinuje výhody Swin Transformerů a U-Net architektur
+- Využívá podmíněné generování (CGAN) pro řízené vkládání lézí podle binární masky
+- Obsahuje specializované loss funkce pro zajištění kvality a realismu inpaintovaných lézí
+- Je optimalizovaná pro práci s 3D volumetrickými daty
+
+#### Datový tok:
+
+1. **Vstupní data**:
+
+   - Pseudo-zdravý mozek (ADC mapa bez lézí)
+   - Binární maska léze (označuje, kde mají být inpaintovány léze)
+
+2. **Výstupní data**:
+   - ADC mapa s inpaintovanými lézemi
+
+### 2. Generování lézí pomocí SwinGAN (implementovaný v `swin_gan.py`)
+
+### 3. Příprava pseudo-zdravých mozků (implementováno v `pseudohealthy_brains.py`)
+
+## Instalace
+
+Pro instalaci požadovaných balíčků použijte:
+
+```bash
+pip install -r requirements.txt
+```
+
+## Použití modelu pro inpainting lézí (CGAN-SwinUNETR)
+
+### Trénování modelu na celých objemech (full volume)
+
+Pro trénování modelu na celých volumetrických datech (bez patchů) spusťte:
+
+```bash
+python inpainting_gan.py --mode train \
+    --pseudo_healthy_dir /cesta/k/pseudo_zdravym_mozkum \
+    --adc_dir /cesta/k/adc_mapam_s_lezemi \
+    --lesion_mask_dir /cesta/k/maskam_lezi \
+    --output_dir ./output_inpainting \
+    --num_epochs 100 \
+    --batch_size 1 \
+    --use_amp
+```
+
+Model automaticky detekuje velikost vstupních dat a vyplní je na nejbližší vyšší mocninu 2 pro každý rozměr, což je potřebné pro SwinUNETR architekturu.
+
+Můžete také specifikovat cílovou velikost manuálně, pokud potřebujete konkrétní rozměry:
+
+```bash
+python inpainting_gan.py --mode train \
+    --pseudo_healthy_dir /cesta/k/pseudo_zdravym_mozkum \
+    --adc_dir /cesta/k/adc_mapam_s_lezemi \
+    --lesion_mask_dir /cesta/k/maskam_lezi \
+    --output_dir ./output_inpainting \
+    --num_epochs 100 \
+    --batch_size 1 \
+    --target_size 32,128,128 \
+    --use_amp
+```
+
+Další užitečné parametry specifické pro full volume trénink:
+
+- `--crop_foreground`: Ořezat objemy na bounding box mozku před tréninkem (šetří paměť)
+- `--target_size`: Manuálně specifikujte cílovou velikost objemů, např. "32,128,128"
+- `--batch_size`: Pro full volume trénink doporučujeme 1 nebo 2 (v závislosti na velikosti dat a paměti GPU)
+
+### Standardní parametry trénování:
+
+- `--lr_g`: Learning rate pro generátor (výchozí: 0.0002)
+- `--lr_d`: Learning rate pro diskriminátor (výchozí: 0.0001)
+- `--lambda_l1`: Váha pro L1 loss (výchozí: 10.0)
+- `--lambda_identity`: Váha pro identity loss mimo masku (výchozí: 5.0)
+- `--lambda_ssim`: Váha pro SSIM loss (výchozí: 1.0)
+- `--lambda_edge`: Váha pro edge loss (výchozí: 1.0)
+- `--checkpoint`: Cesta k checkpointu pro pokračování v tréninku
+
+### Inference s využitím celých objemů
+
+Pro aplikaci natrénovaného modelu na nová data:
+
+```bash
+python inpainting_gan.py --mode inference \
+    --checkpoint /cesta/k/checkpointu/best_model.pth \
+    --inference_input /cesta/k/pseudo_zdravemu_mozku.mha \
+    --inference_mask /cesta/k/masce_leze.mha \
+    --inference_output /cesta/kam/ulozit/vystup.mha
+```
+
+Při inferenci je vstupní objem automaticky doplněn paddingem na konzistentní velikost (mocninu 2), zpracován modelem a poté oříznut zpět na původní velikost.
+
+## Architektura modelu CGAN-SwinUNETR
+
+### Generátor
+
+Generátor využívá architekturu SwinUNETR, která kombinuje Swin Transformer bloky s U-Net strukturou:
+
+- **Vstupy**: Pseudo-zdravý mozek a binární maska léze (spojené jako 2-kanálový vstup)
+- **Architektura**: SwinUNETR s parametrizovatelným počtem feature maps
+- **Výstup**: ADC mapa s inpaintovanou lézí
+
+Výhodou SwinUNETR je schopnost zachytit jak globální kontext (pomocí transformerů), tak lokální detaily (pomocí U-Net struktury), což je ideální pro inpainting lézí, které musí být konzistentní s okolní tkání.
+
+### Diskriminátor
+
+Diskriminátor je implementován jako PatchGAN, který klasifikuje každý patch obrázku jako reálný nebo falešný:
+
+- **Vstupy**: Pseudo-zdravý mozek, maska léze a ADC mapa (reálná nebo generovaná)
+- **Architektura**: Série 3D konvolučních vrstev s LeakyReLU aktivacemi a BatchNorm
+- **Výstup**: Mapa skóre, která indikuje, zda každá oblast obsahuje reálnou nebo generovanou lézi
+
+### Loss funkce
+
+Model používá kombinaci více loss funkcí pro optimální výsledky:
+
+1. **Adversarial Loss**: Standardní GAN loss pro realistické generování
+2. **L1 Reconstruction Loss**: Zajišťuje podobnost generovaných lézí s reálnými (pouze v oblasti masky)
+3. **Identity Loss**: Zajišťuje, že oblasti mimo masku zůstanou nezměněné
+4. **Localized SSIM Loss**: Podporuje strukturální podobnost v oblasti léze
+5. **Edge/Gradient Loss**: Zajišťuje plynulý přechod na hranici léze bez ostrých artefaktů
+
+## Předzpracování dat
+
+Implementace zahrnuje následující kroky předzpracování:
+
+1. Oříznutí dat pomocí bounding boxu zaměřeného na mozek
+2. Normalizace hodnot do rozsahu [0, 1]
+3. Náhodné vzorkování patchů pro efektivní trénink
+4. Konzistentní aplikace transformací pro všechny trojice (pseudo-zdravý, ADC s lézí, maska)
+
+## Citace a odkazy
+
+- SwinUNETR: [Hatamizadeh et al. "Swin UNETR: Swin Transformers for Semantic Segmentation of Brain Tumors in MRI Images"](https://arxiv.org/abs/2201.01266)
+- MONAI: [Medical Open Network for AI](https://monai.io/)
+
+## Kontakt
+
+Pro další informace nebo dotazy ohledně projektu kontaktujte [email@example.com].
