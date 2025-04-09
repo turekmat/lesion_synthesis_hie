@@ -1087,14 +1087,14 @@ class LesionInpaintingTrainer:
     
     def validate(self, val_loader, epoch):
         """
-        Validace modelu na validační sadě
+        Validace modelu
         
         Args:
-            val_loader (DataLoader): DataLoader s validačními daty
-            epoch (int): Číslo aktuální epochy
-            
+            val_loader: DataLoader s validačními daty
+            epoch (int): Aktuální epocha
+        
         Returns:
-            dict: Slovník s průměrnými metrikami na validační sadě
+            dict: Validační metriky
         """
         self.model.eval()
         val_metrics = {
@@ -1107,32 +1107,39 @@ class LesionInpaintingTrainer:
             'd_loss': 0.0
         }
         
-        # Uložit všechny batche pro pozdější náhodný výběr
+        # Ukládat všechny batche, abychom mohli náhodně vybrat jeden pro vizualizaci
         all_batches = []
+        mghnicu_405_batch = None
         
-        # Validace na všech datech
         with torch.no_grad():
             for batch in val_loader:
-                # Uložit batch pro pozdější výběr
-                all_batches.append(batch)
-                
-                # Přesunout data na správné zařízení
+                # Přesunout data na zařízení
                 pseudo_healthy = batch['pseudo_healthy'].to(self.device)
                 lesion_mask = batch['lesion_mask'].to(self.device)
                 real_adc = batch['adc'].to(self.device)
+                patient_id = batch['patient_id'][0]  # Bereme první pacienta z batche
+                
+                # Kontrola, zda jde o pacienta MGHNICU_405
+                if 'MGHNICU_405' in patient_id:
+                    mghnicu_405_batch = batch
+                    print(f"Nalezen pacient MGHNICU_405 ve validační sadě, bude prioritně použit pro vizualizaci")
+                
+                # Uložit batch pro pozdější vizualizaci
+                all_batches.append(batch)
                 
                 # Forward pass
                 with torch.amp.autocast('cuda') if self.use_amp else nullcontext():
+                    # Generování falešných ADC map
                     fake_adc = self.model.generator(pseudo_healthy, lesion_mask)
                     
-                    # Získat predikci diskriminátoru pro generovaná data
+                    # Generator loss
                     disc_fake_pred = self.model.discriminator(pseudo_healthy, lesion_mask, fake_adc)
                     
                     # Výpočet loss pro generátor se správnými argumenty
                     g_loss, g_adv_loss, g_l1_loss, g_identity_loss, g_ssim_loss, g_edge_loss = \
                         self.model.generator_loss(
-                            pseudo_healthy, lesion_mask, real_adc, fake_adc, disc_fake_pred
-                        )
+                        pseudo_healthy, lesion_mask, real_adc, fake_adc, disc_fake_pred
+                    )
                     
                     # Výpočet loss pro diskriminátor
                     # Získat predikci pro reálná data
@@ -1142,7 +1149,7 @@ class LesionInpaintingTrainer:
                         disc_real_pred, disc_fake_pred
                     )
                 
-                # Aktualizace metrik
+                # Akumulovat metriky
                 val_metrics['g_loss'] += g_loss.item()
                 val_metrics['g_adv_loss'] += g_adv_loss.item()
                 val_metrics['g_l1_loss'] += g_l1_loss.item()
@@ -1160,14 +1167,15 @@ class LesionInpaintingTrainer:
         for key in val_metrics:
             self.val_log[key].append(val_metrics[key])
             
-        # Vizualizace na náhodně vybraném obrazu
+        # Vizualizace na náhodně vybraném obrazu, prioritně MGHNICU_405 pokud je dostupný
         if all_batches:
-            # Náhodně vybrat jeden batch
-            random_batch = random.choice(all_batches)
+            # Prioritně použít MGHNICU_405, pokud byl nalezen
+            selected_batch = mghnicu_405_batch if mghnicu_405_batch is not None else random.choice(all_batches)
             
             # Vytvořit PDF vizualizaci pro vybraný batch
-            pdf_path = self.create_full_volume_pdf_visualization(epoch, random_batch)
-            print(f"Full volume PDF visualization created at: {pdf_path}")
+            pdf_path = self.create_full_volume_pdf_visualization(epoch, selected_batch)
+            patient_id = selected_batch['patient_id'][0]
+            print(f"Full volume PDF visualization created for patient {patient_id} at: {pdf_path}")
             
         return val_metrics
     
@@ -1479,14 +1487,39 @@ def train_model(args):
         print("Ukončuji trénink.")
         return
     
+    # Najděme index pacienta MGHNICU_405, aby byl vždy ve validační sadě
+    mghnicu_405_index = None
+    for i, triplet in enumerate(train_dataset.file_triplets):
+        if 'MGHNICU_405' in triplet['patient_id']:
+            mghnicu_405_index = i
+            print(f"Nalezen pacient MGHNICU_405 na indexu {i}, bude vždy použit pro validaci")
+            break
+    
     # Pro validační dataset nepoužíváme augmentace, musíme proto vytvořit nový dataset pro validaci
     if args.use_augmentations and val_size > 0:
         # Vytvoříme indexy pro rozdělení datasetu
         indices = list(range(dataset_size))
+        
+        # Zamíchat indexy a rozdělit je na trénovací a validační
         np.random.seed(args.seed)
         np.random.shuffle(indices)
-        train_indices = indices[:train_size]
-        val_indices = indices[train_size:]
+        
+        # Pokud jsme našli MGHNICU_405, zajistit, že je ve validační sadě
+        if mghnicu_405_index is not None:
+            # Odstranit MGHNICU_405 z indexů, pokud tam je
+            if mghnicu_405_index in indices:
+                indices.remove(mghnicu_405_index)
+            
+            # Rozdělit zbytek indexů
+            train_indices = indices[:train_size]
+            val_indices = indices[train_size:train_size + val_size - 1]  # Rezervovat místo pro MGHNICU_405
+            
+            # Přidat MGHNICU_405 do validační sady
+            val_indices.append(mghnicu_405_index)
+        else:
+            # Standardní rozdělení, pokud MGHNICU_405 není nalezen
+            train_indices = indices[:train_size]
+            val_indices = indices[train_size:train_size + val_size]
         
         # Vytvoříme zvlášť validační dataset bez augmentací
         val_dataset = LesionInpaintingDataset(
@@ -1521,10 +1554,38 @@ def train_model(args):
         )
     else:
         # Pokud nepoužíváme augmentace nebo nemáme validaci, použijeme původní přístup
-        train_dataset, val_dataset = torch.utils.data.random_split(
-            train_dataset, [train_size, val_size],
-            generator=torch.Generator().manual_seed(args.seed)
-        )
+        # s úpravou pro vždy zařazení MGHNICU_405 do validační sady
+        if mghnicu_405_index is not None:
+            # Vytvoříme vlastní rozdělení s MGHNICU_405 vždy ve validační sadě
+            from torch.utils.data import Subset
+            
+            # Vytvoříme indexy pro rozdělení datasetu
+            indices = list(range(dataset_size))
+            
+            # Odstranit MGHNICU_405 z indexů, pokud tam je
+            if mghnicu_405_index in indices:
+                indices.remove(mghnicu_405_index)
+                
+            # Zamíchat zbývající indexy
+            np.random.seed(args.seed)
+            np.random.shuffle(indices)
+            
+            # Rozdělit zbytek indexů
+            train_indices = indices[:train_size]
+            val_indices = indices[train_size:train_size + val_size - 1]
+            
+            # Přidat MGHNICU_405 do validační sady
+            val_indices.append(mghnicu_405_index)
+            
+            # Vytvořit Subset datasety
+            train_dataset = Subset(train_dataset, train_indices)
+            val_dataset = Subset(train_dataset, val_indices)
+        else:
+            # Standardní rozdělení pomocí random_split
+            train_dataset, val_dataset = torch.utils.data.random_split(
+                train_dataset, [train_size, val_size],
+                generator=torch.Generator().manual_seed(args.seed)
+            )
         
         train_dataloader = DataLoader(
             train_dataset,
