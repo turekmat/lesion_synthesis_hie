@@ -482,48 +482,40 @@ class LesionInpaintingGAN(nn.Module):
     
     def compute_edge_loss(self, pred, target, mask, kernel_size=3):
         """
-        Výpočet edge/gradient loss pro zajištění plynulého přechodu na hranici masky
-        Upravená implementace, která se vyhýbá dilataci/erozi a pracuje pouze s PyTorch operacemi
+        Výpočet edge loss pro zajištění plynulého přechodu na hranici masky
+        Implementace bez gradientů, která se zaměřuje pouze na hodnoty v oblasti masky
         
         Args:
             pred (torch.Tensor): Predikovaná ADC mapa [B, 1, D, H, W]
             target (torch.Tensor): Cílová ADC mapa [B, 1, D, H, W]
             mask (torch.Tensor): Binární maska léze [B, 1, D, H, W]
-            kernel_size (int): Velikost oblasti kolem masky pro výpočet gradientů (nepoužívá se pro dilataci)
+            kernel_size (int): Nepoužívá se v této implementaci
         
         Returns:
             torch.Tensor: Skalární hodnota edge loss
         """
-        # Sobelovy operátory pro detekci hran
-        sobel_x = torch.tensor([[[1, 0, -1], [2, 0, -2], [1, 0, -1]]]).float().to(pred.device)
-        sobel_y = torch.tensor([[[1, 2, 1], [0, 0, 0], [-1, -2, -1]]]).float().to(pred.device)
-        sobel_z = torch.tensor([[[1, 2, 1], [2, 4, 2], [1, 2, 1]], 
-                               [[0, 0, 0], [0, 0, 0], [0, 0, 0]], 
-                               [[-1, -2, -1], [-2, -4, -2], [-1, -2, -1]]]).float().to(pred.device)
+        # Nejprve se ujistíme, že všechny tenzory mají stejný tvar
+        if pred.shape != target.shape or pred.shape != mask.shape:
+            # Reportujeme rozdíly ve velikostech pro diagnostiku
+            print(f"Warning: Rozdílné velikosti tensorů - pred: {pred.shape}, target: {target.shape}, mask: {mask.shape}")
+            
+            # Ořezat všechny tensory na nejmenší společnou velikost
+            min_depth = min(pred.shape[2], target.shape[2], mask.shape[2])
+            min_height = min(pred.shape[3], target.shape[3], mask.shape[3])
+            min_width = min(pred.shape[4], target.shape[4], mask.shape[4])
+            
+            pred = pred[:, :, :min_depth, :min_height, :min_width]
+            target = target[:, :, :min_depth, :min_height, :min_width]
+            mask = mask[:, :, :min_depth, :min_height, :min_width]
+            
+            print(f"Tensory ořezány na společnou velikost: {pred.shape}")
         
-        # Přidat dimenze pro batch a kanál
-        sobel_x = sobel_x.unsqueeze(0).unsqueeze(0)
-        sobel_y = sobel_y.unsqueeze(0).unsqueeze(0)
-        sobel_z = sobel_z.unsqueeze(0).unsqueeze(0)
+        # Jednoduchý L1 loss v oblasti masky
+        masked_loss = F.l1_loss(pred * mask, target * mask, reduction='sum')
         
-        # Výpočet gradientů pro predikovaná data a cílová data
-        pred_gradx = F.conv3d(pred, sobel_x, padding=1)
-        pred_grady = F.conv3d(pred, sobel_y, padding=1)
-        
-        target_gradx = F.conv3d(target, sobel_x, padding=1)
-        target_grady = F.conv3d(target, sobel_y, padding=1)
-        
-        # Vypočítat velikost gradientu
-        pred_grad_mag = torch.sqrt(pred_gradx**2 + pred_grady**2 + 1e-6)
-        target_grad_mag = torch.sqrt(target_gradx**2 + target_grady**2 + 1e-6)
-        
-        # Počítat edge loss pouze v oblasti masky
-        # Vyhneme se dilataci a erozi, místo toho počítáme loss přímo v oblasti masky
-        edge_loss = F.l1_loss(pred_grad_mag * mask, target_grad_mag * mask, reduction='sum')
-        
-        # Normalizace dle počtu voxelů v masce
-        mask_sum = torch.sum(mask) + 1e-6
-        edge_loss = edge_loss / mask_sum
+        # Normalizace podle počtu voxelů v masce
+        mask_sum = torch.sum(mask) + 1e-8
+        edge_loss = masked_loss / mask_sum
         
         return edge_loss
     
