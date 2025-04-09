@@ -217,6 +217,35 @@ def create_smooth_transition_mask(binary_mask, sigma=2.0):
     return transition_mask
 
 
+def create_smooth_transition_mask_v2(binary_mask, sigma=2.0, strength=0.8):
+    """
+    Create a smooth transition mask from a binary mask with adjustable strength.
+    Higher strength means stronger effect of reference values.
+    
+    Args:
+        binary_mask: Binary mask defining the area to replace
+        sigma: Sigma for Gaussian smoothing of edges
+        strength: Value between 0 and 1 defining how much of reference value to use.
+                 Higher values mean more of reference value is used in the center of the lesion.
+    
+    Returns:
+        Transition mask array with values ranging from 0 to `strength`
+    """
+    # Create distance map (positive inside the mask, negative outside)
+    dist_map = ndimage.distance_transform_edt(binary_mask) - ndimage.distance_transform_edt(~binary_mask)
+    
+    # Apply Gaussian smoothing to the distance map
+    smooth_dist = gaussian_filter(dist_map, sigma=sigma)
+    
+    # Convert to transition mask in range [0, 1]
+    transition_mask = 1.0 / (1.0 + np.exp(-smooth_dist))
+    
+    # Scale the transition mask to have maximum value of strength
+    transition_mask = transition_mask * strength
+    
+    return transition_mask
+
+
 def create_pseudo_healthy_brain(adc_data, label_data):
     """
     Create a pseudo-healthy brain from ADC and label data by replacing lesions
@@ -247,8 +276,8 @@ def create_pseudo_healthy_brain(adc_data, label_data):
         if lesion_mask[sym_x, sym_y, sym_z]:
             has_symmetric_lesion[x, y, z] = True
     
-    # Create smooth transition mask
-    transition_mask = create_smooth_transition_mask(lesion_mask, sigma=3.0)
+    # Create smooth transition mask - použijeme vyšší hodnotu strength (0.9) pro větší vliv referenčních hodnot
+    transition_mask = create_smooth_transition_mask_v2(lesion_mask, sigma=3.0, strength=0.9)
     
     # Get connected components in the lesion
     labeled_lesions, num_lesions = ndimage.label(lesion_mask)
@@ -297,7 +326,7 @@ def create_pseudo_healthy_brain(adc_data, label_data):
                     noise_scale = 0.1 * avg_value
                     noisy_value = avg_value + (noise[x, y, z] - 0.5) * noise_scale
                     
-                    # Blend between original and new value based on the transition mask
+                    # ZMĚNA: Umožníme větší vliv referenční hodnoty (noisy_value) místo původní hodnoty
                     pseudo_healthy[x, y, z] = (1 - weight) * adc_data[x, y, z] + weight * noisy_value
             
         else:
@@ -335,7 +364,7 @@ def create_pseudo_healthy_brain(adc_data, label_data):
                     noise_scale = 0.1 * avg_ring_value
                     noisy_value = avg_ring_value + (noise[x, y, z] - 0.5) * noise_scale
                     
-                    # Blend between original and new value based on the transition mask
+                    # ZMĚNA: Umožníme větší vliv referenční hodnoty (noisy_value) místo původní hodnoty
                     pseudo_healthy[x, y, z] = (1 - weight) * adc_data[x, y, z] + weight * noisy_value
     
     return pseudo_healthy, reference_values
@@ -501,8 +530,8 @@ def create_pseudo_healthy_brain_with_atlas(adc_data, label_data, atlas_path, std
                 atlas_std_global = np.std(atlas_values_in_lesion)
                 print(f"Atlas normative values in lesion area: mean={atlas_mean:.2f}, std={atlas_std_global:.2f}")
             
-            # Vytvoření přechodové masky pro původní lézi
-            transition_mask = create_smooth_transition_mask(lesion_mask, sigma=3.0)
+            # Vytvoření přechodové masky pro původní lézi - použijeme vyšší hodnotu strength (0.9) pro větší vliv atlasu
+            transition_mask = create_smooth_transition_mask_v2(lesion_mask, sigma=3.0, strength=0.9)
             
             # Komponenty léze v původním prostoru pacienta
             labeled_lesions, num_lesions = ndimage.label(lesion_mask)
@@ -604,7 +633,7 @@ def create_pseudo_healthy_brain_with_atlas(adc_data, label_data, atlas_path, std
                     # Škálování zpět do původního rozsahu hodnot pacientského obrazu
                     scaled_value = noisy_value * (adc_max - adc_min) + adc_min
                     
-                    # Plynulý přechod mezi původní a novou hodnotou
+                    # ZMĚNA: Umožníme větší vliv referenční hodnoty (scaled_value) místo původní hodnoty
                     pseudo_healthy[x, y, z] = (1 - weight) * adc_data[x, y, z] + weight * scaled_value
         
         else:
