@@ -493,13 +493,8 @@ class LesionInpaintingGAN(nn.Module):
         Returns:
             torch.Tensor: Skalární hodnota edge loss
         """
-        # Vytvořit strukturální element pro dilataci
-        struct = generate_binary_structure(3, 1)
+        batch_size = pred.size(0)
         
-        # Přesunout data na CPU pro operace scipy
-        mask_np = mask.detach().cpu().numpy()
-        
-        # Nejprve vypočítat gradienty
         # Sobelovy operátory pro detekci hran
         sobel_x = torch.tensor([[[1, 0, -1], [2, 0, -2], [1, 0, -1]]]).float().to(pred.device)
         sobel_y = torch.tensor([[[1, 2, 1], [0, 0, 0], [-1, -2, -1]]]).float().to(pred.device)
@@ -521,46 +516,44 @@ class LesionInpaintingGAN(nn.Module):
         grad_target_y = F.conv3d(target, sobel_y, padding=1)
         grad_target_z = F.conv3d(target, sobel_z, padding=1)
         
-        # Zapamatovat si velikost gradientů pro pozdější kontrolu
-        grad_shape = grad_pred_x.shape
+        # Zapamatovat si velikost gradientů pro pozdější použití
+        grad_shape = grad_pred_x.shape[2:]  # [D, H, W]
         
-        # Dilatovat masky pro získání hranic, s kontrolou velikostí
-        dilated_masks = []
-        for i in range(mask_np.shape[0]):
-            dilated = binary_dilation(mask_np[i, 0], structure=struct, iterations=kernel_size).astype(np.float32)
-            eroded = binary_erosion(mask_np[i, 0], structure=struct, iterations=kernel_size).astype(np.float32)
+        # Použít erozi a dilataci pro získání hranic léze
+        # Nejprve převést masku léze na CPU pro zpracování
+        mask_np = mask.detach().cpu().numpy()
+        boundary_masks = []
+        
+        for b in range(batch_size):
+            # Provést erozi a dilataci pro získání hranic
+            mask_slice = mask_np[b, 0]  # [D, H, W]
+            struct = generate_binary_structure(3, 1)
+            dilated = binary_dilation(mask_slice, structure=struct, iterations=kernel_size).astype(np.float32)
+            eroded = binary_erosion(mask_slice, structure=struct, iterations=kernel_size).astype(np.float32)
             boundary = (dilated - eroded) > 0
             
-            # Kontrola, zda velikost boundary odpovídá velikosti gradientů
-            if boundary.shape != grad_shape[2:]:
-                print(f"Varování: Velikost hranic {boundary.shape} se neshoduje s velikostí gradientů {grad_shape[2:]}. Provádím změnu velikosti.")
-                # Oříznout nebo paddovat boundary tak, aby odpovídala velikosti gradientů
-                resized_boundary = np.zeros(grad_shape[2:], dtype=np.float32)
-                # Zkopírovat pouze překrývající se část
-                d_min = min(boundary.shape[0], grad_shape[2])
-                h_min = min(boundary.shape[1], grad_shape[3])
-                w_min = min(boundary.shape[2], grad_shape[4])
-                resized_boundary[:d_min, :h_min, :w_min] = boundary[:d_min, :h_min, :w_min]
-                boundary = resized_boundary
-            
-            boundary = torch.from_numpy(boundary).float().to(pred.device)
-            dilated_masks.append(boundary.unsqueeze(0))
+            # Převést zpět na PyTorch tensor
+            boundary_tensor = torch.from_numpy(boundary).float().to(pred.device)
+            boundary_masks.append(boundary_tensor.unsqueeze(0))  # [1, D, H, W]
         
-        # Složit hranice z jednotlivých batch vzorků
-        boundary_mask = torch.cat(dilated_masks, dim=0).unsqueeze(1)
+        # Složit všechny boundary masky
+        boundary_mask = torch.cat(boundary_masks, dim=0).unsqueeze(1)  # [B, 1, D, H, W]
         
-        # Ověřit, že boundary_mask má správnou velikost
-        if boundary_mask.shape[2:] != grad_pred_x.shape[2:]:
-            print(f"Chyba: boundary_mask {boundary_mask.shape} a grad_pred_x {grad_pred_x.shape} mají stále rozdílné velikosti")
-            # Pokud je nutné, přizpůsobit velikost boundary_mask gradientům
-            boundary_mask = F.interpolate(boundary_mask, size=grad_pred_x.shape[2:], mode='nearest')
+        # Interpolovat masku hranice, aby odpovídala velikosti gradientů
+        if boundary_mask.shape[2:] != grad_shape:
+            print(f"Přizpůsobuji velikost hraniční masky z {boundary_mask.shape[2:]} na velikost gradientů {grad_shape}")
+            boundary_mask = F.interpolate(boundary_mask, size=grad_shape, mode='nearest')
         
-        # Výpočet rozdílu gradientů na hranici
+        # Ověřit, že velikosti se shodují před provedením operací
+        assert boundary_mask.shape[2:] == grad_pred_x.shape[2:], \
+            f"Velikost hraniční masky {boundary_mask.shape[2:]} stále neodpovídá velikosti gradientů {grad_pred_x.shape[2:]}"
+        
+        # Vypočítat rozdíl gradientů na hranici
         grad_diff_x = torch.abs(grad_pred_x - grad_target_x) * boundary_mask
         grad_diff_y = torch.abs(grad_pred_y - grad_target_y) * boundary_mask
         grad_diff_z = torch.abs(grad_pred_z - grad_target_z) * boundary_mask
         
-        # Suma rozdílů gradientů na hranici
+        # Suma rozdílů gradientů
         grad_diff = grad_diff_x + grad_diff_y + grad_diff_z
         
         # Průměrný rozdíl gradientů na voxel hranice
