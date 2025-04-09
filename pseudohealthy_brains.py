@@ -277,7 +277,7 @@ def create_pseudo_healthy_brain(adc_data, label_data):
             has_symmetric_lesion[x, y, z] = True
     
     # Create smooth transition mask pro okraje lézí - zvýšíme sigma pro plynulejší přechod
-    edge_transition_mask = create_smooth_transition_mask(lesion_mask, sigma=1.75)
+    edge_transition_mask = create_smooth_transition_mask(lesion_mask, sigma=2.5)
     
     # Get connected components in the lesion
     labeled_lesions, num_lesions = ndimage.label(lesion_mask)
@@ -290,10 +290,10 @@ def create_pseudo_healthy_brain(adc_data, label_data):
     TARGET_RATIO = 1.0  # Maximální přiblížení k cílovým hodnotám
     
     # Hranice mezi vnitřkem léze a okrajem
-    EDGE_THRESHOLD = 0.11  # Sníženo z 0.12 na 0.10 pro výraznější přechod na okraji
+    EDGE_THRESHOLD = 0.08  # Sníženo pro rozšíření přechodové oblasti
     
     # Koeficient pro okrajový přechod
-    EDGE_BLEND_FACTOR = 0.82  # Zvýšeno z 0.8 na 0.85 pro silnější přechod na okrajích
+    EDGE_BLEND_FACTOR = 0.7  # Sníženo pro jemnější přechod na okrajích
     
     # Dodatečný faktor pro zvýšení offsetu
     BOOST_FACTOR = 1.2  # Zvýší celý offset o 20% pro větší efekt
@@ -367,13 +367,12 @@ def create_pseudo_healthy_brain(adc_data, label_data):
                         # Převedeme váhu z rozsahu [EDGE_THRESHOLD, 1] na [0, 1]
                         normalized_weight = (weight - EDGE_THRESHOLD) / (1 - EDGE_THRESHOLD)
                         
-                        # Aplikujeme přenos s kvadratickou funkcí pro plynulejší přechod
-                        # Ale navíc přidáme závislost na vzdálenosti od okraje
-                        blend_ratio = TARGET_RATIO * (1 - 0.5 * (1 - normalized_weight) * (1 - normalized_weight))
+                        # Aplikujeme přenos s kubickou funkcí pro plynulejší přechod
+                        blend_ratio = TARGET_RATIO * (1 - 0.3 * (1 - normalized_weight) ** 3)
                         
                         # Využití vzdálenosti od okraje pro plynulejší přechod uvnitř léze
-                        # Upravená funkce pro ještě silnější efekt v centru
-                        dist_factor = 0.8 + 0.2 * normalized_dist[x, y, z] ** 0.5  # Zvýšení základu na 0.8 pro větší efekt
+                        # Upravená funkce pro plynulejší změnu s kubickou funkcí
+                        dist_factor = 0.7 + 0.3 * normalized_dist[x, y, z] ** 0.33
                         
                         # Aplikujeme offset s ohledem na lokální odchylku
                         pseudo_healthy[x, y, z] = lesion_mean + local_deviation + blend_ratio * dist_factor * offset + noise_value
@@ -382,8 +381,8 @@ def create_pseudo_healthy_brain(adc_data, label_data):
                         # Převedeme váhu z rozsahu [0, EDGE_THRESHOLD] na [0, 1]
                         normalized_weight = weight / EDGE_THRESHOLD
                         
-                        # Kvadratická funkce pro plynulejší nárůst
-                        edge_ratio = TARGET_RATIO * EDGE_BLEND_FACTOR * normalized_weight * normalized_weight
+                        # Kubická funkce pro plynulejší nárůst
+                        edge_ratio = TARGET_RATIO * EDGE_BLEND_FACTOR * normalized_weight ** 3
                         
                         # Aplikujeme offset s ohledem na lokální odchylku - zachová texturu
                         pseudo_healthy[x, y, z] = adc_data[x, y, z] + edge_ratio * offset + noise_value
@@ -455,12 +454,12 @@ def create_pseudo_healthy_brain(adc_data, label_data):
                         # Převedeme váhu z rozsahu [EDGE_THRESHOLD, 1] na [0, 1]
                         normalized_weight = (weight - EDGE_THRESHOLD) / (1 - EDGE_THRESHOLD)
                         
-                        # Aplikujeme přenos s kvadratickou funkcí pro plynulejší přechod
-                        blend_ratio = TARGET_RATIO * (1 - 0.5 * (1 - normalized_weight) * (1 - normalized_weight))
+                        # Aplikujeme přenos s kubickou funkcí pro plynulejší přechod
+                        blend_ratio = TARGET_RATIO * (1 - 0.3 * (1 - normalized_weight) ** 3)
                         
                         # Využití vzdálenosti od okraje pro plynulejší přechod uvnitř léze
-                        # Upravená funkce pro ještě silnější efekt v centru
-                        dist_factor = 0.8 + 0.2 * normalized_dist[x, y, z] ** 0.5  # Zvýšení základu na 0.8 pro větší efekt
+                        # Upravená funkce pro plynulejší změnu s kubickou funkcí
+                        dist_factor = 0.7 + 0.3 * normalized_dist[x, y, z] ** 0.33
                         
                         # Aplikujeme offset s ohledem na lokální odchylku
                         pseudo_healthy[x, y, z] = lesion_mean + local_deviation + blend_ratio * dist_factor * offset + noise_value
@@ -469,8 +468,8 @@ def create_pseudo_healthy_brain(adc_data, label_data):
                         # Převedeme váhu z rozsahu [0, EDGE_THRESHOLD] na [0, 1]
                         normalized_weight = weight / EDGE_THRESHOLD
                         
-                        # Kvadratická funkce pro plynulejší nárůst
-                        edge_ratio = TARGET_RATIO * EDGE_BLEND_FACTOR * normalized_weight * normalized_weight
+                        # Kubická funkce pro plynulejší nárůst
+                        edge_ratio = TARGET_RATIO * EDGE_BLEND_FACTOR * normalized_weight ** 3
                         
                         # Aplikujeme offset s ohledem na lokální odchylku - zachová texturu
                         pseudo_healthy[x, y, z] = adc_data[x, y, z] + edge_ratio * offset + noise_value
@@ -658,7 +657,7 @@ def create_pseudo_healthy_brain_with_atlas(adc_data, label_data, atlas_path, std
                 print(f"Atlas normative values in lesion area: mean={atlas_mean:.2f}, std={atlas_std_global:.2f}")
             
             # Vytvoření přechodové masky pro původní lézi - plynulejší přechody s větším sigma
-            edge_transition_mask = create_smooth_transition_mask(lesion_mask, sigma=1.75)
+            edge_transition_mask = create_smooth_transition_mask(lesion_mask, sigma=2.5)
             
             # Komponenty léze v původním prostoru pacienta
             labeled_lesions, num_lesions = ndimage.label(lesion_mask)
@@ -670,10 +669,10 @@ def create_pseudo_healthy_brain_with_atlas(adc_data, label_data, atlas_path, std
             TARGET_RATIO = 1.0  # Maximální přiblížení k cílovým hodnotám
             
             # Hranice mezi vnitřkem léze a okrajem
-            EDGE_THRESHOLD = 0.10  # Sníženo z 0.12 na 0.10 pro výraznější přechod na okraji
+            EDGE_THRESHOLD = 0.08  # Sníženo pro rozšíření přechodové oblasti
             
             # Koeficient pro okrajový přechod
-            EDGE_BLEND_FACTOR = 0.85  # Zvýšeno z 0.8 na 0.85 pro silnější přechod na okrajích
+            EDGE_BLEND_FACTOR = 0.7  # Sníženo pro jemnější přechod na okrajích
             
             # Dodatečný faktor pro zvýšení offsetu
             BOOST_FACTOR = 1.2  # Zvýší celý offset o 20% pro větší efekt
@@ -752,12 +751,12 @@ def create_pseudo_healthy_brain_with_atlas(adc_data, label_data, atlas_path, std
                         
                         if weight > EDGE_THRESHOLD:
                             normalized_weight = (weight - EDGE_THRESHOLD) / (1 - EDGE_THRESHOLD)
-                            blend_ratio = TARGET_RATIO * (1 - 0.5 * (1 - normalized_weight) * (1 - normalized_weight))
-                            dist_factor = 0.8 + 0.2 * normalized_dist[x, y, z] ** 0.5
+                            blend_ratio = TARGET_RATIO * (1 - 0.3 * (1 - normalized_weight) ** 3)
+                            dist_factor = 0.7 + 0.3 * normalized_dist[x, y, z] ** 0.33
                             pseudo_healthy[x, y, z] = lesion_mean + local_deviation + blend_ratio * dist_factor * offset + noise_value
                         else:
                             normalized_weight = weight / EDGE_THRESHOLD
-                            edge_ratio = TARGET_RATIO * EDGE_BLEND_FACTOR * normalized_weight * normalized_weight
+                            edge_ratio = TARGET_RATIO * EDGE_BLEND_FACTOR * normalized_weight ** 3
                             pseudo_healthy[x, y, z] = adc_data[x, y, z] + edge_ratio * offset + noise_value
                 
                     continue  # Přejdeme na další komponentu léze
@@ -827,12 +826,12 @@ def create_pseudo_healthy_brain_with_atlas(adc_data, label_data, atlas_path, std
                                 # Převedeme váhu z rozsahu [EDGE_THRESHOLD, 1] na [0, 1]
                                 normalized_weight = (weight - EDGE_THRESHOLD) / (1 - EDGE_THRESHOLD)
                                 
-                                # Aplikujeme přenos s kvadratickou funkcí pro plynulejší přechod
-                                blend_ratio = TARGET_RATIO * (1 - 0.5 * (1 - normalized_weight) * (1 - normalized_weight))
+                                # Aplikujeme přenos s kubickou funkcí pro plynulejší přechod
+                                blend_ratio = TARGET_RATIO * (1 - 0.3 * (1 - normalized_weight) ** 3)
                                 
                                 # Využití vzdálenosti od okraje pro plynulejší přechod uvnitř léze
-                                # Upravená funkce pro ještě silnější efekt v centru
-                                dist_factor = 0.8 + 0.2 * normalized_dist[x, y, z] ** 0.5  # Zvýšení základu na 0.8 pro větší efekt
+                                # Upravená funkce pro plynulejší změnu s kubickou funkcí
+                                dist_factor = 0.7 + 0.3 * normalized_dist[x, y, z] ** 0.33
                                 
                                 # Aplikujeme offset s ohledem na lokální odchylku
                                 pseudo_healthy[x, y, z] = lesion_mean + local_deviation + blend_ratio * dist_factor * offset + noise_value
@@ -841,8 +840,8 @@ def create_pseudo_healthy_brain_with_atlas(adc_data, label_data, atlas_path, std
                                 # Převedeme váhu z rozsahu [0, EDGE_THRESHOLD] na [0, 1]
                                 normalized_weight = weight / EDGE_THRESHOLD
                                 
-                                # Kvadratická funkce pro plynulejší nárůst
-                                edge_ratio = TARGET_RATIO * EDGE_BLEND_FACTOR * normalized_weight * normalized_weight
+                                # Kubická funkce pro plynulejší nárůst
+                                edge_ratio = TARGET_RATIO * EDGE_BLEND_FACTOR * normalized_weight ** 3
                                 
                                 # Aplikujeme offset s ohledem na lokální odchylku - zachová texturu
                                 pseudo_healthy[x, y, z] = adc_data[x, y, z] + edge_ratio * offset + noise_value
@@ -902,12 +901,12 @@ def create_pseudo_healthy_brain_with_atlas(adc_data, label_data, atlas_path, std
                         # Převedeme váhu z rozsahu [EDGE_THRESHOLD, 1] na [0, 1]
                         normalized_weight = (weight - EDGE_THRESHOLD) / (1 - EDGE_THRESHOLD)
                         
-                        # Aplikujeme přenos s kvadratickou funkcí pro plynulejší přechod
-                        blend_ratio = TARGET_RATIO * (1 - 0.5 * (1 - normalized_weight) * (1 - normalized_weight))
+                        # Aplikujeme přenos s kubickou funkcí pro plynulejší přechod
+                        blend_ratio = TARGET_RATIO * (1 - 0.3 * (1 - normalized_weight) ** 3)
                         
                         # Využití vzdálenosti od okraje pro plynulejší přechod uvnitř léze
-                        # Upravená funkce pro ještě silnější efekt v centru
-                        dist_factor = 0.8 + 0.2 * normalized_dist[x, y, z] ** 0.5  # Zvýšení základu na 0.8 pro větší efekt
+                        # Upravená funkce pro plynulejší změnu s kubickou funkcí
+                        dist_factor = 0.7 + 0.3 * normalized_dist[x, y, z] ** 0.33
                         
                         # Aplikujeme offset s ohledem na lokální odchylku
                         pseudo_healthy[x, y, z] = lesion_mean + local_deviation + blend_ratio * dist_factor * offset + noise_value
@@ -916,8 +915,8 @@ def create_pseudo_healthy_brain_with_atlas(adc_data, label_data, atlas_path, std
                         # Převedeme váhu z rozsahu [0, EDGE_THRESHOLD] na [0, 1]
                         normalized_weight = weight / EDGE_THRESHOLD
                         
-                        # Kvadratická funkce pro plynulejší nárůst
-                        edge_ratio = TARGET_RATIO * EDGE_BLEND_FACTOR * normalized_weight * normalized_weight
+                        # Kubická funkce pro plynulejší nárůst
+                        edge_ratio = TARGET_RATIO * EDGE_BLEND_FACTOR * normalized_weight ** 3
                         
                         # Aplikujeme offset s ohledem na lokální odchylku - zachová texturu
                         pseudo_healthy[x, y, z] = adc_data[x, y, z] + edge_ratio * offset + noise_value
