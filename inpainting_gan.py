@@ -498,18 +498,8 @@ class LesionInpaintingGAN(nn.Module):
         
         # Přesunout data na CPU pro operace scipy
         mask_np = mask.detach().cpu().numpy()
-        dilated_masks = []
         
-        # Dilatovat masky pro získání hranic
-        for i in range(mask_np.shape[0]):
-            dilated = binary_dilation(mask_np[i, 0], structure=struct, iterations=kernel_size).astype(np.float32)
-            eroded = binary_erosion(mask_np[i, 0], structure=struct, iterations=kernel_size).astype(np.float32)
-            boundary = torch.from_numpy((dilated - eroded) > 0).float().to(mask.device)
-            dilated_masks.append(boundary.unsqueeze(0))
-        
-        # Složit hranice z jednotlivých batch vzorků
-        boundary_mask = torch.cat(dilated_masks, dim=0).unsqueeze(1)
-        
+        # Nejprve vypočítat gradienty
         # Sobelovy operátory pro detekci hran
         sobel_x = torch.tensor([[[1, 0, -1], [2, 0, -2], [1, 0, -1]]]).float().to(pred.device)
         sobel_y = torch.tensor([[[1, 2, 1], [0, 0, 0], [-1, -2, -1]]]).float().to(pred.device)
@@ -530,6 +520,40 @@ class LesionInpaintingGAN(nn.Module):
         grad_target_x = F.conv3d(target, sobel_x, padding=1)
         grad_target_y = F.conv3d(target, sobel_y, padding=1)
         grad_target_z = F.conv3d(target, sobel_z, padding=1)
+        
+        # Zapamatovat si velikost gradientů pro pozdější kontrolu
+        grad_shape = grad_pred_x.shape
+        
+        # Dilatovat masky pro získání hranic, s kontrolou velikostí
+        dilated_masks = []
+        for i in range(mask_np.shape[0]):
+            dilated = binary_dilation(mask_np[i, 0], structure=struct, iterations=kernel_size).astype(np.float32)
+            eroded = binary_erosion(mask_np[i, 0], structure=struct, iterations=kernel_size).astype(np.float32)
+            boundary = (dilated - eroded) > 0
+            
+            # Kontrola, zda velikost boundary odpovídá velikosti gradientů
+            if boundary.shape != grad_shape[2:]:
+                print(f"Varování: Velikost hranic {boundary.shape} se neshoduje s velikostí gradientů {grad_shape[2:]}. Provádím změnu velikosti.")
+                # Oříznout nebo paddovat boundary tak, aby odpovídala velikosti gradientů
+                resized_boundary = np.zeros(grad_shape[2:], dtype=np.float32)
+                # Zkopírovat pouze překrývající se část
+                d_min = min(boundary.shape[0], grad_shape[2])
+                h_min = min(boundary.shape[1], grad_shape[3])
+                w_min = min(boundary.shape[2], grad_shape[4])
+                resized_boundary[:d_min, :h_min, :w_min] = boundary[:d_min, :h_min, :w_min]
+                boundary = resized_boundary
+            
+            boundary = torch.from_numpy(boundary).float().to(pred.device)
+            dilated_masks.append(boundary.unsqueeze(0))
+        
+        # Složit hranice z jednotlivých batch vzorků
+        boundary_mask = torch.cat(dilated_masks, dim=0).unsqueeze(1)
+        
+        # Ověřit, že boundary_mask má správnou velikost
+        if boundary_mask.shape[2:] != grad_pred_x.shape[2:]:
+            print(f"Chyba: boundary_mask {boundary_mask.shape} a grad_pred_x {grad_pred_x.shape} mají stále rozdílné velikosti")
+            # Pokud je nutné, přizpůsobit velikost boundary_mask gradientům
+            boundary_mask = F.interpolate(boundary_mask, size=grad_pred_x.shape[2:], mode='nearest')
         
         # Výpočet rozdílu gradientů na hranici
         grad_diff_x = torch.abs(grad_pred_x - grad_target_x) * boundary_mask
@@ -891,7 +915,7 @@ class LesionInpaintingTrainer:
             self.optimizer_d.zero_grad()
             
             # Generovat falešnou ADC mapu
-            with torch.cuda.amp.autocast() if self.use_amp else nullcontext():
+            with torch.amp.autocast('cuda') if self.use_amp else nullcontext():
                 fake_adc = self.model.generator(pseudo_healthy, lesion_mask)
                 
                 # Predikce diskriminátoru pro reálná a falešná data
@@ -916,7 +940,7 @@ class LesionInpaintingTrainer:
             self.optimizer_g.zero_grad()
             
             # Generovat falešnou ADC mapu znovu (pro generátor)
-            with torch.cuda.amp.autocast() if self.use_amp else nullcontext():
+            with torch.amp.autocast('cuda') if self.use_amp else nullcontext():
                 fake_adc = self.model.generator(pseudo_healthy, lesion_mask)
                 
                 # Predikce diskriminátoru pro falešná data
@@ -1014,24 +1038,25 @@ class LesionInpaintingTrainer:
                 real_adc = batch['adc'].to(self.device)
                 
                 # Forward pass
-                fake_adc = self.model.generator(pseudo_healthy, lesion_mask)
-                
-                # Získat predikci diskriminátoru pro generovaná data
-                disc_fake_pred = self.model.discriminator(pseudo_healthy, lesion_mask, fake_adc)
-                
-                # Výpočet loss pro generátor se správnými argumenty
-                g_loss, g_adv_loss, g_l1_loss, g_identity_loss, g_ssim_loss, g_edge_loss = \
-                    self.model.generator_loss(
-                        pseudo_healthy, lesion_mask, real_adc, fake_adc, disc_fake_pred
+                with torch.amp.autocast('cuda') if self.use_amp else nullcontext():
+                    fake_adc = self.model.generator(pseudo_healthy, lesion_mask)
+                    
+                    # Získat predikci diskriminátoru pro generovaná data
+                    disc_fake_pred = self.model.discriminator(pseudo_healthy, lesion_mask, fake_adc)
+                    
+                    # Výpočet loss pro generátor se správnými argumenty
+                    g_loss, g_adv_loss, g_l1_loss, g_identity_loss, g_ssim_loss, g_edge_loss = \
+                        self.model.generator_loss(
+                            pseudo_healthy, lesion_mask, real_adc, fake_adc, disc_fake_pred
+                        )
+                    
+                    # Výpočet loss pro diskriminátor
+                    # Získat predikci pro reálná data
+                    disc_real_pred = self.model.discriminator(pseudo_healthy, lesion_mask, real_adc)
+                    d_loss = self.model.discriminator_loss(
+                        pseudo_healthy, lesion_mask, real_adc, fake_adc,
+                        disc_real_pred, disc_fake_pred
                     )
-                
-                # Výpočet loss pro diskriminátor
-                # Získat predikci pro reálná data
-                disc_real_pred = self.model.discriminator(pseudo_healthy, lesion_mask, real_adc)
-                d_loss = self.model.discriminator_loss(
-                    pseudo_healthy, lesion_mask, real_adc, fake_adc,
-                    disc_real_pred, disc_fake_pred
-                )
                 
                 # Aktualizace metrik
                 val_metrics['g_loss'] += g_loss.item()
