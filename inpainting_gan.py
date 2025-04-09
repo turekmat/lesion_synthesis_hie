@@ -27,6 +27,13 @@ from pathlib import Path
 import argparse
 from torch.amp import GradScaler, autocast
 from scipy.ndimage import binary_erosion, binary_dilation, generate_binary_structure
+from matplotlib.backends.backend_pdf import PdfPages
+import random
+import matplotlib.gridspec as gridspec
+import pandas as pd
+import json
+from typing import Dict, List, Optional, Union, Tuple
+from contextlib import nullcontext  # Add nullcontext import for the training loop
 
 # Nastavení zařízení pro trénink
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -71,30 +78,72 @@ class LesionInpaintingDataset(Dataset):
         self.target_size = target_size
         
         # Najít všechny pseudo-zdravé soubory jako základ
-        self.pseudo_healthy_files = sorted(list(self.pseudo_healthy_dir.glob("*PSEUDO_HEALTHY.mha")))
+        self.pseudo_healthy_files = sorted(list(self.pseudo_healthy_dir.glob("*.mha")))
         print(f"Nalezeno {len(self.pseudo_healthy_files)} pseudo-zdravých mozků")
+        
+        # Vypsat několik příkladů nalezených souborů pro diagnostiku
+        if len(self.pseudo_healthy_files) > 0:
+            print("Příklady pseudo-zdravých souborů:")
+            for i, f in enumerate(self.pseudo_healthy_files[:3]):
+                print(f"  {i+1}. {f.name}")
+            
+            # Získat všechny ADC a lesion mask soubory
+            all_adc_files = list(self.adc_dir.glob("*.mha"))
+            all_lesion_files = list(self.lesion_mask_dir.glob("*.mha"))
+            
+            print(f"Nalezeno celkem {len(all_adc_files)} ADC souborů a {len(all_lesion_files)} masek lézí")
         
         # Sestavit seznam všech trojic souborů
         self.file_triplets = []
         
         for ph_file in self.pseudo_healthy_files:
             # Extrahovat ID pacienta z názvu pseudo-zdravého souboru
-            patient_id = ph_file.name.split('-PSEUDO_HEALTHY')[0]
+            # Tento kód je flexibilnější - hledáme ID pacienta před "-PSEUDO_HEALTHY"
+            ph_filename = ph_file.name
+            if "-PSEUDO_HEALTHY" in ph_filename:
+                patient_id = ph_filename.split('-PSEUDO_HEALTHY')[0]
+            else:
+                # Pokud nenajdeme přesný formát, použijeme název souboru bez přípony jako ID
+                patient_id = ph_file.stem.split('_')[0]  # Bereme první část před podtržítkem jako ID
             
-            # Najít odpovídající ADC soubor s lézemi
-            adc_file = list(self.adc_dir.glob(f"{patient_id}*-ADC_ss.mha"))
+            # Vypsat ID pacienta pro kontrolu
+            print(f"Hledám soubory pro pacienta ID: {patient_id}")
             
-            # Najít odpovídající masku léze
-            lesion_file = list(self.lesion_mask_dir.glob(f"{patient_id}*_lesion.mha"))
+            # Hledáme ADC soubory s různými možnými přípony
+            adc_file = []
+            for pattern in [f"{patient_id}*-ADC*.mha", f"{patient_id}*adc*.mha", f"{patient_id}*.mha"]:
+                adc_file = list(self.adc_dir.glob(pattern))
+                if adc_file:
+                    print(f"Nalezen ADC soubor s pattern {pattern}: {adc_file[0].name}")
+                    break
+            
+            # Hledáme masky lézí s různými možnými přípony
+            lesion_file = []
+            for pattern in [f"{patient_id}*_lesion*.mha", f"{patient_id}*mask*.mha", f"{patient_id}*lesion*.mha", f"{patient_id}*.mha"]:
+                lesion_file = list(self.lesion_mask_dir.glob(pattern))
+                if lesion_file:
+                    print(f"Nalezena maska léze s pattern {pattern}: {lesion_file[0].name}")
+                    break
             
             if adc_file and lesion_file:
                 self.file_triplets.append({
                     'pseudo_healthy': ph_file,
                     'adc': adc_file[0],
-                    'lesion_mask': lesion_file[0]
+                    'lesion_mask': lesion_file[0],
+                    'patient_id': patient_id
                 })
         
         print(f"Nalezeno {len(self.file_triplets)} kompletních tripletů souborů")
+        
+        # Pokud jsou nalezeny triplety, vypsat je pro kontrolu
+        if self.file_triplets:
+            print("Příklady nalezených tripletů:")
+            for i, triplet in enumerate(self.file_triplets[:min(3, len(self.file_triplets))]):
+                print(f"Triplet {i+1}:")
+                print(f"  Pseudo-healthy: {triplet['pseudo_healthy'].name}")
+                print(f"  ADC: {triplet['adc'].name}")
+                print(f"  Lesion mask: {triplet['lesion_mask'].name}")
+                print(f"  Patient ID: {triplet['patient_id']}")
     
     def __len__(self):
         return len(self.file_triplets)
@@ -219,7 +268,7 @@ class LesionInpaintingDataset(Dataset):
             'pseudo_healthy': pseudo_healthy_data,
             'adc': adc_data,
             'lesion_mask': lesion_mask_data,
-            'patient_id': os.path.basename(triplet['pseudo_healthy']).split('-PSEUDO_HEALTHY')[0],
+            'patient_id': triplet['patient_id'],  # Použít přímo patient_id z tripletu
             'volume_shape': pseudo_healthy_data.shape  # Uložit původní rozměr pro pozdější použití
         }
         
@@ -614,50 +663,50 @@ class LesionInpaintingGAN(nn.Module):
         return self.generator(pseudo_healthy, lesion_mask)
 
 class LesionInpaintingTrainer:
-    """
-    Třída pro trénování LesionInpaintingGAN modelu
-    """
-    def __init__(
-        self,
-        model,
-        optimizer_g,
-        optimizer_d,
-        device='cuda',
-        output_dir='./output',
-        use_amp=True,
-        visualize_interval=5
-    ):
+    """Třída pro trénování GAN modelu pro inpainting lézí"""
+    
+    def __init__(self, model, optimizer_g, optimizer_d, device, output_dir, config=None, use_amp=False, visualize_interval=5):
         """
         Inicializace traineru
         
         Args:
-            model (LesionInpaintingGAN): Model pro trénování
-            optimizer_g (torch.optim.Optimizer): Optimalizátor pro generátor
-            optimizer_d (torch.optim.Optimizer): Optimalizátor pro diskriminátor
-            device (str): Zařízení pro trénování ('cuda' nebo 'cpu')
-            output_dir (str): Adresář pro ukládání výstupů
-            use_amp (bool): Použít Automatic Mixed Precision pro rychlejší trénink
-            visualize_interval (int): Interval epoch pro vizualizaci výsledků
+            model: Instance modelu pro inpainting
+            optimizer_g: Optimizer pro generátor
+            optimizer_d: Optimizer pro diskriminátor
+            device: Zařízení pro výpočty (CPU/GPU)
+            output_dir: Adresář pro ukládání výstupů
+            config: Konfigurace tréninku
+            use_amp: Použít Automatic Mixed Precision
+            visualize_interval: Interval pro vizualizaci výsledků
         """
         self.model = model
         self.optimizer_g = optimizer_g
         self.optimizer_d = optimizer_d
         self.device = device
         self.output_dir = Path(output_dir)
+        self.config = config
         self.use_amp = use_amp
         self.visualize_interval = visualize_interval
         
-        # Vytvořit výstupní adresáře
+        # Vytvoření adresáře pro výstupy, pokud neexistuje
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.checkpoint_dir = self.output_dir / "checkpoints"
-        self.checkpoint_dir.mkdir(exist_ok=True)
-        self.visualization_dir = self.output_dir / "visualizations"
-        self.visualization_dir.mkdir(exist_ok=True)
         
-        # Scaler pro Automatic Mixed Precision
-        self.scaler = GradScaler() if use_amp and device == 'cuda' else None
+        # Vytvořit adresář pro PDF vizualizace
+        self.pdf_visualization_dir = self.output_dir / "pdf_visualizations"
+        self.pdf_visualization_dir.mkdir(exist_ok=True)
         
-        # Log pro sledování průběhu tréninku
+        # Vytvořit adresář pro checkpointy
+        self.checkpoints_dir = self.output_dir / "checkpoints"
+        self.checkpoints_dir.mkdir(exist_ok=True)
+        
+        # Vytvořit adresář pro vzorky
+        self.samples_dir = self.output_dir / "samples"
+        self.samples_dir.mkdir(exist_ok=True)
+        
+        # Inicializace AMP scaler pokud používáme mixed precision
+        self.scaler = GradScaler() if use_amp else None
+        
+        # Inicializace logů
         self.train_log = {
             'epoch': [],
             'g_loss': [],
@@ -683,9 +732,9 @@ class LesionInpaintingTrainer:
     def save_model(self, epoch, is_best=False):
         """Uloží checkpoint modelu"""
         if is_best:
-            checkpoint_path = self.checkpoint_dir / f"best_model.pth"
+            checkpoint_path = self.checkpoints_dir / f"best_model.pth"
         else:
-            checkpoint_path = self.checkpoint_dir / f"model_epoch_{epoch}.pth"
+            checkpoint_path = self.checkpoints_dir / f"model_epoch_{epoch}.pth"
         
         torch.save({
             'epoch': epoch,
@@ -724,8 +773,13 @@ class LesionInpaintingTrainer:
         self.model.eval()
         
         # Vytvořit adresář pro aktuální epochu
-        vis_epoch_dir = self.visualization_dir / f"epoch_{epoch}"
+        vis_epoch_dir = self.samples_dir / f"epoch_{epoch}"
         vis_epoch_dir.mkdir(exist_ok=True)
+        
+        # Vytvořit CSV soubor pro metriky
+        csv_path = vis_epoch_dir / "metrics.csv"
+        with open(csv_path, 'w') as f:
+            f.write("patient_id,slice_idx,ssim,mae\n")
         
         with torch.no_grad():
             for i, batch in enumerate(dataloader):
@@ -741,6 +795,16 @@ class LesionInpaintingTrainer:
                 # Generovat falešnou ADC mapu
                 fake_adc = self.model(pseudo_healthy, lesion_mask)
                 
+                # Výpočet SSIM a MAE na celém objemu
+                # Počítáme SSIM v oblasti léze
+                ssim_value = self.model.ssim_loss(fake_adc * lesion_mask, real_adc * lesion_mask).item()
+                
+                # Počítáme MAE (mean absolute error) v oblasti léze
+                masked_fake = fake_adc * lesion_mask
+                masked_real = real_adc * lesion_mask
+                mae_value = torch.sum(torch.abs(masked_fake - masked_real)) / (torch.sum(lesion_mask) + 1e-8)
+                mae_value = mae_value.item()
+                
                 # Vybrat prostřední řez pro zobrazení
                 slice_idx = pseudo_healthy.shape[2] // 2
                 
@@ -749,6 +813,10 @@ class LesionInpaintingTrainer:
                 mask_slice = lesion_mask[0, 0, slice_idx].cpu().numpy()
                 real_slice = real_adc[0, 0, slice_idx].cpu().numpy()
                 fake_slice = fake_adc[0, 0, slice_idx].cpu().numpy()
+                
+                # Zapsat metriky do CSV
+                with open(csv_path, 'a') as f:
+                    f.write(f"{patient_id},{slice_idx},{ssim_value:.4f},{mae_value:.4f}\n")
                 
                 # Vytvořit obrazek s výsledky
                 fig, axes = plt.subplots(2, 2, figsize=(12, 10))
@@ -775,7 +843,7 @@ class LesionInpaintingTrainer:
                 plt.colorbar(im3, ax=axes[1, 1])
                 
                 # Uložit obrázek
-                fig.suptitle(f'Pacient {patient_id}')
+                fig.suptitle(f'Pacient {patient_id} - SSIM: {ssim_value:.4f}, MAE: {mae_value:.4f}')
                 plt.tight_layout()
                 plt.savefig(vis_epoch_dir / f"{patient_id}_slice_{slice_idx}.png")
                 plt.close(fig)
@@ -800,7 +868,7 @@ class LesionInpaintingTrainer:
                 plt.colorbar(im2, ax=axes[2])
                 
                 # Uložit obrázek
-                fig.suptitle(f'Pacient {patient_id} - Porovnání')
+                fig.suptitle(f'Pacient {patient_id} - Porovnání (SSIM: {ssim_value:.4f}, MAE: {mae_value:.4f})')
                 plt.tight_layout()
                 plt.savefig(vis_epoch_dir / f"{patient_id}_diff_slice_{slice_idx}.png")
                 plt.close(fig)
@@ -840,7 +908,7 @@ class LesionInpaintingTrainer:
             self.optimizer_d.zero_grad()
             
             # Generovat falešnou ADC mapu
-            with torch.cuda.amp.autocast() if self.use_amp else torch.no_grad():
+            with torch.cuda.amp.autocast() if self.use_amp else nullcontext():
                 fake_adc = self.model.generator(pseudo_healthy, lesion_mask)
                 
                 # Predikce diskriminátoru pro reálná a falešná data
@@ -865,7 +933,7 @@ class LesionInpaintingTrainer:
             self.optimizer_g.zero_grad()
             
             # Generovat falešnou ADC mapu znovu (pro generátor)
-            with torch.cuda.amp.autocast() if self.use_amp else torch.no_grad():
+            with torch.cuda.amp.autocast() if self.use_amp else nullcontext():
                 fake_adc = self.model.generator(pseudo_healthy, lesion_mask)
                 
                 # Predikce diskriminátoru pro falešná data
@@ -926,76 +994,90 @@ class LesionInpaintingTrainer:
             'd_loss': epoch_d_loss
         }
     
-    def validate(self, dataloader, epoch):
-        """Validace modelu"""
+    def validate(self, val_loader, epoch):
+        """
+        Validace modelu na validační sadě
+        
+        Args:
+            val_loader (DataLoader): DataLoader s validačními daty
+            epoch (int): Číslo aktuální epochy
+            
+        Returns:
+            dict: Slovník s průměrnými metrikami na validační sadě
+        """
         self.model.eval()
+        val_metrics = {
+            'g_loss': 0.0,
+            'g_adv_loss': 0.0,
+            'g_l1_loss': 0.0,
+            'g_identity_loss': 0.0,
+            'g_ssim_loss': 0.0,
+            'g_edge_loss': 0.0,
+            'd_loss': 0.0
+        }
         
-        epoch_g_loss = 0
-        epoch_g_adv_loss = 0
-        epoch_g_l1_loss = 0
-        epoch_g_identity_loss = 0
-        epoch_g_ssim_loss = 0
-        epoch_g_edge_loss = 0
-        epoch_d_loss = 0
+        # Uložit všechny batche pro pozdější náhodný výběr
+        all_batches = []
         
+        # Validace na všech datech
         with torch.no_grad():
-            for batch in tqdm(dataloader, desc=f"Validace epochy {epoch}"):
+            for batch in val_loader:
+                # Uložit batch pro pozdější výběr
+                all_batches.append(batch)
+                
                 # Přesunout data na správné zařízení
                 pseudo_healthy = batch['pseudo_healthy'].to(self.device)
                 lesion_mask = batch['lesion_mask'].to(self.device)
                 real_adc = batch['adc'].to(self.device)
                 
-                # Generovat falešnou ADC mapu
+                # Forward pass
                 fake_adc = self.model.generator(pseudo_healthy, lesion_mask)
                 
-                # Predikce diskriminátoru
-                disc_real_pred = self.model.discriminator(pseudo_healthy, lesion_mask, real_adc)
+                # Získat predikci diskriminátoru pro generovaná data
                 disc_fake_pred = self.model.discriminator(pseudo_healthy, lesion_mask, fake_adc)
                 
-                # Loss hodnoty
+                # Výpočet loss pro generátor se správnými argumenty
                 g_loss, g_adv_loss, g_l1_loss, g_identity_loss, g_ssim_loss, g_edge_loss = \
                     self.model.generator_loss(
                         pseudo_healthy, lesion_mask, real_adc, fake_adc, disc_fake_pred
                     )
                 
+                # Výpočet loss pro diskriminátor
+                # Získat predikci pro reálná data
+                disc_real_pred = self.model.discriminator(pseudo_healthy, lesion_mask, real_adc)
                 d_loss = self.model.discriminator_loss(
-                    pseudo_healthy, lesion_mask, real_adc, fake_adc, 
+                    pseudo_healthy, lesion_mask, real_adc, fake_adc,
                     disc_real_pred, disc_fake_pred
                 )
                 
-                # Akumulovat loss hodnoty
-                epoch_g_loss += g_loss.item()
-                epoch_g_adv_loss += g_adv_loss.item()
-                epoch_g_l1_loss += g_l1_loss.item()
-                epoch_g_identity_loss += g_identity_loss.item()
-                epoch_g_ssim_loss += g_ssim_loss.item()
-                epoch_g_edge_loss += g_edge_loss.item()
-                epoch_d_loss += d_loss.item()
-        
-        # Vypočítat průměrné hodnoty
-        num_batches = len(dataloader)
-        epoch_g_loss /= num_batches
-        epoch_g_adv_loss /= num_batches
-        epoch_g_l1_loss /= num_batches
-        epoch_g_identity_loss /= num_batches
-        epoch_g_ssim_loss /= num_batches
-        epoch_g_edge_loss /= num_batches
-        epoch_d_loss /= num_batches
-        
-        # Aktualizovat log
+                # Aktualizace metrik
+                val_metrics['g_loss'] += g_loss.item()
+                val_metrics['g_adv_loss'] += g_adv_loss.item()
+                val_metrics['g_l1_loss'] += g_l1_loss.item()
+                val_metrics['g_identity_loss'] += g_identity_loss.item()
+                val_metrics['g_ssim_loss'] += g_ssim_loss.item()
+                val_metrics['g_edge_loss'] += g_edge_loss.item() 
+                val_metrics['d_loss'] += d_loss.item()
+                
+        # Průměrování přes všechny batche
+        for key in val_metrics:
+            val_metrics[key] /= len(val_loader)
+            
+        # Ukládání do val_log
         self.val_log['epoch'].append(epoch)
-        self.val_log['g_loss'].append(epoch_g_loss)
-        self.val_log['g_adv_loss'].append(epoch_g_adv_loss)
-        self.val_log['g_l1_loss'].append(epoch_g_l1_loss)
-        self.val_log['g_identity_loss'].append(epoch_g_identity_loss)
-        self.val_log['g_ssim_loss'].append(epoch_g_ssim_loss)
-        self.val_log['g_edge_loss'].append(epoch_g_edge_loss)
-        self.val_log['d_loss'].append(epoch_d_loss)
-        
-        return {
-            'g_loss': epoch_g_loss,
-            'd_loss': epoch_d_loss
-        }
+        for key in val_metrics:
+            self.val_log[key].append(val_metrics[key])
+            
+        # Vizualizace na náhodně vybraném obrazu
+        if all_batches:
+            # Náhodně vybrat jeden batch
+            random_batch = random.choice(all_batches)
+            
+            # Vytvořit PDF vizualizaci pro vybraný batch
+            pdf_path = self.create_full_volume_pdf_visualization(epoch, random_batch)
+            print(f"Full volume PDF visualization created at: {pdf_path}")
+            
+        return val_metrics
     
     def train(self, train_dataloader, val_dataloader, num_epochs, start_epoch=0, checkpoint_interval=5):
         """
@@ -1021,6 +1103,7 @@ class LesionInpaintingTrainer:
             print(f"Epocha {epoch}/{num_epochs-1}")
             print(f"  Train: G Loss: {train_metrics['g_loss']:.4f}, D Loss: {train_metrics['d_loss']:.4f}")
             print(f"  Val: G Loss: {val_metrics['g_loss']:.4f}, D Loss: {val_metrics['d_loss']:.4f}")
+            print(f"  Val Metriky: SSIM: {val_metrics['g_ssim_loss']:.4f}, MAE: {val_metrics['g_l1_loss']:.4f}")
             
             # Uložit checkpoint
             if (epoch + 1) % checkpoint_interval == 0:
@@ -1041,6 +1124,112 @@ class LesionInpaintingTrainer:
         
         # Vizualizovat finální výsledky
         self.visualize_results(num_epochs - 1, val_dataloader)
+    
+    def create_full_volume_pdf_visualization(self, epoch, batch):
+        """
+        Vytvoří PDF vizualizaci celého objemu pro jeden vzorek z validační sady
+        
+        Args:
+            epoch (int): Aktuální epocha
+            batch (dict): Batch dat obsahující 'pseudo_healthy', 'adc', 'lesion_mask' a 'patient_id'
+            
+        Returns:
+            str: Cesta k vytvořenému PDF souboru
+        """
+        # Přesunout data na správné zařízení
+        pseudo_healthy = batch['pseudo_healthy'].to(self.device)
+        lesion_mask = batch['lesion_mask'].to(self.device)
+        real_adc = batch['adc'].to(self.device)
+        patient_id = batch['patient_id'][0]  # Bereme první pacienta z batche
+        
+        # Generovat falešnou ADC mapu
+        with torch.no_grad():
+            fake_adc = self.model.generator(pseudo_healthy, lesion_mask)
+        
+        # Vypočítat metriky
+        # Počítáme SSIM v oblasti léze
+        ssim_val = self.model.ssim_loss(fake_adc * lesion_mask, real_adc * lesion_mask).item()
+        
+        # Počítáme MAE (mean absolute error) v oblasti léze
+        masked_fake = fake_adc * lesion_mask
+        masked_real = real_adc * lesion_mask
+        mae_val = torch.sum(torch.abs(masked_fake - masked_real)) / (torch.sum(lesion_mask) + 1e-8)
+        mae_val = mae_val.item()
+        
+        # Cesta k výstupnímu PDF souboru
+        pdf_filename = f"epoch_{epoch}_patient_{patient_id}_full_volume.pdf"
+        pdf_path = self.pdf_visualization_dir / pdf_filename
+        
+        # Konvertovat data na CPU a numpy pro vizualizaci
+        pseudo_healthy_np = pseudo_healthy.squeeze(0).cpu().numpy()  # [Z, H, W]
+        real_adc_np = real_adc.squeeze(0).cpu().numpy()  # [Z, H, W]
+        fake_adc_np = fake_adc.squeeze(0).cpu().numpy()  # [Z, H, W]
+        lesion_mask_np = lesion_mask.squeeze(0).cpu().numpy()  # [Z, H, W]
+        
+        num_slices = pseudo_healthy_np.shape[0]
+        max_slices_per_page = 5  # Maximální počet řezů na stránku
+        
+        with PdfPages(pdf_path) as pdf:
+            # Pro každou stránku
+            for page_start in range(0, num_slices, max_slices_per_page):
+                page_end = min(page_start + max_slices_per_page, num_slices)
+                slices_on_page = page_end - page_start
+                
+                # Vytvořit obrázek s řádky (řezy) a sloupci (typy obrazů)
+                fig = plt.figure(figsize=(12, 3 * slices_on_page))
+                
+                # Přidat titulek s metrikami
+                fig.suptitle(f'Patient {patient_id}, Epoch {epoch}, SSIM: {ssim_val:.4f}, MAE: {mae_val:.4f}', 
+                            fontsize=14)
+                
+                # Vytvořit grid pro umístění subplotů
+                gs = gridspec.GridSpec(slices_on_page, 4, figure=fig)
+                
+                # Přidat záhlaví pro sloupce
+                column_titles = ['Pseudo-Healthy', 'Real ADC', 'Generated ADC', 'Lesion Mask']
+                for col, title in enumerate(column_titles):
+                    ax = fig.add_subplot(gs[0, col])
+                    ax.set_title(title)
+                    ax.axis('off')
+                    
+                    # Pokud je to první sloupec, přidáme texty
+                    if col == 0:
+                        # Zobrazit první řádek dat
+                        ax.imshow(pseudo_healthy_np[page_start], cmap='gray')
+                    elif col == 1:
+                        ax.imshow(real_adc_np[page_start], cmap='gray')
+                    elif col == 2:
+                        ax.imshow(fake_adc_np[page_start], cmap='gray')
+                    else:
+                        ax.imshow(lesion_mask_np[page_start], cmap='gray')
+                
+                # Projít všechny řezy na aktuální stránce
+                for i in range(slices_on_page):
+                    slice_idx = page_start + i
+                    
+                    # Pro každý typ obrazu vytvořit subplot
+                    ax1 = fig.add_subplot(gs[i, 0])
+                    ax1.imshow(pseudo_healthy_np[slice_idx], cmap='gray')
+                    ax1.set_title(f'Slice {slice_idx}')
+                    ax1.axis('off')
+                    
+                    ax2 = fig.add_subplot(gs[i, 1])
+                    ax2.imshow(real_adc_np[slice_idx], cmap='gray')
+                    ax2.axis('off')
+                    
+                    ax3 = fig.add_subplot(gs[i, 2])
+                    ax3.imshow(fake_adc_np[slice_idx], cmap='gray')
+                    ax3.axis('off')
+                    
+                    ax4 = fig.add_subplot(gs[i, 3])
+                    ax4.imshow(lesion_mask_np[slice_idx], cmap='gray')
+                    ax4.axis('off')
+                
+                plt.tight_layout(rect=[0, 0, 1, 0.97])  # Nastavení okrajů pro titulek
+                pdf.savefig(fig)
+                plt.close(fig)
+        
+        return str(pdf_path)
 
 
 def train_model(args):
@@ -1143,6 +1332,11 @@ def train_model(args):
         
         print("Aktivovány augmentace dat pro trénink.")
     
+    # Debug výpis pro zobrazení dostupných souborů v adresářích
+    print("Kontrola souborů v adresářích:")
+    print(f"ADC soubory: {list(Path(args.adc_dir).glob('*.mha')[:5])}... (zobrazeno prvních 5)")
+    print(f"Lesion mask soubory: {list(Path(args.lesion_mask_dir).glob('*.mha')[:5])}... (zobrazeno prvních 5)")
+    
     # Načíst dataset
     train_dataset = LesionInpaintingDataset(
         pseudo_healthy_dir=args.pseudo_healthy_dir,
@@ -1154,10 +1348,26 @@ def train_model(args):
         transform=train_transforms
     )
     
+    # Kontrola, zda máme dostatek dat pro trénink
+    if len(train_dataset.file_triplets) == 0:
+        print("ERROR: Nebyly nalezeny žádné kompletní triplety souborů pro trénink.")
+        print("Zkontrolujte cesty k adresářům a formáty názvů souborů.")
+        print("Očekávaný formát ADC souborů: {patient_id}*-ADC_ss.mha")
+        print("Očekávaný formát lesion mask souborů: {patient_id}*_lesion.mha")
+        print("Ukončuji trénink.")
+        return
+    
     # Rozdělit dataset na trénovací a validační část
     dataset_size = len(train_dataset)
     val_size = max(1, int(dataset_size * args.val_ratio))
     train_size = dataset_size - val_size
+    
+    # Zajistit, že máme alespoň jeden vzorek pro trénování a jeden pro validaci
+    if train_size <= 0 or val_size <= 0:
+        print(f"ERROR: Nedostatek dat pro rozdělení na trénovací a validační část. Dataset má pouze {dataset_size} vzorků.")
+        print("Upravte val_ratio nebo použijte větší dataset.")
+        print("Ukončuji trénink.")
+        return
     
     # Pro validační dataset nepoužíváme augmentace, musíme proto vytvořit nový dataset pro validaci
     if args.use_augmentations and val_size > 0:
@@ -1459,7 +1669,7 @@ def main():
                         help='Počet epoch pro step LR scheduler')
     parser.add_argument('--lr_gamma', type=float, default=0.5,
                         help='Faktor snížení learning rate pro scheduler')
-    parser.add_argument('--val_ratio', type=float, default=0.1,
+    parser.add_argument('--val_ratio', type=float, default=0.12,
                         help='Poměr dat pro validaci')
     parser.add_argument('--checkpoint_interval', type=int, default=5,
                         help='Interval epoch pro ukládání checkpointu')
