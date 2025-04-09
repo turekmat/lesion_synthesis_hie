@@ -180,15 +180,19 @@ class LesionInpaintingDataset(Dataset):
         """
         Doplní každý rozměr na nejbližší násobek 32 (patch size pro SwinUNETR).
         Pokud je rozměr již násobkem 32, zůstává beze změny.
+        Garantuje minimální velikost 32x32x32 pro všechny rozměry.
         """
         # Získat aktuální rozměry
         d, h, w = data.shape
         
         # Najít nejbližší vyšší násobek 32 pro každý rozměr, pokud již není násobkem 32
+        # a zároveň zajistit minimální velikost 32 pro všechny rozměry
         patch_size = 32
-        target_d = ((d + patch_size - 1) // patch_size) * patch_size
-        target_h = ((h + patch_size - 1) // patch_size) * patch_size
-        target_w = ((w + patch_size - 1) // patch_size) * patch_size
+        target_d = max(patch_size, ((d + patch_size - 1) // patch_size) * patch_size)
+        target_h = max(patch_size, ((h + patch_size - 1) // patch_size) * patch_size)
+        target_w = max(patch_size, ((w + patch_size - 1) // patch_size) * patch_size)
+        
+        print(f"Padding from {data.shape} to target size: ({target_d}, {target_h}, {target_w})")
         
         # Vypočítat padding pro každý rozměr
         pad_d = max(0, target_d - d)
@@ -277,38 +281,102 @@ class LesionInpaintingDataset(Dataset):
 
 class Generator(nn.Module):
     """
-    Generátor pro CGAN s architekturou SwinUNETR
+    U-Net styl generátoru pro inpainting lézí
     Vstup: Pseudo-zdravý mozek a maska léze
-    Výstup: ADC mapa s inpaintovanou lézí
+    Výstup: Generovaná ADC mapa léze
     """
     def __init__(
-        self,
-        img_size=(96, 96, 96),
-        in_channels=2,  # 1 channel pro pseudo-zdravý mozek + 1 channel pro masku léze
-        out_channels=1, # 1 channel pro výstupní ADC mapu s lézí
-        feature_size=48,
-        drop_rate=0.0,
-        attn_drop_rate=0.0,
-        dropout_path_rate=0.0,
-        use_checkpoint=False
+        self, 
+        in_channels=2,  # 1 pro pseudo-zdravý + 1 pro masku léze
+        out_channels=1,  # 1 pro ADC mapu
+        base_filters=64,
+        depth=5,
+        min_size=32
     ):
         super().__init__()
         
-        # SwinUNETR jako základ generátoru
-        self.swin_unetr = SwinUNETR(
-            img_size=img_size,
-            in_channels=in_channels,
-            out_channels=out_channels,
-            feature_size=feature_size,
-            drop_rate=drop_rate,
-            attn_drop_rate=attn_drop_rate,
-            dropout_path_rate=dropout_path_rate,
-            use_checkpoint=use_checkpoint
+        # Přidáme kontrolu minimální velikosti vstupu
+        self.min_input_size = min_size
+        
+        # Encoder - první konvoluce bez normalizace
+        self.encoder_layers = nn.ModuleList()
+        
+        # První vrstva s menším kernelem a stride=1 pro lepší zpracování malých vstupů
+        self.encoder_layers.append(
+            nn.Sequential(
+                nn.Conv3d(in_channels, base_filters, kernel_size=3, stride=1, padding=1),
+                nn.LeakyReLU(0.2, inplace=True)
+            )
         )
         
-        # Závěrečná aktivační funkce pro zajištění výstupu v rozsahu [0, 1]
-        self.activation = nn.Sigmoid()
-    
+        # Přidat zbytek enkodéru
+        current_filters = base_filters
+        for i in range(1, depth):
+            # Od druhé vrstvy použijeme standardní parametry
+            stride = 2
+            kernel_size = 4
+            
+            self.encoder_layers.append(
+                nn.Sequential(
+                    nn.Conv3d(
+                        current_filters, 
+                        current_filters * 2, 
+                        kernel_size=kernel_size, 
+                        stride=stride, 
+                        padding=1,
+                        bias=False
+                    ),
+                    nn.BatchNorm3d(current_filters * 2),
+                    nn.LeakyReLU(0.2, inplace=True)
+                )
+            )
+            current_filters *= 2
+        
+        # Decoder s přeskočenými spojeními
+        self.decoder_layers = nn.ModuleList()
+        
+        for i in range(depth - 1):
+            # Pro největší hloubku použijeme menší kernel
+            kernel_size = 3 if i == 0 else 4
+            
+            if i == 0:  # Nejhlubší vrstva bez přeskočeného spojení
+                self.decoder_layers.append(
+                    nn.Sequential(
+                        nn.ConvTranspose3d(
+                            current_filters, 
+                            current_filters // 2,
+                            kernel_size=kernel_size, 
+                            stride=2, 
+                            padding=1,
+                            bias=False
+                        ),
+                        nn.BatchNorm3d(current_filters // 2),
+                        nn.ReLU(inplace=True)
+                    )
+                )
+            else:  # Ostatní vrstvy s přeskočeným spojením
+                self.decoder_layers.append(
+                    nn.Sequential(
+                        nn.ConvTranspose3d(
+                            current_filters, 
+                            current_filters // 2,
+                            kernel_size=kernel_size, 
+                            stride=2, 
+                            padding=1,
+                            bias=False
+                        ),
+                        nn.BatchNorm3d(current_filters // 2),
+                        nn.ReLU(inplace=True)
+                    )
+                )
+            current_filters //= 2
+        
+        # Finální konvoluce
+        self.final_conv = nn.Sequential(
+            nn.Conv3d(current_filters, out_channels, kernel_size=3, padding=1),
+            nn.Tanh()  # Normalizovaný výstup v rozmezí [-1, 1]
+        )
+        
     def forward(self, pseudo_healthy, lesion_mask):
         """
         Forward pass generátoru
@@ -318,20 +386,48 @@ class Generator(nn.Module):
             lesion_mask (torch.Tensor): Tensor binární masky léze [B, 1, D, H, W]
         
         Returns:
-            torch.Tensor: ADC mapa s inpaintovanou lézí [B, 1, D, H, W]
+            torch.Tensor: Generovaná ADC mapa léze [B, 1, D, H, W]
         """
-        # Spojit pseudo-zdravý mozek a masku léze do jednoho vstupu
+        # Kontrola minimální velikosti vstupu
+        min_size = self.min_input_size
+        d, h, w = pseudo_healthy.shape[2:5]
+        
+        if d < min_size or h < min_size or w < min_size:
+            print(f"Warning: Input size {(d, h, w)} is smaller than minimum size {min_size}. Results may be unpredictable.")
+        
+        # Spojit vstupy pro generátor
         x = torch.cat([pseudo_healthy, lesion_mask], dim=1)
         
-        # Získat raw výstup ze SwinUNETR
-        out = self.swin_unetr(x)
+        # Uložit výstupy enkodéru pro přeskočená spojení
+        skip_connections = []
         
-        # Aplikovat masku léze, abychom zachovali intenzity voxelů mimo masku
-        # (pouze voxely v oblasti léze by měly být modifikovány)
-        # Výsledek = (1 - maska) * pseudo_zdravý + maska * generovaný_výstup
-        out_masked = (1.0 - lesion_mask) * pseudo_healthy + lesion_mask * self.activation(out)
+        # Encoder
+        for encoder in self.encoder_layers:
+            x = encoder(x)
+            skip_connections.append(x)
         
-        return out_masked
+        # Odstranit nejhlubší vrstvu, která nebude mít přeskočené spojení
+        skip_connections.pop()
+        
+        # Decoder s přeskočenými spojeními
+        for i, decoder in enumerate(self.decoder_layers):
+            x = decoder(x)
+            
+            # Přidat přeskočené spojení, kromě poslední vrstvy enkodéru
+            if i < len(skip_connections):
+                skip = skip_connections[-(i+1)]
+                
+                # Zajistit, že velikosti jsou kompatibilní pro konkatenaci
+                if x.shape[2:] != skip.shape[2:]:
+                    # Interpolace pro zajištění stejné velikosti
+                    x = F.interpolate(x, size=skip.shape[2:], mode='trilinear', align_corners=False)
+                
+                x = torch.cat([x, skip], dim=1)
+        
+        # Finální konvoluce pro generování ADC mapy
+        x = self.final_conv(x)
+        
+        return x
 
 
 class Discriminator(nn.Module):
@@ -344,13 +440,17 @@ class Discriminator(nn.Module):
         self,
         in_channels=3,  # 1 pro pseudo-zdravý + 1 pro masku léze + 1 pro ADC mapu
         base_filters=64,
-        n_layers=4
+        n_layers=4,
+        min_size=32
     ):
         super().__init__()
         
-        # Počáteční konvoluční vrstva
+        # Přidáme kontrolu minimální velikosti vstupu
+        self.min_input_size = min_size
+        
+        # Menší kernel a stride pro první vrstvu, aby lépe zvládala malé vstupy
         layers = [
-            nn.Conv3d(in_channels, base_filters, kernel_size=4, stride=2, padding=1),
+            nn.Conv3d(in_channels, base_filters, kernel_size=3, stride=1, padding=1),
             nn.LeakyReLU(0.2, inplace=True)
         ]
         
@@ -362,12 +462,16 @@ class Discriminator(nn.Module):
             nf_mult_prev = nf_mult
             nf_mult = min(2 ** n, 8)
             
+            # Menší kernel a stride pro další vrstvy
+            kernel_size = 3 if n == 1 else 4
+            stride = 1 if n == 1 else 2
+            
             layers += [
                 nn.Conv3d(
                     base_filters * nf_mult_prev,
                     base_filters * nf_mult,
-                    kernel_size=4,
-                    stride=2,
+                    kernel_size=kernel_size,
+                    stride=stride,
                     padding=1,
                     bias=False
                 ),
@@ -383,7 +487,7 @@ class Discriminator(nn.Module):
             nn.Conv3d(
                 base_filters * nf_mult_prev,
                 base_filters * nf_mult,
-                kernel_size=4,
+                kernel_size=3,  # Menší kernel pro finální vrstvu
                 stride=1,
                 padding=1,
                 bias=False
@@ -393,7 +497,7 @@ class Discriminator(nn.Module):
             nn.Conv3d(
                 base_filters * nf_mult,
                 1,
-                kernel_size=4,
+                kernel_size=3,  # Menší kernel pro výstupní vrstvu
                 stride=1,
                 padding=1
             )
@@ -413,6 +517,13 @@ class Discriminator(nn.Module):
         Returns:
             torch.Tensor: Mapa skóre pravděpodobnosti reálné/generované léze [B, 1, D', H', W']
         """
+        # Kontrola minimální velikosti vstupu
+        min_size = self.min_input_size
+        d, h, w = pseudo_healthy.shape[2:5]
+        
+        if d < min_size or h < min_size or w < min_size:
+            print(f"Warning: Input size {(d, h, w)} is smaller than minimum size {min_size}. Results may be unpredictable.")
+        
         # Spojit všechny vstupy pro diskriminátor
         x = torch.cat([pseudo_healthy, lesion_mask, adc_map], dim=1)
         
