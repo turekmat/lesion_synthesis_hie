@@ -550,10 +550,11 @@ class LesionInpaintingGAN(nn.Module):
         
         # Generátor a diskriminátor
         self.generator = Generator(
-            img_size=img_size,
             in_channels=2,  # pseudo-healthy + mask
             out_channels=1,  # ADC s lézí
-            feature_size=gen_features
+            base_filters=gen_features,
+            depth=5,
+            min_size=32
         )
         
         self.discriminator = Discriminator(
