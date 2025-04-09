@@ -700,8 +700,72 @@ def create_pseudo_healthy_brain_with_atlas(adc_data, label_data, atlas_path, std
                 
                 registered_current_lesion_np = registered_current_lesion.numpy() > 0.5
                 
+                # NOVÁ ÚPRAVA: Místo hledání hodnot přímo pro voxely léze
+                # vytvoříme kolem léze v prostoru atlasu prstenec
+                # a použijeme průměrnou hodnotu z tohoto prstence
+                
+                # Dilatujeme lézi v prostoru atlasu pro vytvoření širšího okolí
+                dilated_atlas_lesion = ndimage.binary_dilation(registered_current_lesion_np, iterations=3)
+                
+                # Vytvoříme prstenec (dilatovaná mínus původní)
+                atlas_ring_mask = dilated_atlas_lesion & ~registered_current_lesion_np
+                
+                # Přidáme podmínku, že hodnoty musí být v atlasu nenulové
+                atlas_ring_mask = atlas_ring_mask & (atlas_np_original > 0)
+                
+                if np.any(atlas_ring_mask):
+                    # Máme validní prstenec v atlasu
+                    atlas_ring_values = atlas_np_original[atlas_ring_mask]
+                    atlas_ring_mean = np.mean(atlas_ring_values)
+                    print(f"Found atlas ring values for lesion component {lesion_idx}: mean={atlas_ring_mean:.2f} from {len(atlas_ring_values)} voxels")
+                    
+                    # Vypočítáme průměrnou hodnotu v aktuální lézi v původním prostoru
+                    lesion_values = adc_data[current_lesion]
+                    lesion_mean = np.mean(lesion_values)
+                    
+                    # Vypočítáme offset s využitím hodnoty z atlasového prstence
+                    offset = atlas_ring_mean - lesion_mean
+                    # Aplikujeme boost faktor pro zvýšení efektu
+                    offset = offset * BOOST_FACTOR
+                    print(f"Offset using atlas ring: {offset:.2f} (Lesion mean: {lesion_mean:.2f}, Atlas ring mean: {atlas_ring_mean:.2f}, Boosted by: {BOOST_FACTOR})")
+                    
+                    # Uložíme referenční hodnotu z atlasového prstence
+                    reference_values[current_lesion] = atlas_ring_mean
+                    
+                    # Vytvoříme mapu vzdálenosti a aplikujeme offset jako obvykle
+                    distance_map = ndimage.distance_transform_edt(current_lesion)
+                    if distance_map.max() > 0:
+                        normalized_dist = distance_map / distance_map.max()
+                    else:
+                        normalized_dist = distance_map
+                    
+                    # Aplikujeme offset s plynulým přechodem
+                    current_coords = np.where(current_lesion)
+                    current_coords = list(zip(current_coords[0], current_coords[1], current_coords[2]))
+                    
+                    for x, y, z in current_coords:
+                        # Standardní aplikace offsetu jako v původním kódu
+                        weight = edge_transition_mask[x, y, z]
+                        noise_scale = 0.05 * atlas_ring_mean
+                        noise_value = (noise[x, y, z] - 0.5) * 2 * noise_scale
+                        local_deviation = adc_data[x, y, z] - lesion_mean
+                        
+                        if weight > EDGE_THRESHOLD:
+                            normalized_weight = (weight - EDGE_THRESHOLD) / (1 - EDGE_THRESHOLD)
+                            blend_ratio = TARGET_RATIO * (1 - 0.5 * (1 - normalized_weight) * (1 - normalized_weight))
+                            dist_factor = 0.8 + 0.2 * normalized_dist[x, y, z] ** 0.5
+                            pseudo_healthy[x, y, z] = lesion_mean + local_deviation + blend_ratio * dist_factor * offset + noise_value
+                        else:
+                            normalized_weight = weight / EDGE_THRESHOLD
+                            edge_ratio = TARGET_RATIO * EDGE_BLEND_FACTOR * normalized_weight * normalized_weight
+                            pseudo_healthy[x, y, z] = adc_data[x, y, z] + edge_ratio * offset + noise_value
+                
+                    continue  # Přejdeme na další komponentu léze
+                
+                # NÁSLEDNÝ KÓD zůstává jako záložní řešení, pokud nemáme validní prstenec v atlasu
                 # NOVÁ ÚPRAVA: Kontrola, jestli jsou v atlasu nenulové hodnoty pro tuto lézi
                 valid_lesion_atlas_mask = (atlas_np_original > 0) & registered_current_lesion_np
+                
                 if not np.any(valid_lesion_atlas_mask):
                     print(f"Warning: No non-zero atlas values for lesion component {lesion_idx}.")
                     print("Using alternative method for this lesion component...")
