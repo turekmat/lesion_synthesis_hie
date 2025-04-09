@@ -1334,8 +1334,10 @@ def train_model(args):
     
     # Debug výpis pro zobrazení dostupných souborů v adresářích
     print("Kontrola souborů v adresářích:")
-    print(f"ADC soubory: {list(Path(args.adc_dir).glob('*.mha')[:5])}... (zobrazeno prvních 5)")
-    print(f"Lesion mask soubory: {list(Path(args.lesion_mask_dir).glob('*.mha')[:5])}... (zobrazeno prvních 5)")
+    adc_files = list(Path(args.adc_dir).glob('*.mha'))
+    lesion_files = list(Path(args.lesion_mask_dir).glob('*.mha'))
+    print(f"ADC soubory: {adc_files[:5] if adc_files else []}... (zobrazeno prvních 5)")
+    print(f"Lesion mask soubory: {lesion_files[:5] if lesion_files else []}... (zobrazeno prvních 5)")
     
     # Načíst dataset
     train_dataset = LesionInpaintingDataset(
