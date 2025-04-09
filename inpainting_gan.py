@@ -575,7 +575,7 @@ class LesionInpaintingGAN(nn.Module):
             in_channels=2,  # pseudo-healthy + mask
             out_channels=1,  # ADC s lézí
             base_filters=gen_features,
-            depth=5,
+            depth=4,  # Změněno z 5 na 4 pro konzistenci s výchozí hodnotou v Generator
             min_size=32
         )
         
@@ -1253,11 +1253,29 @@ class LesionInpaintingTrainer:
         pdf_path = self.pdf_visualization_dir / pdf_filename
         
         # Konvertovat data na CPU a numpy pro vizualizaci
-        pseudo_healthy_np = pseudo_healthy.squeeze(0).cpu().numpy()  # [Z, H, W]
-        real_adc_np = real_adc.squeeze(0).cpu().numpy()  # [Z, H, W]
-        fake_adc_np = fake_adc.squeeze(0).cpu().numpy()  # [Z, H, W]
-        lesion_mask_np = lesion_mask.squeeze(0).cpu().numpy()  # [Z, H, W]
+        # Důležité: převedeme z formátu [B, C, D, H, W] na [D, H, W] pro správné dělení na 2D řezy
+        pseudo_healthy_np = pseudo_healthy.squeeze().cpu().numpy()  # [D, H, W]
+        real_adc_np = real_adc.squeeze().cpu().numpy()  # [D, H, W]
+        fake_adc_np = fake_adc.squeeze().cpu().numpy()  # [D, H, W]
+        lesion_mask_np = lesion_mask.squeeze().cpu().numpy()  # [D, H, W]
         
+        # Zkontrolujeme tvary dat pro debugování
+        print(f"Tvar dat pro vizualizaci - pseudo_healthy: {pseudo_healthy_np.shape}")
+        print(f"Tvar dat pro vizualizaci - real_adc: {real_adc_np.shape}")
+        print(f"Tvar dat pro vizualizaci - fake_adc: {fake_adc_np.shape}")
+        print(f"Tvar dat pro vizualizaci - lesion_mask: {lesion_mask_np.shape}")
+        
+        # Pokud jsou data 4D místo 3D (např. [C, D, H, W]), vezmeme první kanál
+        if len(pseudo_healthy_np.shape) == 4:
+            pseudo_healthy_np = pseudo_healthy_np[0]  # První kanál
+        if len(real_adc_np.shape) == 4:
+            real_adc_np = real_adc_np[0]
+        if len(fake_adc_np.shape) == 4:
+            fake_adc_np = fake_adc_np[0]
+        if len(lesion_mask_np.shape) == 4:
+            lesion_mask_np = lesion_mask_np[0]
+            
+        # Počet řezů ve směru D (hloubka)
         num_slices = pseudo_healthy_np.shape[0]
         max_slices_per_page = 5  # Maximální počet řezů na stránku
         
@@ -1277,44 +1295,30 @@ class LesionInpaintingTrainer:
                 # Vytvořit grid pro umístění subplotů
                 gs = gridspec.GridSpec(slices_on_page, 4, figure=fig)
                 
-                # Přidat záhlaví pro sloupce
-                column_titles = ['Pseudo-Healthy', 'Real ADC', 'Generated ADC', 'Lesion Mask']
-                for col, title in enumerate(column_titles):
-                    ax = fig.add_subplot(gs[0, col])
-                    ax.set_title(title)
-                    ax.axis('off')
-                    
-                    # Pokud je to první sloupec, přidáme texty
-                    if col == 0:
-                        # Zobrazit první řádek dat
-                        ax.imshow(pseudo_healthy_np[page_start], cmap='gray')
-                    elif col == 1:
-                        ax.imshow(real_adc_np[page_start], cmap='gray')
-                    elif col == 2:
-                        ax.imshow(fake_adc_np[page_start], cmap='gray')
-                    else:
-                        ax.imshow(lesion_mask_np[page_start], cmap='gray')
-                
                 # Projít všechny řezy na aktuální stránce
                 for i in range(slices_on_page):
                     slice_idx = page_start + i
                     
                     # Pro každý typ obrazu vytvořit subplot
                     ax1 = fig.add_subplot(gs[i, 0])
+                    # Vybrat konkrétní 2D řez
                     ax1.imshow(pseudo_healthy_np[slice_idx], cmap='gray')
                     ax1.set_title(f'Slice {slice_idx}')
                     ax1.axis('off')
                     
                     ax2 = fig.add_subplot(gs[i, 1])
                     ax2.imshow(real_adc_np[slice_idx], cmap='gray')
+                    ax2.set_title('Real ADC' if i == 0 else '')
                     ax2.axis('off')
                     
                     ax3 = fig.add_subplot(gs[i, 2])
                     ax3.imshow(fake_adc_np[slice_idx], cmap='gray')
+                    ax3.set_title('Generated ADC' if i == 0 else '')
                     ax3.axis('off')
                     
                     ax4 = fig.add_subplot(gs[i, 3])
                     ax4.imshow(lesion_mask_np[slice_idx], cmap='gray')
+                    ax4.set_title('Lesion Mask' if i == 0 else '')
                     ax4.axis('off')
                 
                 plt.tight_layout(rect=[0, 0, 1, 0.97])  # Nastavení okrajů pro titulek
