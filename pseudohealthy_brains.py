@@ -276,8 +276,8 @@ def create_pseudo_healthy_brain(adc_data, label_data):
         if lesion_mask[sym_x, sym_y, sym_z]:
             has_symmetric_lesion[x, y, z] = True
     
-    # Create smooth transition mask pro okraje lézí - výrazně menší sigma pro ostřejší hrany
-    edge_transition_mask = create_smooth_transition_mask(lesion_mask, sigma=1.0)
+    # Create smooth transition mask pro okraje lézí - zvýšíme sigma pro plynulejší přechod
+    edge_transition_mask = create_smooth_transition_mask(lesion_mask, sigma=1.75)
     
     # Get connected components in the lesion
     labeled_lesions, num_lesions = ndimage.label(lesion_mask)
@@ -289,6 +289,12 @@ def create_pseudo_healthy_brain(adc_data, label_data):
     # 0 = zůstat na původní hodnotě, 1 = plně dosáhnout referenční hodnoty
     # NASTAVÍME VELMI VYSOKOU HODNOTU, PROTOŽE PŘEDCHOZÍ POKUSY BYLY PŘÍLIŠ SLABÉ
     TARGET_RATIO = 0.85  # 85% cesty směrem k referenční hodnotě
+    
+    # Hranice mezi vnitřkem léze a okrajem - zvýšíme pro plynulejší přechod
+    EDGE_THRESHOLD = 0.2
+    
+    # Koeficient pro okrajový přechod - snížíme pro jemnější přechod
+    EDGE_BLEND_FACTOR = 0.6  # Bylo 0.7
     
     # Process each connected component (lesion) separately
     for lesion_idx in range(1, num_lesions + 1):
@@ -322,21 +328,31 @@ def create_pseudo_healthy_brain(adc_data, label_data):
                 # Generate Perlin noise with a smaller scale for local variations
                 noise = generate_perlin_noise(shape, scale=5.0, octaves=3)
                 
-                # PŘÍMOČARÝ PŘÍSTUP PRO APLIKACI HODNOT
+                # Modifikovaný přístup pro plynulejší přechod
                 for x, y, z in current_coords:
                     # Přidáme šum škálovaný na cca 5% průměrné hodnoty (méně šumu)
                     noise_scale = 0.05 * avg_value
                     noisy_value = avg_value + (noise[x, y, z] - 0.5) * noise_scale
                     
-                    # Přímočaré nahrazení s vysokým poměrem k referenční hodnotě
+                    # Získáme váhu přechodu
                     weight = edge_transition_mask[x, y, z]
                     
-                    if weight > 0.15:
-                        # Vnitřek léze - silné nahrazení
-                        pseudo_healthy[x, y, z] = (1 - TARGET_RATIO) * adc_data[x, y, z] + TARGET_RATIO * noisy_value
+                    if weight > EDGE_THRESHOLD:
+                        # Vnitřek léze - vylepšená funkce pro plynulejší přechod
+                        # Převedeme váhu z rozsahu [EDGE_THRESHOLD, 1] na [0, 1]
+                        normalized_weight = (weight - EDGE_THRESHOLD) / (1 - EDGE_THRESHOLD)
+                        
+                        # Aplikujeme přenos s kvadratickou funkcí pro plynulejší přechod 
+                        # (rychlý nárůst na začátku, pomalejší na konci)
+                        blend_ratio = TARGET_RATIO * (1 - (1 - normalized_weight) * (1 - normalized_weight))
+                        pseudo_healthy[x, y, z] = (1 - blend_ratio) * adc_data[x, y, z] + blend_ratio * noisy_value
                     else:
-                        # Okraj léze - plynulý přechod (lineární)
-                        edge_ratio = (weight / 0.15) * TARGET_RATIO * 0.7
+                        # Okraj léze - plynulý nelineární přechod
+                        # Převedeme váhu z rozsahu [0, EDGE_THRESHOLD] na [0, 1]
+                        normalized_weight = weight / EDGE_THRESHOLD
+                        
+                        # Kvadratická funkce pro plynulejší nárůst
+                        edge_ratio = TARGET_RATIO * EDGE_BLEND_FACTOR * normalized_weight * normalized_weight
                         pseudo_healthy[x, y, z] = (1 - edge_ratio) * adc_data[x, y, z] + edge_ratio * noisy_value
             
         else:
@@ -370,21 +386,30 @@ def create_pseudo_healthy_brain(adc_data, label_data):
                 current_coords = np.where(current_lesion)
                 current_coords = list(zip(current_coords[0], current_coords[1], current_coords[2]))
                 
-                # PŘÍMOČARÝ PŘÍSTUP PRO APLIKACI HODNOT
+                # Modifikovaný přístup pro plynulejší přechod
                 for x, y, z in current_coords:
                     # Přidáme šum škálovaný na cca 5% průměrné hodnoty (méně šumu)
                     noise_scale = 0.05 * avg_ring_value
                     noisy_value = avg_ring_value + (noise[x, y, z] - 0.5) * noise_scale
                     
-                    # Přímočaré nahrazení s vysokým poměrem k referenční hodnotě
+                    # Získáme váhu přechodu
                     weight = edge_transition_mask[x, y, z]
                     
-                    if weight > 0.15:
-                        # Vnitřek léze - silné nahrazení
-                        pseudo_healthy[x, y, z] = (1 - TARGET_RATIO) * adc_data[x, y, z] + TARGET_RATIO * noisy_value
+                    if weight > EDGE_THRESHOLD:
+                        # Vnitřek léze - vylepšená funkce pro plynulejší přechod
+                        # Převedeme váhu z rozsahu [EDGE_THRESHOLD, 1] na [0, 1]
+                        normalized_weight = (weight - EDGE_THRESHOLD) / (1 - EDGE_THRESHOLD)
+                        
+                        # Aplikujeme přenos s kvadratickou funkcí pro plynulejší přechod
+                        blend_ratio = TARGET_RATIO * (1 - (1 - normalized_weight) * (1 - normalized_weight))
+                        pseudo_healthy[x, y, z] = (1 - blend_ratio) * adc_data[x, y, z] + blend_ratio * noisy_value
                     else:
-                        # Okraj léze - plynulý přechod (lineární)
-                        edge_ratio = (weight / 0.15) * TARGET_RATIO * 0.7
+                        # Okraj léze - plynulý nelineární přechod
+                        # Převedeme váhu z rozsahu [0, EDGE_THRESHOLD] na [0, 1]
+                        normalized_weight = weight / EDGE_THRESHOLD
+                        
+                        # Kvadratická funkce pro plynulejší nárůst
+                        edge_ratio = TARGET_RATIO * EDGE_BLEND_FACTOR * normalized_weight * normalized_weight
                         pseudo_healthy[x, y, z] = (1 - edge_ratio) * adc_data[x, y, z] + edge_ratio * noisy_value
     
     return pseudo_healthy, reference_values
@@ -563,8 +588,8 @@ def create_pseudo_healthy_brain_with_atlas(adc_data, label_data, atlas_path, std
                 atlas_std_global = np.std(atlas_values_in_lesion)
                 print(f"Atlas normative values in lesion area: mean={atlas_mean:.2f}, std={atlas_std_global:.2f}")
             
-            # Vytvoření přechodové masky pro původní lézi - výrazně ostřejší hrany
-            edge_transition_mask = create_smooth_transition_mask(lesion_mask, sigma=1.0)
+            # Vytvoření přechodové masky pro původní lézi - plynulejší přechody s větším sigma
+            edge_transition_mask = create_smooth_transition_mask(lesion_mask, sigma=1.75)
             
             # Komponenty léze v původním prostoru pacienta
             labeled_lesions, num_lesions = ndimage.label(lesion_mask)
@@ -576,6 +601,12 @@ def create_pseudo_healthy_brain_with_atlas(adc_data, label_data, atlas_path, std
             # 0 = zůstat na původní hodnotě, 1 = plně dosáhnout referenční hodnoty
             # NASTAVÍME VELMI VYSOKOU HODNOTU, PROTOŽE PŘEDCHOZÍ POKUSY BYLY PŘÍLIŠ SLABÉ
             TARGET_RATIO = 0.85  # 85% cesty směrem k referenční hodnotě
+            
+            # Hranice mezi vnitřkem léze a okrajem - zvýšíme pro plynulejší přechod
+            EDGE_THRESHOLD = 0.2
+            
+            # Koeficient pro okrajový přechod - snížíme pro jemnější přechod
+            EDGE_BLEND_FACTOR = 0.6  # Bylo 0.7
             
             # Zpracování každé komponenty léze zvlášť
             for lesion_idx in range(1, num_lesions + 1):
@@ -631,17 +662,24 @@ def create_pseudo_healthy_brain_with_atlas(adc_data, label_data, atlas_path, std
                             noise_scale = 0.05 * avg_ring_value
                             noisy_value = avg_ring_value + (noise[x, y, z] - 0.5) * 2 * noise_scale
                             
-                            # Přímočaré nahrazení s vysokým poměrem k referenční hodnotě
-                            # Pro vnitřek léze (weight > 0.15) použijeme TARGET_RATIO přímo
-                            # Pro okraje (weight <= 0.15) použijeme lineární poměr od 0 do TARGET_RATIO*0.7
+                            # Získáme váhu přechodu
                             weight = edge_transition_mask[x, y, z]
                             
-                            if weight > 0.15:
-                                # Vnitřek léze - silné nahrazení
-                                pseudo_healthy[x, y, z] = (1 - TARGET_RATIO) * adc_data[x, y, z] + TARGET_RATIO * noisy_value
+                            if weight > EDGE_THRESHOLD:
+                                # Vnitřek léze - vylepšená funkce pro plynulejší přechod
+                                # Převedeme váhu z rozsahu [EDGE_THRESHOLD, 1] na [0, 1]
+                                normalized_weight = (weight - EDGE_THRESHOLD) / (1 - EDGE_THRESHOLD)
+                                
+                                # Aplikujeme přenos s kvadratickou funkcí pro plynulejší přechod
+                                blend_ratio = TARGET_RATIO * (1 - (1 - normalized_weight) * (1 - normalized_weight))
+                                pseudo_healthy[x, y, z] = (1 - blend_ratio) * adc_data[x, y, z] + blend_ratio * noisy_value
                             else:
-                                # Okraj léze - plynulý přechod (lineární)
-                                edge_ratio = (weight / 0.15) * TARGET_RATIO * 0.7
+                                # Okraj léze - plynulý nelineární přechod
+                                # Převedeme váhu z rozsahu [0, EDGE_THRESHOLD] na [0, 1]
+                                normalized_weight = weight / EDGE_THRESHOLD
+                                
+                                # Kvadratická funkce pro plynulejší nárůst
+                                edge_ratio = TARGET_RATIO * EDGE_BLEND_FACTOR * normalized_weight * normalized_weight
                                 pseudo_healthy[x, y, z] = (1 - edge_ratio) * adc_data[x, y, z] + edge_ratio * noisy_value
                     
                     # Uložíme referenční hodnotu z prstence
@@ -672,15 +710,24 @@ def create_pseudo_healthy_brain_with_atlas(adc_data, label_data, atlas_path, std
                     noise_scale = 0.05 * current_atlas_mean
                     noisy_value = current_atlas_mean + (noise[x, y, z] - 0.5) * 2 * noise_scale
                     
-                    # Přímočaré nahrazení s vysokým poměrem k referenční hodnotě
+                    # Získáme váhu přechodu
                     weight = edge_transition_mask[x, y, z]
                     
-                    if weight > 0.15:
-                        # Vnitřek léze - silné nahrazení
-                        pseudo_healthy[x, y, z] = (1 - TARGET_RATIO) * adc_data[x, y, z] + TARGET_RATIO * noisy_value
+                    if weight > EDGE_THRESHOLD:
+                        # Vnitřek léze - vylepšená funkce pro plynulejší přechod
+                        # Převedeme váhu z rozsahu [EDGE_THRESHOLD, 1] na [0, 1]
+                        normalized_weight = (weight - EDGE_THRESHOLD) / (1 - EDGE_THRESHOLD)
+                        
+                        # Aplikujeme přenos s kvadratickou funkcí pro plynulejší přechod
+                        blend_ratio = TARGET_RATIO * (1 - (1 - normalized_weight) * (1 - normalized_weight))
+                        pseudo_healthy[x, y, z] = (1 - blend_ratio) * adc_data[x, y, z] + blend_ratio * noisy_value
                     else:
-                        # Okraj léze - plynulý přechod (lineární)
-                        edge_ratio = (weight / 0.15) * TARGET_RATIO * 0.7
+                        # Okraj léze - plynulý nelineární přechod
+                        # Převedeme váhu z rozsahu [0, EDGE_THRESHOLD] na [0, 1]
+                        normalized_weight = weight / EDGE_THRESHOLD
+                        
+                        # Kvadratická funkce pro plynulejší nárůst
+                        edge_ratio = TARGET_RATIO * EDGE_BLEND_FACTOR * normalized_weight * normalized_weight
                         pseudo_healthy[x, y, z] = (1 - edge_ratio) * adc_data[x, y, z] + edge_ratio * noisy_value
         
         else:
