@@ -217,7 +217,7 @@ def create_smooth_transition_mask(binary_mask, sigma=2.0):
     return transition_mask
 
 
-def create_smooth_transition_mask_v2(binary_mask, sigma=2.0, strength=0.8):
+def create_smooth_transition_mask_v2(binary_mask, sigma=2.0, strength=1.4):
     """
     Create a smooth transition mask from a binary mask with adjustable strength.
     Higher strength means stronger effect of reference values.
@@ -277,7 +277,7 @@ def create_pseudo_healthy_brain(adc_data, label_data):
             has_symmetric_lesion[x, y, z] = True
     
     # Create smooth transition mask - použijeme vyšší hodnotu strength (0.9) pro větší vliv referenčních hodnot
-    transition_mask = create_smooth_transition_mask_v2(lesion_mask, sigma=3.0, strength=0.9)
+    transition_mask = create_smooth_transition_mask_v2(lesion_mask, sigma=3.0, strength=1.2)
     
     # Get connected components in the lesion
     labeled_lesions, num_lesions = ndimage.label(lesion_mask)
@@ -531,7 +531,7 @@ def create_pseudo_healthy_brain_with_atlas(adc_data, label_data, atlas_path, std
                 print(f"Atlas normative values in lesion area: mean={atlas_mean:.2f}, std={atlas_std_global:.2f}")
             
             # Vytvoření přechodové masky pro původní lézi - použijeme vyšší hodnotu strength (0.9) pro větší vliv atlasu
-            transition_mask = create_smooth_transition_mask_v2(lesion_mask, sigma=3.0, strength=0.9)
+            transition_mask = create_smooth_transition_mask_v2(lesion_mask, sigma=3.0, strength=1.2)
             
             # Komponenty léze v původním prostoru pacienta
             labeled_lesions, num_lesions = ndimage.label(lesion_mask)
