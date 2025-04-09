@@ -1247,6 +1247,10 @@ class LesionInpaintingTrainer:
         masked_real = real_adc * lesion_mask
         mae_val = torch.sum(torch.abs(masked_fake - masked_real)) / (torch.sum(lesion_mask) + 1e-8)
         mae_val = mae_val.item()
+
+        # Vytvořit kombinovaný výsledek (pseudo-zdravý + vygenerovaná léze)
+        # Kombinujeme pseudo-zdravý obraz a generovanou ADC mapu v oblasti léze
+        inpainted_adc = pseudo_healthy * (1 - lesion_mask) + fake_adc * lesion_mask
         
         # Cesta k výstupnímu PDF souboru
         pdf_filename = f"epoch_{epoch}_patient_{patient_id}_full_volume.pdf"
@@ -1258,12 +1262,14 @@ class LesionInpaintingTrainer:
         real_adc_np = real_adc.squeeze().cpu().numpy()  # [D, H, W]
         fake_adc_np = fake_adc.squeeze().cpu().numpy()  # [D, H, W]
         lesion_mask_np = lesion_mask.squeeze().cpu().numpy()  # [D, H, W]
+        inpainted_adc_np = inpainted_adc.squeeze().cpu().numpy()  # [D, H, W]
         
         # Zkontrolujeme tvary dat pro debugování
         print(f"Tvar dat pro vizualizaci - pseudo_healthy: {pseudo_healthy_np.shape}")
         print(f"Tvar dat pro vizualizaci - real_adc: {real_adc_np.shape}")
         print(f"Tvar dat pro vizualizaci - fake_adc: {fake_adc_np.shape}")
         print(f"Tvar dat pro vizualizaci - lesion_mask: {lesion_mask_np.shape}")
+        print(f"Tvar dat pro vizualizaci - inpainted_adc: {inpainted_adc_np.shape}")
         
         # Pokud jsou data 4D místo 3D (např. [C, D, H, W]), vezmeme první kanál
         if len(pseudo_healthy_np.shape) == 4:
@@ -1274,6 +1280,8 @@ class LesionInpaintingTrainer:
             fake_adc_np = fake_adc_np[0]
         if len(lesion_mask_np.shape) == 4:
             lesion_mask_np = lesion_mask_np[0]
+        if len(inpainted_adc_np.shape) == 4:
+            inpainted_adc_np = inpainted_adc_np[0]
             
         # Počet řezů ve směru D (hloubka)
         num_slices = pseudo_healthy_np.shape[0]
@@ -1286,14 +1294,14 @@ class LesionInpaintingTrainer:
                 slices_on_page = page_end - page_start
                 
                 # Vytvořit obrázek s řádky (řezy) a sloupci (typy obrazů)
-                fig = plt.figure(figsize=(12, 3 * slices_on_page))
+                fig = plt.figure(figsize=(15, 3 * slices_on_page))  # Zvětšeno pro 5 sloupců
                 
                 # Přidat titulek s metrikami
                 fig.suptitle(f'Patient {patient_id}, Epoch {epoch}, SSIM: {ssim_val:.4f}, MAE: {mae_val:.4f}', 
                             fontsize=14)
                 
-                # Vytvořit grid pro umístění subplotů
-                gs = gridspec.GridSpec(slices_on_page, 4, figure=fig)
+                # Vytvořit grid pro umístění subplotů - přidán jeden sloupec pro inpainted výsledek
+                gs = gridspec.GridSpec(slices_on_page, 5, figure=fig)
                 
                 # Projít všechny řezy na aktuální stránce
                 for i in range(slices_on_page):
@@ -1303,7 +1311,7 @@ class LesionInpaintingTrainer:
                     ax1 = fig.add_subplot(gs[i, 0])
                     # Vybrat konkrétní 2D řez
                     ax1.imshow(pseudo_healthy_np[slice_idx], cmap='gray')
-                    ax1.set_title(f'Slice {slice_idx}')
+                    ax1.set_title('Pseudo-Healthy' if i == 0 else '')
                     ax1.axis('off')
                     
                     ax2 = fig.add_subplot(gs[i, 1])
@@ -1315,8 +1323,14 @@ class LesionInpaintingTrainer:
                     ax3.imshow(fake_adc_np[slice_idx], cmap='gray')
                     ax3.set_title('Generated ADC' if i == 0 else '')
                     ax3.axis('off')
+
+                    # Nový sloupec pro kombinovaný výsledek (inpainted)
+                    ax5 = fig.add_subplot(gs[i, 3])
+                    ax5.imshow(inpainted_adc_np[slice_idx], cmap='gray')
+                    ax5.set_title('Inpainted Result' if i == 0 else '')
+                    ax5.axis('off')
                     
-                    ax4 = fig.add_subplot(gs[i, 3])
+                    ax4 = fig.add_subplot(gs[i, 4])
                     ax4.imshow(lesion_mask_np[slice_idx], cmap='gray')
                     ax4.set_title('Lesion Mask' if i == 0 else '')
                     ax4.axis('off')
