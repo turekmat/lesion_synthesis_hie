@@ -276,9 +276,8 @@ def create_pseudo_healthy_brain(adc_data, label_data):
         if lesion_mask[sym_x, sym_y, sym_z]:
             has_symmetric_lesion[x, y, z] = True
     
-    # Create smooth transition mask pro okraje lézí
-    # Použijeme klasickou masku s nižším sigma pro lepší hrany
-    edge_transition_mask = create_smooth_transition_mask(lesion_mask, sigma=2.0)
+    # Create smooth transition mask pro okraje lézí - výrazně menší sigma pro ostřejší hrany
+    edge_transition_mask = create_smooth_transition_mask(lesion_mask, sigma=1.0)
     
     # Get connected components in the lesion
     labeled_lesions, num_lesions = ndimage.label(lesion_mask)
@@ -320,38 +319,33 @@ def create_pseudo_healthy_brain(adc_data, label_data):
                 
                 # Apply the average value with noise to the lesion area with smooth transition
                 for x, y, z in current_coords:
-                    # Apply transition weight (pouze pro okraje)
-                    weight = edge_transition_mask[x, y, z]
-                    
-                    # Add noise scaled to about 10% of the avg_value for texture
-                    noise_scale = 0.08 * avg_value  # Trochu menší šum pro přirozenější texturu
+                    # Add noise scaled to about 6% of the avg_value for texture
+                    noise_scale = 0.06 * avg_value  # Menší šum pro přirozenější texturu
                     noisy_value = avg_value + (noise[x, y, z] - 0.5) * noise_scale
                     
-                    # VYLEPŠENÝ PŘÍSTUP: Strmější přechod k referenčním hodnotám
-                    if weight > 0.15:  # Posuneme hranici z 0.5 na 0.3 pro větší oblast přímého nahrazení
-                        # Vnitřek léze - přímé nahrazení referenční hodnotou (s šumem)
+                    # Apply transition weight
+                    weight = edge_transition_mask[x, y, z]
+                    
+                    # SUPER OSTRÝ EXPONENCIÁLNÍ PŘÍSTUP:
+                    if weight > 0.1:  # Velmi nízká hranice pro vnitřek léze
+                        # Vnitřek léze - velmi silná exponenciála
+                        # Použijeme mnohem silnější exponenciálu (power 6 místo 3)
+                        # Tím dostaneme mnohem ostřejší přechod
+                        inner_weight = np.exp((weight - 0.1) * 6) - 1  # Zesílená exponenciála
                         
-                        # Exponenciální škálování vnitřku léze - zajistí plynulejší přechod
-                        # ale zároveň větší vliv cílové hodnoty
-                        inner_weight = np.exp((weight - 0.3) * 3) - 1  # Exponenciální škálování
-                        inner_weight = np.clip(inner_weight, 0, 1)  # Omezení na [0, 1]
+                        # Normalizace na [0,1] s podstatně vyšším maximem
+                        inner_weight = inner_weight / (np.exp(0.9 * 6) - 1)
+                        inner_weight = np.clip(inner_weight, 0, 1)
                         
-                        # Posuneme se blíže k referenční hodnotě i ve vnitřku léze
-                        # čím blíže ke středu léze, tím více se blížíme k pure referenční hodnotě
-                        inner_mix = 0.95 * inner_weight + 0.05  # Minimálně 5% původní hodnoty pro stabilitu
+                        # Výrazně silnější efekt referenčních hodnot - 98% místo 95%
+                        inner_mix = 0.98 * inner_weight + 0.02  # Pouze 2% původní hodnoty pro stabilitu
                         pseudo_healthy[x, y, z] = (1 - inner_mix) * adc_data[x, y, z] + inner_mix * noisy_value
                     else:
-                        # Okraj léze - plynulý přechod do okolní tkáně
-                        # Použijeme trojnásobnou váhu pro strmější přechod
-                        edge_weight_boosted = weight * 3  # Zvýšíme násobič z 2 na 3
+                        # Okraj léze - silnější přechod i zde
+                        # Používáme také exponenciálu pro plynulejší, ale strmější přechod
+                        edge_weight_boosted = (weight / 0.1) ** 3  # Kubická funkce pro rychlejší náběh
                         edge_weight_boosted = min(edge_weight_boosted, 1.0)  # Omezení na max 1.0
-                        
-                        # Exponenciální škálování pro okraje - zajistí rychlejší přechod
-                        boost_exp = np.exp(edge_weight_boosted * 1.5) - 1  # Exponenciální škálování
-                        boost_exp = boost_exp / (np.exp(1.5) - 1)  # Normalizace na [0, 1]
-                        boost_exp = np.clip(boost_exp, 0, 0.95)  # Omezení na [0, 0.95]
-                        
-                        pseudo_healthy[x, y, z] = (1 - boost_exp) * adc_data[x, y, z] + boost_exp * noisy_value
+                        pseudo_healthy[x, y, z] = (1 - edge_weight_boosted * 0.6) * adc_data[x, y, z] + edge_weight_boosted * 0.6 * noisy_value
             
         else:
             # Case 2: Symmetric lesion present - use normative approach
@@ -381,28 +375,24 @@ def create_pseudo_healthy_brain(adc_data, label_data):
                 current_coords = list(zip(current_coords[0], current_coords[1], current_coords[2]))
                 
                 for x, y, z in current_coords:
-                    # Apply transition weight (pouze pro okraje)
-                    weight = edge_transition_mask[x, y, z]
-                    
-                    # Add noise scaled to about 8% of the avg_value
-                    noise_scale = 0.08 * avg_ring_value
+                    # Add noise scaled to about 6% of the avg_value
+                    noise_scale = 0.06 * avg_ring_value
                     noisy_value = avg_ring_value + (noise[x, y, z] - 0.5) * noise_scale
                     
-                    # VYLEPŠENÝ PŘÍSTUP: stejně jako v předchozím případě
-                    if weight > 0.3:  # Posuneme hranici z 0.5 na 0.3
-                        # Vnitřek léze - exponenciální škálování
-                        inner_weight = np.exp((weight - 0.3) * 3) - 1
+                    # Apply transition weight
+                    weight = edge_transition_mask[x, y, z]
+                    
+                    # SUPER OSTRÝ EXPONENCIÁLNÍ PŘÍSTUP - stejný jako výše
+                    if weight > 0.1:
+                        inner_weight = np.exp((weight - 0.1) * 6) - 1
+                        inner_weight = inner_weight / (np.exp(0.9 * 6) - 1)
                         inner_weight = np.clip(inner_weight, 0, 1)
-                        inner_mix = 0.95 * inner_weight + 0.05
+                        inner_mix = 0.98 * inner_weight + 0.02
                         pseudo_healthy[x, y, z] = (1 - inner_mix) * adc_data[x, y, z] + inner_mix * noisy_value
                     else:
-                        # Okraj léze - plynulý přechod s exponenciálním škálováním
-                        edge_weight_boosted = weight * 3
+                        edge_weight_boosted = (weight / 0.1) ** 3
                         edge_weight_boosted = min(edge_weight_boosted, 1.0)
-                        boost_exp = np.exp(edge_weight_boosted * 1.5) - 1
-                        boost_exp = boost_exp / (np.exp(1.5) - 1)
-                        boost_exp = np.clip(boost_exp, 0, 0.95)
-                        pseudo_healthy[x, y, z] = (1 - boost_exp) * adc_data[x, y, z] + boost_exp * noisy_value
+                        pseudo_healthy[x, y, z] = (1 - edge_weight_boosted * 0.6) * adc_data[x, y, z] + edge_weight_boosted * 0.6 * noisy_value
     
     return pseudo_healthy, reference_values
 
@@ -567,9 +557,8 @@ def create_pseudo_healthy_brain_with_atlas(adc_data, label_data, atlas_path, std
                 atlas_std_global = np.std(atlas_values_in_lesion)
                 print(f"Atlas normative values in lesion area: mean={atlas_mean:.2f}, std={atlas_std_global:.2f}")
             
-            # Vytvoření přechodové masky pro původní lézi
-            # Použijeme klasickou masku s nižším sigma pro lepší hrany
-            edge_transition_mask = create_smooth_transition_mask(lesion_mask, sigma=2.0)
+            # Vytvoření přechodové masky pro původní lézi - výrazně ostřejší hrany
+            edge_transition_mask = create_smooth_transition_mask(lesion_mask, sigma=1.0)
             
             # Komponenty léze v původním prostoru pacienta
             labeled_lesions, num_lesions = ndimage.label(lesion_mask)
@@ -622,28 +611,24 @@ def create_pseudo_healthy_brain_with_atlas(adc_data, label_data, atlas_path, std
                         current_coords = list(zip(current_coords[0], current_coords[1], current_coords[2]))
                         
                         for x, y, z in current_coords:
-                            # Apply transition weight (pouze pro okraje)
-                            weight = edge_transition_mask[x, y, z]
-                            
-                            # Přidáme šum škálovaný na cca 8% průměrné hodnoty
-                            noise_scale = 0.08 * avg_ring_value
+                            # Přidáme šum škálovaný na cca 6% průměrné hodnoty
+                            noise_scale = 0.06 * avg_ring_value
                             noisy_value = avg_ring_value + (noise[x, y, z] - 0.5) * 2 * noise_scale
                             
-                            # VYLEPŠENÝ PŘÍSTUP: Strmější přechod k referenčním hodnotám
-                            if weight > 0.3:  # Posuneme hranici z 0.5 na 0.3
-                                # Vnitřek léze - exponenciální škálování
-                                inner_weight = np.exp((weight - 0.3) * 3) - 1
+                            # Apply transition weight
+                            weight = edge_transition_mask[x, y, z]
+                            
+                            # SUPER OSTRÝ EXPONENCIÁLNÍ PŘÍSTUP
+                            if weight > 0.1:
+                                inner_weight = np.exp((weight - 0.1) * 6) - 1
+                                inner_weight = inner_weight / (np.exp(0.9 * 6) - 1)
                                 inner_weight = np.clip(inner_weight, 0, 1)
-                                inner_mix = 0.95 * inner_weight + 0.05
+                                inner_mix = 0.98 * inner_weight + 0.02
                                 pseudo_healthy[x, y, z] = (1 - inner_mix) * adc_data[x, y, z] + inner_mix * noisy_value
                             else:
-                                # Okraj léze - plynulý přechod s exponenciálním škálováním
-                                edge_weight_boosted = weight * 3
+                                edge_weight_boosted = (weight / 0.1) ** 3
                                 edge_weight_boosted = min(edge_weight_boosted, 1.0)
-                                boost_exp = np.exp(edge_weight_boosted * 1.5) - 1
-                                boost_exp = boost_exp / (np.exp(1.5) - 1)
-                                boost_exp = np.clip(boost_exp, 0, 0.95)
-                                pseudo_healthy[x, y, z] = (1 - boost_exp) * adc_data[x, y, z] + boost_exp * noisy_value
+                                pseudo_healthy[x, y, z] = (1 - edge_weight_boosted * 0.6) * adc_data[x, y, z] + edge_weight_boosted * 0.6 * noisy_value
                     
                     # Uložíme referenční hodnotu z prstence
                     if np.any(ring_mask):
@@ -660,45 +645,26 @@ def create_pseudo_healthy_brain_with_atlas(adc_data, label_data, atlas_path, std
                 
                 # Aplikace normativních hodnot z atlasu s přechodem
                 for x, y, z in current_coords:
-                    # Apply transition weight (pouze pro okraje)
-                    weight = edge_transition_mask[x, y, z]
-                    
-                    # ZMĚNA: Přidání šumu škálovaného podle směrodatné odchylky z atlasu
-                    if std_atlas_np is not None:
-                        # Najít odpovídající voxel v registrované lézi
-                        idx = np.argwhere(registered_current_lesion_np)
-                        if len(idx) > 0:
-                            # Použít lokální směrodatnou odchylku z atlasu std pro tento voxel léze
-                            # Pro jednodušší implementaci použijeme průměrnou hodnotu std z transformované oblasti léze
-                            noise_scale = atlas_std_global
-                        else:
-                            # Fallback, pokud není voxel v registrované lézi
-                            noise_scale = atlas_std_global
-                    else:
-                        # Pokud nemáme std atlas, použijeme globální směrodatnou odchylku
-                        noise_scale = atlas_std_global
-                    
                     # Škálování šumu směrodatnou odchylkou
-                    noisy_value = atlas_mean + (noise[x, y, z] - 0.5) * 2 * noise_scale  # *2 pro využití celého rozsahu
+                    noisy_value = atlas_mean + (noise[x, y, z] - 0.5) * 2 * noise_scale
                     
                     # Škálování zpět do původního rozsahu hodnot pacientského obrazu
                     scaled_value = noisy_value * (adc_max - adc_min) + adc_min
                     
-                    # VYLEPŠENÝ PŘÍSTUP: Strmější přechod k referenčním hodnotám
-                    if weight > 0.3:  # Posuneme hranici z 0.5 na 0.3
-                        # Vnitřek léze - exponenciální škálování
-                        inner_weight = np.exp((weight - 0.3) * 3) - 1
+                    # Apply transition weight
+                    weight = edge_transition_mask[x, y, z]
+                    
+                    # SUPER OSTRÝ EXPONENCIÁLNÍ PŘÍSTUP
+                    if weight > 0.1:
+                        inner_weight = np.exp((weight - 0.1) * 6) - 1
+                        inner_weight = inner_weight / (np.exp(0.9 * 6) - 1)
                         inner_weight = np.clip(inner_weight, 0, 1)
-                        inner_mix = 0.95 * inner_weight + 0.05
+                        inner_mix = 0.98 * inner_weight + 0.02
                         pseudo_healthy[x, y, z] = (1 - inner_mix) * adc_data[x, y, z] + inner_mix * scaled_value
                     else:
-                        # Okraj léze - plynulý přechod s exponenciálním škálováním
-                        edge_weight_boosted = weight * 3
+                        edge_weight_boosted = (weight / 0.1) ** 3
                         edge_weight_boosted = min(edge_weight_boosted, 1.0)
-                        boost_exp = np.exp(edge_weight_boosted * 1.5) - 1
-                        boost_exp = boost_exp / (np.exp(1.5) - 1)
-                        boost_exp = np.clip(boost_exp, 0, 0.95)
-                        pseudo_healthy[x, y, z] = (1 - boost_exp) * adc_data[x, y, z] + boost_exp * scaled_value
+                        pseudo_healthy[x, y, z] = (1 - edge_weight_boosted * 0.6) * adc_data[x, y, z] + edge_weight_boosted * 0.6 * scaled_value
         
         else:
             print("Warning: No valid lesion voxels found in registered space. Using original method.")
