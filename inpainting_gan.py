@@ -107,22 +107,17 @@ class LesionInpaintingDataset(Dataset):
                 patient_id = ph_file.stem.split('_')[0]  # Bereme první část před podtržítkem jako ID
             
             # Vypsat ID pacienta pro kontrolu
-            print(f"Hledám soubory pro pacienta ID: {patient_id}")
             
             # Hledáme ADC soubory s různými možnými přípony
             adc_file = []
             for pattern in [f"{patient_id}*-ADC*.mha", f"{patient_id}*adc*.mha", f"{patient_id}*.mha"]:
                 adc_file = list(self.adc_dir.glob(pattern))
-                if adc_file:
-                    print(f"Nalezen ADC soubor s pattern {pattern}: {adc_file[0].name}")
-                    break
             
             # Hledáme masky lézí s různými možnými přípony
             lesion_file = []
             for pattern in [f"{patient_id}*_lesion*.mha", f"{patient_id}*mask*.mha", f"{patient_id}*lesion*.mha", f"{patient_id}*.mha"]:
                 lesion_file = list(self.lesion_mask_dir.glob(pattern))
                 if lesion_file:
-                    print(f"Nalezena maska léze s pattern {pattern}: {lesion_file[0].name}")
                     break
             
             if adc_file and lesion_file:
@@ -135,15 +130,6 @@ class LesionInpaintingDataset(Dataset):
         
         print(f"Nalezeno {len(self.file_triplets)} kompletních tripletů souborů")
         
-        # Pokud jsou nalezeny triplety, vypsat je pro kontrolu
-        if self.file_triplets:
-            print("Příklady nalezených tripletů:")
-            for i, triplet in enumerate(self.file_triplets[:min(3, len(self.file_triplets))]):
-                print(f"Triplet {i+1}:")
-                print(f"  Pseudo-healthy: {triplet['pseudo_healthy'].name}")
-                print(f"  ADC: {triplet['adc'].name}")
-                print(f"  Lesion mask: {triplet['lesion_mask'].name}")
-                print(f"  Patient ID: {triplet['patient_id']}")
     
     def __len__(self):
         return len(self.file_triplets)
