@@ -287,14 +287,13 @@ def create_pseudo_healthy_brain(adc_data, label_data):
     
     # Poměr, jak moc se chceme přiblížit k referenčním hodnotám
     # 0 = zůstat na původní hodnotě, 1 = plně dosáhnout referenční hodnoty
-    # NASTAVÍME VELMI VYSOKOU HODNOTU, PROTOŽE PŘEDCHOZÍ POKUSY BYLY PŘÍLIŠ SLABÉ
     TARGET_RATIO = 0.85  # 85% cesty směrem k referenční hodnotě
     
-    # Hranice mezi vnitřkem léze a okrajem - zvýšíme pro plynulejší přechod
+    # Hranice mezi vnitřkem léze a okrajem
     EDGE_THRESHOLD = 0.2
     
-    # Koeficient pro okrajový přechod - snížíme pro jemnější přechod
-    EDGE_BLEND_FACTOR = 0.6  # Bylo 0.7
+    # Koeficient pro okrajový přechod
+    EDGE_BLEND_FACTOR = 0.6
     
     # Process each connected component (lesion) separately
     for lesion_idx in range(1, num_lesions + 1):
@@ -325,27 +324,54 @@ def create_pseudo_healthy_brain(adc_data, label_data):
                 # Uložíme tuto hodnotu jako referenční pro celou lézi
                 reference_values[current_lesion] = avg_value
                 
+                # Vypočítáme průměrnou hodnotu v aktuální lézi
+                lesion_values = adc_data[current_lesion]
+                lesion_mean = np.mean(lesion_values)
+                
+                # Vypočítáme offset mezi referenční hodnotou a průměrnou hodnotou v lézi
+                offset = avg_value - lesion_mean
+                print(f"Offset value: {offset:.2f} (Lesion mean: {lesion_mean:.2f}, Target mean: {avg_value:.2f})")
+                
                 # Generate Perlin noise with a smaller scale for local variations
                 noise = generate_perlin_noise(shape, scale=5.0, octaves=3)
                 
-                # Modifikovaný přístup pro plynulejší přechod
+                # Vytvoříme mapu vzdálenosti od okraje léze (distance transform)
+                # Hodnoty uvnitř léze budou větší čím dále od okraje
+                distance_map = ndimage.distance_transform_edt(current_lesion)
+                
+                # Normalizujeme mapu vzdálenosti na rozsah [0, 1]
+                if distance_map.max() > 0:
+                    normalized_dist = distance_map / distance_map.max()
+                else:
+                    normalized_dist = distance_map
+                
+                # Aplikujeme offset s plynulým přechodem a s ohledem na vzdálenost od okraje
                 for x, y, z in current_coords:
+                    # Získáme váhu přechodu pro okraj léze
+                    weight = edge_transition_mask[x, y, z]
+                    
                     # Přidáme šum škálovaný na cca 5% průměrné hodnoty (méně šumu)
                     noise_scale = 0.05 * avg_value
-                    noisy_value = avg_value + (noise[x, y, z] - 0.5) * noise_scale
+                    noise_value = (noise[x, y, z] - 0.5) * noise_scale
                     
-                    # Získáme váhu přechodu
-                    weight = edge_transition_mask[x, y, z]
+                    # Lokální odchylka od průměru - zachová texturu
+                    local_deviation = adc_data[x, y, z] - lesion_mean
                     
                     if weight > EDGE_THRESHOLD:
                         # Vnitřek léze - vylepšená funkce pro plynulejší přechod
                         # Převedeme váhu z rozsahu [EDGE_THRESHOLD, 1] na [0, 1]
                         normalized_weight = (weight - EDGE_THRESHOLD) / (1 - EDGE_THRESHOLD)
                         
-                        # Aplikujeme přenos s kvadratickou funkcí pro plynulejší přechod 
-                        # (rychlý nárůst na začátku, pomalejší na konci)
+                        # Aplikujeme přenos s kvadratickou funkcí pro plynulejší přechod
+                        # Ale navíc přidáme závislost na vzdálenosti od okraje
                         blend_ratio = TARGET_RATIO * (1 - (1 - normalized_weight) * (1 - normalized_weight))
-                        pseudo_healthy[x, y, z] = (1 - blend_ratio) * adc_data[x, y, z] + blend_ratio * noisy_value
+                        
+                        # Využití vzdálenosti od okraje pro plynulejší přechod uvnitř léze
+                        # Čím blíž středu léze, tím větší offset (ale zachováme relativní variabilitu)
+                        dist_factor = 0.3 + 0.7 * normalized_dist[x, y, z]
+                        
+                        # Aplikujeme offset s ohledem na lokální odchylku
+                        pseudo_healthy[x, y, z] = lesion_mean + local_deviation + blend_ratio * dist_factor * offset + noise_value
                     else:
                         # Okraj léze - plynulý nelineární přechod
                         # Převedeme váhu z rozsahu [0, EDGE_THRESHOLD] na [0, 1]
@@ -353,11 +379,12 @@ def create_pseudo_healthy_brain(adc_data, label_data):
                         
                         # Kvadratická funkce pro plynulejší nárůst
                         edge_ratio = TARGET_RATIO * EDGE_BLEND_FACTOR * normalized_weight * normalized_weight
-                        pseudo_healthy[x, y, z] = (1 - edge_ratio) * adc_data[x, y, z] + edge_ratio * noisy_value
+                        
+                        # Aplikujeme offset s ohledem na lokální odchylku - zachová texturu
+                        pseudo_healthy[x, y, z] = adc_data[x, y, z] + edge_ratio * offset + noise_value
             
         else:
             # Case 2: Symmetric lesion present - use normative approach
-            # This is a simplified approach without proper atlas registration
             
             # Use the mean of healthy tissue around the lesion as an estimate
             # Create a dilated mask of the lesion
@@ -379,21 +406,42 @@ def create_pseudo_healthy_brain(adc_data, label_data):
                 # Uložíme tuto hodnotu jako referenční pro celou lézi
                 reference_values[current_lesion] = avg_ring_value
                 
+                # Vypočítáme průměrnou hodnotu v aktuální lézi
+                lesion_values = adc_data[current_lesion]
+                lesion_mean = np.mean(lesion_values)
+                
+                # Vypočítáme offset mezi referenční hodnotou a průměrnou hodnotou v lézi
+                offset = avg_ring_value - lesion_mean
+                print(f"Offset value: {offset:.2f} (Lesion mean: {lesion_mean:.2f}, Target mean: {avg_ring_value:.2f})")
+                
                 # Generate noise for the lesion area
                 noise = generate_perlin_noise(shape, scale=5.0, octaves=3)
                 
-                # Apply the average value with noise to the lesion area
+                # Vytvoříme mapu vzdálenosti od okraje léze (distance transform)
+                # Hodnoty uvnitř léze budou větší čím dále od okraje
+                distance_map = ndimage.distance_transform_edt(current_lesion)
+                
+                # Normalizujeme mapu vzdálenosti na rozsah [0, 1]
+                if distance_map.max() > 0:
+                    normalized_dist = distance_map / distance_map.max()
+                else:
+                    normalized_dist = distance_map
+                
+                # Apply the offset value with noise to the lesion area
                 current_coords = np.where(current_lesion)
                 current_coords = list(zip(current_coords[0], current_coords[1], current_coords[2]))
                 
-                # Modifikovaný přístup pro plynulejší přechod
+                # Aplikujeme offset s plynulým přechodem a s ohledem na vzdálenost od okraje
                 for x, y, z in current_coords:
-                    # Přidáme šum škálovaný na cca 5% průměrné hodnoty (méně šumu)
-                    noise_scale = 0.05 * avg_ring_value
-                    noisy_value = avg_ring_value + (noise[x, y, z] - 0.5) * noise_scale
-                    
                     # Získáme váhu přechodu
                     weight = edge_transition_mask[x, y, z]
+                    
+                    # Přidáme šum škálovaný na cca 5% průměrné hodnoty (méně šumu)
+                    noise_scale = 0.05 * avg_ring_value
+                    noise_value = (noise[x, y, z] - 0.5) * 2 * noise_scale
+                    
+                    # Lokální odchylka od průměru - zachová texturu
+                    local_deviation = adc_data[x, y, z] - lesion_mean
                     
                     if weight > EDGE_THRESHOLD:
                         # Vnitřek léze - vylepšená funkce pro plynulejší přechod
@@ -402,7 +450,12 @@ def create_pseudo_healthy_brain(adc_data, label_data):
                         
                         # Aplikujeme přenos s kvadratickou funkcí pro plynulejší přechod
                         blend_ratio = TARGET_RATIO * (1 - (1 - normalized_weight) * (1 - normalized_weight))
-                        pseudo_healthy[x, y, z] = (1 - blend_ratio) * adc_data[x, y, z] + blend_ratio * noisy_value
+                        
+                        # Využití vzdálenosti od okraje pro plynulejší přechod uvnitř léze
+                        dist_factor = 0.3 + 0.7 * normalized_dist[x, y, z]
+                        
+                        # Aplikujeme offset s ohledem na lokální odchylku
+                        pseudo_healthy[x, y, z] = lesion_mean + local_deviation + blend_ratio * dist_factor * offset + noise_value
                     else:
                         # Okraj léze - plynulý nelineární přechod
                         # Převedeme váhu z rozsahu [0, EDGE_THRESHOLD] na [0, 1]
@@ -410,7 +463,9 @@ def create_pseudo_healthy_brain(adc_data, label_data):
                         
                         # Kvadratická funkce pro plynulejší nárůst
                         edge_ratio = TARGET_RATIO * EDGE_BLEND_FACTOR * normalized_weight * normalized_weight
-                        pseudo_healthy[x, y, z] = (1 - edge_ratio) * adc_data[x, y, z] + edge_ratio * noisy_value
+                        
+                        # Aplikujeme offset s ohledem na lokální odchylku - zachová texturu
+                        pseudo_healthy[x, y, z] = adc_data[x, y, z] + edge_ratio * offset + noise_value
     
     return pseudo_healthy, reference_values
 
@@ -598,15 +653,13 @@ def create_pseudo_healthy_brain_with_atlas(adc_data, label_data, atlas_path, std
             noise = generate_perlin_noise(adc_data.shape, scale=5.0, octaves=3)
             
             # Poměr, jak moc se chceme přiblížit k referenčním hodnotám
-            # 0 = zůstat na původní hodnotě, 1 = plně dosáhnout referenční hodnoty
-            # NASTAVÍME VELMI VYSOKOU HODNOTU, PROTOŽE PŘEDCHOZÍ POKUSY BYLY PŘÍLIŠ SLABÉ
             TARGET_RATIO = 0.85  # 85% cesty směrem k referenční hodnotě
             
             # Hranice mezi vnitřkem léze a okrajem - zvýšíme pro plynulejší přechod
             EDGE_THRESHOLD = 0.2
             
             # Koeficient pro okrajový přechod - snížíme pro jemnější přechod
-            EDGE_BLEND_FACTOR = 0.6  # Bylo 0.7
+            EDGE_BLEND_FACTOR = 0.6
             
             # Zpracování každé komponenty léze zvlášť
             for lesion_idx in range(1, num_lesions + 1):
@@ -656,14 +709,35 @@ def create_pseudo_healthy_brain_with_atlas(adc_data, label_data, atlas_path, std
                         current_coords = np.where(current_lesion)
                         current_coords = list(zip(current_coords[0], current_coords[1], current_coords[2]))
                         
-                        # PŘÍMOČARÝ PŘÍSTUP PRO APLIKACI HODNOT
+                        # Vypočítáme průměrnou hodnotu v aktuální lézi
+                        lesion_values = adc_data[current_lesion]
+                        lesion_mean = np.mean(lesion_values)
+                        
+                        # Vypočítáme offset mezi referenční hodnotou a průměrnou hodnotou v lézi
+                        offset = avg_ring_value - lesion_mean
+                        print(f"Offset value: {offset:.2f} (Lesion mean: {lesion_mean:.2f}, Target mean: {avg_ring_value:.2f})")
+                        
+                        # Vytvoříme mapu vzdálenosti od okraje léze (distance transform)
+                        # Hodnoty uvnitř léze budou větší čím dále od okraje
+                        distance_map = ndimage.distance_transform_edt(current_lesion)
+                        
+                        # Normalizujeme mapu vzdálenosti na rozsah [0, 1]
+                        if distance_map.max() > 0:
+                            normalized_dist = distance_map / distance_map.max()
+                        else:
+                            normalized_dist = distance_map
+                        
+                        # Aplikujeme offset s plynulým přechodem
                         for x, y, z in current_coords:
-                            # Přidáme šum škálovaný na cca 5% průměrné hodnoty (méně šumu)
-                            noise_scale = 0.05 * avg_ring_value
-                            noisy_value = avg_ring_value + (noise[x, y, z] - 0.5) * 2 * noise_scale
-                            
                             # Získáme váhu přechodu
                             weight = edge_transition_mask[x, y, z]
+                            
+                            # Přidáme šum škálovaný na cca 5% průměrné hodnoty (méně šumu)
+                            noise_scale = 0.05 * avg_ring_value
+                            noise_value = (noise[x, y, z] - 0.5) * 2 * noise_scale
+                            
+                            # Lokální odchylka od průměru - zachová texturu
+                            local_deviation = adc_data[x, y, z] - lesion_mean
                             
                             if weight > EDGE_THRESHOLD:
                                 # Vnitřek léze - vylepšená funkce pro plynulejší přechod
@@ -672,7 +746,12 @@ def create_pseudo_healthy_brain_with_atlas(adc_data, label_data, atlas_path, std
                                 
                                 # Aplikujeme přenos s kvadratickou funkcí pro plynulejší přechod
                                 blend_ratio = TARGET_RATIO * (1 - (1 - normalized_weight) * (1 - normalized_weight))
-                                pseudo_healthy[x, y, z] = (1 - blend_ratio) * adc_data[x, y, z] + blend_ratio * noisy_value
+                                
+                                # Využití vzdálenosti od okraje pro plynulejší přechod uvnitř léze
+                                dist_factor = 0.3 + 0.7 * normalized_dist[x, y, z]
+                                
+                                # Aplikujeme offset s ohledem na lokální odchylku
+                                pseudo_healthy[x, y, z] = lesion_mean + local_deviation + blend_ratio * dist_factor * offset + noise_value
                             else:
                                 # Okraj léze - plynulý nelineární přechod
                                 # Převedeme váhu z rozsahu [0, EDGE_THRESHOLD] na [0, 1]
@@ -680,7 +759,9 @@ def create_pseudo_healthy_brain_with_atlas(adc_data, label_data, atlas_path, std
                                 
                                 # Kvadratická funkce pro plynulejší nárůst
                                 edge_ratio = TARGET_RATIO * EDGE_BLEND_FACTOR * normalized_weight * normalized_weight
-                                pseudo_healthy[x, y, z] = (1 - edge_ratio) * adc_data[x, y, z] + edge_ratio * noisy_value
+                                
+                                # Aplikujeme offset s ohledem na lokální odchylku - zachová texturu
+                                pseudo_healthy[x, y, z] = adc_data[x, y, z] + edge_ratio * offset + noise_value
                     
                     # Uložíme referenční hodnotu z prstence
                     if np.any(ring_mask):
@@ -699,19 +780,36 @@ def create_pseudo_healthy_brain_with_atlas(adc_data, label_data, atlas_path, std
                 else:
                     current_atlas_mean = atlas_mean
                 
+                # Vypočítáme offset mezi referenční hodnotou a průměrnou hodnotou v lézi
+                offset = current_atlas_mean - lesion_mean
+                print(f"Offset value: {offset:.2f} (Lesion mean: {lesion_mean:.2f}, Target mean: {current_atlas_mean:.2f})")
+                
+                # Vytvoříme mapu vzdálenosti od okraje léze (distance transform)
+                # Hodnoty uvnitř léze budou větší čím dále od okraje
+                distance_map = ndimage.distance_transform_edt(current_lesion)
+                
+                # Normalizujeme mapu vzdálenosti na rozsah [0, 1]
+                if distance_map.max() > 0:
+                    normalized_dist = distance_map / distance_map.max()
+                else:
+                    normalized_dist = distance_map
+                
                 # Uložíme referenční hodnotu z atlasu
                 reference_values[current_lesion] = current_atlas_mean
                 
                 print(f"Lesion component {lesion_idx}: Atlas reference value = {current_atlas_mean:.2f}")
                 
-                # PŘÍMOČARÝ PŘÍSTUP PRO APLIKACI HODNOT
+                # Aplikujeme offset s plynulým přechodem
                 for x, y, z in current_coords:
-                    # Přidáme šum škálovaný na cca 5% průměrné hodnoty (méně šumu)
-                    noise_scale = 0.05 * current_atlas_mean
-                    noisy_value = current_atlas_mean + (noise[x, y, z] - 0.5) * 2 * noise_scale
-                    
                     # Získáme váhu přechodu
                     weight = edge_transition_mask[x, y, z]
+                    
+                    # Přidáme šum škálovaný na cca 5% průměrné hodnoty (méně šumu)
+                    noise_scale = 0.05 * current_atlas_mean
+                    noise_value = (noise[x, y, z] - 0.5) * 2 * noise_scale
+                    
+                    # Lokální odchylka od průměru - zachová texturu
+                    local_deviation = adc_data[x, y, z] - lesion_mean
                     
                     if weight > EDGE_THRESHOLD:
                         # Vnitřek léze - vylepšená funkce pro plynulejší přechod
@@ -720,7 +818,12 @@ def create_pseudo_healthy_brain_with_atlas(adc_data, label_data, atlas_path, std
                         
                         # Aplikujeme přenos s kvadratickou funkcí pro plynulejší přechod
                         blend_ratio = TARGET_RATIO * (1 - (1 - normalized_weight) * (1 - normalized_weight))
-                        pseudo_healthy[x, y, z] = (1 - blend_ratio) * adc_data[x, y, z] + blend_ratio * noisy_value
+                        
+                        # Využití vzdálenosti od okraje pro plynulejší přechod uvnitř léze
+                        dist_factor = 0.3 + 0.7 * normalized_dist[x, y, z]
+                        
+                        # Aplikujeme offset s ohledem na lokální odchylku
+                        pseudo_healthy[x, y, z] = lesion_mean + local_deviation + blend_ratio * dist_factor * offset + noise_value
                     else:
                         # Okraj léze - plynulý nelineární přechod
                         # Převedeme váhu z rozsahu [0, EDGE_THRESHOLD] na [0, 1]
@@ -728,7 +831,9 @@ def create_pseudo_healthy_brain_with_atlas(adc_data, label_data, atlas_path, std
                         
                         # Kvadratická funkce pro plynulejší nárůst
                         edge_ratio = TARGET_RATIO * EDGE_BLEND_FACTOR * normalized_weight * normalized_weight
-                        pseudo_healthy[x, y, z] = (1 - edge_ratio) * adc_data[x, y, z] + edge_ratio * noisy_value
+                        
+                        # Aplikujeme offset s ohledem na lokální odchylku - zachová texturu
+                        pseudo_healthy[x, y, z] = adc_data[x, y, z] + edge_ratio * offset + noise_value
         
         else:
             print("Warning: No valid lesion voxels found in registered space. Using original method.")
