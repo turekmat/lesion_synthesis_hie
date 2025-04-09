@@ -290,10 +290,10 @@ def create_pseudo_healthy_brain(adc_data, label_data):
     TARGET_RATIO = 1.0  # Maximální přiblížení k cílovým hodnotám
     
     # Hranice mezi vnitřkem léze a okrajem
-    EDGE_THRESHOLD = 0.10  # Sníženo z 0.12 na 0.10 pro výraznější přechod na okraji
+    EDGE_THRESHOLD = 0.11  # Sníženo z 0.12 na 0.10 pro výraznější přechod na okraji
     
     # Koeficient pro okrajový přechod
-    EDGE_BLEND_FACTOR = 0.85  # Zvýšeno z 0.8 na 0.85 pro silnější přechod na okrajích
+    EDGE_BLEND_FACTOR = 0.82  # Zvýšeno z 0.8 na 0.85 pro silnější přechod na okrajích
     
     # Dodatečný faktor pro zvýšení offsetu
     BOOST_FACTOR = 1.2  # Zvýší celý offset o 20% pro větší efekt
