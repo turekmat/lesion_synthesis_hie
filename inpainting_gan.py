@@ -192,7 +192,6 @@ class LesionInpaintingDataset(Dataset):
         target_h = max(patch_size, ((h + patch_size - 1) // patch_size) * patch_size)
         target_w = max(patch_size, ((w + patch_size - 1) // patch_size) * patch_size)
         
-        print(f"Padding from {data.shape} to target size: ({target_d}, {target_h}, {target_w})")
         
         # Vypočítat padding pro každý rozměr
         pad_d = max(0, target_d - d)
@@ -334,6 +333,8 @@ class Generator(nn.Module):
         
         # Decoder s přeskočenými spojeními
         self.decoder_layers = nn.ModuleList()
+        # Dodatečné konvoluční vrstvy pro zpracování spojených feature map
+        self.decoder_conv_layers = nn.ModuleList()
         
         for i in range(depth - 1):
             # Pro největší hloubku použijeme menší kernel
@@ -354,6 +355,7 @@ class Generator(nn.Module):
                         nn.ReLU(inplace=True)
                     )
                 )
+                self.decoder_conv_layers.append(None)  # Nejhlubší vrstva nemá přeskočené spojení
             else:  # Ostatní vrstvy s přeskočeným spojením
                 self.decoder_layers.append(
                     nn.Sequential(
@@ -362,6 +364,21 @@ class Generator(nn.Module):
                             current_filters // 2,
                             kernel_size=kernel_size, 
                             stride=2, 
+                            padding=1,
+                            bias=False
+                        ),
+                        nn.BatchNorm3d(current_filters // 2),
+                        nn.ReLU(inplace=True)
+                    )
+                )
+                # Přidat konvoluční vrstvu pro zpracování spojených feature map
+                self.decoder_conv_layers.append(
+                    nn.Sequential(
+                        nn.Conv3d(
+                            current_filters,  # current_filters // 2 + current_filters // 2
+                            current_filters // 2,
+                            kernel_size=3,
+                            stride=1,
                             padding=1,
                             bias=False
                         ),
@@ -422,7 +439,12 @@ class Generator(nn.Module):
                     # Interpolace pro zajištění stejné velikosti
                     x = F.interpolate(x, size=skip.shape[2:], mode='trilinear', align_corners=False)
                 
+                # Spojit feature mapy
                 x = torch.cat([x, skip], dim=1)
+                
+                # Použít dodatečnou konvoluci pro redukci počtu kanálů po konkatenaci
+                if self.decoder_conv_layers[i] is not None:
+                    x = self.decoder_conv_layers[i](x)
         
         # Finální konvoluce pro generování ADC mapy
         x = self.final_conv(x)
