@@ -1491,6 +1491,19 @@ def visualize_results(pseudo_healthy, label, output, target, output_path, metric
                 out_np = output.detach().cpu().numpy() if isinstance(output, torch.Tensor) else output
                 tgt_np = target.detach().cpu().numpy() if isinstance(target, torch.Tensor) else target
                 
+                # Get original range if available for MAE calculation
+                orig_range = None
+                if metrics is not None and "Original ADC Range" in metrics:
+                    range_text = metrics["Original ADC Range"]
+                    if isinstance(range_text, str) and "to" in range_text:
+                        try:
+                            parts = range_text.split("to")
+                            min_val = float(parts[0].strip())
+                            max_val = float(parts[1].strip())
+                            orig_range = (min_val, max_val)
+                        except:
+                            pass
+                
                 # Simplify dimensions - just keep reducing until we get to 3D
                 while len(ph_np.shape) > 3:
                     ph_np = ph_np[0]
@@ -1545,7 +1558,32 @@ def visualize_results(pseudo_healthy, label, output, target, output_path, metric
                         
                         # Check if this is a lesion slice
                         has_lesion = np.any(lbl_slice > 0)
+                        
+                        # Calculate slice-specific MAE for lesion areas
+                        slice_mae = None
+                        if has_lesion:
+                            # Create a clean copy of the pseudo-healthy slice
+                            inpainted_slice = np.copy(ph_slice)
+                            
+                            # Only replace voxels in the lesion area with the output from generator
+                            lesion_mask = lbl_slice > 0
+                            inpainted_slice[lesion_mask] = out_slice[lesion_mask]
+                            
+                            # Calculate MAE only for the lesion area
+                            abs_diff = np.abs(inpainted_slice[lesion_mask] - tgt_slice[lesion_mask])
+                            slice_mae = np.mean(abs_diff)
+                            
+                            # Denormalize if original range is available
+                            if orig_range is not None:
+                                orig_min, orig_max = orig_range
+                                slice_mae_orig = slice_mae * (orig_max - orig_min)
+                                slice_mae_display = f"Slice MAE: {slice_mae:.4f} (norm) / {slice_mae_orig:.4f} (orig)"
+                            else:
+                                slice_mae_display = f"Slice MAE: {slice_mae:.4f}"
+                        
                         slice_title = f"Slice {z}" + (" (contains lesion)" if has_lesion else "")
+                        if has_lesion and slice_mae is not None:
+                            slice_title += f" - {slice_mae_display}"
                         
                         # 1. Pseudo-healthy
                         axes[0].imshow(ph_slice, cmap='gray')
@@ -1575,7 +1613,14 @@ def visualize_results(pseudo_healthy, label, output, target, output_path, metric
                         
                         # Show inpainted result
                         axes[2].imshow(inpainted_slice, cmap='gray')
-                        axes[2].set_title('Output (Inpainted Brain)')
+                        title = 'Output (Inpainted Brain)'
+                        if has_lesion and slice_mae is not None:
+                            # Add MAE directly in the plot title
+                            if orig_range is not None:
+                                title += f"\nMAE: {slice_mae:.4f} (norm) / {slice_mae * (orig_max - orig_min):.4f} (orig)"
+                            else:
+                                title += f"\nMAE: {slice_mae:.4f}"
+                        axes[2].set_title(title)
                         axes[2].axis('off')
                         
                         # 4. Target
