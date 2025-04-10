@@ -104,7 +104,7 @@ class PatchExtractor:
         self.patch_size = patch_size
         self.overlap = overlap
     
-    def extract_patches_with_lesions(self, pseudo_healthy, label, adc):
+    def extract_patches_with_lesions(self, pseudo_healthy, label, adc, max_attempts=3, current_attempt=0):
         """
         Extract patches that contain lesions
         
@@ -112,6 +112,8 @@ class PatchExtractor:
             pseudo_healthy: tensor of shape [C, D, H, W]
             label: tensor of shape [C, D, H, W]
             adc: tensor of shape [C, D, H, W]
+            max_attempts: maximum number of recursive attempts
+            current_attempt: current recursive attempt count
             
         Returns:
             patches_ph: list of pseudo_healthy patches
@@ -122,8 +124,8 @@ class PatchExtractor:
         # Get non-zero indices from the label
         non_zero_indices = torch.nonzero(label[0])
         
-        if len(non_zero_indices) == 0:
-            # If no lesion, return a single random patch
+        if len(non_zero_indices) == 0 or current_attempt >= max_attempts:
+            # If no lesion or max attempts reached, return a single random patch
             d, h, w = pseudo_healthy.shape[1:]
             z_start = random.randint(0, max(0, d - self.patch_size[0]))
             y_start = random.randint(0, max(0, h - self.patch_size[1]))
@@ -200,9 +202,46 @@ class PatchExtractor:
                 patches_adc.append(adc_patch)
                 patch_coords.append((z_start, y_start, x_start))
         
-        # If no patches with lesions were found, take a random patch
-        if len(patches_ph) == 0:
-            return self.extract_patches_with_lesions(pseudo_healthy, label, adc)
+        # If no patches with lesions were found, try again with a slight variation
+        # but limit the number of recursive attempts to avoid stack overflow
+        if len(patches_ph) == 0 and current_attempt < max_attempts:
+            # Apply small random shift to non-zero indices to try to find lesions
+            if len(non_zero_indices) > 0:
+                for i in range(len(non_zero_indices)):
+                    non_zero_indices[i, 0] += random.randint(-5, 5)
+                    non_zero_indices[i, 1] += random.randint(-5, 5)
+                    non_zero_indices[i, 2] += random.randint(-5, 5)
+            
+            return self.extract_patches_with_lesions(pseudo_healthy, label, adc, max_attempts, current_attempt + 1)
+        elif len(patches_ph) == 0:
+            # If still no patches with lesions after max attempts, return random patch
+            d, h, w = pseudo_healthy.shape[1:]
+            z_start = random.randint(0, max(0, d - self.patch_size[0]))
+            y_start = random.randint(0, max(0, h - self.patch_size[1]))
+            x_start = random.randint(0, max(0, w - self.patch_size[2]))
+            
+            ph_patch = pseudo_healthy[:, 
+                                     z_start:z_start+self.patch_size[0], 
+                                     y_start:y_start+self.patch_size[1], 
+                                     x_start:x_start+self.patch_size[2]]
+            
+            label_patch = label[:, 
+                              z_start:z_start+self.patch_size[0], 
+                              y_start:y_start+self.patch_size[1], 
+                              x_start:x_start+self.patch_size[2]]
+            
+            adc_patch = adc[:, 
+                          z_start:z_start+self.patch_size[0], 
+                          y_start:y_start+self.patch_size[1], 
+                          x_start:x_start+self.patch_size[2]]
+            
+            # Pad if necessary
+            if ph_patch.shape[1:] != self.patch_size:
+                ph_patch = self._pad_patch(ph_patch)
+                label_patch = self._pad_patch(label_patch)
+                adc_patch = self._pad_patch(adc_patch)
+            
+            return [ph_patch], [label_patch], [adc_patch], [(z_start, y_start, x_start)]
         
         return patches_ph, patches_label, patches_adc, patch_coords
     
@@ -211,10 +250,11 @@ class PatchExtractor:
         if len(non_zero_indices) == 0:
             return []
         
-        centers = [non_zero_indices[0].tolist()]
+        # Convert to list of lists to avoid recursion issues with torch tensors
+        indices_list = [idx.tolist() for idx in non_zero_indices]
+        centers = [indices_list[0]]
         
-        for idx in non_zero_indices:
-            idx = idx.tolist()
+        for idx in indices_list[1:]:
             # Check if this voxel is far enough from existing centers
             is_new_center = True
             for center in centers:
