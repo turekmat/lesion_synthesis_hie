@@ -783,6 +783,22 @@ def train(args):
         else:
             return torch.nn.functional.l1_loss(pred, target)
     
+    def mean_absolute_error(pred, target, mask):
+        """Mean Absolute Error (MAE) in lesion regions"""
+        # Apply mask to both prediction and target
+        masked_pred = pred * mask
+        masked_target = target * mask
+        
+        # Calculate absolute difference
+        abs_diff = torch.abs(masked_pred - masked_target)
+        
+        # Calculate mean only over masked regions
+        mask_sum = mask.sum()
+        if mask_sum > 0:
+            return abs_diff.sum() / mask_sum
+        else:
+            return torch.tensor(0.0, device=pred.device)
+    
     def dice_coefficient(pred, target, mask, smooth=1e-5):
         """Dice coefficient metric for evaluating overlap in lesion areas"""
         # Apply mask to both prediction and target
@@ -914,6 +930,7 @@ def train(args):
         val_healthy_loss = 0.0
         val_lesion_dice = 0.0
         val_lesion_ssim = 0.0
+        val_lesion_mae = 0.0  # Přidáno pro sledování MAE v oblasti lézí
         val_examples = 0
         
         with torch.no_grad():
@@ -954,8 +971,6 @@ def train(args):
                     
                     for patch_idx, (ph_patch, label_patch, coords) in enumerate(zip(filtered_patches_ph, filtered_patches_label, filtered_patch_coords)):
                         try:
-                            # Print patch dimensions for debugging
-                            print(f"Input patch {patch_idx}: shape={ph_patch.shape}, coords={coords}")
                             
                             # Add batch dimension
                             ph_patch = ph_patch.unsqueeze(0)  # Add batch dimension [1, C, Z, Y, X]
@@ -990,7 +1005,6 @@ def train(args):
                             # Remove batch dimension for reconstruction
                             output_patches.append(output_patch[0])
                             valid_patch_coords.append(coords)
-                            print(f"Successfully processed patch {patch_idx}, output shape: {output_patch.shape}")
                             
                         except Exception as patch_error:
                             print(f"Error processing patch {patch_idx}: {patch_error}")
@@ -998,7 +1012,6 @@ def train(args):
                     
                     # Reconstruct full volume
                     if output_patches:
-                        print(f"Reconstructing from {len(output_patches)} processed patches")
                         
                         try:
                             # Ensure all patches have the same number of dimensions
@@ -1014,7 +1027,6 @@ def train(args):
                             
                             # Verify shapes after normalization
                             patch_shapes = [p.shape for p in output_patches]
-                            print(f"Patch shapes after normalization: {patch_shapes[:5]}..." if len(patch_shapes) > 5 else patch_shapes)
                             
                             # Reconstruct the volume
                             reconstructed = patch_extractor.reconstruct_from_patches(
@@ -1027,12 +1039,9 @@ def train(args):
                             
                             # Check if inpainted has too many dimensions
                             if inpainted.dim() > pseudo_healthy[0].dim():
-                                print(f"Normalizing inpainted dimensions from {inpainted.shape} to match {pseudo_healthy[0].shape}")
                                 # Remove extra dimensions
                                 while inpainted.dim() > pseudo_healthy[0].dim():
-                                    inpainted = inpainted.squeeze(0)
-                                print(f"Normalized dimensions: {inpainted.shape}")
-                            
+                                    inpainted = inpainted.squeeze(0)                        
                             # Ensure all tensors have consistent dimensions for loss calculation
                             inpainted_for_loss = inpainted.unsqueeze(0)  # Add batch dimension [1, C, Z, Y, X]
                             
@@ -1059,17 +1068,22 @@ def train(args):
                             # 5. Structural similarity in lesion regions
                             lesion_ssim = structural_similarity(inpainted_for_loss, adc, label)
                             
+                            # 6. MAE in lesion regions
+                            lesion_mae = mean_absolute_error(inpainted_for_loss, adc, label)
+                            
                             # Accumulate metrics
                             val_loss += val_batch_loss.item()
                             val_lesion_loss += lesion_loss.item()
                             val_healthy_loss += healthy_loss.item()
                             val_lesion_dice += lesion_dice.item()
                             val_lesion_ssim += lesion_ssim.item()
+                            val_lesion_mae += lesion_mae.item()  # Přidáno
                             val_examples += 1
                             
                             print(f"Validation metrics for sample {val_batch_idx}:")
                             print(f"  - Total loss: {val_batch_loss.item():.4f}")
                             print(f"  - Lesion L1 loss: {lesion_loss.item():.4f}")
+                            print(f"  - Lesion MAE: {lesion_mae.item():.4f}")  # Přidáno
                             print(f"  - Healthy L1 loss: {healthy_loss.item():.4f}")
                             print(f"  - Lesion Dice: {lesion_dice.item():.4f}")
                             print(f"  - Lesion SSIM: {lesion_ssim.item():.4f}")
@@ -1090,11 +1104,13 @@ def train(args):
             avg_val_healthy_loss = val_healthy_loss / val_examples
             avg_val_lesion_dice = val_lesion_dice / val_examples
             avg_val_lesion_ssim = val_lesion_ssim / val_examples
+            avg_val_lesion_mae = val_lesion_mae / val_examples  # Přidáno
             
             # Print validation metrics summary
             print("\nValidation Results:")
             print(f"Overall L1 Loss: {avg_val_loss:.4f}")
             print(f"Lesion L1 Loss: {avg_val_lesion_loss:.4f}")
+            print(f"Lesion MAE: {avg_val_lesion_mae:.4f}")  # Přidáno
             print(f"Healthy L1 Loss: {avg_val_healthy_loss:.4f}")
             print(f"Lesion Dice Coefficient: {avg_val_lesion_dice:.4f}")
             print(f"Lesion SSIM: {avg_val_lesion_ssim:.4f}")
@@ -1169,6 +1185,7 @@ def train(args):
                         # Prepare metrics dictionary for visualization
                         vis_metrics = {
                             "Lesion L1 Loss": lesion_loss.item(),
+                            "Lesion MAE": lesion_mae.item(),  # Přidáno
                             "Lesion Dice": lesion_dice.item(),
                             "Lesion SSIM": lesion_ssim.item(),
                             "Healthy L1 Loss": healthy_loss.item(),
@@ -1212,7 +1229,8 @@ def train(args):
                 'val_lesion_loss': avg_val_lesion_loss,
                 'val_healthy_loss': avg_val_healthy_loss,
                 'val_lesion_dice': avg_val_lesion_dice,
-                'val_lesion_ssim': avg_val_lesion_ssim
+                'val_lesion_ssim': avg_val_lesion_ssim,
+                'val_lesion_mae': avg_val_lesion_mae  # Přidáno
             }, os.path.join(args.output_dir, f"checkpoint_epoch_{epoch+1}.pth"))
 
 def visualize_results(pseudo_healthy, label, output, target, output_path, metrics=None):
@@ -1252,6 +1270,7 @@ def visualize_results(pseudo_healthy, label, output, target, output_path, metric
                 plt.text(0.5, y_pos-0.1, "Metrics Explanations:", ha='center', fontsize=12, weight='bold')
                 explanations = [
                     "Lesion L1 Loss: Lower is better, measures pixel-wise reconstruction accuracy",
+                    "Lesion MAE: Lower is better, Mean Absolute Error in lesion regions",  # Přidáno
                     "Lesion Dice: Higher is better (max 1.0), measures overlap between output and target",
                     "Lesion SSIM: Higher is better (max 1.0), measures structural similarity"
                 ]
@@ -1409,7 +1428,7 @@ def visualize_results(pseudo_healthy, label, output, target, output_path, metric
                                 
                                 # Calculate slice-specific metrics
                                 slice_metrics = {
-                                    "Mean Error": np.mean(masked_diff) if np.sum(lbl_slice) > 0 else 0,
+                                    "Mean Error (MAE)": np.mean(masked_diff) if np.sum(lbl_slice) > 0 else 0,  # Přejmenováno pro zdůraznění MAE
                                     "Max Error": np.max(masked_diff) if np.sum(lbl_slice) > 0 else 0,
                                     "% of Lesion Voxels": 100 * np.sum(lbl_slice) / lbl_slice.size
                                 }
