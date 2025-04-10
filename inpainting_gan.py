@@ -11,15 +11,12 @@ from monai.networks.nets import SwinUNETR
 from monai.losses import DiceLoss
 from monai.transforms import (
     Compose,
-    LoadImaged,
     ScaleIntensityd,
     RandRotated,
     RandAffined,
     RandScaleIntensityd,
     EnsureTyped,
-    EnsureChannelFirstd,
-    Spacingd,
-    Orientationd
+    EnsureChannelFirstd
 )
 from monai.data import list_data_collate
 from monai.inferers import sliding_window_inference
@@ -50,9 +47,9 @@ class LesionInpaintingDataset(Dataset):
             
             if os.path.exists(adc_file) and os.path.exists(label_file):
                 self.data.append({
-                    "pseudo_healthy": ph_file,
-                    "adc": adc_file,
-                    "label": label_file
+                    "pseudo_healthy_file": ph_file,
+                    "adc_file": adc_file,
+                    "label_file": label_file
                 })
         
         print(f"{'Training' if train else 'Validation'} dataset contains {len(self.data)} samples")
@@ -61,8 +58,42 @@ class LesionInpaintingDataset(Dataset):
         return len(self.data)
 
     def __getitem__(self, idx):
-        data_dict = self.data[idx]
+        file_dict = self.data[idx]
         
+        # Load data using SimpleITK
+        pseudo_healthy_img = sitk.ReadImage(file_dict["pseudo_healthy_file"])
+        adc_img = sitk.ReadImage(file_dict["adc_file"])
+        label_img = sitk.ReadImage(file_dict["label_file"])
+        
+        # Convert to numpy arrays
+        pseudo_healthy = sitk.GetArrayFromImage(pseudo_healthy_img).astype(np.float32)
+        adc = sitk.GetArrayFromImage(adc_img).astype(np.float32)
+        label = sitk.GetArrayFromImage(label_img).astype(np.float32)
+        
+        # Add channel dimension
+        pseudo_healthy = np.expand_dims(pseudo_healthy, axis=0)
+        adc = np.expand_dims(adc, axis=0)
+        label = np.expand_dims(label, axis=0)
+        
+        # Convert to PyTorch tensors
+        pseudo_healthy = torch.from_numpy(pseudo_healthy)
+        adc = torch.from_numpy(adc)
+        label = torch.from_numpy(label)
+        
+        # Create data dictionary
+        data_dict = {
+            "pseudo_healthy": pseudo_healthy,
+            "adc": adc,
+            "label": label,
+            "pseudo_healthy_meta": {
+                "filename": file_dict["pseudo_healthy_file"],
+                "origin": pseudo_healthy_img.GetOrigin(),
+                "spacing": pseudo_healthy_img.GetSpacing(),
+                "direction": pseudo_healthy_img.GetDirection()
+            }
+        }
+        
+        # Apply additional transforms if provided
         if self.transform:
             data_dict = self.transform(data_dict)
         
@@ -351,12 +382,8 @@ def train(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     
-    # Define transforms - specify SimpleITK reader explicitly
+    # Define transforms - all SimpleITK loading is handled in the dataset
     train_transforms = Compose([
-        LoadImaged(keys=["pseudo_healthy", "adc", "label"], reader="SimpleITK"),
-        EnsureChannelFirstd(keys=["pseudo_healthy", "adc", "label"]),
-        Orientationd(keys=["pseudo_healthy", "adc", "label"], axcodes="RAS"),
-        Spacingd(keys=["pseudo_healthy", "adc", "label"], pixdim=(1.0, 1.0, 1.0), mode=("bilinear", "bilinear", "nearest")),
         ScaleIntensityd(keys=["pseudo_healthy", "adc"], minv=0.0, maxv=1.0),
         RandAffined(
             keys=["pseudo_healthy", "adc", "label"],
@@ -371,10 +398,6 @@ def train(args):
     ])
     
     val_transforms = Compose([
-        LoadImaged(keys=["pseudo_healthy", "adc", "label"], reader="SimpleITK"),
-        EnsureChannelFirstd(keys=["pseudo_healthy", "adc", "label"]),
-        Orientationd(keys=["pseudo_healthy", "adc", "label"], axcodes="RAS"),
-        Spacingd(keys=["pseudo_healthy", "adc", "label"], pixdim=(1.0, 1.0, 1.0), mode=("bilinear", "bilinear", "nearest")),
         ScaleIntensityd(keys=["pseudo_healthy", "adc"], minv=0.0, maxv=1.0),
         EnsureTyped(keys=["pseudo_healthy", "adc", "label"]),
     ])
@@ -604,25 +627,24 @@ def inference(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     
-    # Define transforms - specify SimpleITK reader explicitly
-    infer_transforms = Compose([
-        LoadImaged(keys=["pseudo_healthy", "label"], reader="SimpleITK"),
-        EnsureChannelFirstd(keys=["pseudo_healthy", "label"]),
-        Orientationd(keys=["pseudo_healthy", "label"], axcodes="RAS"),
-        Spacingd(keys=["pseudo_healthy", "label"], pixdim=(1.0, 1.0, 1.0), mode=("bilinear", "nearest")),
-        ScaleIntensityd(keys=["pseudo_healthy"], minv=0.0, maxv=1.0),
-        EnsureTyped(keys=["pseudo_healthy", "label"]),
-    ])
+    # Load pseudo-healthy and lesion files directly with SimpleITK
+    pseudo_healthy_img = sitk.ReadImage(args.input_pseudo_healthy)
+    label_img = sitk.ReadImage(args.input_label)
     
-    # Load pseudo-healthy and lesion files
-    data = [{
-        "pseudo_healthy": args.input_pseudo_healthy,
-        "label": args.input_label
-    }]
+    # Convert to numpy arrays
+    pseudo_healthy_np = sitk.GetArrayFromImage(pseudo_healthy_img).astype(np.float32)
+    label_np = sitk.GetArrayFromImage(label_img).astype(np.float32)
     
-    # Create dataset
-    dataset = monai.data.Dataset(data=data, transform=infer_transforms)
-    loader = DataLoader(dataset, batch_size=1, shuffle=False)
+    # Add channel dimension and convert to PyTorch tensors
+    pseudo_healthy = torch.from_numpy(np.expand_dims(pseudo_healthy_np, axis=0))
+    label = torch.from_numpy(np.expand_dims(label_np, axis=0))
+    
+    # Normalize intensity
+    pseudo_healthy = (pseudo_healthy - pseudo_healthy.min()) / (pseudo_healthy.max() - pseudo_healthy.min())
+    
+    # Move to device
+    pseudo_healthy = pseudo_healthy.to(device)
+    label = label.to(device)
     
     # Load model
     model = LesionInpaintingModel(in_channels=2, out_channels=1).to(device)
@@ -634,62 +656,55 @@ def inference(args):
     
     # Perform inference
     with torch.no_grad():
-        for batch_data in loader:
-            pseudo_healthy = batch_data["pseudo_healthy"].to(device)
-            label = batch_data["label"].to(device)
+        # Extract patches with lesions
+        patches_ph, patches_label, _, patch_coords = patch_extractor.extract_patches_with_lesions(
+            pseudo_healthy.unsqueeze(0)[0], label.unsqueeze(0)[0], pseudo_healthy.unsqueeze(0)[0]  # Use pseudo_healthy as placeholder for adc
+        )
+        
+        output_patches = []
+        for ph_patch, label_patch in zip(patches_ph, patches_label):
+            ph_patch = ph_patch.unsqueeze(0)
+            label_patch = label_patch.unsqueeze(0)
             
-            # Get original shape and metadata for saving output
-            original_data = sitk.ReadImage(args.input_pseudo_healthy)
-            
-            # Extract patches with lesions
-            patches_ph, patches_label, _, patch_coords = patch_extractor.extract_patches_with_lesions(
-                pseudo_healthy[0], label[0], pseudo_healthy[0]  # Use pseudo_healthy as placeholder for adc
+            # Generate inpainted output
+            output_patch = model(ph_patch, label_patch)
+            output_patches.append(output_patch[0])
+        
+        # Reconstruct full volume
+        if output_patches:
+            reconstructed = patch_extractor.reconstruct_from_patches(
+                output_patches, patch_coords, pseudo_healthy.unsqueeze(0).shape
             )
             
-            output_patches = []
-            for ph_patch, label_patch in zip(patches_ph, patches_label):
-                ph_patch = ph_patch.unsqueeze(0)
-                label_patch = label_patch.unsqueeze(0)
-                
-                # Generate inpainted output
-                output_patch = model(ph_patch, label_patch)
-                output_patches.append(output_patch[0])
+            # Apply the lesion mask to only modify lesion regions
+            dilated_mask = torch.nn.functional.max_pool3d(
+                label.unsqueeze(0), kernel_size=3, stride=1, padding=1
+            )
             
-            # Reconstruct full volume
-            if output_patches:
-                reconstructed = patch_extractor.reconstruct_from_patches(
-                    output_patches, patch_coords, pseudo_healthy.shape
+            # Create final inpainted image - copy pseudo-healthy and replace only in lesion regions
+            final_output = pseudo_healthy.unsqueeze(0).clone()
+            final_output = final_output * (1 - dilated_mask) + reconstructed * dilated_mask
+            
+            # Convert to numpy and rescale if needed
+            output_np = final_output[0, 0].cpu().numpy()
+            
+            # Create SimpleITK image with same properties as input
+            output_image = sitk.GetImageFromArray(output_np)
+            output_image.CopyInformation(pseudo_healthy_img)
+            
+            # Save output
+            sitk.WriteImage(output_image, args.output_file)
+            print(f"Saved inpainted result to {args.output_file}")
+            
+            # Visualize result if requested
+            if args.visualize:
+                visualize_results(
+                    pseudo_healthy.unsqueeze(0), 
+                    label.unsqueeze(0), 
+                    final_output, 
+                    pseudo_healthy.unsqueeze(0),  # Use pseudo-healthy as placeholder for target
+                    args.output_file.replace(".mha", ".pdf")
                 )
-                
-                # Apply the lesion mask to only modify lesion regions
-                dilated_mask = torch.nn.functional.max_pool3d(
-                    label, kernel_size=3, stride=1, padding=1
-                )
-                
-                # Create final inpainted image - copy pseudo-healthy and replace only in lesion regions
-                final_output = pseudo_healthy.clone()
-                final_output = final_output * (1 - dilated_mask) + reconstructed * dilated_mask
-                
-                # Convert to numpy and rescale if needed
-                output_np = final_output[0, 0].cpu().numpy()
-                
-                # Create SimpleITK image with same properties as input
-                output_image = sitk.GetImageFromArray(output_np)
-                output_image.CopyInformation(original_data)
-                
-                # Save output
-                sitk.WriteImage(output_image, args.output_file)
-                print(f"Saved inpainted result to {args.output_file}")
-                
-                # Visualize result if requested
-                if args.visualize:
-                    visualize_results(
-                        pseudo_healthy[0], 
-                        label[0], 
-                        final_output[0], 
-                        pseudo_healthy[0],  # Use pseudo-healthy as placeholder for target
-                        args.output_file.replace(".mha", ".pdf")
-                    )
 
 def main():
     parser = argparse.ArgumentParser(description="3D Lesion Inpainting Model")
