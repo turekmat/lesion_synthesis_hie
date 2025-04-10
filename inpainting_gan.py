@@ -141,7 +141,7 @@ class PatchExtractor:
             label_patch = label[:, 
                               z_start:z_start+self.patch_size[0], 
                               y_start:y_start+self.patch_size[1], 
-                              x_start:z_start+self.patch_size[2]]
+                              x_start:x_start+self.patch_size[2]]
             
             adc_patch = adc[:, 
                           z_start:z_start+self.patch_size[0], 
@@ -366,28 +366,59 @@ class PatchExtractor:
 
     def reconstruct_from_patches(self, patches, patch_coords, output_shape):
         """
-        Reconstruct full volume from patches
+        Reconstruct full volume from patches.
+        
+        Parameters:
+        -----------
+        patches : list of torch.Tensor
+            List of patches, each with shape [C, Z, Y, X]
+        patch_coords : list of tuple
+            List of coordinates (z, y, x) indicating the starting position of each patch
+        output_shape : tuple
+            Shape of the output volume [C, Z, Y, X]
+            
+        Returns:
+        --------
+        torch.Tensor
+            Reconstructed volume
         """
         reconstructed = torch.zeros(output_shape, device=patches[0].device)
         count = torch.zeros(output_shape, device=patches[0].device)
         
-        for patch, (z, y, x) in zip(patches, patch_coords):
-            z_end = min(z + self.patch_size[0], output_shape[1])
-            y_end = min(y + self.patch_size[1], output_shape[2])
-            x_end = min(x + self.patch_size[2], output_shape[3])
+        try:
+            for patch, (z, y, x) in zip(patches, patch_coords):
+                # Get actual patch dimensions
+                patch_shape = patch.shape
+                
+                # Calculate the end coordinates based on patch dimensions
+                # and ensure they don't exceed output boundaries
+                z_end = min(z + patch_shape[1], output_shape[1])
+                y_end = min(y + patch_shape[2], output_shape[2])
+                x_end = min(x + patch_shape[3], output_shape[3])
+                
+                # Calculate the actual patch size to copy (may be smaller than the patch itself)
+                patch_z = min(patch_shape[1], z_end - z)
+                patch_y = min(patch_shape[2], y_end - y)
+                patch_x = min(patch_shape[3], x_end - x)
+                
+                # Only copy the valid portion of the patch
+                if patch_z > 0 and patch_y > 0 and patch_x > 0:
+                    reconstructed[:, z:z_end, y:y_end, x:x_end] += patch[:, :patch_z, :patch_y, :patch_x]
+                    count[:, z:z_end, y:y_end, x:x_end] += 1
+                else:
+                    print(f"Warning: Invalid patch dimensions for coords ({z}, {y}, {x}): shape={patch_shape}, output_shape={output_shape}")
             
-            patch_z = z_end - z
-            patch_y = y_end - y
-            patch_x = x_end - x
+            # Average overlapping regions
+            count[count == 0] = 1  # Avoid division by zero
+            reconstructed = reconstructed / count
             
-            reconstructed[:, z:z_end, y:y_end, x:x_end] += patch[:, :patch_z, :patch_y, :patch_x]
-            count[:, z:z_end, y:y_end, x:x_end] += 1
-        
-        # Average overlapping regions
-        count[count == 0] = 1  # Avoid division by zero
-        reconstructed = reconstructed / count
-        
-        return reconstructed
+            return reconstructed
+            
+        except Exception as e:
+            print(f"Error in reconstruct_from_patches: {e}")
+            for i, (patch, coords) in enumerate(zip(patches, patch_coords)):
+                print(f"Patch {i}: shape={patch.shape}, coords={coords}")
+            raise
 
 class LesionInpaintingModel(nn.Module):
     def __init__(self, in_channels=2, out_channels=1):
@@ -616,7 +647,10 @@ def train(args):
         
         # Validation
         model.eval()
-        val_loss = 0
+        val_loss = 0.0
+        val_lesion_loss = 0.0
+        val_healthy_loss = 0.0
+        val_examples = 0
         
         with torch.no_grad():
             for val_batch_idx, val_batch_data in enumerate(val_loader):
@@ -631,43 +665,57 @@ def train(args):
                 
                 output_patches = []
                 for ph_patch, label_patch in zip(patches_ph, patches_label):
-                    ph_patch = ph_patch.unsqueeze(0)
+                    ph_patch = ph_patch.unsqueeze(0)  # Add batch dimension [1, C, Z, Y, X]
                     label_patch = label_patch.unsqueeze(0)
                     
                     # Generate inpainted output
                     output_patch = model(ph_patch, label_patch)
+                    
+                    # Check if output patch dimensions match expected dimensions
+                    expected_shape = ph_patch.shape[2:]  # Expected spatial dimensions [Z, Y, X]
+                    output_shape = output_patch.shape[2:]  # Actual spatial dimensions
+                    
+                    if expected_shape != output_shape:
+                        print(f"Warning: Output patch dimensions {output_shape} don't match expected dimensions {expected_shape}")
+                    
+                    # Remove batch dimension for reconstruction
                     output_patches.append(output_patch[0])
                 
                 # Reconstruct full volume
                 if output_patches:
-                    reconstructed = patch_extractor.reconstruct_from_patches(
-                        output_patches, patch_coords, pseudo_healthy.shape
-                    )
-                    
-                    # Apply the lesion mask to only modify lesion regions
-                    dilated_mask = torch.nn.functional.max_pool3d(
-                        label, kernel_size=3, stride=1, padding=1
-                    )
-                    
-                    # Create final inpainted image - copy pseudo-healthy and replace only in lesion regions
-                    final_output = pseudo_healthy.clone()
-                    final_output = final_output * (1 - dilated_mask) + reconstructed * dilated_mask
-                    
-                    # Calculate validation loss
-                    l1_loss = masked_l1_loss(final_output, adc, label)
-                    smooth_loss = gradient_loss(final_output, label)
-                    loss = l1_loss + smooth_loss
-                    val_loss += loss.item()
-                    
-                    # Save validation visualization for the first batch
-                    if val_batch_idx == 0 and (epoch + 1) % args.vis_freq == 0:
-                        visualize_results(
-                            pseudo_healthy[0], 
-                            label[0], 
-                            final_output[0], 
-                            adc[0],
-                            os.path.join(args.output_dir, f"epoch_{epoch+1}_validation.pdf")
+                    try:
+                        reconstructed = patch_extractor.reconstruct_from_patches(
+                            output_patches, patch_coords, pseudo_healthy.shape
                         )
+                        
+                        # Apply lesion mask for validation metrics
+                        inpainted = pseudo_healthy[0].clone()
+                        inpainted = inpainted * (1 - label[0]) + reconstructed * label[0]
+                        
+                        # Calculate validation losses
+                        val_batch_loss = reconstruction_loss(inpainted.unsqueeze(0), adc)
+                        
+                        # Separate losses for lesion and healthy regions
+                        lesion_loss = reconstruction_loss(
+                            (inpainted * label[0]).unsqueeze(0), 
+                            adc * label
+                        )
+                        
+                        healthy_loss = reconstruction_loss(
+                            (inpainted * (1 - label[0])).unsqueeze(0),
+                            adc * (1 - label)
+                        )
+                        
+                        val_loss += val_batch_loss.item()
+                        val_lesion_loss += lesion_loss.item()
+                        val_healthy_loss += healthy_loss.item()
+                        val_examples += 1
+                        
+                    except Exception as e:
+                        print(f"Error during validation reconstruction: {e}")
+                        for i, patch in enumerate(output_patches):
+                            print(f"Patch {i} shape: {patch.shape}, coord: {patch_coords[i]}")
+                        continue
         
         avg_val_loss = val_loss / max(1, len(val_loader))
         print(f"Validation Loss: {avg_val_loss:.4f}")
