@@ -501,12 +501,21 @@ class PatchExtractor:
         print(f"Reconstructing from {len(patches)} patches to output shape {output_shape}")
         print(f"First patch shape: {patches[0].shape}")
         
-        # Create tensors for reconstruction
-        reconstructed = torch.zeros(working_shape, device=patches[0].device)
-        count = torch.zeros(working_shape, device=patches[0].device)
+        # Get device from the first patch
+        device = patches[0].device
+        print(f"Using device: {device} for reconstruction")
+        
+        # Create tensors for reconstruction - ensure they're on the same device as patches
+        reconstructed = torch.zeros(working_shape, device=device)
+        count = torch.zeros(working_shape, device=device)
         
         try:
             for i, (patch, (z, y, x)) in enumerate(zip(patches, patch_coords)):
+                # Make sure patch is on the right device
+                if patch.device != device:
+                    patch = patch.to(device)
+                    print(f"Moved patch {i} from {patch.device} to {device}")
+                
                 # Get actual patch dimensions
                 patch_shape = patch.shape
                 
@@ -602,7 +611,7 @@ class PatchExtractor:
         except Exception as e:
             print(f"Error in reconstruct_from_patches: {e}")
             for i, (patch, coords) in enumerate(zip(patches, patch_coords)):
-                print(f"Patch {i}: shape={patch.shape}, coords={coords}")
+                print(f"Patch {i}: shape={patch.shape}, coords={coords}, device={patch.device}")
             raise
 
 class LesionInpaintingModel(nn.Module):
@@ -1053,6 +1062,12 @@ def train(args):
                             # Verify shapes after normalization
                             patch_shapes = [p.shape for p in output_patches]
                             
+                            # Ensure all patches are on the same device (GPU)
+                            for i in range(len(output_patches)):
+                                if output_patches[i].device != device:
+                                    print(f"Moving patch {i} from {output_patches[i].device} to {device}")
+                                    output_patches[i] = output_patches[i].to(device)
+                            
                             # Reconstruct the volume
                             reconstructed = patch_extractor.reconstruct_from_patches(
                                 output_patches, valid_patch_coords, pseudo_healthy.shape
@@ -1191,6 +1206,12 @@ def train(args):
                     
                     # Reconstruct volume
                     if output_patches:
+                        # Ensure all patches are on the same device (GPU)
+                        for i in range(len(output_patches)):
+                            if output_patches[i].device != device:
+                                print(f"Moving visualization patch {i} from {output_patches[i].device} to {device}")
+                                output_patches[i] = output_patches[i].to(device)
+                                
                         reconstructed = patch_extractor.reconstruct_from_patches(
                             output_patches, filtered_patch_coords, ph.shape
                         )
@@ -1605,6 +1626,12 @@ def inference(args):
         
         # Reconstruct full volume
         if output_patches:
+            # Ensure all patches are on the same device (GPU)
+            for i in range(len(output_patches)):
+                if output_patches[i].device != device:
+                    print(f"Moving inference patch {i} from {output_patches[i].device} to {device}")
+                    output_patches[i] = output_patches[i].to(device)
+                    
             reconstructed = patch_extractor.reconstruct_from_patches(
                 output_patches, patch_coords, pseudo_healthy.shape
             )
