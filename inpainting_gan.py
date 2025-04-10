@@ -1260,9 +1260,12 @@ class LesionInpaintingTrainer:
                 disc_fake_pred = self.model.discriminator(pseudo_healthy_d, lesion_mask_d, fake_adc_d)
                 
                 # Loss generátoru
+                # Zajistíme správný tvar fake_adc před výpočtem loss funkce
+                fake_adc_loss = fake_adc_d  # Použijeme již upravený tensor se správným tvarem [B, 1, D, H, W]
+                
                 g_loss, g_adv_loss, g_l1_loss, g_identity_loss, g_ssim_loss, g_edge_loss = \
                     self.model.generator_loss(
-                        pseudo_healthy, lesion_mask, real_adc, fake_adc, disc_fake_pred
+                        pseudo_healthy, lesion_mask, real_adc, fake_adc_loss, disc_fake_pred
                     )
             
             # Zpětná propagace pro generátor
