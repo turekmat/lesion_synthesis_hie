@@ -1256,7 +1256,7 @@ def main():
     train_parser.add_argument("--batch_size", type=int, default=1, help="Batch size")
     train_parser.add_argument("--learning_rate", type=float, default=0.0001, help="Learning rate")
     train_parser.add_argument("--save_freq", type=int, default=10, help="Save checkpoint frequency")
-    train_parser.add_argument("--vis_freq", type=int, default=5, help="Visualization frequency")
+    train_parser.add_argument("--vis_freq", type=int, default=1, help="Visualization frequency")
     
     # Inference arguments
     infer_parser = subparsers.add_parser("infer", help="Inference mode")
