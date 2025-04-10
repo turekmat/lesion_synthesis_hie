@@ -26,6 +26,7 @@ import SimpleITK as sitk
 import glob
 import random
 from tqdm import tqdm
+import datetime
 
 class LesionInpaintingDataset(Dataset):
     def __init__(self, pseudo_healthy_dir, adc_dir, label_dir, transform=None, train=True):
@@ -767,9 +768,73 @@ def train(args):
     masked_l1_loss = MaskedL1Loss().to(device)
     gradient_loss = GradientSmoothingLoss(weight=0.1).to(device)
     
-    # Define reconstruction loss function (L1 loss) for validation
-    def reconstruction_loss(pred, target):
-        return torch.nn.functional.l1_loss(pred, target)
+    # Define evaluation metrics
+    def reconstruction_loss(pred, target, mask=None):
+        """L1 loss for reconstruction, can be masked"""
+        if mask is not None:
+            # Mask both prediction and target
+            masked_pred = pred * mask
+            masked_target = target * mask
+            mask_sum = mask.sum()
+            if mask_sum > 0:
+                return torch.nn.functional.l1_loss(masked_pred, masked_target, reduction='sum') / mask_sum
+            else:
+                return torch.tensor(0.0, device=pred.device)
+        else:
+            return torch.nn.functional.l1_loss(pred, target)
+    
+    def dice_coefficient(pred, target, mask, smooth=1e-5):
+        """Dice coefficient metric for evaluating overlap in lesion areas"""
+        # Apply mask to both prediction and target
+        masked_pred = pred * mask
+        masked_target = target * mask
+        
+        # Flatten the tensors
+        pred_flat = masked_pred.reshape(-1)
+        target_flat = masked_target.reshape(-1)
+        
+        # Calculate Dice coefficient
+        intersection = (pred_flat * target_flat).sum()
+        pred_sum = pred_flat.sum()
+        target_sum = target_flat.sum()
+        
+        dice = (2. * intersection + smooth) / (pred_sum + target_sum + smooth)
+        return dice
+    
+    def structural_similarity(pred, target, mask):
+        """Structural similarity index for evaluating quality in lesion areas"""
+        # This is a simplified version that approximates SSIM
+        # For a full SSIM implementation, additional windowed processing would be needed
+        
+        # Apply mask
+        masked_pred = pred * mask
+        masked_target = target * mask
+        
+        # Only compute if mask has non-zero elements
+        mask_sum = mask.sum()
+        if mask_sum == 0:
+            return torch.tensor(1.0, device=pred.device)  # Perfect score for empty mask
+            
+        # Compute means
+        mu_pred = masked_pred.sum() / mask_sum
+        mu_target = masked_target.sum() / mask_sum
+        
+        # Compute variances
+        var_pred = ((masked_pred - mu_pred * mask) ** 2).sum() / mask_sum
+        var_target = ((masked_target - mu_target * mask) ** 2).sum() / mask_sum
+        
+        # Compute covariance
+        cov = ((masked_pred - mu_pred * mask) * (masked_target - mu_target * mask)).sum() / mask_sum
+        
+        # Constants for stability
+        c1 = (0.01 * 1) ** 2
+        c2 = (0.03 * 1) ** 2
+        
+        # Compute SSIM
+        ssim = ((2 * mu_pred * mu_target + c1) * (2 * cov + c2)) / \
+               ((mu_pred**2 + mu_target**2 + c1) * (var_pred + var_target + c2))
+               
+        return ssim
     
     # Initialize optimizer
     optimizer = optim.Adam(model.parameters(), lr=args.learning_rate)
@@ -778,7 +843,8 @@ def train(args):
     patch_extractor = PatchExtractor(patch_size=(64, 64, 32))
     
     # Training loop
-    best_val_loss = float('inf')
+    best_val_lesion_loss = float('inf')  # Changed from best_val_loss to best_val_lesion_loss
+    best_val_lesion_dice = 0.0  # New metric to track
     for epoch in range(args.epochs):
         model.train()
         epoch_loss = 0
@@ -846,17 +912,16 @@ def train(args):
         val_loss = 0.0
         val_lesion_loss = 0.0
         val_healthy_loss = 0.0
+        val_lesion_dice = 0.0
+        val_lesion_ssim = 0.0
         val_examples = 0
         
         with torch.no_grad():
             for val_batch_idx, val_batch_data in enumerate(val_loader):
-                print(f"Processing validation batch {val_batch_idx}")
                 pseudo_healthy = val_batch_data["pseudo_healthy"].to(device)
                 adc = val_batch_data["adc"].to(device)
                 label = val_batch_data["label"].to(device)
                 
-                # Print volume dimensions for debugging
-                print(f"Volume dimensions: pseudo_healthy={pseudo_healthy.shape}, label={label.shape}")
                 
                 try:
                     # Extract patches containing lesions, ensuring valid coordinates
@@ -864,7 +929,6 @@ def train(args):
                         pseudo_healthy[0], label[0], adc[0]
                     )
                     
-                    print(f"Extracted {len(patches_ph)} patches")
                     
                     # Filter out patches with invalid coordinates (negative values)
                     valid_patches = []
@@ -878,7 +942,6 @@ def train(args):
                         print(f"Warning: No valid patches found for validation sample {val_batch_idx}")
                         continue
                     
-                    print(f"After filtering, {len(valid_patches)} valid patches remain")
                     
                     filtered_patches_ph = [patches_ph[i] for i in valid_patches]
                     filtered_patches_label = [patches_label[i] for i in valid_patches]
@@ -909,7 +972,6 @@ def train(args):
                                 print(f"Warning: Output patch dimensions {output_shape} don't match expected dimensions {expected_shape}")
                                 # Try to fix dimensions using interpolation
                                 if len(output_shape) == len(expected_shape):
-                                    print(f"Attempting to resize output patch to match expected dimensions")
                                     try:
                                         # Use interpolate to resize to expected dimensions
                                         output_patch = torch.nn.functional.interpolate(
@@ -918,7 +980,6 @@ def train(args):
                                             mode='trilinear',
                                             align_corners=False
                                         )
-                                        print(f"Successfully resized patch to {output_patch.shape[2:]}")
                                     except Exception as resize_err:
                                         print(f"Error resizing patch: {resize_err}")
                                         continue
@@ -975,27 +1036,43 @@ def train(args):
                             # Ensure all tensors have consistent dimensions for loss calculation
                             inpainted_for_loss = inpainted.unsqueeze(0)  # Add batch dimension [1, C, Z, Y, X]
                             
-                            # Calculate validation losses using simple L1 loss
+                            # Create dilated mask for better boundary evaluation
+                            dilated_mask = torch.nn.functional.max_pool3d(
+                                label, kernel_size=3, stride=1, padding=1
+                            )
+                            
+                            # Calculate validation metrics
+                            # 1. Overall L1 loss (whole volume)
                             val_batch_loss = reconstruction_loss(inpainted_for_loss, adc)
                             
-                            # Separate losses for lesion and healthy regions
-                            # Use mask multiplication to isolate regions
-                            lesion_loss = reconstruction_loss(
-                                (inpainted * label[0]).unsqueeze(0), 
-                                adc * label
-                            )
+                            # 2. L1 loss only in lesion regions
+                            lesion_loss = reconstruction_loss(inpainted_for_loss, adc, label)
                             
+                            # 3. L1 loss only in healthy regions
                             healthy_loss = reconstruction_loss(
-                                (inpainted * (1 - label[0])).unsqueeze(0),
-                                adc * (1 - label)
+                                inpainted_for_loss, adc, (1 - label)
                             )
                             
+                            # 4. Dice coefficient in lesion regions
+                            lesion_dice = dice_coefficient(inpainted_for_loss, adc, label)
+                            
+                            # 5. Structural similarity in lesion regions
+                            lesion_ssim = structural_similarity(inpainted_for_loss, adc, label)
+                            
+                            # Accumulate metrics
                             val_loss += val_batch_loss.item()
                             val_lesion_loss += lesion_loss.item()
                             val_healthy_loss += healthy_loss.item()
+                            val_lesion_dice += lesion_dice.item()
+                            val_lesion_ssim += lesion_ssim.item()
                             val_examples += 1
                             
-                            print(f"Successfully processed validation sample {val_batch_idx}, losses: total={val_batch_loss.item():.4f}, lesion={lesion_loss.item():.4f}, healthy={healthy_loss.item():.4f}")
+                            print(f"Validation metrics for sample {val_batch_idx}:")
+                            print(f"  - Total loss: {val_batch_loss.item():.4f}")
+                            print(f"  - Lesion L1 loss: {lesion_loss.item():.4f}")
+                            print(f"  - Healthy L1 loss: {healthy_loss.item():.4f}")
+                            print(f"  - Lesion Dice: {lesion_dice.item():.4f}")
+                            print(f"  - Lesion SSIM: {lesion_ssim.item():.4f}")
                             
                         except Exception as e:
                             print(f"Error during validation reconstruction: {e}")
@@ -1007,13 +1084,24 @@ def train(args):
                     continue
         
         if val_examples > 0:
+            # Calculate average metrics
             avg_val_loss = val_loss / val_examples
             avg_val_lesion_loss = val_lesion_loss / val_examples
             avg_val_healthy_loss = val_healthy_loss / val_examples
-            print(f"Validation Loss: {avg_val_loss:.4f} (Lesion: {avg_val_lesion_loss:.4f}, Healthy: {avg_val_healthy_loss:.4f})")
+            avg_val_lesion_dice = val_lesion_dice / val_examples
+            avg_val_lesion_ssim = val_lesion_ssim / val_examples
+            
+            # Print validation metrics summary
+            print("\nValidation Results:")
+            print(f"Overall L1 Loss: {avg_val_loss:.4f}")
+            print(f"Lesion L1 Loss: {avg_val_lesion_loss:.4f}")
+            print(f"Healthy L1 Loss: {avg_val_healthy_loss:.4f}")
+            print(f"Lesion Dice Coefficient: {avg_val_lesion_dice:.4f}")
+            print(f"Lesion SSIM: {avg_val_lesion_ssim:.4f}")
         else:
             print("Warning: No valid validation examples found")
-            avg_val_loss = float('inf')
+            avg_val_lesion_loss = float('inf')
+            avg_val_lesion_dice = 0.0
         
         # Create visualizations every vis_freq epochs
         if (epoch + 1) % args.vis_freq == 0 and val_examples > 0:
@@ -1077,44 +1165,106 @@ def train(args):
                         
                         # Create visualization
                         vis_path = os.path.join(args.output_dir, f"epoch_{epoch+1}_validation.pdf")
+                        
+                        # Prepare metrics dictionary for visualization
+                        vis_metrics = {
+                            "Lesion L1 Loss": lesion_loss.item(),
+                            "Lesion Dice": lesion_dice.item(),
+                            "Lesion SSIM": lesion_ssim.item(),
+                            "Healthy L1 Loss": healthy_loss.item(),
+                            "Total L1 Loss": val_batch_loss.item()
+                        }
+                        
                         visualize_results(
                             ph, 
                             lbl, 
                             inpainted.unsqueeze(0).unsqueeze(0), 
                             adc_target,
-                            vis_path
+                            vis_path,
+                            metrics=vis_metrics
                         )
                         print(f"Saved validation visualization to {vis_path}")
                         break
                 except Exception as vis_error:
                     print(f"Error creating visualization: {vis_error}")
         
-        # Save best model
-        if avg_val_loss < best_val_loss:
-            best_val_loss = avg_val_loss
-            torch.save(model.state_dict(), os.path.join(args.output_dir, "best_model.pth"))
-            print(f"Saved new best model with validation loss: {best_val_loss:.4f}")
+        # Save best model (now using lesion-focused metrics)
+        # Option 1: Save based on lesion L1 loss (lower is better)
+        if avg_val_lesion_loss < best_val_lesion_loss:
+            best_val_lesion_loss = avg_val_lesion_loss
+            torch.save(model.state_dict(), os.path.join(args.output_dir, "best_lesion_loss_model.pth"))
+            print(f"Saved new best model with lesion L1 loss: {best_val_lesion_loss:.4f}")
+            
+        # Option 2: Save based on lesion Dice coefficient (higher is better)
+        if avg_val_lesion_dice > best_val_lesion_dice:
+            best_val_lesion_dice = avg_val_lesion_dice
+            torch.save(model.state_dict(), os.path.join(args.output_dir, "best_lesion_dice_model.pth"))
+            print(f"Saved new best model with lesion Dice coefficient: {best_val_lesion_dice:.4f}")
         
-        # Save checkpoint
+        # Save checkpoint with all metrics
         if (epoch + 1) % args.save_freq == 0:
             torch.save({
                 'epoch': epoch + 1,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'loss': avg_epoch_loss,
-                'val_loss': avg_val_loss
+                'val_loss': avg_val_loss,
+                'val_lesion_loss': avg_val_lesion_loss,
+                'val_healthy_loss': avg_val_healthy_loss,
+                'val_lesion_dice': avg_val_lesion_dice,
+                'val_lesion_ssim': avg_val_lesion_ssim
             }, os.path.join(args.output_dir, f"checkpoint_epoch_{epoch+1}.pth"))
 
-def visualize_results(pseudo_healthy, label, output, target, output_path):
+def visualize_results(pseudo_healthy, label, output, target, output_path, metrics=None):
     """
     Simplified visualization function that generates a valid PDF with minimal processing
+    
+    Args:
+        pseudo_healthy: Tensor of pseudo-healthy input
+        label: Tensor of lesion labels
+        output: Tensor of model output
+        target: Tensor of target data
+        output_path: Path to save the PDF
+        metrics: Dictionary of metrics to include in the PDF, e.g. {'lesion_loss': 0.1, 'dice': 0.85, ...}
     """
     try:
         # Save a very basic PDF without complex processing
         with PdfPages(output_path) as pdf:
+            # Create a metrics summary page if metrics are provided
+            if metrics is not None and isinstance(metrics, dict):
+                plt.figure(figsize=(8, 6))
+                plt.text(0.5, 0.95, "Lesion Metrics Summary", ha='center', fontsize=16, weight='bold')
+                
+                # Draw values in a table-like format
+                y_pos = 0.85
+                for metric_name, metric_value in metrics.items():
+                    formatted_value = f"{metric_value:.4f}" if isinstance(metric_value, (int, float)) else str(metric_value)
+                    plt.text(0.1, y_pos, f"{metric_name}:", fontsize=12)
+                    plt.text(0.7, y_pos, formatted_value, fontsize=12)
+                    y_pos -= 0.05
+                
+                # Draw a border around metrics
+                metrics_border = plt.Rectangle((0.05, y_pos), 0.9, 0.9-y_pos, 
+                                              fill=False, color='gray', linestyle='--', transform=plt.gca().transAxes)
+                plt.gca().add_patch(metrics_border)
+                
+                # Add explanations about metrics
+                plt.text(0.5, y_pos-0.1, "Metrics Explanations:", ha='center', fontsize=12, weight='bold')
+                explanations = [
+                    "Lesion L1 Loss: Lower is better, measures pixel-wise reconstruction accuracy",
+                    "Lesion Dice: Higher is better (max 1.0), measures overlap between output and target",
+                    "Lesion SSIM: Higher is better (max 1.0), measures structural similarity"
+                ]
+                for i, explanation in enumerate(explanations):
+                    plt.text(0.1, y_pos-0.2-(i*0.05), explanation, fontsize=10)
+                
+                plt.axis('off')
+                pdf.savefig()
+                plt.close()
+            
             # Create a single summary page to ensure the PDF is valid
             plt.figure(figsize=(8, 6))
-            plt.text(0.5, 0.8, "Simplified Visualization", ha='center', fontsize=16)
+            plt.text(0.5, 0.8, "Reconstruction Visualization", ha='center', fontsize=16, weight='bold')
             plt.text(0.5, 0.6, "Input shape: " + str(pseudo_healthy.shape), ha='center')
             plt.text(0.5, 0.5, "Label shape: " + str(label.shape), ha='center')
             plt.text(0.5, 0.4, "Output shape: " + str(output.shape), ha='center')
@@ -1159,10 +1309,32 @@ def visualize_results(pseudo_healthy, label, output, target, output_path):
                 num_slices = min(10, depth)  # Maximum 10 slices
                 slice_indices = list(range(0, depth, max(1, depth // num_slices)))[:num_slices]
                 
-                # Add pages showing middle slice for each volume
+                # Find slices with lesions for visualization
+                lesion_slices = []
+                for z in range(depth):
+                    if np.any(lbl_np[z] > 0):
+                        lesion_slices.append(z)
+                
+                # Prioritize lesion slices but limit total
+                if lesion_slices:
+                    # Always include some lesion slices
+                    final_slices = lesion_slices[:min(5, len(lesion_slices))]
+                    
+                    # Add non-lesion slices if needed to get to num_slices
+                    if len(final_slices) < num_slices:
+                        non_lesion_slices = [z for z in slice_indices if z not in lesion_slices]
+                        final_slices.extend(non_lesion_slices[:num_slices - len(final_slices)])
+                    
+                    # Sort slices for sequential viewing
+                    slice_indices = sorted(final_slices)
+                else:
+                    # If no lesion slices, use default slice_indices
+                    pass
+                
+                # Add pages showing slices for each volume
                 for z_idx, z in enumerate(slice_indices):
                     try:
-                        fig, axes = plt.subplots(2, 2, figsize=(8, 8))
+                        fig, axes = plt.subplots(2, 2, figsize=(10, 8))
                         axes = axes.flatten()
                         
                         # Get 2D slices
@@ -1181,24 +1353,72 @@ def visualize_results(pseudo_healthy, label, output, target, output_path):
                         if len(tgt_slice.shape) > 2:
                             tgt_slice = tgt_slice[0] if tgt_slice.shape[0] == 1 else np.mean(tgt_slice, axis=0)
                         
-                        # Basic display without colorbars or complex formatting
+                        # Check if this is a lesion slice
+                        has_lesion = np.any(lbl_slice > 0)
+                        slice_title = f"Slice {z}" + (" (contains lesion)" if has_lesion else "")
+                        
+                        # Display each image
                         axes[0].imshow(ph_slice, cmap='gray')
                         axes[0].set_title('Pseudo-healthy')
                         axes[0].axis('off')
                         
-                        axes[1].imshow(lbl_slice, cmap='Reds')
-                        axes[1].set_title('Label')
+                        # For label, use a red overlay
+                        axes[1].imshow(ph_slice, cmap='gray')  # Background
+                        if has_lesion:  # Only add overlay if there's a lesion
+                            mask = lbl_slice > 0
+                            # Create red mask
+                            red_mask = np.zeros((*lbl_slice.shape, 4))  # RGBA
+                            red_mask[mask, 0] = 1.0  # Red channel
+                            red_mask[mask, 3] = 0.5  # Alpha for mask
+                            axes[1].imshow(red_mask)
+                        axes[1].set_title('Label Overlay')
                         axes[1].axis('off')
                         
-                        axes[2].imshow(out_slice, cmap='gray')
+                        # For output and target
+                        im_out = axes[2].imshow(out_slice, cmap='gray')
                         axes[2].set_title('Output')
                         axes[2].axis('off')
+                        plt.colorbar(im_out, ax=axes[2], fraction=0.046, pad=0.04)
                         
-                        axes[3].imshow(tgt_slice, cmap='gray')
+                        im_tgt = axes[3].imshow(tgt_slice, cmap='gray')
                         axes[3].set_title('Target')
                         axes[3].axis('off')
+                        plt.colorbar(im_tgt, ax=axes[3], fraction=0.046, pad=0.04)
                         
-                        plt.suptitle(f"Slice {z}")
+                        # Show difference image if it's a lesion slice
+                        if has_lesion:
+                            # Add a 5th plot for the difference in lesion region
+                            fig.set_size_inches(10, 10)  # Increase figure size
+                            ax_diff = fig.add_subplot(3, 2, 5)  # Add a new subplot
+                            
+                            # Calculate absolute difference in lesion region
+                            diff = np.abs(out_slice - tgt_slice)
+                            masked_diff = diff * lbl_slice
+                            
+                            im_diff = ax_diff.imshow(masked_diff, cmap='hot')
+                            ax_diff.set_title('Absolute Difference in Lesion')
+                            ax_diff.axis('off')
+                            plt.colorbar(im_diff, ax=ax_diff, fraction=0.046, pad=0.04)
+                            
+                            # Add text for slice-specific metrics if available
+                            if metrics is not None:
+                                ax_text = fig.add_subplot(3, 2, 6)
+                                ax_text.axis('off')
+                                ax_text.text(0.1, 0.8, "Slice Lesion Stats:", fontsize=12, weight='bold')
+                                y_pos = 0.7
+                                
+                                # Calculate slice-specific metrics
+                                slice_metrics = {
+                                    "Mean Error": np.mean(masked_diff) if np.sum(lbl_slice) > 0 else 0,
+                                    "Max Error": np.max(masked_diff) if np.sum(lbl_slice) > 0 else 0,
+                                    "% of Lesion Voxels": 100 * np.sum(lbl_slice) / lbl_slice.size
+                                }
+                                
+                                for name, value in slice_metrics.items():
+                                    ax_text.text(0.1, y_pos, f"{name}: {value:.4f}", fontsize=10)
+                                    y_pos -= 0.1
+                        
+                        plt.suptitle(slice_title, fontsize=16)
                         plt.tight_layout()
                         pdf.savefig(fig)
                         plt.close(fig)
@@ -1219,7 +1439,7 @@ def visualize_results(pseudo_healthy, label, output, target, output_path):
         # Verify the PDF is valid
         import os
         if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
-            print(f"Simplified PDF created successfully: {output_path} ({os.path.getsize(output_path)} bytes)")
+            print(f"PDF visualization created successfully: {output_path} ({os.path.getsize(output_path)} bytes)")
         else:
             print(f"Warning: PDF file may not have been created properly")
             raise RuntimeError("PDF file creation failed")
@@ -1235,6 +1455,10 @@ def visualize_results(pseudo_healthy, label, output, target, output_path):
                 f.write(f"Label shape: {label.shape}\n")
                 f.write(f"Output shape: {output.shape}\n")
                 f.write(f"Target shape: {target.shape}\n")
+                if metrics:
+                    f.write("\nMetrics:\n")
+                    for k, v in metrics.items():
+                        f.write(f"{k}: {v}\n")
             print(f"Created text file with information instead")
         except Exception as txt_error:
             print(f"Failed to create even a text file: {txt_error}")
@@ -1293,7 +1517,7 @@ def inference(args):
         # Reconstruct full volume
         if output_patches:
             reconstructed = patch_extractor.reconstruct_from_patches(
-                output_patches, patch_coords, pseudo_healthy.unsqueeze(0).shape
+                output_patches, patch_coords, pseudo_healthy.shape
             )
             
             # Apply the lesion mask to only modify lesion regions
@@ -1318,12 +1542,20 @@ def inference(args):
             
             # Visualize result if requested
             if args.visualize:
+                # For inference, we don't have metrics, so just create a simple info dict
+                inference_info = {
+                    "Model": os.path.basename(args.model_path),
+                    "Mode": "Inference",
+                    "Time": str(datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+                }
+                
                 visualize_results(
                     pseudo_healthy.unsqueeze(0), 
                     label.unsqueeze(0), 
                     final_output, 
                     pseudo_healthy.unsqueeze(0),  # Use pseudo-healthy as placeholder for target
-                    args.output_file.replace(".mha", ".pdf")
+                    args.output_file.replace(".mha", ".pdf"),
+                    metrics=inference_info
                 )
 
 def main():
