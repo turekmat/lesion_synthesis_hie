@@ -874,6 +874,16 @@ class LesionInpaintingGAN(nn.Module):
         Returns:
             torch.Tensor: Skalární hodnota edge loss
         """
+        # Kontrola a úprava tvaru tensorů
+        if pred.shape[1] != 1:
+            pred = pred[:, 0:1]
+            
+        if target.shape[1] != 1:
+            target = target[:, 0:1]
+            
+        if mask.shape[1] != 1:
+            mask = mask[:, 0:1]
+                
         # Nejprve se ujistíme, že všechny tenzory mají stejný tvar
         if pred.shape != target.shape or pred.shape != mask.shape:
             # Reportujeme rozdíly ve velikostech pro diagnostiku
@@ -972,9 +982,31 @@ class LesionInpaintingGAN(nn.Module):
         Returns:
             torch.Tensor: Skalární hodnota lokalizovaného SSIM loss
         """
+        # Kontrola a úprava tvaru tensorů
+        if pred.shape[1] != 1:
+            print(f"Warning: Predikovaná ADC mapa má tvar {pred.shape}, očekáván je [B, 1, D, H, W]")
+            pred = pred[:, 0:1]
+            
+        if target.shape[1] != 1:
+            print(f"Warning: Cílová ADC mapa má tvar {target.shape}, očekáván je [B, 1, D, H, W]")
+            target = target[:, 0:1]
+            
+        if mask.shape[1] != 1:
+            print(f"Warning: Maska léze má tvar {mask.shape}, očekáván je [B, 1, D, H, W]")
+            mask = mask[:, 0:1]
+            
         # Výpočet SSIM loss pouze v oblasti léze
-        ssim_loss_val = 1.0 - self.ssim_loss(pred * mask, target * mask)
-        return ssim_loss_val
+        try:
+            ssim_loss_val = 1.0 - self.ssim_loss(pred * mask, target * mask)
+            return ssim_loss_val
+        except ValueError as e:
+            print(f"Chyba při výpočtu SSIM: {e}")
+            print(f"Tvar pred: {pred.shape}, tvar target: {target.shape}, tvar mask: {mask.shape}")
+            pred_masked = pred * mask
+            target_masked = target * mask
+            print(f"Tvar pred_masked: {pred_masked.shape}, tvar target_masked: {target_masked.shape}")
+            # Pokud nastal problém, vrátíme alespoň L1 loss
+            return F.l1_loss(pred * mask, target * mask) * 2.0
     
     def generator_loss(self, pseudo_healthy, lesion_mask, real_adc, fake_adc, disc_fake_pred):
         """
@@ -990,6 +1022,16 @@ class LesionInpaintingGAN(nn.Module):
         Returns:
             tuple: (celkový loss, adversarial loss, L1 loss, identity loss, SSIM loss, edge loss)
         """
+        # Kontrola a zajištění správných tvarů tensorů
+        if pseudo_healthy.shape[1] != 1:
+            pseudo_healthy = pseudo_healthy[:, 0:1]
+        if lesion_mask.shape[1] != 1:
+            lesion_mask = lesion_mask[:, 0:1]
+        if real_adc.shape[1] != 1:
+            real_adc = real_adc[:, 0:1]
+        if fake_adc.shape[1] != 1:
+            fake_adc = fake_adc[:, 0:1]
+            
         # Adversarial loss pro generátor - motivovat generátor k vytváření věrohodných lézí
         target_real = torch.ones_like(disc_fake_pred).to(disc_fake_pred.device)
         adv_loss = self.adversarial_loss(disc_fake_pred, target_real)
@@ -1537,7 +1579,7 @@ class LesionInpaintingTrainer:
                     # Výpočet loss pro generátor se správnými argumenty
                     g_loss, g_adv_loss, g_l1_loss, g_identity_loss, g_ssim_loss, g_edge_loss = \
                         self.model.generator_loss(
-                        pseudo_healthy, lesion_mask, real_adc, fake_adc, disc_fake_pred
+                        pseudo_healthy, lesion_mask, real_adc, fake_adc_d, disc_fake_pred
                     )
                     
                     # Výpočet loss pro diskriminátor
