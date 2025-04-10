@@ -373,6 +373,8 @@ class LesionInpaintingDataset(Dataset):
             if idx == 0:  # Jen pro první vzorek pro omezení výpisů
                 print(f"DEBUG: Tvary před transformací: pseudo_healthy={sample['pseudo_healthy'].shape}, "
                       f"adc={sample['adc'].shape}, lesion_mask={sample['lesion_mask'].shape}")
+                print(f"DEBUG: Typy před transformací: pseudo_healthy={type(sample['pseudo_healthy'])}, "
+                      f"adc={type(sample['adc'])}, lesion_mask={type(sample['lesion_mask'])}")
             
             sample = self.transform(sample)
             
@@ -380,6 +382,8 @@ class LesionInpaintingDataset(Dataset):
             if idx == 0:  # Jen pro první vzorek pro omezení výpisů
                 print(f"DEBUG: Tvary po transformaci: pseudo_healthy={sample['pseudo_healthy'].shape}, "
                       f"adc={sample['adc'].shape}, lesion_mask={sample['lesion_mask'].shape}")
+                print(f"DEBUG: Typy po transformaci: pseudo_healthy={type(sample['pseudo_healthy'])}, "
+                      f"adc={type(sample['adc'])}, lesion_mask={type(sample['lesion_mask'])}")
         
         # Převést data na torch tenzory s přidáním kanálové dimenze
         for key in ['pseudo_healthy', 'adc', 'lesion_mask']:
@@ -1825,22 +1829,22 @@ def train_model(args):
                     keys=keys,
                     prob=args.aug_rotate_prob,
                     max_k=3,  # maximálně 3 rotace (0, 90, 180, 270 stupňů)
-                    spatial_axes=(1, 2)  # Upravte podle formátu dat - viz komentáře výše
+                    spatial_axes=(0, 1)  # Opraveno - používáme (0, 1) pro první dvě dimenze
                 ),
                 
                 # Náhodné překlápění (zrcadlení)
                 RandFlipd(
                     keys=keys,
                     prob=args.aug_flip_prob,
-                    spatial_axis=None  # náhodný výběr os
+                    spatial_axis=None  # náhodný výběr os - toto je v pořádku, protože None znamená náhodný výběr z dostupných os
                 ),
                 
                 # Affinní transformace (rotace, škálování, posuny)
                 RandAffined(
                     keys=keys,
                     prob=args.aug_affine_prob,
-                    rotate_range=(np.pi/36, np.pi/36, np.pi/36),  # max +/- 5 stupňů ve všech osách
-                    scale_range=(0.05, 0.05, 0.05),  # škálování o +/- 5%
+                    rotate_range=(np.pi/36, np.pi/36, np.pi/36),  # max +/- 5 stupňů ve všech osách - správně pro 3D data
+                    scale_range=(0.05, 0.05, 0.05),  # škálování o +/- 5% - správně pro 3D data
                     mode=('bilinear', 'bilinear', 'nearest'),  # interpolace pro každý typ dat
                     padding_mode='zeros'
                 ),
