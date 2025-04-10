@@ -656,12 +656,28 @@ def train(args):
             label = batch_data["label"].to(device)
             
             # Extract patches containing lesions
-            patches_ph, patches_label, patches_adc, _ = patch_extractor.extract_patches_with_lesions(
+            patches_ph, patches_label, patches_adc, patch_coords = patch_extractor.extract_patches_with_lesions(
                 pseudo_healthy[0], label[0], adc[0]
             )
             
+            # Filter out patches with invalid coordinates (negative values)
+            valid_patches = []
+            for i, (patch, coords) in enumerate(zip(patches_ph, patch_coords)):
+                if all(c >= 0 for c in coords):
+                    valid_patches.append(i)
+            
+            # Skip if no valid patches
+            if not valid_patches:
+                print(f"Warning: No valid patches found for training sample {batch_idx}")
+                continue
+                
+            # Use only valid patches
+            filtered_patches_ph = [patches_ph[i] for i in valid_patches]
+            filtered_patches_label = [patches_label[i] for i in valid_patches]
+            filtered_patches_adc = [patches_adc[i] for i in valid_patches]
+            
             batch_loss = 0
-            for ph_patch, label_patch, adc_patch in zip(patches_ph, patches_label, patches_adc):
+            for ph_patch, label_patch, adc_patch in zip(filtered_patches_ph, filtered_patches_label, filtered_patches_adc):
                 # Add batch dimension
                 ph_patch = ph_patch.unsqueeze(0)
                 label_patch = label_patch.unsqueeze(0)
@@ -684,8 +700,8 @@ def train(args):
                 train_samples += 1
             
             # Average loss over patches
-            if len(patches_ph) > 0:
-                avg_batch_loss = batch_loss / len(patches_ph)
+            if len(filtered_patches_ph) > 0:
+                avg_batch_loss = batch_loss / len(filtered_patches_ph)
                 epoch_loss += avg_batch_loss
                 
         avg_epoch_loss = epoch_loss / max(1, len(train_loader))
