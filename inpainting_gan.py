@@ -251,27 +251,59 @@ class PatchExtractor:
     def _extract_and_add_patch(self, pseudo_healthy, label, adc, z_start, y_start, x_start, 
                               patches_ph, patches_label, patches_adc, patch_coords):
         """Helper method to extract a patch and add it to collections if it contains lesions"""
+        # Handle negative coordinates - clip to 0
+        z_start = max(0, z_start)
+        y_start = max(0, y_start)
+        x_start = max(0, x_start)
+        
+        # Handle out-of-bounds coordinates
+        if (z_start >= pseudo_healthy.shape[1] or 
+            y_start >= pseudo_healthy.shape[2] or 
+            x_start >= pseudo_healthy.shape[3]):
+            print(f"Warning: Skipping out-of-bounds patch coordinates: ({z_start}, {y_start}, {x_start})")
+            return False
+            
+        # Calculate actual patch size to avoid out-of-bounds
+        z_end = min(z_start + self.patch_size[0], pseudo_healthy.shape[1])
+        y_end = min(y_start + self.patch_size[1], pseudo_healthy.shape[2])
+        x_end = min(x_start + self.patch_size[2], pseudo_healthy.shape[3])
+        
         # Extract patches
         ph_patch = pseudo_healthy[:, 
-                                 z_start:z_start+self.patch_size[0], 
-                                 y_start:y_start+self.patch_size[1], 
-                                 x_start:x_start+self.patch_size[2]]
+                                 z_start:z_end, 
+                                 y_start:y_end, 
+                                 x_start:x_end]
         
         label_patch = label[:, 
-                          z_start:z_start+self.patch_size[0], 
-                          y_start:y_start+self.patch_size[1], 
-                          x_start:x_start+self.patch_size[2]]
+                          z_start:z_end, 
+                          y_start:y_end, 
+                          x_start:x_end]
         
         adc_patch = adc[:, 
-                      z_start:z_start+self.patch_size[0], 
-                      y_start:y_start+self.patch_size[1], 
-                      x_start:x_start+self.patch_size[2]]
+                      z_start:z_end, 
+                      y_start:y_end, 
+                      x_start:x_end]
         
-        # Pad if necessary
-        if ph_patch.shape[1:] != self.patch_size:
+        # Check if patches have expected dimensions
+        expected_dim = 4  # [C, Z, Y, X]
+        if ph_patch.dim() != expected_dim:
+            print(f"Warning: Patch has unexpected dimension {ph_patch.dim()}, expected {expected_dim}")
+            return False
+        
+        # Pad if necessary to match required patch size
+        if (ph_patch.shape[1] != self.patch_size[0] or 
+            ph_patch.shape[2] != self.patch_size[1] or 
+            ph_patch.shape[3] != self.patch_size[2]):
             ph_patch = self._pad_patch(ph_patch)
             label_patch = self._pad_patch(label_patch)
             adc_patch = self._pad_patch(adc_patch)
+        
+        # Validate patch dimensions after padding
+        if (ph_patch.shape[1] != self.patch_size[0] or 
+            ph_patch.shape[2] != self.patch_size[1] or 
+            ph_patch.shape[3] != self.patch_size[2]):
+            print(f"Warning: After padding, patch still has incorrect shape: {ph_patch.shape}, expected: [C, {self.patch_size[0]}, {self.patch_size[1]}, {self.patch_size[2]}]")
+            return False
         
         # Only add patch if it contains lesion
         if label_patch.sum() > 0:
@@ -350,19 +382,71 @@ class PatchExtractor:
         return centers
     
     def _pad_patch(self, patch):
-        """Pad patch to match required patch size"""
+        """
+        Pad patch to match required patch size
+        
+        Args:
+            patch: Tensor of shape [C, D, H, W] or similar
+            
+        Returns:
+            Padded patch with shape [C, patch_size[0], patch_size[1], patch_size[2]]
+        """
+        # Ensure patch has 4 dimensions [C, D, H, W]
+        if patch.dim() != 4:
+            print(f"Warning: Patch has {patch.dim()} dimensions, expected 4. Shape: {patch.shape}")
+            # Try to fix the dimensions
+            if patch.dim() == 3:  # [D, H, W] - missing channel dimension
+                patch = patch.unsqueeze(0)
+            elif patch.dim() == 5:  # [B, C, D, H, W] - has batch dimension
+                patch = patch.squeeze(0)
+            else:
+                # Can't easily fix, so return as is
+                return patch
+        
+        # Get current dimensions
         c, d, h, w = patch.shape
+        
+        # Calculate padding needed for each dimension
         pad_d = max(0, self.patch_size[0] - d)
         pad_h = max(0, self.patch_size[1] - h)
         pad_w = max(0, self.patch_size[2] - w)
         
+        # Apply padding
         if pad_d > 0 or pad_h > 0 or pad_w > 0:
-            return torch.nn.functional.pad(
-                patch, 
-                (0, pad_w, 0, pad_h, 0, pad_d), 
-                mode='constant', 
-                value=0
-            )
+            # Calculate padding for each side (PyTorch padding is applied from the last dimension backward)
+            # Format: (padding_left, padding_right, padding_top, padding_bottom, padding_front, padding_back)
+            paddings = (0, pad_w, 0, pad_h, 0, pad_d)
+            
+            try:
+                padded_patch = torch.nn.functional.pad(
+                    patch, 
+                    paddings, 
+                    mode='constant', 
+                    value=0
+                )
+                
+                # Verify the dimensions after padding
+                if padded_patch.shape[1:] != tuple(self.patch_size):
+                    print(f"Warning: After padding, patch has shape {padded_patch.shape}, expected [C, {self.patch_size[0]}, {self.patch_size[1]}, {self.patch_size[2]}]")
+                    # If dimensions still mismatch, try a different approach
+                    # Create new tensor with the exact target size
+                    target_patch = torch.zeros((c, self.patch_size[0], self.patch_size[1], self.patch_size[2]), 
+                                              device=patch.device, dtype=patch.dtype)
+                    # Copy the original data to the new tensor
+                    target_d = min(d, self.patch_size[0])
+                    target_h = min(h, self.patch_size[1])
+                    target_w = min(w, self.patch_size[2])
+                    target_patch[:, :target_d, :target_h, :target_w] = patch[:, :target_d, :target_h, :target_w]
+                    return target_patch
+                
+                return padded_patch
+            except Exception as e:
+                print(f"Error during padding: {e}")
+                # Create a new tensor with the correct size as fallback
+                return torch.zeros((c, self.patch_size[0], self.patch_size[1], self.patch_size[2]), 
+                                  device=patch.device, dtype=patch.dtype)
+        
+        # If patch size already matches or is larger, return as is
         return patch
 
     def reconstruct_from_patches(self, patches, patch_coords, output_shape):
@@ -376,7 +460,7 @@ class PatchExtractor:
         patch_coords : list of tuple
             List of coordinates (z, y, x) indicating the starting position of each patch
         output_shape : tuple
-            Shape of the output volume [C, Z, Y, X]
+            Shape of the output volume [B, C, Z, Y, X] or [C, Z, Y, X]
             
         Returns:
         --------
@@ -395,55 +479,101 @@ class PatchExtractor:
             if z < 0 or y < 0 or x < 0:
                 raise ValueError(f"Patch {i} has negative coordinates: ({z}, {y}, {x})")
         
+        # Ensure output_shape has 4 dimensions [C, Z, Y, X] or 5 dimensions [B, C, Z, Y, X]
+        if len(output_shape) == 5:  # [B, C, Z, Y, X]
+            # Remove batch dimension for processing
+            working_shape = output_shape[1:]
+            has_batch_dim = True
+        else:  # [C, Z, Y, X]
+            working_shape = output_shape
+            has_batch_dim = False
+            
         # Log information for debugging
         print(f"Reconstructing from {len(patches)} patches to output shape {output_shape}")
         print(f"First patch shape: {patches[0].shape}")
         
         # Create tensors for reconstruction
-        reconstructed = torch.zeros(output_shape, device=patches[0].device)
-        count = torch.zeros(output_shape, device=patches[0].device)
+        reconstructed = torch.zeros(working_shape, device=patches[0].device)
+        count = torch.zeros(working_shape, device=patches[0].device)
         
         try:
             for i, (patch, (z, y, x)) in enumerate(zip(patches, patch_coords)):
                 # Get actual patch dimensions
                 patch_shape = patch.shape
                 
-                # Check for dimension mismatch
-                if len(patch_shape) != 4:  # C, Z, Y, X
-                    raise ValueError(f"Patch {i} has invalid dimensions: {patch_shape}, expected 4D tensor")
+                # Check for dimension mismatch - patch should be [C, Z, Y, X]
+                if len(patch_shape) != 4:
+                    print(f"Warning: Patch {i} has unexpected dimensions: {patch_shape}, expected 4D tensor [C, Z, Y, X]")
+                    continue
                 
                 # Calculate the end coordinates based on patch dimensions
                 # and ensure they don't exceed output boundaries
-                z_end = min(z + patch_shape[1], output_shape[1])
-                y_end = min(y + patch_shape[2], output_shape[2])
-                x_end = min(x + patch_shape[3], output_shape[3])
+                z_end = min(z + patch_shape[1], working_shape[1])
+                y_end = min(y + patch_shape[2], working_shape[2])
+                x_end = min(x + patch_shape[3], working_shape[3])
                 
                 # Calculate the actual patch size to copy (may be smaller than the patch itself)
                 patch_z = min(patch_shape[1], z_end - z)
                 patch_y = min(patch_shape[2], y_end - y)
                 patch_x = min(patch_shape[3], x_end - x)
                 
+                # Skip patches that don't fit the volume dimensions
+                if z >= working_shape[1] or y >= working_shape[2] or x >= working_shape[3]:
+                    print(f"Warning: Patch {i} coordinates outside volume: ({z}, {y}, {x}), volume shape: {working_shape}")
+                    continue
+                
                 # Only copy the valid portion of the patch
                 if patch_z > 0 and patch_y > 0 and patch_x > 0:
                     try:
-                        # Check for dimension match before adding to reconstructed
+                        # Extract the slices for both output and patch
                         output_slice = reconstructed[:, z:z_end, y:y_end, x:x_end]
                         patch_slice = patch[:, :patch_z, :patch_y, :patch_x]
                         
+                        # Ensure dimensions match
                         if output_slice.shape != patch_slice.shape:
-                            print(f"Patch {i} slice shape mismatch: output_slice {output_slice.shape}, patch_slice {patch_slice.shape}")
-                            # Skip this patch if dimensions don't match
-                            continue
+                            print(f"Patch {i} dimension mismatch: output_slice {output_slice.shape}, patch_slice {patch_slice.shape}")
                             
+                            # Try to match dimensions by padding or cropping patch
+                            if output_slice.dim() > patch_slice.dim():
+                                # Output slice has more dimensions than patch slice
+                                print(f"  -> Padding patch to match output dimensions")
+                                # This is a rare case, we can't easily handle it without knowing which dimension is missing
+                                continue
+                            elif patch_slice.dim() > output_slice.dim():
+                                # Patch slice has more dimensions than output slice
+                                print(f"  -> Reducing patch dimensions to match output")
+                                while patch_slice.dim() > output_slice.dim():
+                                    patch_slice = patch_slice.squeeze(0)
+                            
+                            # Check if dimensions now match after adjustment
+                            if output_slice.shape != patch_slice.shape:
+                                # If still not matching, try to pad or crop specific dimensions
+                                new_patch_slice = torch.zeros_like(output_slice)
+                                # Copy the overlapping part
+                                min_c = min(output_slice.shape[0], patch_slice.shape[0])
+                                min_z = min(output_slice.shape[1], patch_slice.shape[1]) if output_slice.dim() > 1 and patch_slice.dim() > 1 else 0
+                                min_y = min(output_slice.shape[2], patch_slice.shape[2]) if output_slice.dim() > 2 and patch_slice.dim() > 2 else 0
+                                min_x = min(output_slice.shape[3], patch_slice.shape[3]) if output_slice.dim() > 3 and patch_slice.dim() > 3 else 0
+                                
+                                # Create slice objects based on dimensions
+                                if output_slice.dim() == 4 and patch_slice.dim() == 4:
+                                    new_patch_slice[:min_c, :min_z, :min_y, :min_x] = patch_slice[:min_c, :min_z, :min_y, :min_x]
+                                else:
+                                    print(f"  -> Cannot reconcile dimensions, skipping patch")
+                                    continue
+                                
+                                patch_slice = new_patch_slice
+                            
+                        # Add patch to reconstructed volume and update count
                         reconstructed[:, z:z_end, y:y_end, x:x_end] += patch_slice
                         count[:, z:z_end, y:y_end, x:x_end] += 1
-                    except RuntimeError as e:
+                    except Exception as e:
                         print(f"Error adding patch {i} at coords ({z}, {y}, {x}): {e}")
-                        print(f"Patch shape: {patch.shape}, Patch slice: {patch[:, :patch_z, :patch_y, :patch_x].shape}")
-                        print(f"Output slice: {reconstructed[:, z:z_end, y:y_end, x:x_end].shape}")
+                        print(f"Patch shape: {patch.shape}, slice shape: {patch_slice.shape if 'patch_slice' in locals() else 'N/A'}")
+                        print(f"Output slice shape: {output_slice.shape if 'output_slice' in locals() else 'N/A'}")
                         continue
                 else:
-                    print(f"Warning: Invalid patch dimensions for coords ({z}, {y}, {x}): shape={patch_shape}, output_shape={output_shape}")
+                    print(f"Warning: Invalid patch dimensions for coords ({z}, {y}, {x}): shape={patch_shape}, output_shape={working_shape}")
             
             # Average overlapping regions
             count[count == 0] = 1  # Avoid division by zero
@@ -453,6 +583,10 @@ class PatchExtractor:
             if torch.isnan(reconstructed).any():
                 print("Warning: NaN values detected in reconstruction")
                 reconstructed = torch.nan_to_num(reconstructed, 0.0)
+            
+            # Add batch dimension back if original shape had it
+            if has_batch_dim:
+                reconstructed = reconstructed.unsqueeze(0)
             
             return reconstructed
             
@@ -716,96 +850,150 @@ def train(args):
         
         with torch.no_grad():
             for val_batch_idx, val_batch_data in enumerate(val_loader):
+                print(f"Processing validation batch {val_batch_idx}")
                 pseudo_healthy = val_batch_data["pseudo_healthy"].to(device)
                 adc = val_batch_data["adc"].to(device)
                 label = val_batch_data["label"].to(device)
                 
-                # Extract patches containing lesions, ensuring valid coordinates
-                patches_ph, patches_label, patches_adc, patch_coords = patch_extractor.extract_patches_with_lesions(
-                    pseudo_healthy[0], label[0], adc[0]
-                )
+                # Print volume dimensions for debugging
+                print(f"Volume dimensions: pseudo_healthy={pseudo_healthy.shape}, label={label.shape}")
                 
-                # Filter out patches with invalid coordinates (negative values)
-                valid_patches = []
-                valid_coords = []
-                for i, (patch, coords) in enumerate(zip(patches_ph, patch_coords)):
-                    if all(c >= 0 for c in coords):
-                        valid_patches.append(i)
-                        valid_coords.append(coords)
-                
-                if not valid_patches:
-                    # Skip this sample if no valid patches
-                    continue
-                
-                filtered_patches_ph = [patches_ph[i] for i in valid_patches]
-                filtered_patches_label = [patches_label[i] for i in valid_patches]
-                filtered_patches_adc = [patches_adc[i] for i in valid_patches]
-                filtered_patch_coords = [patch_coords[i] for i in valid_patches]
-                
-                output_patches = []
-                for ph_patch, label_patch in zip(filtered_patches_ph, filtered_patches_label):
-                    ph_patch = ph_patch.unsqueeze(0)  # Add batch dimension [1, C, Z, Y, X]
-                    label_patch = label_patch.unsqueeze(0)
+                try:
+                    # Extract patches containing lesions, ensuring valid coordinates
+                    patches_ph, patches_label, patches_adc, patch_coords = patch_extractor.extract_patches_with_lesions(
+                        pseudo_healthy[0], label[0], adc[0]
+                    )
                     
-                    # Generate inpainted output
-                    output_patch = model(ph_patch, label_patch)
+                    print(f"Extracted {len(patches_ph)} patches")
                     
-                    # Ensure output matches input dimensions
-                    expected_shape = ph_patch.shape[2:]  # Expected spatial dimensions [Z, Y, X]
-                    output_shape = output_patch.shape[2:]  # Actual spatial dimensions
+                    # Filter out patches with invalid coordinates (negative values)
+                    valid_patches = []
+                    valid_coords = []
+                    for i, (patch, coords) in enumerate(zip(patches_ph, patch_coords)):
+                        if all(c >= 0 for c in coords):
+                            valid_patches.append(i)
+                            valid_coords.append(coords)
                     
-                    if expected_shape != output_shape:
-                        print(f"Warning: Output patch dimensions {output_shape} don't match expected dimensions {expected_shape}")
-                        # Resize output to match expected dimensions if needed
-                        # This could be done with interpolation, but for simplicity we'll skip this patch
+                    if not valid_patches:
+                        print(f"Warning: No valid patches found for validation sample {val_batch_idx}")
                         continue
                     
-                    # Remove batch dimension for reconstruction
-                    output_patches.append(output_patch[0])
-                
-                # Reconstruct full volume
-                if output_patches:
-                    try:
-                        # Ensure all patches have the same dimensions
-                        patch_shapes = [p.shape for p in output_patches]
-                        if len(set(str(s) for s in patch_shapes)) > 1:
-                            print(f"Warning: Inconsistent patch shapes: {patch_shapes}")
-                            # Skip this sample if patches have inconsistent shapes
-                            continue
+                    print(f"After filtering, {len(valid_patches)} valid patches remain")
+                    
+                    filtered_patches_ph = [patches_ph[i] for i in valid_patches]
+                    filtered_patches_label = [patches_label[i] for i in valid_patches]
+                    filtered_patches_adc = [patches_adc[i] for i in valid_patches]
+                    filtered_patch_coords = [patch_coords[i] for i in valid_patches]
+                    
+                    # Process patches one by one
+                    output_patches = []
+                    valid_patch_coords = []
+                    
+                    for patch_idx, (ph_patch, label_patch, coords) in enumerate(zip(filtered_patches_ph, filtered_patches_label, filtered_patch_coords)):
+                        try:
+                            # Print patch dimensions for debugging
+                            print(f"Input patch {patch_idx}: shape={ph_patch.shape}, coords={coords}")
                             
-                        reconstructed = patch_extractor.reconstruct_from_patches(
-                            output_patches, filtered_patch_coords, pseudo_healthy.shape
-                        )
+                            # Add batch dimension
+                            ph_patch = ph_patch.unsqueeze(0)  # Add batch dimension [1, C, Z, Y, X]
+                            label_patch = label_patch.unsqueeze(0)
+                            
+                            # Generate inpainted output
+                            output_patch = model(ph_patch, label_patch)
+                            
+                            # Check output shape
+                            expected_shape = ph_patch.shape[2:]  # Expected spatial dimensions [Z, Y, X]
+                            output_shape = output_patch.shape[2:]  # Actual spatial dimensions
+                            
+                            if expected_shape != output_shape:
+                                print(f"Warning: Output patch dimensions {output_shape} don't match expected dimensions {expected_shape}")
+                                # Try to fix dimensions using interpolation
+                                if len(output_shape) == len(expected_shape):
+                                    print(f"Attempting to resize output patch to match expected dimensions")
+                                    try:
+                                        # Use interpolate to resize to expected dimensions
+                                        output_patch = torch.nn.functional.interpolate(
+                                            output_patch,
+                                            size=expected_shape,
+                                            mode='trilinear',
+                                            align_corners=False
+                                        )
+                                        print(f"Successfully resized patch to {output_patch.shape[2:]}")
+                                    except Exception as resize_err:
+                                        print(f"Error resizing patch: {resize_err}")
+                                        continue
+                                else:
+                                    # Skip this patch if dimensions don't match and can't be fixed
+                                    continue
+                            
+                            # Remove batch dimension for reconstruction
+                            output_patches.append(output_patch[0])
+                            valid_patch_coords.append(coords)
+                            print(f"Successfully processed patch {patch_idx}, output shape: {output_patch.shape}")
+                            
+                        except Exception as patch_error:
+                            print(f"Error processing patch {patch_idx}: {patch_error}")
+                            continue
+                    
+                    # Reconstruct full volume
+                    if output_patches:
+                        print(f"Reconstructing from {len(output_patches)} processed patches")
                         
-                        # Apply lesion mask for validation metrics
-                        inpainted = pseudo_healthy[0].clone()
-                        inpainted = inpainted * (1 - label[0]) + reconstructed * label[0]
-                        
-                        # Calculate validation losses using simple L1 loss
-                        val_batch_loss = reconstruction_loss(inpainted.unsqueeze(0), adc)
-                        
-                        # Separate losses for lesion and healthy regions
-                        # Use mask multiplication to isolate regions
-                        lesion_loss = reconstruction_loss(
-                            (inpainted * label[0]).unsqueeze(0), 
-                            adc * label
-                        )
-                        
-                        healthy_loss = reconstruction_loss(
-                            (inpainted * (1 - label[0])).unsqueeze(0),
-                            adc * (1 - label)
-                        )
-                        
-                        val_loss += val_batch_loss.item()
-                        val_lesion_loss += lesion_loss.item()
-                        val_healthy_loss += healthy_loss.item()
-                        val_examples += 1
-                        
-                    except Exception as e:
-                        print(f"Error during validation reconstruction: {e}")
-                        for i, patch in enumerate(output_patches):
-                            print(f"Patch {i} shape: {patch.shape}, coord: {filtered_patch_coords[i]}")
-                        continue
+                        try:
+                            # Ensure all patches have the same number of dimensions
+                            patch_dims = [p.dim() for p in output_patches]
+                            if len(set(patch_dims)) > 1:
+                                print(f"Warning: Inconsistent patch dimensions: {patch_dims}")
+                                # Try to normalize dimensions
+                                for i in range(len(output_patches)):
+                                    while output_patches[i].dim() < 4:  # Ensure 4D [C, Z, Y, X]
+                                        output_patches[i] = output_patches[i].unsqueeze(0)
+                                    while output_patches[i].dim() > 4:
+                                        output_patches[i] = output_patches[i].squeeze(0)
+                            
+                            # Verify shapes after normalization
+                            patch_shapes = [p.shape for p in output_patches]
+                            print(f"Patch shapes after normalization: {patch_shapes[:5]}..." if len(patch_shapes) > 5 else patch_shapes)
+                            
+                            # Reconstruct the volume
+                            reconstructed = patch_extractor.reconstruct_from_patches(
+                                output_patches, valid_patch_coords, pseudo_healthy.shape
+                            )
+                            
+                            # Apply lesion mask for validation metrics
+                            inpainted = pseudo_healthy[0].clone()
+                            inpainted = inpainted * (1 - label[0]) + reconstructed * label[0]
+                            
+                            # Calculate validation losses using simple L1 loss
+                            val_batch_loss = reconstruction_loss(inpainted.unsqueeze(0), adc)
+                            
+                            # Separate losses for lesion and healthy regions
+                            # Use mask multiplication to isolate regions
+                            lesion_loss = reconstruction_loss(
+                                (inpainted * label[0]).unsqueeze(0), 
+                                adc * label
+                            )
+                            
+                            healthy_loss = reconstruction_loss(
+                                (inpainted * (1 - label[0])).unsqueeze(0),
+                                adc * (1 - label)
+                            )
+                            
+                            val_loss += val_batch_loss.item()
+                            val_lesion_loss += lesion_loss.item()
+                            val_healthy_loss += healthy_loss.item()
+                            val_examples += 1
+                            
+                            print(f"Successfully processed validation sample {val_batch_idx}, losses: total={val_batch_loss.item():.4f}, lesion={lesion_loss.item():.4f}, healthy={healthy_loss.item():.4f}")
+                            
+                        except Exception as e:
+                            print(f"Error during validation reconstruction: {e}")
+                            for i, patch in enumerate(output_patches[:5]):  # Print only first 5 for brevity
+                                print(f"Patch {i} shape: {patch.shape}, coord: {valid_patch_coords[i]}")
+                            continue
+                except Exception as batch_error:
+                    print(f"Error processing validation batch {val_batch_idx}: {batch_error}")
+                    continue
         
         if val_examples > 0:
             avg_val_loss = val_loss / val_examples
