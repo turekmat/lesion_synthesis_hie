@@ -71,6 +71,10 @@ class LesionInpaintingDataset(Dataset):
         adc = sitk.GetArrayFromImage(adc_img).astype(np.float32)
         label = sitk.GetArrayFromImage(label_img).astype(np.float32)
         
+        # Capture original ranges BEFORE normalization
+        ph_original_range = (float(np.min(pseudo_healthy)), float(np.max(pseudo_healthy)))
+        adc_original_range = (float(np.min(adc)), float(np.max(adc)))
+        
         # Add channel dimension
         pseudo_healthy = np.expand_dims(pseudo_healthy, axis=0)
         adc = np.expand_dims(adc, axis=0)
@@ -91,6 +95,10 @@ class LesionInpaintingDataset(Dataset):
                 "origin": pseudo_healthy_img.GetOrigin(),
                 "spacing": pseudo_healthy_img.GetSpacing(),
                 "direction": pseudo_healthy_img.GetDirection()
+            },
+            "original_ranges": {
+                "pseudo_healthy": ph_original_range,
+                "adc": adc_original_range
             }
         }
         
@@ -946,11 +954,16 @@ def train(args):
                 adc = val_batch_data["adc"].to(device)
                 label = val_batch_data["label"].to(device)
                 
-                # Capture original data ranges for denormalization
-                ph_orig_range = (val_batch_data["pseudo_healthy"].min().item(), 
-                               val_batch_data["pseudo_healthy"].max().item())
-                adc_orig_range = (val_batch_data["adc"].min().item(), 
-                                val_batch_data["adc"].max().item())
+                # Get the original ranges from the dataset
+                if "original_ranges" in val_batch_data:
+                    ph_orig_range = val_batch_data["original_ranges"]["pseudo_healthy"]
+                    adc_orig_range = val_batch_data["original_ranges"]["adc"]
+                    print(f"Original ADC range: {adc_orig_range[0].item():.4f} to {adc_orig_range[1].item():.4f}")
+                else:
+                    # Fallback if original ranges are not available
+                    print("Warning: Original ranges not found in data. Using normalized range.")
+                    ph_orig_range = (0.0, 1.0)
+                    adc_orig_range = (0.0, 1.0)
                 
                 try:
                     # Extract patches containing lesions, ensuring valid coordinates
@@ -1197,9 +1210,9 @@ def train(args):
                         # Prepare metrics dictionary for visualization
                         vis_metrics = {
                             "Lesion L1 Loss": lesion_loss.item(),
-                            "Lesion MAE": lesion_mae.item(),  # Now denormalized
-                            "Lesion MAE (original scale)": lesion_mae.item(),  # Renamed for clarity
-                            "Original Data Range": f"{adc_orig_range[0]:.2f} to {adc_orig_range[1]:.2f}",
+                            "Lesion MAE (normalized)": lesion_mae.item() / (adc_orig_range[1].item() - adc_orig_range[0].item()),  # Normalized MAE
+                            "Lesion MAE (original scale)": lesion_mae.item(),  # Already denormalized by the function
+                            "Original ADC Range": f"{adc_orig_range[0].item():.4f} to {adc_orig_range[1].item():.4f}",
                             "Lesion Dice": lesion_dice.item(),
                             "Lesion SSIM": lesion_ssim.item(),
                             "Healthy L1 Loss": healthy_loss.item(),
@@ -1407,15 +1420,25 @@ def visualize_results(pseudo_healthy, label, output, target, output_path, metric
                         axes[1].set_title('Label Overlay')
                         axes[1].axis('off')
                         
-                        # FIXED: Create properly combined output image - pseudo-healthy with lesion regions replaced
-                        combined_slice = ph_slice.copy()
+                        # OPRAVENO: Správné vytvoření výstupního obrázku (mozek s inpaintovanými lézemi)
+                        # Použij originální pseudo-healthy a nahraď pouze oblasti s lézemi z výstupu modelu
+                        combined_slice = np.copy(ph_slice)  # Klonovat celý mozek
+                        
                         if has_lesion:
-                            # Replace only lesion regions with the model output
-                            combined_slice[lbl_slice > 0] = out_slice[lbl_slice > 0]
+                            # Maska léze
+                            lesion_mask = lbl_slice > 0
                             
-                        # For output and target
+                            # Nahraď pouze oblasti s lézemi výstupem modelu
+                            combined_slice[lesion_mask] = out_slice[lesion_mask]
+                            
+                            # Pro debugging: ukaž rozsah hodnot
+                            print(f"Slice {z} - Ph range: [{np.min(ph_slice):.4f}, {np.max(ph_slice):.4f}], "
+                                  f"Output range: [{np.min(out_slice):.4f}, {np.max(out_slice):.4f}], "
+                                  f"Combined range: [{np.min(combined_slice):.4f}, {np.max(combined_slice):.4f}]")
+                                
+                        # Pro output a target
                         im_out = axes[2].imshow(combined_slice, cmap='gray')
-                        axes[2].set_title('Output (Inpainted)')
+                        axes[2].set_title('Output (Inpainted Brain)')
                         axes[2].axis('off')
                         plt.colorbar(im_out, ax=axes[2], fraction=0.046, pad=0.04)
                         
@@ -1448,22 +1471,25 @@ def visualize_results(pseudo_healthy, label, output, target, output_path, metric
                                 
                                 # Get original data range if available
                                 orig_range = None
-                                if "Original Data Range" in metrics:
-                                    range_text = metrics["Original Data Range"]
+                                if "Original ADC Range" in metrics:
+                                    range_text = metrics["Original ADC Range"]
                                     if isinstance(range_text, str) and "to" in range_text:
                                         try:
                                             parts = range_text.split("to")
                                             min_val = float(parts[0].strip())
                                             max_val = float(parts[1].strip())
                                             orig_range = (min_val, max_val)
-                                        except:
+                                            print(f"Parsed original range: {min_val:.4f} to {max_val:.4f}")
+                                        except Exception as e:
+                                            print(f"Error parsing range: {e}")
                                             pass
                                 
                                 # Calculate slice-specific metrics
                                 mean_error = np.mean(masked_diff) if np.sum(lbl_slice) > 0 else 0
                                 # Denormalize mean error if possible
                                 if orig_range is not None:
-                                    denorm_mean_error = mean_error * (orig_range[1] - orig_range[0])
+                                    orig_min, orig_max = orig_range
+                                    denorm_mean_error = mean_error * (orig_max - orig_min)
                                     error_label = f"Mean Error (MAE): {mean_error:.4f} (normalized), {denorm_mean_error:.4f} (original scale)"
                                 else:
                                     error_label = f"Mean Error (MAE): {mean_error:.4f}"
