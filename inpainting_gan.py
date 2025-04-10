@@ -555,9 +555,15 @@ class Generator(nn.Module):
             nn.Sigmoid()
         )
         
-        # Finální konvoluce pro generování výstupu 
+        # Explicitně vytvoříme vrstvu pro redukci kanálů
+        self.channel_reduction = nn.Sequential(
+            nn.Conv3d(self.dec_channels[-1], 16, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True)
+        )
+        
+        # Finální konvoluce pro generování výstupu - nyní vždy očekává 16 kanálů
         self.final_conv = nn.Sequential(
-            nn.Conv3d(self.dec_channels[-1], out_channels, kernel_size=3, padding=1),
+            nn.Conv3d(16, out_channels, kernel_size=3, padding=1),
             nn.Tanh()  # Normalizovaný výstup v rozmezí [-1, 1]
         )
     
@@ -620,13 +626,27 @@ class Generator(nn.Module):
         # Aplikace attention mechanismu na finální feature mapu
         # Konkatenujeme masku léze s feature mapou pro attention model
         attention_input = torch.cat([x, F.interpolate(lesion_mask, size=x.shape[2:], mode='nearest')], dim=1)
+        
+        # Debug info to check layer dimensions
+        # print(f"Feature map dimension before attention: {x.shape}")
+        # print(f"Attention input dimension: {attention_input.shape}")
+        
         attention_map = self.attention(attention_input)
         
         # Aplikujeme attention mapu na feature mapu - více se soustředíme na oblasti s lézí
         x = x * attention_map + x  # Reziduální spojení pro stabilitu
         
+        # Debug info
+        # print(f"Feature map dimension after attention: {x.shape}")
+        
+        # Použijeme vrstvu pro redukci počtu kanálů před finální konvolucí
+        x = self.channel_reduction(x)
+        
         # Finální konvoluce pro generování výstupu
         raw_output = self.final_conv(x)
+        
+        # Debug info
+        # print(f"Raw output dimension: {raw_output.shape}")
         
         # === Vylepšení hranového přechodu ===
         # Vytvoříme plynulý přechod na hranici masky pro přirozenější inpainting
