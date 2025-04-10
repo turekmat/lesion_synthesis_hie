@@ -280,9 +280,9 @@ class LesionInpaintingDataset(Dataset):
 
 class Generator(nn.Module):
     """
-    U-Net styl generátoru pro inpainting lézí
+    UNet-like generátor pro inpainting lézí
     Vstup: Pseudo-zdravý mozek a maska léze
-    Výstup: Generovaná ADC mapa léze
+    Výstup: ADC mapa léze
     """
     def __init__(
         self, 
@@ -297,99 +297,135 @@ class Generator(nn.Module):
         # Přidáme kontrolu minimální velikosti vstupu
         self.min_input_size = min_size
         
-        # Maximální počet filtrů pro zabránění OOM
-        max_filters = 512
-        
-        # Encoder - ukládáme přímo konvoluční bloky a jejich výstupní počty kanálů
+        # Enkodér - postupně snižuje rozlišení a zvyšuje počet kanálů
         self.enc_blocks = nn.ModuleList()
-        self.enc_channels = []
-        
-        # První vrstva enkodéru - bez normalizace a s menším kernelem
+        self.enc_channels = []  # Pro uchování počtu kanálů v jednotlivých vrstvách
+
+        # První blok enkodéru (ne-stride konvoluce)
         self.enc_blocks.append(
             nn.Sequential(
-                nn.Conv3d(in_channels, base_filters, kernel_size=3, stride=1, padding=1),
-                nn.LeakyReLU(0.2, inplace=True)
+                nn.Conv3d(in_channels, base_filters, kernel_size=3, stride=1, padding=1, bias=False),
+                nn.BatchNorm3d(base_filters),
+                nn.ReLU(inplace=True),
+                nn.Conv3d(base_filters, base_filters, kernel_size=3, stride=1, padding=1, bias=False),
+                nn.BatchNorm3d(base_filters),
+                nn.ReLU(inplace=True)
             )
         )
         self.enc_channels.append(base_filters)
         
-        # Zbytek enkodéru - dvojnásobíme počet filtrů s každou úrovní
-        in_c = base_filters
+        # Další bloky enkodéru (konvoluce se stride)
+        current_size = min_size
         for i in range(1, depth):
-            out_c = min(in_c * 2, max_filters)
+            in_channels = base_filters * (2 ** (i - 1))
+            out_channels = base_filters * (2 ** i)
+            
+            # Pokud by další downsampling vedl k příliš malé velikosti, přestaneme
+            if current_size // 2 < 4:  # Minimální velikost 4x4x4
+                break
+                
+            current_size = current_size // 2
+            
             self.enc_blocks.append(
                 nn.Sequential(
-                    nn.Conv3d(in_c, out_c, kernel_size=4, stride=2, padding=1, bias=False),
-                    nn.BatchNorm3d(out_c),
-                    nn.LeakyReLU(0.2, inplace=True)
+                    nn.Conv3d(in_channels, out_channels, kernel_size=4, stride=2, padding=1, bias=False),
+                    nn.BatchNorm3d(out_channels),
+                    nn.ReLU(inplace=True),
+                    nn.Conv3d(out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False),
+                    nn.BatchNorm3d(out_channels),
+                    nn.ReLU(inplace=True)
                 )
             )
-            self.enc_channels.append(out_c)
-            in_c = out_c
+            self.enc_channels.append(out_channels)
         
-        # Bottleneck - mostní vrstva bez downsamplingu
+        # Bottleneck
         self.bottleneck = nn.Sequential(
-            nn.Conv3d(in_c, in_c, kernel_size=3, stride=1, padding=1, bias=False),
-            nn.BatchNorm3d(in_c),
-            nn.LeakyReLU(0.2, inplace=True)
+            nn.Conv3d(self.enc_channels[-1], self.enc_channels[-1]*2, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm3d(self.enc_channels[-1]*2),
+            nn.ReLU(inplace=True),
+            nn.Conv3d(self.enc_channels[-1]*2, self.enc_channels[-1]*2, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm3d(self.enc_channels[-1]*2),
+            nn.ReLU(inplace=True)
         )
         
-        # Decoder - dekonvoluční bloky a jejich výstupní kanály
+        # Dekodér - postupně zvyšuje rozlišení a snižuje počet kanálů
         self.dec_blocks = nn.ModuleList()
         self.dec_channels = []
         
-        # Po každé dekonvoluci následuje konvoluce pro zpracování konkatenovaných funkcí
-        for i in range(depth - 1, -1, -1):
-            if i == depth - 1:  # První dekodér (zpracovává bottleneck)
-                # Vstup: bottleneck features
-                # Výstup: polovina kanálů
-                dec_in = in_c
-                dec_out = self.enc_channels[i]
+        # První decoder blok (zpracovává bottleneck)
+        self.dec_blocks.append(
+            nn.Sequential(
+                nn.Conv3d(self.enc_channels[-1]*2, self.enc_channels[-1], kernel_size=3, stride=1, padding=1, bias=False),
+                nn.BatchNorm3d(self.enc_channels[-1]),
+                nn.ReLU(inplace=True),
+                nn.Conv3d(self.enc_channels[-1], self.enc_channels[-1], kernel_size=3, stride=1, padding=1, bias=False),
+                nn.BatchNorm3d(self.enc_channels[-1]),
+                nn.ReLU(inplace=True),
+                nn.Upsample(scale_factor=2, mode='trilinear', align_corners=False)
+            )
+        )
+        self.dec_channels.append(self.enc_channels[-1])
+
+        # Další bloky dekodéru se skip connections
+        for i in range(len(self.enc_channels) - 1, 0, -1):
+            if i == 1:  # Poslední blok dekodéru
+                dec_in = self.dec_channels[-1] + self.enc_channels[i-1]
                 
+                # Menší počet kanálů v posledním bloku, neupsamplujeme
                 self.dec_blocks.append(
                     nn.Sequential(
-                        nn.ConvTranspose3d(dec_in, dec_out, kernel_size=4, stride=2, padding=1, bias=False),
-                        nn.BatchNorm3d(dec_out),
+                        nn.Conv3d(dec_in, dec_in // 2, kernel_size=3, stride=1, padding=1, bias=False),
+                        nn.BatchNorm3d(dec_in // 2),
+                        nn.ReLU(inplace=True),
+                        nn.Conv3d(dec_in // 2, dec_in // 2, kernel_size=3, stride=1, padding=1, bias=False),
+                        nn.BatchNorm3d(dec_in // 2),
                         nn.ReLU(inplace=True)
                     )
                 )
-                self.dec_channels.append(dec_out)
+                self.dec_channels.append(dec_in // 2)
             else:
-                # Vstup: předchozí decoder (dec_channels[depth-i-2]) + skip connection (enc_channels[i])
-                # Výstup: odpovídající encoder s polovičním počtem kanálů nebo méně
-                if i > 0:
-                    dec_in = self.dec_channels[-1] + self.enc_channels[i]
-                    dec_out = self.enc_channels[i-1]
-                    
-                    # Vrstva s transponovanou konvolucí a následnou úpravou kanálů
-                    self.dec_blocks.append(
-                        nn.Sequential(
-                            # Nejprve zredukujeme kanály z konkatenace
-                            nn.Conv3d(dec_in, self.dec_channels[-1], kernel_size=3, stride=1, padding=1, bias=False),
-                            nn.BatchNorm3d(self.dec_channels[-1]),
-                            nn.ReLU(inplace=True),
-                            # Pak provedeme up-sampling 
-                            nn.ConvTranspose3d(self.dec_channels[-1], dec_out, kernel_size=4, stride=2, padding=1, bias=False),
-                            nn.BatchNorm3d(dec_out),
-                            nn.ReLU(inplace=True)
-                        )
+                dec_in = self.dec_channels[-1] + self.enc_channels[i-1]
+                dec_out = self.enc_channels[i-1]
+                
+                self.dec_blocks.append(
+                    nn.Sequential(
+                        nn.Conv3d(dec_in, dec_out, kernel_size=3, stride=1, padding=1, bias=False),
+                        nn.BatchNorm3d(dec_out),
+                        nn.ReLU(inplace=True),
+                        nn.Conv3d(dec_out, dec_out, kernel_size=3, stride=1, padding=1, bias=False),
+                        nn.BatchNorm3d(dec_out),
+                        nn.ReLU(inplace=True),
+                        nn.Upsample(scale_factor=2, mode='trilinear', align_corners=False)
                     )
-                    self.dec_channels.append(dec_out)
-                else:
-                    # Poslední dekódovací vrstva - vstup je předchozí výstup + první enkodér
-                    dec_in = self.dec_channels[-1] + self.enc_channels[0]
-                    dec_out = base_filters // 2  # Half of initial filters
-                    
-                    # Poslední decoder
-                    self.dec_blocks.append(
-                        nn.Sequential(
-                            # Zredukujeme počet kanálů po konkatenaci s prvním enkodérem
-                            nn.Conv3d(dec_in, base_filters, kernel_size=3, stride=1, padding=1, bias=False),
-                            nn.BatchNorm3d(base_filters),
-                            nn.ReLU(inplace=True)
-                        )
+                )
+                self.dec_channels.append(dec_out)
+        
+        # Poslední úprava pro finální výstup - jeden blok bez upsample
+        if len(self.dec_blocks) < len(self.enc_blocks):
+            if self.dec_blocks:
+                dec_in = self.dec_channels[-1] + self.enc_channels[0]
+                dec_out = base_filters // 2  # Half of initial filters
+                
+                # Poslední decoder
+                self.dec_blocks.append(
+                    nn.Sequential(
+                        # Zredukujeme počet kanálů po konkatenaci s prvním enkodérem
+                        nn.Conv3d(dec_in, base_filters, kernel_size=3, stride=1, padding=1, bias=False),
+                        nn.BatchNorm3d(base_filters),
+                        nn.ReLU(inplace=True)
                     )
-                    self.dec_channels.append(base_filters)
+                )
+                self.dec_channels.append(base_filters)
+                
+        # Attention modul pro zaměření na léze
+        self.attention = nn.Sequential(
+            nn.Conv3d(self.dec_channels[-1] + 1, 64, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv3d(64, 32, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv3d(32, 1, kernel_size=1),
+            nn.Sigmoid()
+        )
         
         # Finální konvoluce pro generování výstupu 
         self.final_conv = nn.Sequential(
@@ -399,7 +435,7 @@ class Generator(nn.Module):
     
     def forward(self, pseudo_healthy, lesion_mask):
         """
-        Forward pass generátoru
+        Forward pass generátoru s vylepšeným přechodem na hraně masky
         
         Args:
             pseudo_healthy (torch.Tensor): Tensor pseudo-zdravého mozku [B, 1, D, H, W]
@@ -446,10 +482,58 @@ class Generator(nn.Module):
             # Aplikujeme decoder blok
             x = block(x)
         
-        # Finální konvoluce
-        x = self.final_conv(x)
+        # Aplikace attention mechanismu na finální feature mapu
+        # Konkatenujeme masku léze s feature mapou pro attention model
+        attention_input = torch.cat([x, F.interpolate(lesion_mask, size=x.shape[2:], mode='nearest')], dim=1)
+        attention_map = self.attention(attention_input)
         
-        return x
+        # Aplikujeme attention mapu na feature mapu - více se soustředíme na oblasti s lézí
+        x = x * attention_map + x  # Reziduální spojení pro stabilitu
+        
+        # Finální konvoluce pro generování výstupu
+        raw_output = self.final_conv(x)
+        
+        # === Vylepšení hranového přechodu ===
+        # Vytvoříme plynulý přechod na hranici masky pro přirozenější inpainting
+        
+        # 1. Dilatace a eroze masky pro vytvoření hranového pásu
+        kernel_size = 5  # Velikost jádra pro dilataci/erozi
+        padding = kernel_size // 2
+        
+        # Dilatace masky
+        dilated_mask = F.max_pool3d(lesion_mask, kernel_size=kernel_size, stride=1, padding=padding)
+        
+        # Eroze masky (1 - max_pool3d(1 - mask))
+        eroded_mask = 1 - F.max_pool3d(1 - lesion_mask, kernel_size=kernel_size, stride=1, padding=padding)
+        
+        # Hranice masky je rozdíl mezi dilatovanou a erodovanou maskou
+        edge_mask = dilated_mask - eroded_mask
+        
+        # 2. Vytvoření váhované přechodové masky pro plynulé prolínání
+        # Použijeme Gaussovo rozmazání na masku léze pro vytvoření plynulého přechodu
+        
+        # Vytvoříme přechodovou masku s jemnějším přechodem
+        # Nejprve vytvoříme základní přechodovou masku
+        transition_mask = (dilated_mask - eroded_mask) * 0.5 + eroded_mask
+        
+        # Aplikujeme další vyhlazení - vytvoříme jemnější verzi pomocí 3D konvoluce
+        # Simulujeme Gaussův filtr pomocí průměrové konvoluce
+        smooth_kernel_size = 7
+        smooth_padding = smooth_kernel_size // 2
+        smooth_transition_mask = F.avg_pool3d(transition_mask, 
+                                              kernel_size=smooth_kernel_size, 
+                                              stride=1, 
+                                              padding=smooth_padding)
+        
+        # 3. Finální kombinace s plynulým přechodem
+        # - vnitřek léze: použijeme raw_output
+        # - hranice léze: vážený průměr mezi raw_output a pseudo_healthy
+        # - mimo lézi: použijeme pseudo_healthy (zajistí identity loss v oblastech mimo lézi)
+        
+        # Aplikujeme vyhlazený přechod s větším důrazem na zachování původního obrazu mimo lézi
+        final_output = pseudo_healthy * (1 - smooth_transition_mask) + raw_output * smooth_transition_mask
+        
+        return final_output
 
 
 class Discriminator(nn.Module):
@@ -566,7 +650,7 @@ class LesionInpaintingGAN(nn.Module):
         lambda_l1=10.0,
         lambda_identity=5.0,
         lambda_ssim=1.0,
-        lambda_edge=1.0
+        lambda_edge=3.0  # Increased from 1.0 to 3.0 for stronger edge preservation
     ):
         super().__init__()
         
@@ -617,13 +701,13 @@ class LesionInpaintingGAN(nn.Module):
     def compute_edge_loss(self, pred, target, mask, kernel_size=3):
         """
         Výpočet edge loss pro zajištění plynulého přechodu na hranici masky
-        Implementace bez gradientů, která se zaměřuje pouze na hodnoty v oblasti masky
+        Vylepšená verze, která využívá detekci hranic a gradientů pro plynulejší přechody
         
         Args:
             pred (torch.Tensor): Predikovaná ADC mapa [B, 1, D, H, W]
             target (torch.Tensor): Cílová ADC mapa [B, 1, D, H, W]
             mask (torch.Tensor): Binární maska léze [B, 1, D, H, W]
-            kernel_size (int): Nepoužívá se v této implementaci
+            kernel_size (int): Velikost jádra pro dilataci a erozi hranic
         
         Returns:
             torch.Tensor: Skalární hodnota edge loss
@@ -644,14 +728,75 @@ class LesionInpaintingGAN(nn.Module):
             
             print(f"Tensory ořezány na společnou velikost: {pred.shape}")
         
-        # Jednoduchý L1 loss v oblasti masky
-        masked_loss = F.l1_loss(pred * mask, target * mask, reduction='sum')
+        # 1. Detekce hranic masky pomocí dilatace a eroze
+        # Vytvoříme jádro pro 3D dilataci/erozi
+        padding = kernel_size // 2
         
-        # Normalizace podle počtu voxelů v masce
+        # Dilatace masky
+        dilated_mask = F.max_pool3d(mask, kernel_size=kernel_size, stride=1, padding=padding)
+        
+        # Eroze masky (1 - max_pool3d(1 - mask))
+        eroded_mask = 1 - F.max_pool3d(1 - mask, kernel_size=kernel_size, stride=1, padding=padding)
+        
+        # Hranice masky je rozdíl mezi dilatovanou a erodovanou maskou
+        edge_mask = dilated_mask - eroded_mask
+        
+        # 2. Výpočet gradientů obrazu pro zpřesnění hran
+        # Sobel operátor pro detekci hran ve 3D - zjednodušená verze pro každou dimenzi
+        # Definujeme konvoluční jádra pro detekci hran v různých směrech
+        sobel_z = torch.tensor([[[1, 2, 1], [2, 4, 2], [1, 2, 1]],
+                               [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+                               [[-1, -2, -1], [-2, -4, -2], [-1, -2, -1]]], dtype=torch.float32, device=pred.device)
+        
+        sobel_y = torch.tensor([[[1, 2, 1], [0, 0, 0], [-1, -2, -1]],
+                               [[2, 4, 2], [0, 0, 0], [-2, -4, -2]],
+                               [[1, 2, 1], [0, 0, 0], [-1, -2, -1]]], dtype=torch.float32, device=pred.device)
+        
+        sobel_x = torch.tensor([[[1, 0, -1], [2, 0, -2], [1, 0, -1]],
+                               [[2, 0, -2], [4, 0, -4], [2, 0, -2]],
+                               [[1, 0, -1], [2, 0, -2], [1, 0, -1]]], dtype=torch.float32, device=pred.device)
+        
+        # Rozšíříme na potřebné dimenze a přidáme kanálovou dimenzi
+        sobel_z = sobel_z.view(1, 1, 3, 3, 3)
+        sobel_y = sobel_y.view(1, 1, 3, 3, 3)
+        sobel_x = sobel_x.view(1, 1, 3, 3, 3)
+        
+        # Aplikujeme Sobel operátory na predikované a cílové obrazy
+        # Využijeme funkcionální konvoluci
+        pred_grad_z = F.conv3d(pred, sobel_z, padding=1, groups=1)
+        pred_grad_y = F.conv3d(pred, sobel_y, padding=1, groups=1)
+        pred_grad_x = F.conv3d(pred, sobel_x, padding=1, groups=1)
+        
+        target_grad_z = F.conv3d(target, sobel_z, padding=1, groups=1)
+        target_grad_y = F.conv3d(target, sobel_y, padding=1, groups=1)
+        target_grad_x = F.conv3d(target, sobel_x, padding=1, groups=1)
+        
+        # Magnitudy gradientů
+        pred_grad_magnitude = torch.sqrt(pred_grad_x**2 + pred_grad_y**2 + pred_grad_z**2)
+        target_grad_magnitude = torch.sqrt(target_grad_x**2 + target_grad_y**2 + target_grad_z**2)
+        
+        # 3. Kombinovaný Edge Loss - soustředí se na hrany masky
+        # L1 Loss na hranách (edge_mask) a váhovaný L1 Loss v oblasti masky
+        edge_area_loss = F.l1_loss(pred * edge_mask, target * edge_mask, reduction='sum')
+        mask_area_loss = F.l1_loss(pred * mask, target * mask, reduction='sum')
+        
+        # Gradient loss - porovnání magnitudy gradientů na hranách
+        grad_edge_loss = F.l1_loss(pred_grad_magnitude * edge_mask, 
+                                   target_grad_magnitude * edge_mask, 
+                                   reduction='sum')
+        
+        # Normalizační faktory - prevence dělení nulou
+        edge_sum = torch.sum(edge_mask) + 1e-8
         mask_sum = torch.sum(mask) + 1e-8
-        edge_loss = masked_loss / mask_sum
         
-        return edge_loss
+        # Kombinovaný loss s větší vahou na hrany a gradienty
+        combined_loss = (
+            (2.0 * edge_area_loss / edge_sum) +  # Větší váha na hrany
+            (mask_area_loss / mask_sum) +
+            (1.5 * grad_edge_loss / edge_sum)    # Přidání gradientní složky
+        ) / 4.5  # Normalizace
+        
+        return combined_loss
     
     def compute_localized_ssim_loss(self, pred, target, mask):
         """
@@ -690,8 +835,26 @@ class LesionInpaintingGAN(nn.Module):
         # Rekonstrukční L1 loss - pouze v oblasti léze
         l1_loss_masked = self.l1_loss(fake_adc * lesion_mask, real_adc * lesion_mask)
         
-        # Identity loss - oblast mimo masku by měla zůstat nezměněná
-        identity_loss = self.l1_loss(fake_adc * (1 - lesion_mask), pseudo_healthy * (1 - lesion_mask))
+        # Vylepšená identity loss - oblast mimo masku by měla zůstat naprosto nezměněná
+        # Vytvoříme váhovanou masku pro oblasti mimo lézi
+        outside_mask = 1 - lesion_mask
+        
+        # Dilatace masky pro zjištění přechodových oblastí
+        kernel_size = 5
+        padding = kernel_size // 2
+        dilated_mask = F.max_pool3d(lesion_mask, kernel_size=kernel_size, stride=1, padding=padding)
+        
+        # Přechodová oblast - oblasti v blízkosti léze, ale ne přímo v lézi
+        transition_area = dilated_mask - lesion_mask
+        
+        # Oblasti daleko od léze - mimo dilatovanou masku
+        far_outside = outside_mask - transition_area
+        
+        # Silnější váha pro oblasti daleko od léze (2x) a střední váha pro přechodové oblasti (1.5x)
+        weighted_outside_mask = far_outside * 2.0 + transition_area * 1.5
+        
+        # Identity loss s váhovanou maskou
+        identity_loss = self.l1_loss(fake_adc * weighted_outside_mask, pseudo_healthy * weighted_outside_mask)
         
         # Lokalizovaný SSIM loss pro strukturální podobnost v oblasti léze
         local_ssim_loss = self.compute_localized_ssim_loss(fake_adc, real_adc, lesion_mask)
@@ -1885,7 +2048,7 @@ def main():
                         help='Váha identity loss funkce')
     parser.add_argument('--lambda_ssim', type=float, default=1.0,
                         help='Váha SSIM loss funkce')
-    parser.add_argument('--lambda_edge', type=float, default=1.0,
+    parser.add_argument('--lambda_edge', type=float, default=3.0,
                         help='Váha edge loss funkce')
     
     # Inferenční mód
