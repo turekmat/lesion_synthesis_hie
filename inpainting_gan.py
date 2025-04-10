@@ -822,7 +822,20 @@ def train(args):
     # Define evaluation metrics
     def reconstruction_loss(pred, target, mask=None):
         """L1 loss for reconstruction, can be masked"""
+        # Set device consistently
+        device = pred.device
+        
+        # Check target device and move if needed
+        if target.device != device:
+            print(f"Moving target from {target.device} to {device} in reconstruction_loss")
+            target = target.to(device)
+            
         if mask is not None:
+            # Check mask device and move if needed
+            if mask.device != device:
+                print(f"Moving mask from {mask.device} to {device} in reconstruction_loss")
+                mask = mask.to(device)
+                
             # Mask both prediction and target
             masked_pred = pred * mask
             masked_target = target * mask
@@ -830,12 +843,24 @@ def train(args):
             if mask_sum > 0:
                 return torch.nn.functional.l1_loss(masked_pred, masked_target, reduction='sum') / mask_sum
             else:
-                return torch.tensor(0.0, device=pred.device)
+                return torch.tensor(0.0, device=device)
         else:
             return torch.nn.functional.l1_loss(pred, target)
     
     def mean_absolute_error(pred, target, mask, orig_range=None):
         """Mean Absolute Error (MAE) in lesion regions, with option to denormalize"""
+        # Set device consistently
+        device = pred.device
+        
+        # Check target and mask devices and move if needed
+        if target.device != device:
+            print(f"Moving target from {target.device} to {device} in mean_absolute_error")
+            target = target.to(device)
+            
+        if mask.device != device:
+            print(f"Moving mask from {mask.device} to {device} in mean_absolute_error")
+            mask = mask.to(device)
+            
         # Apply mask to both prediction and target
         masked_pred = pred * mask
         masked_target = target * mask
@@ -851,14 +876,42 @@ def train(args):
             # Denormalize the MAE value if range is provided
             if orig_range is not None:
                 orig_min, orig_max = orig_range
+                
+                # Check if orig_range is a tensor and move to device if needed
+                if isinstance(orig_min, torch.Tensor):
+                    if orig_min.device != device:
+                        print(f"Moving orig_min from {orig_min.device} to {device}")
+                        orig_min = orig_min.to(device)
+                else:
+                    orig_min = torch.tensor(orig_min, device=device)
+                    
+                if isinstance(orig_max, torch.Tensor):
+                    if orig_max.device != device:
+                        print(f"Moving orig_max from {orig_max.device} to {device}")
+                        orig_max = orig_max.to(device)
+                else:
+                    orig_max = torch.tensor(orig_max, device=device)
+                
                 mae = mae * (orig_max - orig_min)
                 
             return mae
         else:
-            return torch.tensor(0.0, device=pred.device)
+            return torch.tensor(0.0, device=device)
     
     def dice_coefficient(pred, target, mask, smooth=1e-5):
         """Dice coefficient metric for evaluating overlap in lesion areas"""
+        # Set device consistently
+        device = pred.device
+        
+        # Check target and mask devices and move if needed
+        if target.device != device:
+            print(f"Moving target from {target.device} to {device} in dice_coefficient")
+            target = target.to(device)
+            
+        if mask.device != device:
+            print(f"Moving mask from {mask.device} to {device} in dice_coefficient")
+            mask = mask.to(device)
+            
         # Apply mask to both prediction and target
         masked_pred = pred * mask
         masked_target = target * mask
@@ -877,9 +930,18 @@ def train(args):
     
     def structural_similarity(pred, target, mask):
         """Structural similarity index for evaluating quality in lesion areas"""
-        # This is a simplified version that approximates SSIM
-        # For a full SSIM implementation, additional windowed processing would be needed
+        # Set device consistently
+        device = pred.device
         
+        # Check target and mask devices and move if needed
+        if target.device != device:
+            print(f"Moving target from {target.device} to {device} in structural_similarity")
+            target = target.to(device)
+            
+        if mask.device != device:
+            print(f"Moving mask from {mask.device} to {device} in structural_similarity")
+            mask = mask.to(device)
+            
         # Apply mask
         masked_pred = pred * mask
         masked_target = target * mask
@@ -887,7 +949,7 @@ def train(args):
         # Only compute if mask has non-zero elements
         mask_sum = mask.sum()
         if mask_sum == 0:
-            return torch.tensor(1.0, device=pred.device)  # Perfect score for empty mask
+            return torch.tensor(1.0, device=device)  # Perfect score for empty mask
             
         # Compute means
         mu_pred = masked_pred.sum() / mask_sum
@@ -1001,12 +1063,21 @@ def train(args):
                 if "original_ranges" in val_batch_data:
                     ph_orig_range = val_batch_data["original_ranges"]["pseudo_healthy"]
                     adc_orig_range = val_batch_data["original_ranges"]["adc"]
-                    print(f"Original ADC range: {adc_orig_range[0].item():.4f} to {adc_orig_range[1].item():.4f}")
+                    
+                    # Move ranges to the appropriate device
+                    cuda_device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+                    if isinstance(adc_orig_range[0], torch.Tensor) and adc_orig_range[0].device != cuda_device:
+                        adc_orig_range = (adc_orig_range[0].to(cuda_device), adc_orig_range[1].to(cuda_device))
+                    if isinstance(ph_orig_range[0], torch.Tensor) and ph_orig_range[0].device != cuda_device:  
+                        ph_orig_range = (ph_orig_range[0].to(cuda_device), ph_orig_range[1].to(cuda_device))
+                        
+                    print(f"Original ADC range: {adc_orig_range[0].item():.4f} to {adc_orig_range[1].item():.4f}, device: {adc_orig_range[0].device if isinstance(adc_orig_range[0], torch.Tensor) else 'N/A'}")
                 else:
                     # Fallback if original ranges are not available
                     print("Warning: Original ranges not found in data. Using normalized range.")
-                    ph_orig_range = (0.0, 1.0)
-                    adc_orig_range = (0.0, 1.0)
+                    cuda_device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+                    ph_orig_range = (torch.tensor(0.0, device=cuda_device), torch.tensor(1.0, device=cuda_device))
+                    adc_orig_range = (torch.tensor(0.0, device=cuda_device), torch.tensor(1.0, device=cuda_device))
                 
                 try:
                     # Extract patches containing lesions, ensuring valid coordinates
@@ -1146,6 +1217,27 @@ def train(args):
                             dilated_mask = torch.nn.functional.max_pool3d(
                                 label, kernel_size=3, stride=1, padding=1
                             )
+                            
+                            # Final check of all tensor devices before metric calculations
+                            cuda_device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+                            print(f"Device check before metrics - cuda_device: {cuda_device}")
+                            print(f"  - inpainted_for_loss: {inpainted_for_loss.device}")
+                            print(f"  - adc: {adc.device}")
+                            print(f"  - label: {label.device}")
+                            print(f"  - dilated_mask: {dilated_mask.device}")
+                            
+                            # Force everything to cuda
+                            inpainted_for_loss = inpainted_for_loss.to(cuda_device)
+                            adc = adc.to(cuda_device)
+                            label = label.to(cuda_device)
+                            dilated_mask = dilated_mask.to(cuda_device)
+                            
+                            # Check adc_orig_range device
+                            if isinstance(adc_orig_range[0], torch.Tensor):
+                                print(f"  - adc_orig_range[0]: {adc_orig_range[0].device}")
+                                if adc_orig_range[0].device != cuda_device:
+                                    adc_orig_range = (adc_orig_range[0].to(cuda_device), adc_orig_range[1].to(cuda_device))
+                                    print(f"    - moved to {adc_orig_range[0].device}")
                             
                             # Calculate validation metrics
                             # 1. Overall L1 loss (whole volume)
