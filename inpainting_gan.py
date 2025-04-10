@@ -369,7 +369,17 @@ class LesionInpaintingDataset(Dataset):
         
         # Aplikovat transformace, pokud jsou definovány
         if self.transform:
+            # Přidat debug informace o tvaru před transformací
+            if idx == 0:  # Jen pro první vzorek pro omezení výpisů
+                print(f"DEBUG: Tvary před transformací: pseudo_healthy={sample['pseudo_healthy'].shape}, "
+                      f"adc={sample['adc'].shape}, lesion_mask={sample['lesion_mask'].shape}")
+            
             sample = self.transform(sample)
+            
+            # Přidat debug informace o tvaru po transformaci
+            if idx == 0:  # Jen pro první vzorek pro omezení výpisů
+                print(f"DEBUG: Tvary po transformaci: pseudo_healthy={sample['pseudo_healthy'].shape}, "
+                      f"adc={sample['adc'].shape}, lesion_mask={sample['lesion_mask'].shape}")
         
         # Převést data na torch tenzory s přidáním kanálové dimenze
         for key in ['pseudo_healthy', 'adc', 'lesion_mask']:
@@ -379,6 +389,11 @@ class LesionInpaintingDataset(Dataset):
             elif isinstance(sample[key], torch.Tensor) and sample[key].ndim == 3:
                 # Pokud je to už tensor, ale bez kanálové dimenze, přidáme ji
                 sample[key] = sample[key].unsqueeze(0)
+        
+        # Přidat debug informace o konečném tvaru
+        if idx == 0:  # Jen pro první vzorek pro omezení výpisů
+            print(f"DEBUG: Finální tvary: pseudo_healthy={sample['pseudo_healthy'].shape}, "
+                  f"adc={sample['adc'].shape}, lesion_mask={sample['lesion_mask'].shape}")
         
         return sample
 
@@ -1797,11 +1812,20 @@ def train_model(args):
             # Definice transformací pro data augmentaci
             train_transforms = Compose([
                 # Náhodné rotace o 90 stupňů v rovině (2D řezy)
+                # DŮLEŽITÉ: spatial_axes parametr závisí na formátu dat v době aplikace transformace
+                # Pro data ve formátu [C, D, H, W] (s kanálovou dimenzí):
+                #   - (1, 2) = rotace v rovině D-H (sagitální)
+                #   - (1, 3) = rotace v rovině D-W (koronální)
+                #   - (2, 3) = rotace v rovině H-W (axiální)
+                # Pro data ve formátu [D, H, W] (bez kanálové dimenze):
+                #   - (0, 1) = rotace v rovině D-H (sagitální)
+                #   - (0, 2) = rotace v rovině D-W (koronální)
+                #   - (1, 2) = rotace v rovině H-W (axiální)
                 RandRotate90d(
                     keys=keys,
                     prob=args.aug_rotate_prob,
                     max_k=3,  # maximálně 3 rotace (0, 90, 180, 270 stupňů)
-                    spatial_axes=(2, 3)  # rotace v osách y-z (2D řezy) - upraveno pro 5D tensor [B, C, D, H, W]
+                    spatial_axes=(1, 2)  # Upravte podle formátu dat - viz komentáře výše
                 ),
                 
                 # Náhodné překlápění (zrcadlení)
