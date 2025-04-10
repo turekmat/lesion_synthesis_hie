@@ -964,8 +964,19 @@ def train(args):
                             inpainted = pseudo_healthy[0].clone()
                             inpainted = inpainted * (1 - label[0]) + reconstructed * label[0]
                             
+                            # Check if inpainted has too many dimensions
+                            if inpainted.dim() > pseudo_healthy[0].dim():
+                                print(f"Normalizing inpainted dimensions from {inpainted.shape} to match {pseudo_healthy[0].shape}")
+                                # Remove extra dimensions
+                                while inpainted.dim() > pseudo_healthy[0].dim():
+                                    inpainted = inpainted.squeeze(0)
+                                print(f"Normalized dimensions: {inpainted.shape}")
+                            
+                            # Ensure all tensors have consistent dimensions for loss calculation
+                            inpainted_for_loss = inpainted.unsqueeze(0)  # Add batch dimension [1, C, Z, Y, X]
+                            
                             # Calculate validation losses using simple L1 loss
-                            val_batch_loss = reconstruction_loss(inpainted.unsqueeze(0), adc)
+                            val_batch_loss = reconstruction_loss(inpainted_for_loss, adc)
                             
                             # Separate losses for lesion and healthy regions
                             # Use mask multiplication to isolate regions
@@ -1003,6 +1014,80 @@ def train(args):
         else:
             print("Warning: No valid validation examples found")
             avg_val_loss = float('inf')
+        
+        # Create visualizations every vis_freq epochs
+        if (epoch + 1) % args.vis_freq == 0 and val_examples > 0:
+            print(f"Creating validation visualizations for epoch {epoch+1}")
+            # Select a sample from validation dataset
+            for vis_idx, val_batch_data in enumerate(val_loader):
+                # Only visualize the first sample
+                if vis_idx > 0: break
+                
+                try:
+                    ph = val_batch_data["pseudo_healthy"].to(device)
+                    adc_target = val_batch_data["adc"].to(device)
+                    lbl = val_batch_data["label"].to(device)
+                    
+                    # Extract patches
+                    patches_ph, patches_label, _, patch_coords = patch_extractor.extract_patches_with_lesions(
+                        ph[0], lbl[0], ph[0]  # Using ph as placeholder for adc
+                    )
+                    
+                    # Filter out patches with invalid coordinates
+                    valid_patches = []
+                    valid_coords = []
+                    for i, (patch, coords) in enumerate(zip(patches_ph, patch_coords)):
+                        if all(c >= 0 for c in coords):
+                            valid_patches.append(i)
+                            valid_coords.append(coords)
+                    
+                    if not valid_patches:
+                        continue
+                        
+                    # Process valid patches
+                    filtered_patches_ph = [patches_ph[i] for i in valid_patches]
+                    filtered_patches_label = [patches_label[i] for i in valid_patches]
+                    filtered_patch_coords = [patch_coords[i] for i in valid_patches]
+                    
+                    output_patches = []
+                    
+                    # Generate predictions for each patch
+                    for ph_patch, label_patch in zip(filtered_patches_ph, filtered_patches_label):
+                        ph_patch = ph_patch.unsqueeze(0)
+                        label_patch = label_patch.unsqueeze(0)
+                        
+                        with torch.no_grad():
+                            output_patch = model(ph_patch, label_patch)
+                            output_patches.append(output_patch[0])
+                    
+                    # Reconstruct volume
+                    if output_patches:
+                        reconstructed = patch_extractor.reconstruct_from_patches(
+                            output_patches, filtered_patch_coords, ph.shape
+                        )
+                        
+                        # Create inpainted result
+                        inpainted = ph[0].clone()
+                        inpainted = inpainted * (1 - lbl[0]) + reconstructed * lbl[0]
+                        
+                        # Normalize dimensions if needed
+                        if inpainted.dim() > ph[0].dim():
+                            while inpainted.dim() > ph[0].dim():
+                                inpainted = inpainted.squeeze(0)
+                        
+                        # Create visualization
+                        vis_path = os.path.join(args.output_dir, f"epoch_{epoch+1}_validation.pdf")
+                        visualize_results(
+                            ph, 
+                            lbl, 
+                            inpainted.unsqueeze(0).unsqueeze(0), 
+                            adc_target,
+                            vis_path
+                        )
+                        print(f"Saved validation visualization to {vis_path}")
+                        break
+                except Exception as vis_error:
+                    print(f"Error creating visualization: {vis_error}")
         
         # Save best model
         if avg_val_loss < best_val_loss:
