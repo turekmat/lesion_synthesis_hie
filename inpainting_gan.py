@@ -44,7 +44,7 @@ class LesionInpaintingDataset(Dataset):
     Dataset pro načítání trojic snímků: pseudo-zdravý mozek (vstup), ADC mapa s lézemi (cíl) 
     a binární maska léze (podmínka)
     
-    Tato verze pracuje s celými objemy (full volume) místo patchů.
+    Tato verze pracuje s patchi zaměřenými na oblasti léze.
     """
     def __init__(
         self,
@@ -54,7 +54,9 @@ class LesionInpaintingDataset(Dataset):
         transform=None,
         norm_range=(0, 1),
         crop_foreground=True,
-        target_size=None
+        target_size=None,
+        patch_size=(64, 64, 32),  # Velikost patchů pro trénink
+        use_patches=True  # Příznak, zda používat patche nebo celé objemy
     ):
         """
         Inicializace datasetu
@@ -68,6 +70,8 @@ class LesionInpaintingDataset(Dataset):
             crop_foreground (bool): Zda ořezat data na bounding box mozku
             target_size (tuple): Cílová velikost výstupních objemů (D, H, W), pokud None, zachová se původní velikost
                                  s paddingem na nejbližší mocninu 2 pro každý rozměr
+            patch_size (tuple): Velikost patchů pro trénink (D, H, W)
+            use_patches (bool): Pokud True, bude používat patche místo celých objemů
         """
         self.pseudo_healthy_dir = Path(pseudo_healthy_dir)
         self.adc_dir = Path(adc_dir)
@@ -76,6 +80,8 @@ class LesionInpaintingDataset(Dataset):
         self.norm_range = norm_range
         self.crop_foreground = crop_foreground
         self.target_size = target_size
+        self.patch_size = patch_size
+        self.use_patches = use_patches
         
         # Najít všechny pseudo-zdravé soubory jako základ
         self.pseudo_healthy_files = sorted(list(self.pseudo_healthy_dir.glob("*.mha")))
@@ -130,8 +136,44 @@ class LesionInpaintingDataset(Dataset):
         
         print(f"Nalezeno {len(self.file_triplets)} kompletních tripletů souborů")
         
+        if self.use_patches:
+            # Pokud používáme patche, připravíme si seznam všech patchů
+            self.patches = []
+            
+            print("Připravuji seznam patchů zaměřených na oblasti lézí...")
+            for triplet_idx, triplet in enumerate(self.file_triplets):
+                # Načíst masku léze - potřebujeme najít oblasti s lézí
+                lesion_mask_data, _ = self._load_and_preprocess(triplet['lesion_mask'])
+                
+                # Binarizovat masku léze
+                lesion_mask_data = (lesion_mask_data > 0).astype(np.float32)
+                
+                # Zjistit, jestli maska obsahuje nějaké léze
+                if np.sum(lesion_mask_data) > 0:
+                    # Najít souřadnice lézí
+                    lesion_coords = np.where(lesion_mask_data > 0)
+                    
+                    # Pro každý bod léze vytvoříme patch
+                    # Omezíme počet patchů pro velké léze, aby nedošlo k duplikátům
+                    # a příliš velkému datasetu
+                    max_points = 10  # Maximální počet patchů pro jednu lézi
+                    step = max(1, len(lesion_coords[0]) // max_points)
+                    
+                    for i in range(0, len(lesion_coords[0]), step):
+                        z, y, x = lesion_coords[0][i], lesion_coords[1][i], lesion_coords[2][i]
+                        
+                        # Zaznamenat informace o patchích
+                        self.patches.append({
+                            'triplet_idx': triplet_idx,
+                            'center': (z, y, x),
+                            'patient_id': triplet['patient_id']
+                        })
+            
+            print(f"Celkem vytvořeno {len(self.patches)} patchů zaměřených na léze")
     
     def __len__(self):
+        if self.use_patches:
+            return len(self.patches)
         return len(self.file_triplets)
     
     def _load_and_preprocess(self, file_path):
@@ -176,6 +218,35 @@ class LesionInpaintingDataset(Dataset):
         z_min, z_max, y_min, y_max, x_min, x_max = bbox
         return data[z_min:z_max, y_min:y_max, x_min:x_max]
     
+    def _extract_patch(self, volume, center, patch_size):
+        """Extrahuje patch z objemu podle zadaného středu a velikosti"""
+        z, y, x = center
+        d, h, w = patch_size
+        
+        # Vypočítat hranice patche
+        z_start = max(0, z - d // 2)
+        y_start = max(0, y - h // 2)
+        x_start = max(0, x - w // 2)
+        
+        z_end = min(volume.shape[0], z_start + d)
+        y_end = min(volume.shape[1], y_start + h)
+        x_end = min(volume.shape[2], x_start + w)
+        
+        # Extrahovat patch
+        patch = volume[z_start:z_end, y_start:y_end, x_start:x_end]
+        
+        # Pokud je patch menší než požadovaná velikost, doplníme ho nulami
+        if patch.shape != patch_size:
+            # Vytvořit prázdný patch požadované velikosti
+            padded_patch = np.zeros(patch_size, dtype=patch.dtype)
+            
+            # Vložit extrahovaný patch do prázdného
+            padded_patch[:patch.shape[0], :patch.shape[1], :patch.shape[2]] = patch
+            
+            return padded_patch
+        
+        return patch
+    
     def _pad_to_power_of_2(self, data):
         """
         Doplní každý rozměr na nejbližší násobek 32 (patch size pro SwinUNETR).
@@ -215,66 +286,90 @@ class LesionInpaintingDataset(Dataset):
     
     def __getitem__(self, idx):
         """Vrátí položku datasetu podle indexu"""
-        # Získat cestu k souborům
-        triplet = self.file_triplets[idx]
-        
-        # Načíst a předzpracovat data
-        pseudo_healthy_data, ph_img = self._load_and_preprocess(triplet['pseudo_healthy'])
-        adc_data, _ = self._load_and_preprocess(triplet['adc'])
-        lesion_mask_data, _ = self._load_and_preprocess(triplet['lesion_mask'])
-        
-        # Binarizovat masku léze
-        lesion_mask_data = (lesion_mask_data > 0).astype(np.float32)
-        
-        # Pokud je požadováno, ořízni data pomocí bounding boxu
-        if self.crop_foreground:
-            # Použít kombinaci pseudo-zdravého mozku a masky léze pro určení bounding boxu
-            combined_mask = (pseudo_healthy_data > 0) | (lesion_mask_data > 0)
-            bbox = self._get_bounding_box(combined_mask)
+        if self.use_patches:
+            # Patch-based přístup
+            patch_info = self.patches[idx]
+            triplet_idx = patch_info['triplet_idx']
+            center = patch_info['center']
+            patient_id = patch_info['patient_id']
             
-            pseudo_healthy_data = self._crop_to_bounding_box(pseudo_healthy_data, bbox)
-            adc_data = self._crop_to_bounding_box(adc_data, bbox)
-            lesion_mask_data = self._crop_to_bounding_box(lesion_mask_data, bbox)
+            # Získat cestu k souborům
+            triplet = self.file_triplets[triplet_idx]
+            
+            # Načíst a předzpracovat data
+            pseudo_healthy_data, ph_img = self._load_and_preprocess(triplet['pseudo_healthy'])
+            adc_data, _ = self._load_and_preprocess(triplet['adc'])
+            lesion_mask_data, _ = self._load_and_preprocess(triplet['lesion_mask'])
+            
+            # Binarizovat masku léze
+            lesion_mask_data = (lesion_mask_data > 0).astype(np.float32)
+            
+            # Normalizovat hodnoty
+            pseudo_healthy_data = self._normalize(pseudo_healthy_data)
+            adc_data = self._normalize(adc_data)
+            
+            # Extrahovat patche
+            pseudo_healthy_patch = self._extract_patch(pseudo_healthy_data, center, self.patch_size)
+            adc_patch = self._extract_patch(adc_data, center, self.patch_size)
+            lesion_mask_patch = self._extract_patch(lesion_mask_data, center, self.patch_size)
+            
+            # Vytvořit sample slovník pro MONAI transformace
+            sample = {
+                'pseudo_healthy': pseudo_healthy_patch,
+                'adc': adc_patch,
+                'lesion_mask': lesion_mask_patch,
+                'patient_id': patient_id,
+                'volume_shape': pseudo_healthy_data.shape,  # Uložit původní rozměr pro pozdější použití
+                'patch_center': center  # Uložit pozici patche v původním objemu
+            }
+        else:
+            # Původní přístup s celými objemy
+            # Získat cestu k souborům
+            triplet = self.file_triplets[idx]
+            
+            # Načíst a předzpracovat data
+            pseudo_healthy_data, ph_img = self._load_and_preprocess(triplet['pseudo_healthy'])
+            adc_data, _ = self._load_and_preprocess(triplet['adc'])
+            lesion_mask_data, _ = self._load_and_preprocess(triplet['lesion_mask'])
+            
+            # Binarizovat masku léze
+            lesion_mask_data = (lesion_mask_data > 0).astype(np.float32)
+            
+            # Pokud je požadováno, ořízni data pomocí bounding boxu
+            if self.crop_foreground:
+                # Použít kombinaci pseudo-zdravého mozku a masky léze pro určení bounding boxu
+                combined_mask = (pseudo_healthy_data > 0) | (lesion_mask_data > 0)
+                bbox = self._get_bounding_box(combined_mask)
+                
+                pseudo_healthy_data = self._crop_to_bounding_box(pseudo_healthy_data, bbox)
+                adc_data = self._crop_to_bounding_box(adc_data, bbox)
+                lesion_mask_data = self._crop_to_bounding_box(lesion_mask_data, bbox)
+            
+            # Normalizovat hodnoty
+            pseudo_healthy_data = self._normalize(pseudo_healthy_data)
+            adc_data = self._normalize(adc_data)
+            
+            # Doplnit na mocninu 2 pomocí paddingu
+            pseudo_healthy_data = self._pad_to_power_of_2(pseudo_healthy_data)
+            adc_data = self._pad_to_power_of_2(adc_data)
+            lesion_mask_data = self._pad_to_power_of_2(lesion_mask_data)
+            
+            # Ujistit se, že všechna data mají stejné rozměry
+            assert pseudo_healthy_data.shape == adc_data.shape == lesion_mask_data.shape, \
+                f"Nekonzistentní rozměry: pseudo_healthy={pseudo_healthy_data.shape}, adc={adc_data.shape}, mask={lesion_mask_data.shape}"
+            
+            # Vytvořit sample slovník pro MONAI transformace
+            sample = {
+                'pseudo_healthy': pseudo_healthy_data,
+                'adc': adc_data,
+                'lesion_mask': lesion_mask_data,
+                'patient_id': triplet['patient_id'],
+                'volume_shape': pseudo_healthy_data.shape  # Uložit původní rozměr pro pozdější použití
+            }
         
-        # Normalizovat hodnoty
-        pseudo_healthy_data = self._normalize(pseudo_healthy_data)
-        adc_data = self._normalize(adc_data)
-        
-        # Doplnit na mocninu 2 pomocí paddingu
-        pseudo_healthy_data = self._pad_to_power_of_2(pseudo_healthy_data)
-        adc_data = self._pad_to_power_of_2(adc_data)
-        lesion_mask_data = self._pad_to_power_of_2(lesion_mask_data)
-        
-        # Ujistit se, že všechna data mají stejné rozměry
-        assert pseudo_healthy_data.shape == adc_data.shape == lesion_mask_data.shape, \
-            f"Nekonzistentní rozměry: pseudo_healthy={pseudo_healthy_data.shape}, adc={adc_data.shape}, mask={lesion_mask_data.shape}"
-        
-        # Vytvořit sample slovník pro MONAI transformace
-        sample = {
-            'pseudo_healthy': pseudo_healthy_data,
-            'adc': adc_data,
-            'lesion_mask': lesion_mask_data,
-            'patient_id': triplet['patient_id'],  # Použít přímo patient_id z tripletu
-            'volume_shape': pseudo_healthy_data.shape  # Uložit původní rozměr pro pozdější použití
-        }
-        
-        # Převést numerická data na torch tenzory a přidat kanálovou dimenzi
-        for key in ['pseudo_healthy', 'adc', 'lesion_mask']:
-            sample[key] = torch.from_numpy(sample[key]).unsqueeze(0)
-        
-        # Aplikovat další transformace, pokud jsou definované
+        # Aplikovat transformace, pokud jsou definovány
         if self.transform:
-            # MONAI transformace očekává slovník metadat, proto nejprve převedeme na vhodný formát
-            transform_sample = {}
-            for key in ['pseudo_healthy', 'adc', 'lesion_mask']:
-                transform_sample[key] = sample[key]
-            
-            # Aplikovat transformace
-            transform_sample = self.transform(transform_sample)
-            
-            # Vrátit transformovaná data zpět do původního sample
-            for key in ['pseudo_healthy', 'adc', 'lesion_mask']:
-                sample[key] = transform_sample[key]
+            sample = self.transform(sample)
         
         return sample
 
@@ -1627,12 +1722,27 @@ def train_model(args):
     target_size = (target_d, target_h, target_w)
     print(f"Původní velikost dat prvního vzorku: {sample_data.shape}")
     print(f"Zaokrouhleno na násobky {patch_size}: {target_size}")
-    print(f"Tato velikost bude použita pro inicializaci modelu, ale dataset bude dynamicky zpracovávat každý vzorek individuálně.")
+    
+    # Nastavení pro patch-based trénink
+    use_patches = args.use_patches if hasattr(args, 'use_patches') else True
+    
+    if use_patches:
+        # Nastavení velikosti patchů
+        patch_size = (64, 64, 32)  # Výchozí velikost patche
+        if hasattr(args, 'patch_size') and args.patch_size:
+            patch_size = tuple(map(int, args.patch_size.split(',')))
+        print(f"Použito trénování na patchích o velikosti: {patch_size}")
+        # Pro patch-based trénink použijeme patch jako cílovou velikost pro model
+        model_input_size = patch_size
+    else:
+        print(f"Použito trénování na celých objemech, dataset bude dynamicky zpracovávat každý vzorek individuálně.")
+        # Pro trénink na celých objemech použijeme původní cílovou velikost
+        model_input_size = target_size
     
     if args.target_size:
         # Použít zadanou cílovou velikost, pokud je specifikována
-        target_size = tuple(map(int, args.target_size.split(',')))
-        print(f"Použita ručně specifikovaná cílová velikost pro model: {target_size}")
+        model_input_size = tuple(map(int, args.target_size.split(',')))
+        print(f"Použita ručně specifikovaná cílová velikost pro model: {model_input_size}")
     
     # Definovat transformace pro augmentaci dat (pouze pro tréninkovou část)
     train_transforms = None
@@ -1710,13 +1820,21 @@ def train_model(args):
     print(f"Lesion mask soubory: {lesion_files[:5] if lesion_files else []}... (zobrazeno prvních 5)")
     
     # Načíst dataset
+    patch_size = None
+    if args.use_patches:
+        # Převeďte string na tuple celých čísel
+        patch_size = tuple(map(int, args.patch_size.split(',')))
+        print(f"Používám patch-based training s velikostí patche: {patch_size}")
+    
     train_dataset = LesionInpaintingDataset(
         pseudo_healthy_dir=args.pseudo_healthy_dir,
         adc_dir=args.adc_dir,
         lesion_mask_dir=args.lesion_mask_dir,
         norm_range=(0, 1),
         crop_foreground=args.crop_foreground,
-        transform=train_transforms
+        transform=train_transforms,
+        patch_size=patch_size,
+        use_patches=args.use_patches
     )
     
     # Kontrola, zda máme dostatek dat pro trénink
@@ -1781,7 +1899,9 @@ def train_model(args):
             lesion_mask_dir=args.lesion_mask_dir,
             norm_range=(0, 1),
             crop_foreground=args.crop_foreground,
-            transform=None  # bez augmentací pro validaci
+            transform=None,  # bez augmentací pro validaci
+            patch_size=patch_size,
+            use_patches=args.use_patches
         )
         
         # Použijeme SubsetRandomSampler pro vytvoření dataloaderu pouze s požadovanými indexy
@@ -1861,7 +1981,7 @@ def train_model(args):
     
     # Inicializovat model s novými rozměry
     model = LesionInpaintingGAN(
-        img_size=target_size,
+        img_size=model_input_size,  # Použít správnou velikost podle typu tréninku
         gen_features=args.gen_features,
         disc_base_filters=args.disc_base_filters,
         disc_n_layers=args.disc_n_layers,
@@ -2082,6 +2202,13 @@ def main():
                         help='Ořezat objemy na bounding box mozku')
     parser.add_argument('--target_size', type=str, default=None,
                         help='Cílová velikost výstupních objemů, např. "32,128,128"')
+    
+    # Nové parametry pro patch-based trénink
+    parser.add_argument('--use_patches', action='store_true', default=True,
+                        help='Použít patch-based trénink místo celých objemů')
+    parser.add_argument('--patch_size', type=str, default='64,64,32',
+                        help='Velikost patchů pro trénink, např. "64,64,32"')
+    
     parser.add_argument('--lr_g', type=float, default=0.0002,
                         help='Learning rate pro generátor')
     parser.add_argument('--lr_d', type=float, default=0.0001,
