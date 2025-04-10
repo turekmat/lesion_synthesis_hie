@@ -483,6 +483,10 @@ class PatchExtractor:
         if len(patches) != len(patch_coords):
             raise ValueError(f"Number of patches ({len(patches)}) does not match number of coordinates ({len(patch_coords)})")
         
+        # Force CUDA device - use the exact string "cuda:0" which is more reliable
+        cuda_device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        print(f"Forcing device {cuda_device} for reconstruction")
+        
         # Validate that all patch coordinates are non-negative
         for i, (z, y, x) in enumerate(patch_coords):
             if z < 0 or y < 0 or x < 0:
@@ -499,28 +503,26 @@ class PatchExtractor:
             
         # Log information for debugging
         print(f"Reconstructing from {len(patches)} patches to output shape {output_shape}")
-        print(f"First patch shape: {patches[0].shape}")
+        print(f"First patch shape: {patches[0].shape}, device: {patches[0].device}")
         
-        # Get device from the first patch - use str representation to ensure exact match
-        device = patches[0].device
-        print(f"Using device: {device} for reconstruction")
-        
-        # Check all patches for device consistency before reconstruction
+        # Force move all patches to the CUDA device
+        cuda_patches = []
         for i, patch in enumerate(patches):
-            if patch.device != device:
-                print(f"Warning: Patch {i} is on device {patch.device}, moving to {device}")
-                patches[i] = patch.to(device)
+            # Only show message if actually moving
+            if patch.device != cuda_device:
+                print(f"Moving patch {i} from {patch.device} to {cuda_device}")
+            cuda_patches.append(patch.to(cuda_device))
         
-        # Create tensors for reconstruction - use the device from patches
-        reconstructed = torch.zeros(working_shape, device=device)
-        count = torch.zeros(working_shape, device=device)
+        # Create tensors for reconstruction directly on the CUDA device
+        reconstructed = torch.zeros(working_shape, device=cuda_device)
+        count = torch.zeros(working_shape, device=cuda_device)
         
         try:
-            for i, (patch, (z, y, x)) in enumerate(zip(patches, patch_coords)):
-                # Validate patch device again during the loop as a safeguard
-                if patch.device != device:
-                    print(f"Moving patch {i} from {patch.device} to {device}")
-                    patch = patch.to(device)
+            for i, (patch, (z, y, x)) in enumerate(zip(cuda_patches, patch_coords)):
+                # Double-check the device
+                if patch.device != cuda_device:
+                    print(f"Warning: Patch {i} still on {patch.device} after moving! Fixing...")
+                    patch = patch.to(cuda_device)
                 
                 # Get actual patch dimensions
                 patch_shape = patch.shape
@@ -553,10 +555,14 @@ class PatchExtractor:
                         output_slice = reconstructed[:, z:z_end, y:y_end, x:x_end]
                         patch_slice = patch[:, :patch_z, :patch_y, :patch_x]
                         
-                        # Validate devices before operations
-                        if output_slice.device != patch_slice.device:
-                            print(f"Device mismatch: output_slice on {output_slice.device}, patch_slice on {patch_slice.device}")
-                            patch_slice = patch_slice.to(output_slice.device)
+                        # Verify the tensor is on the correct device before operation
+                        if output_slice.device != cuda_device:
+                            print(f"ERROR: output_slice on wrong device: {output_slice.device}")
+                            output_slice = output_slice.to(cuda_device)
+                            
+                        if patch_slice.device != cuda_device:
+                            print(f"ERROR: patch_slice on wrong device: {patch_slice.device}")
+                            patch_slice = patch_slice.to(cuda_device)
                         
                         # Ensure dimensions match
                         if output_slice.shape != patch_slice.shape:
@@ -578,6 +584,11 @@ class PatchExtractor:
                             if output_slice.shape != patch_slice.shape:
                                 # If still not matching, try to pad or crop specific dimensions
                                 new_patch_slice = torch.zeros_like(output_slice)
+                                # Verify new tensor is on the correct device
+                                if new_patch_slice.device != cuda_device:
+                                    print(f"ERROR: new_patch_slice on wrong device: {new_patch_slice.device}")
+                                    new_patch_slice = new_patch_slice.to(cuda_device)
+                                    
                                 # Copy the overlapping part
                                 min_c = min(output_slice.shape[0], patch_slice.shape[0])
                                 min_z = min(output_slice.shape[1], patch_slice.shape[1]) if output_slice.dim() > 1 and patch_slice.dim() > 1 else 0
@@ -598,9 +609,9 @@ class PatchExtractor:
                         count[:, z:z_end, y:y_end, x:x_end] += 1
                     except Exception as e:
                         print(f"Error adding patch {i} at coords ({z}, {y}, {x}): {e}")
-                        print(f"Patch shape: {patch.shape}, slice shape: {patch_slice.shape if 'patch_slice' in locals() else 'N/A'}")
-                        print(f"Output slice shape: {output_slice.shape if 'output_slice' in locals() else 'N/A'}")
-                        print(f"Patch device: {patch.device}, output_slice device: {output_slice.device if 'output_slice' in locals() else 'N/A'}")
+                        print(f"Patch shape: {patch.shape}, device: {patch.device}")
+                        print(f"Output slice shape: {output_slice.shape if 'output_slice' in locals() else 'N/A'}, "
+                              f"device: {output_slice.device if 'output_slice' in locals() else 'N/A'}")
                         continue
                 else:
                     print(f"Warning: Invalid patch dimensions for coords ({z}, {y}, {x}): shape={patch_shape}, output_shape={working_shape}")
@@ -618,12 +629,23 @@ class PatchExtractor:
             if has_batch_dim:
                 reconstructed = reconstructed.unsqueeze(0)
             
+            # Final device verification
+            print(f"Reconstruction complete. Output tensor shape: {reconstructed.shape}, device: {reconstructed.device}")
+            
             return reconstructed
             
         except Exception as e:
             print(f"Error in reconstruct_from_patches: {e}")
-            for i, (patch, coords) in enumerate(zip(patches, patch_coords)):
-                print(f"Patch {i}: shape={patch.shape}, coords={coords}, device={patch.device}")
+            # Print detailed device information for debugging
+            for i, patch in enumerate(cuda_patches):
+                print(f"Patch {i}: shape={patch.shape}, coord={patch_coords[i]}, device={patch.device}")
+            
+            # Check if reconstructed and count are initialized and print their devices
+            if 'reconstructed' in locals():
+                print(f"reconstructed device: {reconstructed.device}")
+            if 'count' in locals():
+                print(f"count device: {count.device}")
+                
             raise
 
 class LesionInpaintingModel(nn.Module):
@@ -1074,47 +1096,54 @@ def train(args):
                             # Verify shapes after normalization
                             patch_shapes = [p.shape for p in output_patches]
                             
+                            # Use explicit cuda:0 device
+                            cuda_device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+                            print(f"Validation using device: {cuda_device}")
+                            
+                            # Move all inputs to CUDA
+                            ph = ph.to(cuda_device)
+                            lbl = lbl.to(cuda_device)
+                            
                             # Ensure all patches are on the same device (GPU)
                             for i in range(len(output_patches)):
-                                if output_patches[i].device != device:
-                                    print(f"Moving patch {i} from {output_patches[i].device} to {device}")
-                                    # Use the exact device object, not a string
-                                    output_patches[i] = output_patches[i].to(device)
+                                if output_patches[i].device != cuda_device:
+                                    print(f"Moving visualization patch {i} from {output_patches[i].device} to {cuda_device}")
+                                    output_patches[i] = output_patches[i].to(cuda_device)
                             
                             # Print device information for debugging
-                            print(f"Validation: First patch device: {output_patches[0].device}, target device: {device}")
-                            
+                            print(f"Visualization: First patch device: {output_patches[0].device}, target device: {cuda_device}")
+                                
                             # Reconstruct the volume
                             reconstructed = patch_extractor.reconstruct_from_patches(
-                                output_patches, valid_patch_coords, pseudo_healthy.shape
+                                output_patches, valid_patch_coords, ph.shape
                             )
                             
                             # Apply lesion mask for validation metrics
-                            inpainted = pseudo_healthy[0].clone()
+                            inpainted = ph[0].clone()
                             
-                            # Ensure the reconstructed tensor is on the same device as pseudo_healthy
-                            if reconstructed.device != pseudo_healthy.device:
-                                print(f"Moving reconstructed from {reconstructed.device} to {pseudo_healthy.device}")
-                                reconstructed = reconstructed.to(pseudo_healthy.device)
+                            # Ensure the reconstructed tensor is on the same device as ph
+                            if reconstructed.device != ph.device:
+                                print(f"Viz: Moving reconstructed from {reconstructed.device} to {ph.device}")
+                                reconstructed = reconstructed.to(ph.device)
                             
-                            # Ensure label is on the same device as pseudo_healthy 
-                            if label[0].device != pseudo_healthy[0].device:
-                                print(f"Moving label from {label[0].device} to {pseudo_healthy[0].device}")
-                                label = label.to(pseudo_healthy.device)
+                            # Ensure lbl is on the same device as ph
+                            if lbl[0].device != ph[0].device:
+                                print(f"Viz: Moving label from {lbl[0].device} to {ph[0].device}")
+                                lbl = lbl.to(ph.device)
                                 
-                            inpainted = inpainted * (1 - label[0]) + reconstructed * label[0]
+                            inpainted = inpainted * (1 - lbl[0]) + reconstructed * lbl[0]
                             
                             # Check if inpainted has too many dimensions
-                            if inpainted.dim() > pseudo_healthy[0].dim():
+                            if inpainted.dim() > ph[0].dim():
                                 # Remove extra dimensions
-                                while inpainted.dim() > pseudo_healthy[0].dim():
+                                while inpainted.dim() > ph[0].dim():
                                     inpainted = inpainted.squeeze(0)                        
                             # Ensure all tensors have consistent dimensions for loss calculation
                             inpainted_for_loss = inpainted.unsqueeze(0)  # Add batch dimension [1, C, Z, Y, X]
                             
                             # Create dilated mask for better boundary evaluation
                             dilated_mask = torch.nn.functional.max_pool3d(
-                                label, kernel_size=3, stride=1, padding=1
+                                lbl, kernel_size=3, stride=1, padding=1
                             )
                             
                             # Calculate validation metrics
@@ -1122,21 +1151,21 @@ def train(args):
                             val_batch_loss = reconstruction_loss(inpainted_for_loss, adc)
                             
                             # 2. L1 loss only in lesion regions
-                            lesion_loss = reconstruction_loss(inpainted_for_loss, adc, label)
+                            lesion_loss = reconstruction_loss(inpainted_for_loss, adc, lbl)
                             
                             # 3. L1 loss only in healthy regions
                             healthy_loss = reconstruction_loss(
-                                inpainted_for_loss, adc, (1 - label)
+                                inpainted_for_loss, adc, (1 - lbl)
                             )
                             
                             # 4. Dice coefficient in lesion regions
-                            lesion_dice = dice_coefficient(inpainted_for_loss, adc, label)
+                            lesion_dice = dice_coefficient(inpainted_for_loss, adc, lbl)
                             
                             # 5. Structural similarity in lesion regions
-                            lesion_ssim = structural_similarity(inpainted_for_loss, adc, label)
+                            lesion_ssim = structural_similarity(inpainted_for_loss, adc, lbl)
                             
                             # 6. MAE in lesion regions with denormalization
-                            lesion_mae = mean_absolute_error(inpainted_for_loss, adc, label, adc_orig_range)
+                            lesion_mae = mean_absolute_error(inpainted_for_loss, adc, lbl, adc_orig_range)
                             
                             # Accumulate metrics
                             val_loss += val_batch_loss.item()
@@ -1233,15 +1262,22 @@ def train(args):
                     
                     # Reconstruct volume
                     if output_patches:
+                        # Use explicit cuda:0 device
+                        cuda_device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+                        print(f"Visualization using device: {cuda_device}")
+                        
+                        # Move all inputs to CUDA
+                        ph = ph.to(cuda_device)
+                        lbl = lbl.to(cuda_device)
+                        
                         # Ensure all patches are on the same device (GPU)
                         for i in range(len(output_patches)):
-                            if output_patches[i].device != device:
-                                print(f"Moving visualization patch {i} from {output_patches[i].device} to {device}")
-                                # Use the exact device object, not a string
-                                output_patches[i] = output_patches[i].to(device)
+                            if output_patches[i].device != cuda_device:
+                                print(f"Moving visualization patch {i} from {output_patches[i].device} to {cuda_device}")
+                                output_patches[i] = output_patches[i].to(cuda_device)
                         
                         # Print device information for debugging
-                        print(f"Visualization: First patch device: {output_patches[0].device}, target device: {device}")
+                        print(f"Visualization: First patch device: {output_patches[0].device}, target device: {cuda_device}")
                                 
                         reconstructed = patch_extractor.reconstruct_from_patches(
                             output_patches, filtered_patch_coords, ph.shape
@@ -1652,6 +1688,14 @@ def inference(args):
     
     # Perform inference
     with torch.no_grad():
+        # Use explicit cuda:0 device
+        cuda_device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        print(f"Inference using device: {cuda_device}")
+        
+        # Ensure all inputs are on CUDA
+        pseudo_healthy = pseudo_healthy.to(cuda_device)
+        label = label.to(cuda_device)
+        
         # Extract patches with lesions
         patches_ph, patches_label, _, patch_coords = patch_extractor.extract_patches_with_lesions(
             pseudo_healthy.unsqueeze(0)[0], label.unsqueeze(0)[0], pseudo_healthy.unsqueeze(0)[0]  # Use pseudo_healthy as placeholder for adc
@@ -1659,8 +1703,9 @@ def inference(args):
         
         output_patches = []
         for ph_patch, label_patch in zip(patches_ph, patches_label):
-            ph_patch = ph_patch.unsqueeze(0)
-            label_patch = label_patch.unsqueeze(0)
+            # Move patches to CUDA
+            ph_patch = ph_patch.to(cuda_device).unsqueeze(0)
+            label_patch = label_patch.to(cuda_device).unsqueeze(0)
             
             # Generate inpainted output
             output_patch = model(ph_patch, label_patch)
@@ -1670,9 +1715,12 @@ def inference(args):
         if output_patches:
             # Ensure all patches are on the same device (GPU)
             for i in range(len(output_patches)):
-                if output_patches[i].device != device:
-                    print(f"Moving inference patch {i} from {output_patches[i].device} to {device}")
-                    output_patches[i] = output_patches[i].to(device)
+                if output_patches[i].device != cuda_device:
+                    print(f"Moving inference patch {i} from {output_patches[i].device} to {cuda_device}")
+                    output_patches[i] = output_patches[i].to(cuda_device)
+            
+            # Print device information
+            print(f"Inference: First patch device: {output_patches[0].device}, target device: {cuda_device}")
                     
             reconstructed = patch_extractor.reconstruct_from_patches(
                 output_patches, patch_coords, pseudo_healthy.shape
