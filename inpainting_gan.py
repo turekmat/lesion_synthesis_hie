@@ -1774,70 +1774,77 @@ def train_model(args):
     # Definovat transformace pro augmentaci dat (pouze pro tréninkovou část)
     train_transforms = None
     if args.use_augmentations:
-        from monai.transforms import (
-            RandRotate90d,
-            RandFlipd,
-            RandAffined,
-            RandScaleIntensityd,
-            RandShiftIntensityd,
-            RandGaussianNoised,
-            Compose
-        )
+        # Pro testování patch-based tréninku je možné vypnout augmentace, pokud způsobují problémy
+        # Nastavte následující příznak na True pro vypnutí augmentací
+        disable_augmentation_for_testing = False
         
-        # Klíče pro všechny data tensory v sample
-        keys = ['pseudo_healthy', 'adc', 'lesion_mask']
-        
-        # Definice transformací pro data augmentaci
-        train_transforms = Compose([
-            # Náhodné rotace o 90 stupňů v rovině (2D řezy)
-            RandRotate90d(
-                keys=keys,
-                prob=args.aug_rotate_prob,
-                max_k=3,  # maximálně 3 rotace (0, 90, 180, 270 stupňů)
-                spatial_axes=(1, 2)  # rotace v osách y-z (2D řezy)
-            ),
-            
-            # Náhodné překlápění (zrcadlení)
-            RandFlipd(
-                keys=keys,
-                prob=args.aug_flip_prob,
-                spatial_axis=None  # náhodný výběr os
-            ),
-            
-            # Affinní transformace (rotace, škálování, posuny)
-            RandAffined(
-                keys=keys,
-                prob=args.aug_affine_prob,
-                rotate_range=(np.pi/36, np.pi/36, np.pi/36),  # max +/- 5 stupňů ve všech osách
-                scale_range=(0.05, 0.05, 0.05),  # škálování o +/- 5%
-                mode=('bilinear', 'bilinear', 'nearest'),  # interpolace pro každý typ dat
-                padding_mode='zeros'
-            ),
-            
-            # Úpravy intenzit - jen pro intenzitní mapy, ne pro masky
-            RandScaleIntensityd(
-                keys=['pseudo_healthy', 'adc'],
-                prob=args.aug_intensity_prob,
-                factors=0.1  # násobení intenzit faktorem v rozsahu [0.9, 1.1]
-            ),
-            
-            # Posuvy intenzit
-            RandShiftIntensityd(
-                keys=['pseudo_healthy', 'adc'],
-                prob=args.aug_intensity_prob,
-                offsets=0.1  # přičtení hodnoty v rozsahu [-0.1, 0.1]
-            ),
-            
-            # Gaussovský šum
-            RandGaussianNoised(
-                keys=['pseudo_healthy', 'adc'],
-                prob=args.aug_noise_prob,
-                mean=0.0,
-                std=0.05  # standardní odchylka šumu
+        if disable_augmentation_for_testing:
+            print("Augmentace dočasně vypnuty pro testování")
+        else:
+            from monai.transforms import (
+                RandRotate90d,
+                RandFlipd,
+                RandAffined,
+                RandScaleIntensityd,
+                RandShiftIntensityd,
+                RandGaussianNoised,
+                Compose
             )
-        ])
-        
-        print("Aktivovány augmentace dat pro trénink.")
+            
+            # Klíče pro všechny data tensory v sample
+            keys = ['pseudo_healthy', 'adc', 'lesion_mask']
+            
+            # Definice transformací pro data augmentaci
+            train_transforms = Compose([
+                # Náhodné rotace o 90 stupňů v rovině (2D řezy)
+                RandRotate90d(
+                    keys=keys,
+                    prob=args.aug_rotate_prob,
+                    max_k=3,  # maximálně 3 rotace (0, 90, 180, 270 stupňů)
+                    spatial_axes=(2, 3)  # rotace v osách y-z (2D řezy) - upraveno pro 5D tensor [B, C, D, H, W]
+                ),
+                
+                # Náhodné překlápění (zrcadlení)
+                RandFlipd(
+                    keys=keys,
+                    prob=args.aug_flip_prob,
+                    spatial_axis=None  # náhodný výběr os
+                ),
+                
+                # Affinní transformace (rotace, škálování, posuny)
+                RandAffined(
+                    keys=keys,
+                    prob=args.aug_affine_prob,
+                    rotate_range=(np.pi/36, np.pi/36, np.pi/36),  # max +/- 5 stupňů ve všech osách
+                    scale_range=(0.05, 0.05, 0.05),  # škálování o +/- 5%
+                    mode=('bilinear', 'bilinear', 'nearest'),  # interpolace pro každý typ dat
+                    padding_mode='zeros'
+                ),
+                
+                # Úpravy intenzit - jen pro intenzitní mapy, ne pro masky
+                RandScaleIntensityd(
+                    keys=['pseudo_healthy', 'adc'],
+                    prob=args.aug_intensity_prob,
+                    factors=0.1  # násobení intenzit faktorem v rozsahu [0.9, 1.1]
+                ),
+                
+                # Posuvy intenzit
+                RandShiftIntensityd(
+                    keys=['pseudo_healthy', 'adc'],
+                    prob=args.aug_intensity_prob,
+                    offsets=0.1  # přičtení hodnoty v rozsahu [-0.1, 0.1]
+                ),
+                
+                # Gaussovský šum
+                RandGaussianNoised(
+                    keys=['pseudo_healthy', 'adc'],
+                    prob=args.aug_noise_prob,
+                    mean=0.0,
+                    std=0.05  # standardní odchylka šumu
+                )
+            ])
+            
+            print("Aktivovány augmentace dat pro trénink.")
     
     # Debug výpis pro zobrazení dostupných souborů v adresářích
     print("Kontrola souborů v adresářích:")
