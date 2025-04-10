@@ -1878,124 +1878,247 @@ def train_model(args):
     print(f"ADC soubory: {adc_files[:5] if adc_files else []}... (zobrazeno prvních 5)")
     print(f"Lesion mask soubory: {lesion_files[:5] if lesion_files else []}... (zobrazeno prvních 5)")
     
-    # Definujeme vlastní collate funkci pro řešení problému s různými tvary tenzorů
-    def custom_collate_fn(batch):
-        """
-        Vlastní collate funkce, která upraví všechny tenzory na stejný tvar, než je seskupí.
-        Řeší problém 'stack expects each tensor to be equal size' když RandRotate90d změní tvar.
-        """
-        # Extrakt všech klíčů z prvního vzorku
-        keys = batch[0].keys()
-        
-        # Pro každý klíč, který obsahuje tenzor, najdeme maximální rozměry
-        result = {}
-        for key in keys:
-            if isinstance(batch[0][key], (torch.Tensor, np.ndarray)):
-                # Získat tvary všech tenzorů pro tento klíč
-                shapes = [sample[key].shape for sample in batch]
-                print(f"DEBUG: Tvary pro klíč {key}: {shapes}")
-                
-                # Pokud mají všechny stejný tvar, můžeme je jednoduše seskupit
-                if all(shape == shapes[0] for shape in shapes):
-                    result[key] = torch.stack([sample[key] for sample in batch])
-                else:
-                    # Musíme je upravit na stejný tvar
-                    # Strategie: Změníme pořadí dimenzí, aby vždy byly seřazeny od největší po nejmenší
-                    # (kromě kanálové dimenze, kterou necháme na začátku)
-                    processed_tensors = []
-                    for sample in batch:
-                        tensor = sample[key]
-        # Pokud neexistují existující léze, použijeme původní masku nové léze
-        combined_mask_data = mask_data
-        new_lesion_mask_data = mask_data
+    # Načíst dataset
+    patch_size = None
+    if args.use_patches:
+        # Převeďte string na tuple celých čísel
+        patch_size = tuple(map(int, args.patch_size.split(',')))
+        print(f"Používám patch-based training s velikostí patche: {patch_size}")
     
-    # Normalizovat hodnoty
-    ph_data = np.clip(ph_data, 0, None)
-    if np.max(ph_data) - np.min(ph_data) > 0:
-        ph_data = (ph_data - np.min(ph_data)) / (np.max(ph_data) - np.min(ph_data))
-    
-    # Uložit původní tvar pro pozdější obnovení
-    original_shape = ph_data.shape
-    
-    # Dynamicky doplnit na nejbližší násobek 32 pro každý rozměr
-    d, h, w = ph_data.shape
-    patch_size = 32
-    target_d = ((d + patch_size - 1) // patch_size) * patch_size
-    target_h = ((h + patch_size - 1) // patch_size) * patch_size
-    target_w = ((w + patch_size - 1) // patch_size) * patch_size
-    
-    print(f"Původní velikost dat: {original_shape}")
-    print(f"Paddovaná velikost pro inference: ({target_d}, {target_h}, {target_w})")
-    
-    # Pad data
-    pad_d = max(0, target_d - d)
-    pad_h = max(0, target_h - h)
-    pad_w = max(0, target_w - w)
-    
-    # Aplikovat padding symetricky
-    pad_d_before, pad_d_after = pad_d // 2, pad_d - (pad_d // 2)
-    pad_h_before, pad_h_after = pad_h // 2, pad_h - (pad_h // 2)
-    pad_w_before, pad_w_after = pad_w // 2, pad_w - (pad_w // 2)
-    
-    # Padding pro pseudo-zdravý mozek
-    padded_ph_data = np.pad(
-        ph_data,
-        ((pad_d_before, pad_d_after), (pad_h_before, pad_h_after), (pad_w_before, pad_w_after)),
-        mode='constant',
-        constant_values=0
+    train_dataset = LesionInpaintingDataset(
+        pseudo_healthy_dir=args.pseudo_healthy_dir,
+        adc_dir=args.adc_dir,
+        lesion_mask_dir=args.lesion_mask_dir,
+        norm_range=(0, 1),
+        crop_foreground=args.crop_foreground,
+        transform=train_transforms,
+        patch_size=patch_size,
+        use_patches=args.use_patches
     )
     
-    # Padding pro masku nové léze (bez existujících lézí)
-    padded_new_lesion_mask_data = np.pad(
-        new_lesion_mask_data,
-        ((pad_d_before, pad_d_after), (pad_h_before, pad_h_after), (pad_w_before, pad_w_after)),
-        mode='constant',
-        constant_values=0
-    )
+    # Kontrola, zda máme dostatek dat pro trénink
+    if len(train_dataset.file_triplets) == 0:
+        print("ERROR: Nebyly nalezeny žádné kompletní triplety souborů pro trénink.")
+        print("Zkontrolujte cesty k adresářům a formáty názvů souborů.")
+        print("Očekávaný formát ADC souborů: {patient_id}*-ADC_ss.mha")
+        print("Očekávaný formát lesion mask souborů: {patient_id}*_lesion.mha")
+        print("Ukončuji trénink.")
+        return
     
-    # Převést na torch tensor a přidat dimenze pro batch a kanál
-    ph_tensor = torch.from_numpy(padded_ph_data).unsqueeze(0).unsqueeze(0).to(device)
-    mask_tensor = torch.from_numpy(padded_new_lesion_mask_data).unsqueeze(0).unsqueeze(0).to(device)
+    # Rozdělit dataset na trénovací a validační část
+    dataset_size = len(train_dataset)
+    val_size = max(1, int(dataset_size * args.val_ratio))
+    train_size = dataset_size - val_size
     
-    # Generovat inpaintovaný mozek pouze pro oblasti nových lézí
-    model.eval()
-    with torch.no_grad():
-        inpainted = model(ph_tensor, mask_tensor)
+    # Zajistit, že máme alespoň jeden vzorek pro trénování a jeden pro validaci
+    if train_size <= 0 or val_size <= 0:
+        print(f"ERROR: Nedostatek dat pro rozdělení na trénovací a validační část. Dataset má pouze {dataset_size} vzorků.")
+        print("Upravte val_ratio nebo použijte větší dataset.")
+        print("Ukončuji trénink.")
+        return
     
-    # Převést zpět na numpy array
-    inpainted_data = inpainted.squeeze().cpu().numpy()
+    # Najděme index pacienta MGHNICU_405, aby byl vždy ve validační sadě
+    mghnicu_405_index = None
+    for i, triplet in enumerate(train_dataset.file_triplets):
+        if 'MGHNICU_405' in triplet['patient_id']:
+            mghnicu_405_index = i
+            print(f"Nalezen pacient MGHNICU_405 na indexu {i}, bude vždy použit pro validaci")
+            break
     
-    # Ořezat zpět na původní velikost
-    inpainted_data = inpainted_data[
-        pad_d_before:pad_d_before + d,
-        pad_h_before:pad_h_before + h,
-        pad_w_before:pad_w_before + w
-    ]
-    
-    # Aplikovat původní existující léze na výstup, pokud existují
-    if existing_lesion_path:
-        # Získat původní data s existujícími lézemi
-        original_adc_data = ph_data.copy()  # Zde případně načíst původní ADC s existujícími lézemi
+    # Pro validační dataset nepoužíváme augmentace, musíme proto vytvořit nový dataset pro validaci
+    if args.use_augmentations and val_size > 0:
+        # Vytvoříme indexy pro rozdělení datasetu
+        indices = list(range(dataset_size))
         
-        # Kombinovat výsledek: zachováme existující léze a přidáme nové jen tam, kde nejsou existující
-        final_output = (1 - existing_lesion_data) * inpainted_data + existing_lesion_data * original_adc_data
+        # Zamíchat indexy a rozdělit je na trénovací a validační
+        np.random.seed(args.seed)
+        np.random.shuffle(indices)
+        
+        # Pokud jsme našli MGHNICU_405, zajistit, že je ve validační sadě
+        if mghnicu_405_index is not None:
+            # Odstranit MGHNICU_405 z indexů, pokud tam je
+            if mghnicu_405_index in indices:
+                indices.remove(mghnicu_405_index)
+            
+            # Rozdělit zbytek indexů
+            train_indices = indices[:train_size]
+            val_indices = indices[train_size:train_size + val_size - 1]  # Rezervovat místo pro MGHNICU_405
+            
+            # Přidat MGHNICU_405 do validační sady
+            val_indices.append(mghnicu_405_index)
+        else:
+            # Standardní rozdělení, pokud MGHNICU_405 není nalezen
+            train_indices = indices[:train_size]
+            val_indices = indices[train_size:train_size + val_size]
+        
+        # Vytvoříme zvlášť validační dataset bez augmentací
+        val_dataset = LesionInpaintingDataset(
+            pseudo_healthy_dir=args.pseudo_healthy_dir,
+            adc_dir=args.adc_dir,
+            lesion_mask_dir=args.lesion_mask_dir,
+            norm_range=(0, 1),
+            crop_foreground=args.crop_foreground,
+            transform=None,  # bez augmentací pro validaci
+            patch_size=patch_size,
+            use_patches=args.use_patches
+        )
+        
+        # Použijeme SubsetRandomSampler pro vytvoření dataloaderu pouze s požadovanými indexy
+        from torch.utils.data import SubsetRandomSampler
+        train_sampler = SubsetRandomSampler(train_indices)
+        val_sampler = SubsetRandomSampler(val_indices)
+        
+        # Dataloadery s příslušnými samplery
+        train_dataloader = DataLoader(
+            train_dataset,
+            batch_size=args.batch_size,
+            sampler=train_sampler,
+            num_workers=args.num_workers,
+            pin_memory=True
+        )
+        
+        val_dataloader = DataLoader(
+            val_dataset,
+            batch_size=1,  # Pro validaci je vhodnější batch size 1
+            sampler=val_sampler,
+            num_workers=args.num_workers,
+            pin_memory=True
+        )
     else:
-        final_output = inpainted_data
+        # Pokud nepoužíváme augmentace nebo nemáme validaci, použijeme původní přístup
+        # s úpravou pro vždy zařazení MGHNICU_405 do validační sady
+        if mghnicu_405_index is not None:
+            # Vytvoříme vlastní rozdělení s MGHNICU_405 vždy ve validační sadě
+            from torch.utils.data import Subset
+            
+            # Vytvoříme indexy pro rozdělení datasetu
+            indices = list(range(dataset_size))
+            
+            # Odstranit MGHNICU_405 z indexů, pokud tam je
+            if mghnicu_405_index in indices:
+                indices.remove(mghnicu_405_index)
+                
+            # Zamíchat zbývající indexy
+            np.random.seed(args.seed)
+            np.random.shuffle(indices)
+            
+            # Rozdělit zbytek indexů
+            train_indices = indices[:train_size]
+            val_indices = indices[train_size:train_size + val_size - 1]
+            
+            # Přidat MGHNICU_405 do validační sady
+            val_indices.append(mghnicu_405_index)
+            
+            # Vytvořit Subset datasety
+            train_dataset = Subset(train_dataset, train_indices)
+            val_dataset = Subset(train_dataset, val_indices)
+        else:
+            # Standardní rozdělení pomocí random_split
+            train_dataset, val_dataset = torch.utils.data.random_split(
+                train_dataset, [train_size, val_size],
+                generator=torch.Generator().manual_seed(args.seed)
+            )
+        
+        train_dataloader = DataLoader(
+            train_dataset,
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=args.num_workers,
+            pin_memory=True
+        )
+        
+        val_dataloader = DataLoader(
+            val_dataset,
+            batch_size=1,  # Pro validaci je vhodnější batch size 1
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=True
+        )
+        
+    print(f"Velikost trénovacího datasetu: {train_size}")
+    print(f"Velikost validačního datasetu: {val_size}")
     
-    # Ověřit, že jsme zpět na původní velikosti
-    assert final_output.shape == original_shape, \
-        f"Velikost výstupu {final_output.shape} neodpovídá původní velikosti {original_shape}"
+    # Definovat vstupní velikost pro model (závisí na patch-based nebo full-volume tréninku)
+    if args.use_patches:
+        # Pro patch-based trénink použijeme velikost patche
+        model_input_size = patch_size
+    else:
+        # Pro full-volume trénink zkusíme najít velikost dat
+        # Podíváme se na první vzorek v datasetu
+        sample = train_dataset[0]
+        if isinstance(train_dataset, Subset):
+            # Pokud používáme Subset, musíme získat původní dataset
+            sample = train_dataset.dataset[train_dataset.indices[0]]
+        
+        # Zjistit velikost z prvního vzorku
+        if 'volume_shape' in sample:
+            model_input_size = sample['volume_shape']
+        else:
+            # Výchozí velikost, pokud nelze zjistit z datasetu
+            model_input_size = (64, 64, 64)
     
-    # Uložit výsledek jako MHA soubor
-    save_mha_file(final_output, ph_img, output_path)
+    print(f"Vstupní velikost pro model: {model_input_size}")
     
-    # Uložit kombinovanou masku lézí, pokud je specifikována cesta
-    if output_combined_mask_path:
-        save_mha_file(combined_mask_data, ph_img, output_combined_mask_path)
+    # Inicializovat model s novými rozměry
+    model = LesionInpaintingGAN(
+        img_size=model_input_size,  # Použít správnou velikost podle typu tréninku
+        gen_features=args.gen_features,
+        disc_base_filters=args.disc_base_filters,
+        disc_n_layers=args.disc_n_layers,
+        lambda_l1=args.lambda_l1,
+        lambda_identity=args.lambda_identity,
+        lambda_ssim=args.lambda_ssim,
+        lambda_edge=args.lambda_edge
+    ).to(device)
     
-    print(f"Inpaintovaný mozek uložen do {output_path}")
-    if output_combined_mask_path:
-        print(f"Kombinovaná maska lézí uložena do {output_combined_mask_path}")
+    # Inicializovat optimizer pro generátor a diskriminátor
+    optimizer_g = torch.optim.Adam(model.generator.parameters(), lr=args.lr_g, betas=(args.beta1, args.beta2))
+    optimizer_d = torch.optim.Adam(model.discriminator.parameters(), lr=args.lr_d, betas=(args.beta1, args.beta2))
+    
+    # Vytvořit scheduler pro learning rate
+    if args.use_lr_scheduler:
+        scheduler_g = torch.optim.lr_scheduler.StepLR(
+            optimizer_g, step_size=args.lr_step, gamma=args.lr_gamma
+        )
+        
+        scheduler_d = torch.optim.lr_scheduler.StepLR(
+            optimizer_d, step_size=args.lr_step, gamma=args.lr_gamma
+        )
+    else:
+        scheduler_g = None
+        scheduler_d = None
+    
+    # Vytvořit výstupní adresář
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Inicializovat trainer
+    trainer = LesionInpaintingTrainer(
+        model=model,
+        optimizer_g=optimizer_g,
+        optimizer_d=optimizer_d,
+        device=device,
+        output_dir=output_dir,
+        config=args,
+        use_amp=args.use_amp,
+        visualize_interval=args.visualize_interval
+    )
+    
+    # Načíst checkpoint, pokud je zadán
+    start_epoch = 0
+    if args.checkpoint:
+        print(f"Načítám checkpoint: {args.checkpoint}")
+        start_epoch = trainer.load_model(args.checkpoint)
+        print(f"Načten checkpoint z epochy {start_epoch}")
+    
+    # Spustit trénink
+    trainer.train(
+        train_dataloader=train_dataloader,
+        val_dataloader=val_dataloader,
+        num_epochs=args.num_epochs,
+        start_epoch=start_epoch,
+        checkpoint_interval=args.checkpoint_interval
+    )
 
 
 def main():
