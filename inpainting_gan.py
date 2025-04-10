@@ -501,20 +501,26 @@ class PatchExtractor:
         print(f"Reconstructing from {len(patches)} patches to output shape {output_shape}")
         print(f"First patch shape: {patches[0].shape}")
         
-        # Get device from the first patch
+        # Get device from the first patch - use str representation to ensure exact match
         device = patches[0].device
         print(f"Using device: {device} for reconstruction")
         
-        # Create tensors for reconstruction - ensure they're on the same device as patches
+        # Check all patches for device consistency before reconstruction
+        for i, patch in enumerate(patches):
+            if patch.device != device:
+                print(f"Warning: Patch {i} is on device {patch.device}, moving to {device}")
+                patches[i] = patch.to(device)
+        
+        # Create tensors for reconstruction - use the device from patches
         reconstructed = torch.zeros(working_shape, device=device)
         count = torch.zeros(working_shape, device=device)
         
         try:
             for i, (patch, (z, y, x)) in enumerate(zip(patches, patch_coords)):
-                # Make sure patch is on the right device
+                # Validate patch device again during the loop as a safeguard
                 if patch.device != device:
+                    print(f"Moving patch {i} from {patch.device} to {device}")
                     patch = patch.to(device)
-                    print(f"Moved patch {i} from {patch.device} to {device}")
                 
                 # Get actual patch dimensions
                 patch_shape = patch.shape
@@ -546,6 +552,11 @@ class PatchExtractor:
                         # Extract the slices for both output and patch
                         output_slice = reconstructed[:, z:z_end, y:y_end, x:x_end]
                         patch_slice = patch[:, :patch_z, :patch_y, :patch_x]
+                        
+                        # Validate devices before operations
+                        if output_slice.device != patch_slice.device:
+                            print(f"Device mismatch: output_slice on {output_slice.device}, patch_slice on {patch_slice.device}")
+                            patch_slice = patch_slice.to(output_slice.device)
                         
                         # Ensure dimensions match
                         if output_slice.shape != patch_slice.shape:
@@ -589,6 +600,7 @@ class PatchExtractor:
                         print(f"Error adding patch {i} at coords ({z}, {y}, {x}): {e}")
                         print(f"Patch shape: {patch.shape}, slice shape: {patch_slice.shape if 'patch_slice' in locals() else 'N/A'}")
                         print(f"Output slice shape: {output_slice.shape if 'output_slice' in locals() else 'N/A'}")
+                        print(f"Patch device: {patch.device}, output_slice device: {output_slice.device if 'output_slice' in locals() else 'N/A'}")
                         continue
                 else:
                     print(f"Warning: Invalid patch dimensions for coords ({z}, {y}, {x}): shape={patch_shape}, output_shape={working_shape}")
@@ -1066,7 +1078,11 @@ def train(args):
                             for i in range(len(output_patches)):
                                 if output_patches[i].device != device:
                                     print(f"Moving patch {i} from {output_patches[i].device} to {device}")
+                                    # Use the exact device object, not a string
                                     output_patches[i] = output_patches[i].to(device)
+                            
+                            # Print device information for debugging
+                            print(f"Validation: First patch device: {output_patches[0].device}, target device: {device}")
                             
                             # Reconstruct the volume
                             reconstructed = patch_extractor.reconstruct_from_patches(
@@ -1075,6 +1091,17 @@ def train(args):
                             
                             # Apply lesion mask for validation metrics
                             inpainted = pseudo_healthy[0].clone()
+                            
+                            # Ensure the reconstructed tensor is on the same device as pseudo_healthy
+                            if reconstructed.device != pseudo_healthy.device:
+                                print(f"Moving reconstructed from {reconstructed.device} to {pseudo_healthy.device}")
+                                reconstructed = reconstructed.to(pseudo_healthy.device)
+                            
+                            # Ensure label is on the same device as pseudo_healthy 
+                            if label[0].device != pseudo_healthy[0].device:
+                                print(f"Moving label from {label[0].device} to {pseudo_healthy[0].device}")
+                                label = label.to(pseudo_healthy.device)
+                                
                             inpainted = inpainted * (1 - label[0]) + reconstructed * label[0]
                             
                             # Check if inpainted has too many dimensions
@@ -1210,7 +1237,11 @@ def train(args):
                         for i in range(len(output_patches)):
                             if output_patches[i].device != device:
                                 print(f"Moving visualization patch {i} from {output_patches[i].device} to {device}")
+                                # Use the exact device object, not a string
                                 output_patches[i] = output_patches[i].to(device)
+                        
+                        # Print device information for debugging
+                        print(f"Visualization: First patch device: {output_patches[0].device}, target device: {device}")
                                 
                         reconstructed = patch_extractor.reconstruct_from_patches(
                             output_patches, filtered_patch_coords, ph.shape
@@ -1218,6 +1249,17 @@ def train(args):
                         
                         # Create inpainted result
                         inpainted = ph[0].clone()
+                        
+                        # Ensure the reconstructed tensor is on the same device as ph
+                        if reconstructed.device != ph.device:
+                            print(f"Viz: Moving reconstructed from {reconstructed.device} to {ph.device}")
+                            reconstructed = reconstructed.to(ph.device)
+                        
+                        # Ensure lbl is on the same device as ph
+                        if lbl[0].device != ph[0].device:
+                            print(f"Viz: Moving label from {lbl[0].device} to {ph[0].device}")
+                            lbl = lbl.to(ph.device)
+                            
                         inpainted = inpainted * (1 - lbl[0]) + reconstructed * lbl[0]
                         
                         # Normalize dimensions if needed
@@ -1641,6 +1683,16 @@ def inference(args):
                 label.unsqueeze(0), kernel_size=3, stride=1, padding=1
             )
             
+            # Ensure the reconstructed tensor is on the same device as pseudo_healthy
+            if reconstructed.device != pseudo_healthy.device:
+                print(f"Inference: Moving reconstructed from {reconstructed.device} to {pseudo_healthy.device}")
+                reconstructed = reconstructed.to(pseudo_healthy.device)
+            
+            # Ensure dilated_mask is on the same device as pseudo_healthy
+            if dilated_mask.device != pseudo_healthy.device:
+                print(f"Inference: Moving dilated_mask from {dilated_mask.device} to {pseudo_healthy.device}")
+                dilated_mask = dilated_mask.to(pseudo_healthy.device)
+                
             # Create final inpainted image - copy pseudo-healthy and replace only in lesion regions
             final_output = pseudo_healthy.unsqueeze(0).clone()
             final_output = final_output * (1 - dilated_mask) + reconstructed * dilated_mask
