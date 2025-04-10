@@ -783,8 +783,8 @@ def train(args):
         else:
             return torch.nn.functional.l1_loss(pred, target)
     
-    def mean_absolute_error(pred, target, mask):
-        """Mean Absolute Error (MAE) in lesion regions"""
+    def mean_absolute_error(pred, target, mask, orig_range=None):
+        """Mean Absolute Error (MAE) in lesion regions, with option to denormalize"""
         # Apply mask to both prediction and target
         masked_pred = pred * mask
         masked_target = target * mask
@@ -795,7 +795,14 @@ def train(args):
         # Calculate mean only over masked regions
         mask_sum = mask.sum()
         if mask_sum > 0:
-            return abs_diff.sum() / mask_sum
+            mae = abs_diff.sum() / mask_sum
+            
+            # Denormalize the MAE value if range is provided
+            if orig_range is not None:
+                orig_min, orig_max = orig_range
+                mae = mae * (orig_max - orig_min)
+                
+            return mae
         else:
             return torch.tensor(0.0, device=pred.device)
     
@@ -939,6 +946,11 @@ def train(args):
                 adc = val_batch_data["adc"].to(device)
                 label = val_batch_data["label"].to(device)
                 
+                # Capture original data ranges for denormalization
+                ph_orig_range = (val_batch_data["pseudo_healthy"].min().item(), 
+                               val_batch_data["pseudo_healthy"].max().item())
+                adc_orig_range = (val_batch_data["adc"].min().item(), 
+                                val_batch_data["adc"].max().item())
                 
                 try:
                     # Extract patches containing lesions, ensuring valid coordinates
@@ -1068,8 +1080,8 @@ def train(args):
                             # 5. Structural similarity in lesion regions
                             lesion_ssim = structural_similarity(inpainted_for_loss, adc, label)
                             
-                            # 6. MAE in lesion regions
-                            lesion_mae = mean_absolute_error(inpainted_for_loss, adc, label)
+                            # 6. MAE in lesion regions with denormalization
+                            lesion_mae = mean_absolute_error(inpainted_for_loss, adc, label, adc_orig_range)
                             
                             # Accumulate metrics
                             val_loss += val_batch_loss.item()
@@ -1185,7 +1197,9 @@ def train(args):
                         # Prepare metrics dictionary for visualization
                         vis_metrics = {
                             "Lesion L1 Loss": lesion_loss.item(),
-                            "Lesion MAE": lesion_mae.item(),  # Přidáno
+                            "Lesion MAE": lesion_mae.item(),  # Now denormalized
+                            "Lesion MAE (original scale)": lesion_mae.item(),  # Renamed for clarity
+                            "Original Data Range": f"{adc_orig_range[0]:.2f} to {adc_orig_range[1]:.2f}",
                             "Lesion Dice": lesion_dice.item(),
                             "Lesion SSIM": lesion_ssim.item(),
                             "Healthy L1 Loss": healthy_loss.item(),
@@ -1269,8 +1283,8 @@ def visualize_results(pseudo_healthy, label, output, target, output_path, metric
                 # Add explanations about metrics
                 plt.text(0.5, y_pos-0.1, "Metrics Explanations:", ha='center', fontsize=12, weight='bold')
                 explanations = [
+                    "Lesion MAE (original scale): Lower is better, Mean Absolute Error in original data scale",
                     "Lesion L1 Loss: Lower is better, measures pixel-wise reconstruction accuracy",
-                    "Lesion MAE: Lower is better, Mean Absolute Error in lesion regions",  # Přidáno
                     "Lesion Dice: Higher is better (max 1.0), measures overlap between output and target",
                     "Lesion SSIM: Higher is better (max 1.0), measures structural similarity"
                 ]
@@ -1393,9 +1407,15 @@ def visualize_results(pseudo_healthy, label, output, target, output_path, metric
                         axes[1].set_title('Label Overlay')
                         axes[1].axis('off')
                         
+                        # FIXED: Create properly combined output image - pseudo-healthy with lesion regions replaced
+                        combined_slice = ph_slice.copy()
+                        if has_lesion:
+                            # Replace only lesion regions with the model output
+                            combined_slice[lbl_slice > 0] = out_slice[lbl_slice > 0]
+                            
                         # For output and target
-                        im_out = axes[2].imshow(out_slice, cmap='gray')
-                        axes[2].set_title('Output')
+                        im_out = axes[2].imshow(combined_slice, cmap='gray')
+                        axes[2].set_title('Output (Inpainted)')
                         axes[2].axis('off')
                         plt.colorbar(im_out, ax=axes[2], fraction=0.046, pad=0.04)
                         
@@ -1411,7 +1431,7 @@ def visualize_results(pseudo_healthy, label, output, target, output_path, metric
                             ax_diff = fig.add_subplot(3, 2, 5)  # Add a new subplot
                             
                             # Calculate absolute difference in lesion region
-                            diff = np.abs(out_slice - tgt_slice)
+                            diff = np.abs(combined_slice - tgt_slice)
                             masked_diff = diff * lbl_slice
                             
                             im_diff = ax_diff.imshow(masked_diff, cmap='hot')
@@ -1426,15 +1446,39 @@ def visualize_results(pseudo_healthy, label, output, target, output_path, metric
                                 ax_text.text(0.1, 0.8, "Slice Lesion Stats:", fontsize=12, weight='bold')
                                 y_pos = 0.7
                                 
+                                # Get original data range if available
+                                orig_range = None
+                                if "Original Data Range" in metrics:
+                                    range_text = metrics["Original Data Range"]
+                                    if isinstance(range_text, str) and "to" in range_text:
+                                        try:
+                                            parts = range_text.split("to")
+                                            min_val = float(parts[0].strip())
+                                            max_val = float(parts[1].strip())
+                                            orig_range = (min_val, max_val)
+                                        except:
+                                            pass
+                                
                                 # Calculate slice-specific metrics
+                                mean_error = np.mean(masked_diff) if np.sum(lbl_slice) > 0 else 0
+                                # Denormalize mean error if possible
+                                if orig_range is not None:
+                                    denorm_mean_error = mean_error * (orig_range[1] - orig_range[0])
+                                    error_label = f"Mean Error (MAE): {mean_error:.4f} (normalized), {denorm_mean_error:.4f} (original scale)"
+                                else:
+                                    error_label = f"Mean Error (MAE): {mean_error:.4f}"
+                                    
                                 slice_metrics = {
-                                    "Mean Error (MAE)": np.mean(masked_diff) if np.sum(lbl_slice) > 0 else 0,  # Přejmenováno pro zdůraznění MAE
+                                    error_label: "",
                                     "Max Error": np.max(masked_diff) if np.sum(lbl_slice) > 0 else 0,
                                     "% of Lesion Voxels": 100 * np.sum(lbl_slice) / lbl_slice.size
                                 }
                                 
                                 for name, value in slice_metrics.items():
-                                    ax_text.text(0.1, y_pos, f"{name}: {value:.4f}", fontsize=10)
+                                    if value == "":  # For the custom error label
+                                        ax_text.text(0.1, y_pos, name, fontsize=10)
+                                    else:
+                                        ax_text.text(0.1, y_pos, f"{name}: {value:.4f}", fontsize=10)
                                     y_pos -= 0.1
                         
                         plt.suptitle(slice_title, fontsize=16)
