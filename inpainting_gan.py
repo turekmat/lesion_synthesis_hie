@@ -1100,50 +1100,51 @@ def train(args):
                             cuda_device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
                             print(f"Validation using device: {cuda_device}")
                             
-                            # Move all inputs to CUDA
-                            ph = ph.to(cuda_device)
-                            lbl = lbl.to(cuda_device)
+                            # Ensure all inputs are on CUDA
+                            pseudo_healthy = pseudo_healthy.to(cuda_device)
+                            label = label.to(cuda_device)
+                            adc = adc.to(cuda_device)
                             
                             # Ensure all patches are on the same device (GPU)
                             for i in range(len(output_patches)):
                                 if output_patches[i].device != cuda_device:
-                                    print(f"Moving visualization patch {i} from {output_patches[i].device} to {cuda_device}")
+                                    print(f"Moving patch {i} from {output_patches[i].device} to {cuda_device}")
                                     output_patches[i] = output_patches[i].to(cuda_device)
                             
                             # Print device information for debugging
-                            print(f"Visualization: First patch device: {output_patches[0].device}, target device: {cuda_device}")
-                                
+                            print(f"Validation: First patch device: {output_patches[0].device}, target device: {cuda_device}")
+                            
                             # Reconstruct the volume
                             reconstructed = patch_extractor.reconstruct_from_patches(
-                                output_patches, valid_patch_coords, ph.shape
+                                output_patches, valid_patch_coords, pseudo_healthy.shape
                             )
                             
                             # Apply lesion mask for validation metrics
-                            inpainted = ph[0].clone()
+                            inpainted = pseudo_healthy[0].clone()
                             
-                            # Ensure the reconstructed tensor is on the same device as ph
-                            if reconstructed.device != ph.device:
-                                print(f"Viz: Moving reconstructed from {reconstructed.device} to {ph.device}")
-                                reconstructed = reconstructed.to(ph.device)
+                            # Ensure the reconstructed tensor is on the same device as pseudo_healthy
+                            if reconstructed.device != pseudo_healthy.device:
+                                print(f"Moving reconstructed from {reconstructed.device} to {pseudo_healthy.device}")
+                                reconstructed = reconstructed.to(pseudo_healthy.device)
                             
-                            # Ensure lbl is on the same device as ph
-                            if lbl[0].device != ph[0].device:
-                                print(f"Viz: Moving label from {lbl[0].device} to {ph[0].device}")
-                                lbl = lbl.to(ph.device)
+                            # Ensure label is on the same device as pseudo_healthy 
+                            if label[0].device != pseudo_healthy[0].device:
+                                print(f"Moving label from {label[0].device} to {pseudo_healthy[0].device}")
+                                label = label.to(pseudo_healthy.device)
                                 
-                            inpainted = inpainted * (1 - lbl[0]) + reconstructed * lbl[0]
+                            inpainted = inpainted * (1 - label[0]) + reconstructed * label[0]
                             
                             # Check if inpainted has too many dimensions
-                            if inpainted.dim() > ph[0].dim():
+                            if inpainted.dim() > pseudo_healthy[0].dim():
                                 # Remove extra dimensions
-                                while inpainted.dim() > ph[0].dim():
+                                while inpainted.dim() > pseudo_healthy[0].dim():
                                     inpainted = inpainted.squeeze(0)                        
                             # Ensure all tensors have consistent dimensions for loss calculation
                             inpainted_for_loss = inpainted.unsqueeze(0)  # Add batch dimension [1, C, Z, Y, X]
                             
                             # Create dilated mask for better boundary evaluation
                             dilated_mask = torch.nn.functional.max_pool3d(
-                                lbl, kernel_size=3, stride=1, padding=1
+                                label, kernel_size=3, stride=1, padding=1
                             )
                             
                             # Calculate validation metrics
@@ -1151,21 +1152,21 @@ def train(args):
                             val_batch_loss = reconstruction_loss(inpainted_for_loss, adc)
                             
                             # 2. L1 loss only in lesion regions
-                            lesion_loss = reconstruction_loss(inpainted_for_loss, adc, lbl)
+                            lesion_loss = reconstruction_loss(inpainted_for_loss, adc, label)
                             
                             # 3. L1 loss only in healthy regions
                             healthy_loss = reconstruction_loss(
-                                inpainted_for_loss, adc, (1 - lbl)
+                                inpainted_for_loss, adc, (1 - label)
                             )
                             
                             # 4. Dice coefficient in lesion regions
-                            lesion_dice = dice_coefficient(inpainted_for_loss, adc, lbl)
+                            lesion_dice = dice_coefficient(inpainted_for_loss, adc, label)
                             
                             # 5. Structural similarity in lesion regions
-                            lesion_ssim = structural_similarity(inpainted_for_loss, adc, lbl)
+                            lesion_ssim = structural_similarity(inpainted_for_loss, adc, label)
                             
                             # 6. MAE in lesion regions with denormalization
-                            lesion_mae = mean_absolute_error(inpainted_for_loss, adc, lbl, adc_orig_range)
+                            lesion_mae = mean_absolute_error(inpainted_for_loss, adc, label, adc_orig_range)
                             
                             # Accumulate metrics
                             val_loss += val_batch_loss.item()
