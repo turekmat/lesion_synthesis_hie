@@ -351,9 +351,9 @@ def train(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     
-    # Define transforms
+    # Define transforms - specify SimpleITK reader explicitly
     train_transforms = Compose([
-        LoadImaged(keys=["pseudo_healthy", "adc", "label"]),
+        LoadImaged(keys=["pseudo_healthy", "adc", "label"], reader="SimpleITK"),
         EnsureChannelFirstd(keys=["pseudo_healthy", "adc", "label"]),
         Orientationd(keys=["pseudo_healthy", "adc", "label"], axcodes="RAS"),
         Spacingd(keys=["pseudo_healthy", "adc", "label"], pixdim=(1.0, 1.0, 1.0), mode=("bilinear", "bilinear", "nearest")),
@@ -371,7 +371,7 @@ def train(args):
     ])
     
     val_transforms = Compose([
-        LoadImaged(keys=["pseudo_healthy", "adc", "label"]),
+        LoadImaged(keys=["pseudo_healthy", "adc", "label"], reader="SimpleITK"),
         EnsureChannelFirstd(keys=["pseudo_healthy", "adc", "label"]),
         Orientationd(keys=["pseudo_healthy", "adc", "label"], axcodes="RAS"),
         Spacingd(keys=["pseudo_healthy", "adc", "label"], pixdim=(1.0, 1.0, 1.0), mode=("bilinear", "bilinear", "nearest")),
@@ -604,9 +604,9 @@ def inference(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     
-    # Define transforms
+    # Define transforms - specify SimpleITK reader explicitly
     infer_transforms = Compose([
-        LoadImaged(keys=["pseudo_healthy", "label"]),
+        LoadImaged(keys=["pseudo_healthy", "label"], reader="SimpleITK"),
         EnsureChannelFirstd(keys=["pseudo_healthy", "label"]),
         Orientationd(keys=["pseudo_healthy", "label"], axcodes="RAS"),
         Spacingd(keys=["pseudo_healthy", "label"], pixdim=(1.0, 1.0, 1.0), mode=("bilinear", "nearest")),
