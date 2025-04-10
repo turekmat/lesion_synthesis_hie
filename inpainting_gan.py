@@ -1107,218 +1107,137 @@ def train(args):
 
 def visualize_results(pseudo_healthy, label, output, target, output_path):
     """
-    Visualize results by creating a PDF with slice-by-slice comparisons
+    Simplified visualization function that generates a valid PDF with minimal processing
     """
     try:
-        # Convert tensors to numpy arrays and ensure they're valid
-        pseudo_healthy_np = pseudo_healthy.detach().cpu().numpy()
-        label_np = label.detach().cpu().numpy()
-        output_np = output.detach().cpu().numpy()
-        target_np = target.detach().cpu().numpy()
-        
-        print(f"Original data shapes: pseudo_healthy={pseudo_healthy_np.shape}, label={label_np.shape}, output={output_np.shape}, target={target_np.shape}")
-        
-        # Handle multi-dimensional data - we need to get to shape [D, H, W] for visualization
-        # First, remove any batch dimensions (typically the first dimension)
-        while len(pseudo_healthy_np.shape) > 3 and pseudo_healthy_np.shape[0] == 1:
-            pseudo_healthy_np = pseudo_healthy_np[0]
-        while len(label_np.shape) > 3 and label_np.shape[0] == 1:
-            label_np = label_np[0]
-        while len(output_np.shape) > 3 and output_np.shape[0] == 1:
-            output_np = output_np[0]
-        while len(target_np.shape) > 3 and target_np.shape[0] == 1:
-            target_np = target_np[0]
-            
-        print(f"After dimension reduction: pseudo_healthy={pseudo_healthy_np.shape}, label={label_np.shape}, output={output_np.shape}, target={target_np.shape}")
-        
-        # Check if dimensions are appropriate for visualization
-        if len(pseudo_healthy_np.shape) != 3 or len(label_np.shape) != 3 or len(output_np.shape) != 3 or len(target_np.shape) != 3:
-            print("Warning: Data dimensions are not appropriate for visualization. Attempting to correct...")
-            
-            # If dimensions are still wrong, try to fix them
-            # Sometimes the data might be [C, D, H, W] with C > 1, so we need to select a channel
-            if len(pseudo_healthy_np.shape) == 4:  # [C, D, H, W]
-                pseudo_healthy_np = pseudo_healthy_np[0]  # Take first channel
-            if len(label_np.shape) == 4:
-                label_np = label_np[0]
-            if len(output_np.shape) == 4:
-                output_np = output_np[0]
-            if len(target_np.shape) == 4:
-                target_np = target_np[0]
-        
-        print(f"Final data shapes: pseudo_healthy={pseudo_healthy_np.shape}, label={label_np.shape}, output={output_np.shape}, target={target_np.shape}")
-        
-        # Check that all arrays have at least 1 dimension of sufficient size (D > 0)
-        if (pseudo_healthy_np.shape[0] < 1 or label_np.shape[0] < 1 or 
-            output_np.shape[0] < 1 or target_np.shape[0] < 1):
-            raise ValueError("One or more arrays have insufficient depth dimension")
-            
-        # Check for NaN values
-        has_nan = {
-            'pseudo_healthy': np.isnan(pseudo_healthy_np).any(),
-            'label': np.isnan(label_np).any(),
-            'output': np.isnan(output_np).any(),
-            'target': np.isnan(target_np).any()
-        }
-        if any(has_nan.values()):
-            print(f"Warning: NaN values detected in data: {has_nan}")
-            # Replace NaN values with zeros
-            pseudo_healthy_np = np.nan_to_num(pseudo_healthy_np)
-            label_np = np.nan_to_num(label_np)
-            output_np = np.nan_to_num(output_np)
-            target_np = np.nan_to_num(target_np)
-        
-        # Create PDF
+        # Save a very basic PDF without complex processing
         with PdfPages(output_path) as pdf:
-            # Determine the number of depth slices (choose the minimum depth across all arrays)
-            depths = [
-                pseudo_healthy_np.shape[0],
-                label_np.shape[0],
-                output_np.shape[0],
-                target_np.shape[0]
-            ]
-            depth = min(depths)
-            print(f"Minimum depth across all arrays: {depth}")
+            # Create a single summary page to ensure the PDF is valid
+            plt.figure(figsize=(8, 6))
+            plt.text(0.5, 0.8, "Simplified Visualization", ha='center', fontsize=16)
+            plt.text(0.5, 0.6, "Input shape: " + str(pseudo_healthy.shape), ha='center')
+            plt.text(0.5, 0.5, "Label shape: " + str(label.shape), ha='center')
+            plt.text(0.5, 0.4, "Output shape: " + str(output.shape), ha='center')
+            plt.text(0.5, 0.3, "Target shape: " + str(target.shape), ha='center')
+            plt.axis('off')
+            pdf.savefig()
+            plt.close()
             
-            if depth == 0:
-                raise ValueError("No slices available for visualization")
-            
-            # If depth is large, subsample to avoid creating too many pages
-            max_slices_to_visualize = 30  # Maximum number of slices to include
-            
-            if depth <= max_slices_to_visualize:
-                slices_to_visualize = list(range(depth))
-            else:
-                # Sample slices evenly throughout the volume
-                slices_to_visualize = np.linspace(0, depth-1, max_slices_to_visualize, dtype=int).tolist()
-            
-            print(f"Visualizing {len(slices_to_visualize)} slices: {slices_to_visualize[:5]}...")
-            
-            # Keep track if any slices were successfully added
-            slices_added = False
-            
-            for z_idx, z in enumerate(slices_to_visualize):
-                try:
-                    print(f"Processing slice {z} ({z_idx+1}/{len(slices_to_visualize)})")
-                    
-                    # Create figure and axes
-                    fig, axs = plt.subplots(1, 4, figsize=(16, 4))
-                    
-                    # Extract 2D slices safely
-                    ph_slice = pseudo_healthy_np[z]
-                    lbl_slice = label_np[z]
-                    out_slice = output_np[z]
-                    tgt_slice = target_np[z]
-                    
-                    # If slices still have extra dimensions, we need to squeeze them to 2D
-                    if len(ph_slice.shape) > 2:
-                        print(f"Squeezing pseudo_healthy slice from {ph_slice.shape}")
-                        ph_slice = np.squeeze(ph_slice)
-                    if len(lbl_slice.shape) > 2:
-                        print(f"Squeezing label slice from {lbl_slice.shape}")
-                        lbl_slice = np.squeeze(lbl_slice)
-                    if len(out_slice.shape) > 2:
-                        print(f"Squeezing output slice from {out_slice.shape}")
-                        out_slice = np.squeeze(out_slice)
-                    if len(tgt_slice.shape) > 2:
-                        print(f"Squeezing target slice from {tgt_slice.shape}")
-                        tgt_slice = np.squeeze(tgt_slice)
-                    
-                    print(f"Slice shapes: ph={ph_slice.shape}, lbl={lbl_slice.shape}, out={out_slice.shape}, tgt={tgt_slice.shape}")
-                    
-                    # Plot pseudo-healthy slice
-                    im0 = axs[0].imshow(ph_slice, cmap='gray')
-                    axs[0].set_title(f'Pseudo-healthy (z={z})')
-                    plt.colorbar(im0, ax=axs[0], fraction=0.046, pad=0.04)
-                    
-                    # Plot label slice
-                    im1 = axs[1].imshow(lbl_slice, cmap='Reds')
-                    axs[1].set_title(f'Lesion Mask')
-                    plt.colorbar(im1, ax=axs[1], fraction=0.046, pad=0.04)
-                    
-                    # Plot output slice
-                    im2 = axs[2].imshow(out_slice, cmap='gray')
-                    axs[2].set_title(f'Inpainted Output')
-                    plt.colorbar(im2, ax=axs[2], fraction=0.046, pad=0.04)
-                    
-                    # Plot target slice
-                    im3 = axs[3].imshow(tgt_slice, cmap='gray')
-                    axs[3].set_title(f'Target ADC')
-                    plt.colorbar(im3, ax=axs[3], fraction=0.046, pad=0.04)
-                    
-                    # Add a note if this slice contains any lesion
-                    has_lesion = np.any(lbl_slice > 0)
-                    if has_lesion:
-                        plt.figtext(0.5, 0.01, "This slice contains lesion", ha='center', fontsize=12, 
-                                    bbox={'facecolor': 'yellow', 'alpha': 0.5, 'pad': 5})
-                    
-                    plt.tight_layout(rect=[0, 0.03, 1, 1])  # Make room for the text at the bottom
-                    pdf.savefig(fig)
-                    plt.close(fig)
-                    
-                    slices_added = True
-                    
-                except Exception as slice_error:
-                    print(f"Error visualizing slice {z}: {slice_error}")
-                    import traceback
-                    traceback.print_exc()
-                    
-                    # Try to add a simple error slide instead
-                    try:
-                        error_fig, error_ax = plt.subplots(figsize=(8, 6))
-                        error_ax.text(0.5, 0.5, f"Error processing slice {z}: {str(slice_error)}", ha='center', va='center', fontsize=12, wrap=True)
-                        error_ax.axis('off')
-                        pdf.savefig(error_fig)
-                        plt.close(error_fig)
-                    except Exception as error_fig_error:
-                        print(f"Could not create error figure: {error_fig_error}")
-            
-            # Add a summary page at the end
+            # Convert data to numpy with minimal processing
             try:
-                summary_fig, summary_ax = plt.subplots(figsize=(8, 6))
+                ph_np = pseudo_healthy.detach().cpu().numpy() if isinstance(pseudo_healthy, torch.Tensor) else pseudo_healthy
+                lbl_np = label.detach().cpu().numpy() if isinstance(label, torch.Tensor) else label
+                out_np = output.detach().cpu().numpy() if isinstance(output, torch.Tensor) else output
+                tgt_np = target.detach().cpu().numpy() if isinstance(target, torch.Tensor) else target
                 
-                # Count how many slices have lesions
-                if len(label_np.shape) == 3:  # [D, H, W]
-                    lesion_count = sum(1 for z in range(depth) if np.any(label_np[z] > 0))
-                else:
-                    lesion_count = 0
+                # Simplify dimensions - just keep reducing until we get to 3D
+                while len(ph_np.shape) > 3:
+                    ph_np = ph_np[0]
+                while len(lbl_np.shape) > 3:
+                    lbl_np = lbl_np[0]
+                while len(out_np.shape) > 3:
+                    out_np = out_np[0]
+                while len(tgt_np.shape) > 3:
+                    tgt_np = tgt_np[0]
                 
-                summary_text = (
-                    f"Visualization Complete\n\n"
-                    f"Total slices: {depth}\n"
-                    f"Slices with lesions: {lesion_count}\n"
-                    f"Slices visualized: {len(slices_to_visualize)}"
-                )
-                summary_ax.text(0.5, 0.5, summary_text, ha='center', va='center', fontsize=14)
-                summary_ax.axis('off')
-                pdf.savefig(summary_fig)
-                plt.close(summary_fig)
-            except Exception as summary_error:
-                print(f"Error creating summary page: {summary_error}")
+                # Add dimension information page
+                plt.figure(figsize=(8, 6))
+                plt.text(0.5, 0.9, "Processed Data Shapes", ha='center', fontsize=16)
+                plt.text(0.5, 0.7, f"Pseudo-healthy: {ph_np.shape}", ha='center')
+                plt.text(0.5, 0.6, f"Label: {lbl_np.shape}", ha='center')
+                plt.text(0.5, 0.5, f"Output: {out_np.shape}", ha='center')
+                plt.text(0.5, 0.4, f"Target: {tgt_np.shape}", ha='center')
+                plt.axis('off')
+                pdf.savefig()
+                plt.close()
+                
+                # Get minimum depth to avoid index errors
+                depths = [ph_np.shape[0], lbl_np.shape[0], out_np.shape[0], tgt_np.shape[0]]
+                depth = min(depths)
+                
+                # Limit number of slices to visualize
+                num_slices = min(10, depth)  # Maximum 10 slices
+                slice_indices = list(range(0, depth, max(1, depth // num_slices)))[:num_slices]
+                
+                # Add pages showing middle slice for each volume
+                for z_idx, z in enumerate(slice_indices):
+                    try:
+                        fig, axes = plt.subplots(2, 2, figsize=(8, 8))
+                        axes = axes.flatten()
+                        
+                        # Get 2D slices
+                        ph_slice = ph_np[z]
+                        lbl_slice = lbl_np[z]
+                        out_slice = out_np[z]
+                        tgt_slice = tgt_np[z]
+                        
+                        # Ensure slices are 2D
+                        if len(ph_slice.shape) > 2:
+                            ph_slice = ph_slice[0] if ph_slice.shape[0] == 1 else np.mean(ph_slice, axis=0)
+                        if len(lbl_slice.shape) > 2:
+                            lbl_slice = lbl_slice[0] if lbl_slice.shape[0] == 1 else np.mean(lbl_slice, axis=0)
+                        if len(out_slice.shape) > 2:
+                            out_slice = out_slice[0] if out_slice.shape[0] == 1 else np.mean(out_slice, axis=0)
+                        if len(tgt_slice.shape) > 2:
+                            tgt_slice = tgt_slice[0] if tgt_slice.shape[0] == 1 else np.mean(tgt_slice, axis=0)
+                        
+                        # Basic display without colorbars or complex formatting
+                        axes[0].imshow(ph_slice, cmap='gray')
+                        axes[0].set_title('Pseudo-healthy')
+                        axes[0].axis('off')
+                        
+                        axes[1].imshow(lbl_slice, cmap='Reds')
+                        axes[1].set_title('Label')
+                        axes[1].axis('off')
+                        
+                        axes[2].imshow(out_slice, cmap='gray')
+                        axes[2].set_title('Output')
+                        axes[2].axis('off')
+                        
+                        axes[3].imshow(tgt_slice, cmap='gray')
+                        axes[3].set_title('Target')
+                        axes[3].axis('off')
+                        
+                        plt.suptitle(f"Slice {z}")
+                        plt.tight_layout()
+                        pdf.savefig(fig)
+                        plt.close(fig)
+                    except Exception as slice_error:
+                        print(f"Error visualizing slice {z}: {slice_error}")
+                        # Continue to next slice
+            
+            except Exception as data_error:
+                print(f"Error processing data: {data_error}")
+                # Add error page
+                plt.figure(figsize=(8, 6))
+                plt.text(0.5, 0.5, f"Error processing data:\n{str(data_error)}", 
+                         ha='center', va='center', wrap=True)
+                plt.axis('off')
+                pdf.savefig()
+                plt.close()
         
-        # Verify the PDF was created successfully
+        # Verify the PDF is valid
         import os
         if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
-            print(f"PDF file verified: {output_path} ({os.path.getsize(output_path)} bytes)")
+            print(f"Simplified PDF created successfully: {output_path} ({os.path.getsize(output_path)} bytes)")
         else:
-            print(f"Warning: PDF file may not have been created properly: {output_path}")
+            print(f"Warning: PDF file may not have been created properly")
+            raise RuntimeError("PDF file creation failed")
             
     except Exception as e:
         print(f"Failed to create PDF visualization: {e}")
-        import traceback
-        traceback.print_exc()
         
-        # Last resort attempt to create a simple PDF with error message
+        # Last resort - create a text file instead
         try:
-            with PdfPages(output_path) as pdf:
-                fig, ax = plt.subplots(figsize=(8, 6))
-                ax.text(0.5, 0.5, f"Visualization Error:\n{str(e)}", ha='center', va='center', fontsize=16, wrap=True)
-                ax.axis('off')
-                pdf.savefig(fig)
-                plt.close(fig)
-            print(f"Created error PDF at {output_path}")
-        except Exception as last_error:
-            print(f"Final error creating PDF: {last_error}")
+            with open(output_path.replace('.pdf', '.txt'), 'w') as f:
+                f.write(f"Visualization Error: {str(e)}\n")
+                f.write(f"Pseudo-healthy shape: {pseudo_healthy.shape}\n")
+                f.write(f"Label shape: {label.shape}\n")
+                f.write(f"Output shape: {output.shape}\n")
+                f.write(f"Target shape: {target.shape}\n")
+            print(f"Created text file with information instead")
+        except Exception as txt_error:
+            print(f"Failed to create even a text file: {txt_error}")
 
 def inference(args):
     """
