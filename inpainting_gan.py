@@ -1130,6 +1130,18 @@ def visualize_results(pseudo_healthy, label, output, target, output_path):
             
         print(f"After batch removal: pseudo_healthy={pseudo_healthy_np.shape}, label={label_np.shape}, output={output_np.shape}, target={target_np.shape}")
         
+        # Ensure all arrays have the same number of dimensions (remove excessive channel dimensions if needed)
+        if pseudo_healthy_np.shape[0] == 1 and len(pseudo_healthy_np.shape) == 4:
+            pseudo_healthy_np = pseudo_healthy_np[0]  # Remove channel dimension
+        if label_np.shape[0] == 1 and len(label_np.shape) == 4:
+            label_np = label_np[0]
+        if output_np.shape[0] == 1 and len(output_np.shape) == 4:
+            output_np = output_np[0]
+        if target_np.shape[0] == 1 and len(target_np.shape) == 4:
+            target_np = target_np[0]
+            
+        print(f"After channel removal: pseudo_healthy={pseudo_healthy_np.shape}, label={label_np.shape}, output={output_np.shape}, target={target_np.shape}")
+        
         # Check for NaN values
         has_nan = {
             'pseudo_healthy': np.isnan(pseudo_healthy_np).any(),
@@ -1147,86 +1159,65 @@ def visualize_results(pseudo_healthy, label, output, target, output_path):
         
         # Create PDF
         with PdfPages(output_path) as pdf:
-            # Find slices with lesions
-            lesion_slices = []
-            try:
-                # Loop through each slice and check if it has any lesion
-                for z in range(label_np.shape[0]):
-                    if np.sum(label_np[z]) > 0:
-                        lesion_slices.append(z)
-                
-                print(f"Found {len(lesion_slices)} slices with lesions")
-            except Exception as e:
-                print(f"Error finding lesion slices: {e}")
-                lesion_slices = []
+            # Determine total number of depth slices
+            depth = pseudo_healthy_np.shape[0]
+            print(f"Total number of slices: {depth}")
             
-            # If no lesion slices found, choose some random slices
-            if not lesion_slices:
-                print("No lesion slices found, using random slices")
-                num_slices = min(5, label_np.shape[0])
-                lesion_slices = np.linspace(0, label_np.shape[0]-1, num_slices, dtype=int).tolist()
-                print(f"Selected random slices: {lesion_slices}")
+            # If depth is large, subsample to avoid creating too many pages
+            max_slices_to_visualize = 30  # Maximum number of slices to include
             
-            # Generate empty figure as a fallback
-            try:
-                fallback_fig, fallback_ax = plt.subplots(figsize=(8, 6))
-                fallback_ax.text(0.5, 0.5, "Data Processing Error - Fallback Image", ha='center', va='center', fontsize=20)
-                fallback_ax.axis('off')
-            except Exception as fallback_err:
-                print(f"Error creating fallback figure: {fallback_err}")
+            if depth <= max_slices_to_visualize:
+                slices_to_visualize = list(range(depth))
+            else:
+                # Sample slices evenly throughout the volume
+                slices_to_visualize = np.linspace(0, depth-1, max_slices_to_visualize, dtype=int).tolist()
+            
+            print(f"Visualizing {len(slices_to_visualize)} slices: {slices_to_visualize[:5]}...")
             
             # Keep track if any slices were successfully added
             slices_added = False
             
-            for z in lesion_slices:
+            for z_idx, z in enumerate(slices_to_visualize):
                 try:
-                    print(f"Processing slice {z}")
-                    
-                    # Verify slice index is valid
-                    if (z < 0 or z >= pseudo_healthy_np.shape[0] or 
-                        z >= label_np.shape[0] or 
-                        z >= output_np.shape[0] or 
-                        z >= target_np.shape[0]):
-                        print(f"Slice index {z} out of range. Skipping.")
-                        continue
+                    print(f"Processing slice {z} ({z_idx+1}/{len(slices_to_visualize)})")
                     
                     # Create figure and axes
                     fig, axs = plt.subplots(1, 4, figsize=(16, 4))
                     
-                    # Plot pseudo-healthy slice
-                    slice_ph = pseudo_healthy_np[z]
-                    print(f"Pseudo-healthy slice shape: {slice_ph.shape}")
-                    im0 = axs[0].imshow(slice_ph, cmap='gray')
+                    # For each image, we need to extract a proper 2D slice
+                    # The data should have shape [D, H, W] where z indexes into D
+                    
+                    # Plot pseudo-healthy slice (skip channel dim if present)
+                    im0 = axs[0].imshow(pseudo_healthy_np[z], cmap='gray')
                     axs[0].set_title(f'Pseudo-healthy (z={z})')
                     plt.colorbar(im0, ax=axs[0], fraction=0.046, pad=0.04)
                     
                     # Plot label slice
-                    slice_lbl = label_np[z]
-                    print(f"Label slice shape: {slice_lbl.shape}")
-                    im1 = axs[1].imshow(slice_lbl, cmap='Reds')
+                    im1 = axs[1].imshow(label_np[z], cmap='Reds')
                     axs[1].set_title(f'Lesion Mask')
                     plt.colorbar(im1, ax=axs[1], fraction=0.046, pad=0.04)
                     
                     # Plot output slice
-                    slice_out = output_np[z]
-                    print(f"Output slice shape: {slice_out.shape}")
-                    im2 = axs[2].imshow(slice_out, cmap='gray')
+                    im2 = axs[2].imshow(output_np[z], cmap='gray')
                     axs[2].set_title(f'Inpainted Output')
                     plt.colorbar(im2, ax=axs[2], fraction=0.046, pad=0.04)
                     
                     # Plot target slice
-                    slice_tgt = target_np[z]
-                    print(f"Target slice shape: {slice_tgt.shape}")
-                    im3 = axs[3].imshow(slice_tgt, cmap='gray')
+                    im3 = axs[3].imshow(target_np[z], cmap='gray')
                     axs[3].set_title(f'Target ADC')
                     plt.colorbar(im3, ax=axs[3], fraction=0.046, pad=0.04)
                     
-                    plt.tight_layout()
+                    # Add a note if this slice contains any lesion
+                    has_lesion = np.any(label_np[z] > 0)
+                    if has_lesion:
+                        plt.figtext(0.5, 0.01, "This slice contains lesion", ha='center', fontsize=12, 
+                                    bbox={'facecolor': 'yellow', 'alpha': 0.5, 'pad': 5})
+                    
+                    plt.tight_layout(rect=[0, 0.03, 1, 1])  # Make room for the text at the bottom
                     pdf.savefig(fig)
                     plt.close(fig)
                     
                     slices_added = True
-                    print(f"Successfully added slice {z} to PDF")
                     
                 except Exception as slice_error:
                     print(f"Error visualizing slice {z}: {slice_error}")
@@ -1236,45 +1227,35 @@ def visualize_results(pseudo_healthy, label, output, target, output_path):
                     # Try to add a simple error slide instead
                     try:
                         error_fig, error_ax = plt.subplots(figsize=(8, 6))
-                        error_ax.text(0.5, 0.5, f"Error processing slice {z}", ha='center', va='center', fontsize=20)
+                        error_ax.text(0.5, 0.5, f"Error processing slice {z}: {str(slice_error)}", ha='center', va='center', fontsize=12, wrap=True)
                         error_ax.axis('off')
                         pdf.savefig(error_fig)
                         plt.close(error_fig)
-                        slices_added = True
-                    except:
-                        # If that fails too, try to use the fallback figure
-                        try:
-                            if 'fallback_fig' in locals():
-                                pdf.savefig(fallback_fig)
-                                slices_added = True
-                        except:
-                            pass
+                    except Exception as error_fig_error:
+                        print(f"Could not create error figure: {error_fig_error}")
             
-            # If no slices were added, add a fallback page
-            if not slices_added and 'fallback_fig' in locals():
-                try:
-                    pdf.savefig(fallback_fig)
-                    print("Added fallback page because no slices could be processed")
-                except Exception as fallback_save_err:
-                    print(f"Error saving fallback page: {fallback_save_err}")
-            
-            # Close fallback figure if it exists
-            if 'fallback_fig' in locals():
-                try:
-                    plt.close(fallback_fig)
-                except:
-                    pass
-            
-            # Save a confirmation page
+            # Add a summary page at the end
             try:
                 summary_fig, summary_ax = plt.subplots(figsize=(8, 6))
-                summary_text = f"Visualization Complete\n\n{len(lesion_slices)} slices processed\n{slices_added}"
-                summary_ax.text(0.5, 0.5, summary_text, ha='center', va='center', fontsize=20)
+                
+                # Count how many slices have lesions
+                if len(label_np.shape) == 3:  # [D, H, W]
+                    lesion_count = sum(1 for z in range(depth) if np.any(label_np[z] > 0))
+                else:
+                    lesion_count = 0
+                
+                summary_text = (
+                    f"Visualization Complete\n\n"
+                    f"Total slices: {depth}\n"
+                    f"Slices with lesions: {lesion_count}\n"
+                    f"Slices visualized: {len(slices_to_visualize)}"
+                )
+                summary_ax.text(0.5, 0.5, summary_text, ha='center', va='center', fontsize=14)
                 summary_ax.axis('off')
                 pdf.savefig(summary_fig)
                 plt.close(summary_fig)
-            except Exception as confirm_error:
-                print(f"Error adding confirmation page: {confirm_error}")
+            except Exception as summary_error:
+                print(f"Error creating summary page: {summary_error}")
         
         # Verify the PDF was created successfully
         import os
@@ -1292,7 +1273,7 @@ def visualize_results(pseudo_healthy, label, output, target, output_path):
         try:
             with PdfPages(output_path) as pdf:
                 fig, ax = plt.subplots(figsize=(8, 6))
-                ax.text(0.5, 0.5, f"Visualization Error:\n{str(e)}", ha='center', va='center', fontsize=16)
+                ax.text(0.5, 0.5, f"Visualization Error:\n{str(e)}", ha='center', va='center', fontsize=16, wrap=True)
                 ax.axis('off')
                 pdf.savefig(fig)
                 plt.close(fig)
