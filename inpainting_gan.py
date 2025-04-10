@@ -1109,47 +1109,82 @@ def visualize_results(pseudo_healthy, label, output, target, output_path):
     """
     Visualize results by creating a PDF with slice-by-slice comparisons
     """
-    # Convert tensors to numpy arrays
-    pseudo_healthy = pseudo_healthy.detach().cpu().numpy()[0]  # Remove channel dim
-    label = label.detach().cpu().numpy()[0]
-    output = output.detach().cpu().numpy()[0]
-    target = target.detach().cpu().numpy()[0]
-    
-    # Create PDF
-    with PdfPages(output_path) as pdf:
-        # Only include slices that have lesions
-        lesion_slices = np.where(np.sum(label, axis=(1, 2)) > 0)[0]
+    try:
+        # Convert tensors to numpy arrays
+        pseudo_healthy = pseudo_healthy.detach().cpu().numpy()[0]  # Remove channel dim
+        label = label.detach().cpu().numpy()[0]
+        output = output.detach().cpu().numpy()[0]
+        target = target.detach().cpu().numpy()[0]
         
-        if len(lesion_slices) == 0:
-            # If no lesion slices, show a few random slices
-            lesion_slices = np.linspace(0, label.shape[0]-1, 5, dtype=int)
+        # Create PDF
+        with PdfPages(output_path) as pdf:
+            # Only include slices that have lesions
+            lesion_slices = np.where(np.sum(label, axis=(1, 2)) > 0)[0]
+            
+            if len(lesion_slices) == 0:
+                # If no lesion slices, show a few random slices
+                lesion_slices = np.linspace(0, label.shape[0]-1, 5, dtype=int)
+            
+            print(f"Generating PDF with {len(lesion_slices)} slices")
+            
+            for z in lesion_slices:
+                try:
+                    fig, axs = plt.subplots(1, 4, figsize=(16, 4))
+                    
+                    # Plot pseudo-healthy
+                    im0 = axs[0].imshow(pseudo_healthy[z], cmap='gray')
+                    axs[0].set_title(f'Pseudo-healthy (z={z})')
+                    plt.colorbar(im0, ax=axs[0], fraction=0.046, pad=0.04)
+                    
+                    # Plot label
+                    im1 = axs[1].imshow(label[z], cmap='Reds')
+                    axs[1].set_title(f'Lesion Mask')
+                    plt.colorbar(im1, ax=axs[1], fraction=0.046, pad=0.04)
+                    
+                    # Plot output
+                    im2 = axs[2].imshow(output[z], cmap='gray')
+                    axs[2].set_title(f'Inpainted Output')
+                    plt.colorbar(im2, ax=axs[2], fraction=0.046, pad=0.04)
+                    
+                    # Plot target
+                    im3 = axs[3].imshow(target[z], cmap='gray')
+                    axs[3].set_title(f'Target ADC')
+                    plt.colorbar(im3, ax=axs[3], fraction=0.046, pad=0.04)
+                    
+                    plt.tight_layout()
+                    pdf.savefig(fig)
+                    plt.close(fig)  # Explicitly close the figure
+                except Exception as slice_error:
+                    print(f"Error visualizing slice {z}: {slice_error}")
+                    if 'fig' in locals():
+                        plt.close(fig)
+                    continue
+            
+            # Save a confirmation page to ensure PDF is properly completed
+            try:
+                fig, ax = plt.subplots(figsize=(8, 6))
+                ax.text(0.5, 0.5, "Visualization Complete", ha='center', va='center', fontsize=20)
+                ax.axis('off')
+                pdf.savefig(fig)
+                plt.close(fig)
+            except Exception as confirm_error:
+                print(f"Error adding confirmation page: {confirm_error}")
+                if 'fig' in locals():
+                    plt.close(fig)
+            
+        print(f"PDF visualization successfully saved to {output_path}")
         
-        for z in lesion_slices:
-            fig, axs = plt.subplots(1, 4, figsize=(16, 4))
+        # Verify the PDF was created successfully
+        import os
+        if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+            print(f"PDF file verified: {output_path} ({os.path.getsize(output_path)} bytes)")
+        else:
+            print(f"Warning: PDF file may not have been created properly: {output_path}")
             
-            # Plot pseudo-healthy
-            im0 = axs[0].imshow(pseudo_healthy[z], cmap='gray')
-            axs[0].set_title(f'Pseudo-healthy (z={z})')
-            plt.colorbar(im0, ax=axs[0], fraction=0.046, pad=0.04)
-            
-            # Plot label
-            im1 = axs[1].imshow(label[z], cmap='Reds')
-            axs[1].set_title(f'Lesion Mask')
-            plt.colorbar(im1, ax=axs[1], fraction=0.046, pad=0.04)
-            
-            # Plot output
-            im2 = axs[2].imshow(output[z], cmap='gray')
-            axs[2].set_title(f'Inpainted Output')
-            plt.colorbar(im2, ax=axs[2], fraction=0.046, pad=0.04)
-            
-            # Plot target
-            im3 = axs[3].imshow(target[z], cmap='gray')
-            axs[3].set_title(f'Target ADC')
-            plt.colorbar(im3, ax=axs[3], fraction=0.046, pad=0.04)
-            
-            plt.tight_layout()
-            pdf.savefig(fig)
-            plt.close()
+    except Exception as e:
+        print(f"Failed to create PDF visualization: {e}")
+        import traceback
+        traceback.print_exc()
 
 def inference(args):
     """
