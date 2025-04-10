@@ -100,9 +100,11 @@ class LesionInpaintingDataset(Dataset):
         return data_dict
 
 class PatchExtractor:
-    def __init__(self, patch_size=(64, 64, 32), overlap=0.5):
+    def __init__(self, patch_size=(64, 64, 32), overlap=0.5, augment_patches=True, num_augmented_patches=3):
         self.patch_size = patch_size
         self.overlap = overlap
+        self.augment_patches = augment_patches
+        self.num_augmented_patches = num_augmented_patches
     
     def extract_patches_with_lesions(self, pseudo_healthy, label, adc, max_attempts=3, current_attempt=0):
         """
@@ -139,7 +141,7 @@ class PatchExtractor:
             label_patch = label[:, 
                               z_start:z_start+self.patch_size[0], 
                               y_start:y_start+self.patch_size[1], 
-                              x_start:x_start+self.patch_size[2]]
+                              x_start:z_start+self.patch_size[2]]
             
             adc_patch = adc[:, 
                           z_start:z_start+self.patch_size[0], 
@@ -154,16 +156,30 @@ class PatchExtractor:
             
             return [ph_patch], [label_patch], [adc_patch], [(z_start, y_start, x_start)]
         
-        # Cluster lesion voxels to find lesion centers
-        centers = self._cluster_lesion_voxels(non_zero_indices)
+        # Get bounding box of the lesion to ensure we capture entire lesions
+        z_indices = non_zero_indices[:, 0]
+        y_indices = non_zero_indices[:, 1]
+        x_indices = non_zero_indices[:, 2]
+        
+        z_min, z_max = z_indices.min().item(), z_indices.max().item()
+        y_min, y_max = y_indices.min().item(), y_indices.max().item()
+        x_min, x_max = x_indices.min().item(), x_indices.max().item()
+        
+        # Calculate lesion center
+        z_center = (z_min + z_max) // 2
+        y_center = (y_min + y_max) // 2
+        x_center = (x_min + x_max) // 2
+        
+        # Cluster lesion voxels to find centers of multiple lesions
+        lesion_centers = self._cluster_lesion_voxels(non_zero_indices)
         
         patches_ph, patches_label, patches_adc, patch_coords = [], [], [], []
         
         # Extract patches around each lesion center
-        for center in centers:
+        for center in lesion_centers:
             z, y, x = center
             
-            # Calculate patch start coordinates
+            # Calculate base patch coordinates centered on the lesion
             z_start = max(0, z - self.patch_size[0] // 2)
             y_start = max(0, y - self.patch_size[1] // 2)
             x_start = max(0, x - self.patch_size[2] // 2)
@@ -173,34 +189,20 @@ class PatchExtractor:
             y_start = min(y_start, pseudo_healthy.shape[2] - self.patch_size[1])
             x_start = min(x_start, pseudo_healthy.shape[3] - self.patch_size[2])
             
-            # Extract patches
-            ph_patch = pseudo_healthy[:, 
-                                     z_start:z_start+self.patch_size[0], 
-                                     y_start:y_start+self.patch_size[1], 
-                                     x_start:x_start+self.patch_size[2]]
+            # Extract base patch
+            self._extract_and_add_patch(
+                pseudo_healthy, label, adc, 
+                z_start, y_start, x_start,
+                patches_ph, patches_label, patches_adc, patch_coords
+            )
             
-            label_patch = label[:, 
-                              z_start:z_start+self.patch_size[0], 
-                              y_start:y_start+self.patch_size[1], 
-                              x_start:x_start+self.patch_size[2]]
-            
-            adc_patch = adc[:, 
-                          z_start:z_start+self.patch_size[0], 
-                          y_start:y_start+self.patch_size[1], 
-                          x_start:x_start+self.patch_size[2]]
-            
-            # Pad if necessary
-            if ph_patch.shape[1:] != self.patch_size:
-                ph_patch = self._pad_patch(ph_patch)
-                label_patch = self._pad_patch(label_patch)
-                adc_patch = self._pad_patch(adc_patch)
-            
-            # Only add patch if it contains lesion
-            if label_patch.sum() > 0:
-                patches_ph.append(ph_patch)
-                patches_label.append(label_patch)
-                patches_adc.append(adc_patch)
-                patch_coords.append((z_start, y_start, x_start))
+            # Generate augmented patches with different offsets
+            if self.augment_patches:
+                self._generate_augmented_patches(
+                    pseudo_healthy, label, adc,
+                    z, y, x,  # Lesion center
+                    patches_ph, patches_label, patches_adc, patch_coords
+                )
         
         # If no patches with lesions were found, try again with a slight variation
         # but limit the number of recursive attempts to avoid stack overflow
@@ -244,6 +246,82 @@ class PatchExtractor:
             return [ph_patch], [label_patch], [adc_patch], [(z_start, y_start, x_start)]
         
         return patches_ph, patches_label, patches_adc, patch_coords
+    
+    def _extract_and_add_patch(self, pseudo_healthy, label, adc, z_start, y_start, x_start, 
+                              patches_ph, patches_label, patches_adc, patch_coords):
+        """Helper method to extract a patch and add it to collections if it contains lesions"""
+        # Extract patches
+        ph_patch = pseudo_healthy[:, 
+                                 z_start:z_start+self.patch_size[0], 
+                                 y_start:y_start+self.patch_size[1], 
+                                 x_start:x_start+self.patch_size[2]]
+        
+        label_patch = label[:, 
+                          z_start:z_start+self.patch_size[0], 
+                          y_start:y_start+self.patch_size[1], 
+                          x_start:x_start+self.patch_size[2]]
+        
+        adc_patch = adc[:, 
+                      z_start:z_start+self.patch_size[0], 
+                      y_start:y_start+self.patch_size[1], 
+                      x_start:x_start+self.patch_size[2]]
+        
+        # Pad if necessary
+        if ph_patch.shape[1:] != self.patch_size:
+            ph_patch = self._pad_patch(ph_patch)
+            label_patch = self._pad_patch(label_patch)
+            adc_patch = self._pad_patch(adc_patch)
+        
+        # Only add patch if it contains lesion
+        if label_patch.sum() > 0:
+            patches_ph.append(ph_patch)
+            patches_label.append(label_patch)
+            patches_adc.append(adc_patch)
+            patch_coords.append((z_start, y_start, x_start))
+            return True
+        return False
+    
+    def _generate_augmented_patches(self, pseudo_healthy, label, adc, center_z, center_y, center_x, 
+                                   patches_ph, patches_label, patches_adc, patch_coords):
+        """Generate multiple augmented patches around a lesion center with various offsets"""
+        # Define various offsets to capture the lesion from different angles
+        # These offsets are relative to the center and give different context around the lesion
+        offsets = []
+        
+        # Add offsets with different shifts in each dimension
+        for i in range(self.num_augmented_patches):
+            # Random offset in each dimension, but not too large to lose the lesion
+            z_offset = random.randint(-self.patch_size[0]//4, self.patch_size[0]//4)
+            y_offset = random.randint(-self.patch_size[1]//4, self.patch_size[1]//4)
+            x_offset = random.randint(-self.patch_size[2]//4, self.patch_size[2]//4)
+            offsets.append((z_offset, y_offset, x_offset))
+        
+        # Add diagonal offsets to see lesion from corner views
+        offsets.extend([
+            (self.patch_size[0]//6, self.patch_size[1]//6, self.patch_size[2]//6),
+            (-self.patch_size[0]//6, -self.patch_size[1]//6, -self.patch_size[2]//6),
+            (self.patch_size[0]//6, -self.patch_size[1]//6, self.patch_size[2]//6),
+            (-self.patch_size[0]//6, self.patch_size[1]//6, -self.patch_size[2]//6)
+        ])
+        
+        # Generate augmented patches with each offset
+        for z_offset, y_offset, x_offset in offsets:
+            # Calculate new patch start coordinates with offset
+            z_start = max(0, center_z - self.patch_size[0]//2 + z_offset)
+            y_start = max(0, center_y - self.patch_size[1]//2 + y_offset)
+            x_start = max(0, center_x - self.patch_size[2]//2 + x_offset)
+            
+            # Adjust if patch exceeds volume boundaries
+            z_start = min(z_start, pseudo_healthy.shape[1] - self.patch_size[0])
+            y_start = min(y_start, pseudo_healthy.shape[2] - self.patch_size[1])
+            x_start = min(x_start, pseudo_healthy.shape[3] - self.patch_size[2])
+            
+            # Extract and add the patch
+            self._extract_and_add_patch(
+                pseudo_healthy, label, adc, 
+                z_start, y_start, x_start,
+                patches_ph, patches_label, patches_adc, patch_coords
+            )
     
     def _cluster_lesion_voxels(self, non_zero_indices, min_distance=16):
         """Simple clustering of lesion voxels to find centers"""
@@ -533,9 +611,6 @@ def train(args):
                 avg_batch_loss = batch_loss / len(patches_ph)
                 epoch_loss += avg_batch_loss
                 
-                if batch_idx % 5 == 0:
-                    print(f"Batch {batch_idx}, Loss: {avg_batch_loss:.4f}")
-        
         avg_epoch_loss = epoch_loss / max(1, len(train_loader))
         print(f"Epoch {epoch+1}, Average Loss: {avg_epoch_loss:.4f}")
         
