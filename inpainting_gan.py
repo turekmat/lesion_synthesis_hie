@@ -371,6 +371,15 @@ class LesionInpaintingDataset(Dataset):
         if self.transform:
             sample = self.transform(sample)
         
+        # Převést data na torch tenzory s přidáním kanálové dimenze
+        for key in ['pseudo_healthy', 'adc', 'lesion_mask']:
+            if isinstance(sample[key], np.ndarray):
+                # Převést numpy array na torch tensor a přidat kanálovou dimenzi
+                sample[key] = torch.from_numpy(sample[key]).unsqueeze(0)
+            elif isinstance(sample[key], torch.Tensor) and sample[key].ndim == 3:
+                # Pokud je to už tensor, ale bez kanálové dimenze, přidáme ji
+                sample[key] = sample[key].unsqueeze(0)
+        
         return sample
 
 class Generator(nn.Module):
@@ -533,12 +542,19 @@ class Generator(nn.Module):
         Forward pass generátoru s vylepšeným přechodem na hraně masky
         
         Args:
-            pseudo_healthy (torch.Tensor): Tensor pseudo-zdravého mozku [B, 1, D, H, W]
-            lesion_mask (torch.Tensor): Tensor binární masky léze [B, 1, D, H, W]
+            pseudo_healthy (torch.Tensor): Tensor pseudo-zdravého mozku [B, 1, D, H, W] nebo [B, D, H, W]
+            lesion_mask (torch.Tensor): Tensor binární masky léze [B, 1, D, H, W] nebo [B, D, H, W]
         
         Returns:
             torch.Tensor: Generovaná ADC mapa léze [B, 1, D, H, W]
         """
+        # Kontrola a úprava tvaru vstupů - zajistíme 5D tensory [B, C, D, H, W]
+        if pseudo_healthy.ndim == 4:
+            pseudo_healthy = pseudo_healthy.unsqueeze(1)  # Přidáme kanálovou dimenzi
+            
+        if lesion_mask.ndim == 4:
+            lesion_mask = lesion_mask.unsqueeze(1)  # Přidáme kanálovou dimenzi
+        
         # Kontrola minimální velikosti vstupu
         min_size = self.min_input_size
         d, h, w = pseudo_healthy.shape[2:5]
@@ -711,13 +727,23 @@ class Discriminator(nn.Module):
         Forward pass diskriminátoru
         
         Args:
-            pseudo_healthy (torch.Tensor): Tensor pseudo-zdravého mozku [B, 1, D, H, W]
-            lesion_mask (torch.Tensor): Tensor binární masky léze [B, 1, D, H, W]
-            adc_map (torch.Tensor): Tensor ADC mapy (reálné nebo generované) [B, 1, D, H, W]
+            pseudo_healthy (torch.Tensor): Tensor pseudo-zdravého mozku [B, 1, D, H, W] nebo [B, D, H, W]
+            lesion_mask (torch.Tensor): Tensor binární masky léze [B, 1, D, H, W] nebo [B, D, H, W]
+            adc_map (torch.Tensor): Tensor ADC mapy (reálné nebo generované) [B, 1, D, H, W] nebo [B, D, H, W]
         
         Returns:
             torch.Tensor: Mapa skóre pravděpodobnosti reálné/generované léze [B, 1, D', H', W']
         """
+        # Kontrola a úprava tvarů vstupů - zajistíme 5D tensory [B, C, D, H, W]
+        if pseudo_healthy.ndim == 4:
+            pseudo_healthy = pseudo_healthy.unsqueeze(1)  # Přidáme kanálovou dimenzi
+            
+        if lesion_mask.ndim == 4:
+            lesion_mask = lesion_mask.unsqueeze(1)  # Přidáme kanálovou dimenzi
+            
+        if adc_map.ndim == 4:
+            adc_map = adc_map.unsqueeze(1)  # Přidáme kanálovou dimenzi
+        
         # Kontrola minimální velikosti vstupu
         min_size = self.min_input_size
         d, h, w = pseudo_healthy.shape[2:5]
@@ -1020,12 +1046,13 @@ class LesionInpaintingGAN(nn.Module):
         Forward pass celého modelu
         
         Args:
-            pseudo_healthy (torch.Tensor): Pseudo-zdravý mozek [B, 1, D, H, W]
-            lesion_mask (torch.Tensor): Binární maska léze [B, 1, D, H, W]
+            pseudo_healthy (torch.Tensor): Pseudo-zdravý mozek [B, 1, D, H, W] nebo [B, D, H, W]
+            lesion_mask (torch.Tensor): Binární maska léze [B, 1, D, H, W] nebo [B, D, H, W]
         
         Returns:
             torch.Tensor: Generovaná ADC mapa s lézí [B, 1, D, H, W]
         """
+        # Kontrola a úprava tvarů vstupů je už implementována v metodě Generator.forward
         return self.generator(pseudo_healthy, lesion_mask)
 
 class LesionInpaintingTrainer:
