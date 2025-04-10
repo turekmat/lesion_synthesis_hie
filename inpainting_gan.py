@@ -630,8 +630,25 @@ class Discriminator(nn.Module):
         if d < min_size or h < min_size or w < min_size:
             print(f"Warning: Input size {(d, h, w)} is smaller than minimum size {min_size}. Results may be unpredictable.")
         
-        # Spojit všechny vstupy pro diskriminátor
+        # Kontrola a úprava dimenzí vstupů
+        # Zajistíme, že každý vstup má přesně 1 kanál
+        if pseudo_healthy.shape[1] != 1:
+            print(f"Warning: Unexpected pseudo_healthy channels: {pseudo_healthy.shape[1]}, using only first channel")
+            pseudo_healthy = pseudo_healthy[:, 0:1]
+            
+        if lesion_mask.shape[1] != 1:
+            print(f"Warning: Unexpected lesion_mask channels: {lesion_mask.shape[1]}, using only first channel")
+            lesion_mask = lesion_mask[:, 0:1]
+            
+        if adc_map.shape[1] != 1:
+            print(f"Warning: Unexpected adc_map channels: {adc_map.shape[1]}, using only first channel")
+            adc_map = adc_map[:, 0:1]
+        
+        # Spojit všechny vstupy pro diskriminátor - nyní by měly mít správné dimenze
         x = torch.cat([pseudo_healthy, lesion_mask, adc_map], dim=1)
+        
+        # Debug informace o tvaru výsledného tenzoru
+        # print(f"Discriminator input shape after concatenation: {x.shape}")
         
         # Získat mapu skóre
         return self.model(x)
@@ -1047,7 +1064,7 @@ class LesionInpaintingTrainer:
                 patient_id = batch['patient_id'][0]
                 
                 # Generovat falešnou ADC mapu
-                fake_adc = self.model(pseudo_healthy, lesion_mask)
+                fake_adc = self.model.generator(pseudo_healthy, lesion_mask)
                 
                 # Výpočet SSIM a MAE na celém objemu
                 # Počítáme SSIM v oblasti léze
@@ -1152,11 +1169,21 @@ class LesionInpaintingTrainer:
         # Progress bar pro sledování průběhu
         pbar = tqdm(dataloader, desc=f"Epoch {epoch}")
         
-        for batch in pbar:
+        # Flag pro debug výpisy - nastavit na True pouze při diagnostice
+        debug_first_batch = True
+        
+        for batch_idx, batch in enumerate(pbar):
             # Přesunout data na správné zařízení
             pseudo_healthy = batch['pseudo_healthy'].to(self.device)
             lesion_mask = batch['lesion_mask'].to(self.device)
             real_adc = batch['adc'].to(self.device)
+            
+            # Debug výpisy pro diagnostiku
+            if batch_idx == 0 and debug_first_batch:
+                print(f"\nDEBUG - Input shapes:")
+                print(f"pseudo_healthy: {pseudo_healthy.shape}")
+                print(f"lesion_mask: {lesion_mask.shape}")
+                print(f"real_adc: {real_adc.shape}")
             
             # ===== Trénink diskriminátoru =====
             self.optimizer_d.zero_grad()
@@ -1165,9 +1192,43 @@ class LesionInpaintingTrainer:
             with torch.amp.autocast('cuda') if self.use_amp else nullcontext():
                 fake_adc = self.model.generator(pseudo_healthy, lesion_mask)
                 
+                # Debug výpisy pro diagnostiku
+                if batch_idx == 0 and debug_first_batch:
+                    print(f"fake_adc shape after generator: {fake_adc.shape}")
+                
+                # Kontrola a zajištění správných tvarů tensorů před předáním diskriminátoru
+                if pseudo_healthy.shape[1] != 1:
+                    pseudo_healthy_d = pseudo_healthy[:, 0:1]
+                else:
+                    pseudo_healthy_d = pseudo_healthy
+                    
+                if lesion_mask.shape[1] != 1:
+                    lesion_mask_d = lesion_mask[:, 0:1]
+                else:
+                    lesion_mask_d = lesion_mask
+                    
+                if real_adc.shape[1] != 1:
+                    real_adc_d = real_adc[:, 0:1]
+                else:
+                    real_adc_d = real_adc
+                    
+                if fake_adc.shape[1] != 1:
+                    fake_adc_d = fake_adc[:, 0:1]
+                else:
+                    fake_adc_d = fake_adc
+                
+                # Debug výpisy pro diagnostiku
+                if batch_idx == 0 and debug_first_batch:
+                    print(f"\nDEBUG - Processed tensor shapes for discriminator:")
+                    print(f"pseudo_healthy_d: {pseudo_healthy_d.shape}")
+                    print(f"lesion_mask_d: {lesion_mask_d.shape}")
+                    print(f"real_adc_d: {real_adc_d.shape}")
+                    print(f"fake_adc_d: {fake_adc_d.shape}")
+                    debug_first_batch = False  # Pouze pro první batch
+                
                 # Predikce diskriminátoru pro reálná a falešná data
-                disc_real_pred = self.model.discriminator(pseudo_healthy, lesion_mask, real_adc)
-                disc_fake_pred = self.model.discriminator(pseudo_healthy, lesion_mask, fake_adc.detach())
+                disc_real_pred = self.model.discriminator(pseudo_healthy_d, lesion_mask_d, real_adc_d)
+                disc_fake_pred = self.model.discriminator(pseudo_healthy_d, lesion_mask_d, fake_adc_d.detach())
                 
                 # Loss diskriminátoru
                 d_loss = self.model.discriminator_loss(
@@ -1190,8 +1251,13 @@ class LesionInpaintingTrainer:
             with torch.amp.autocast('cuda') if self.use_amp else nullcontext():
                 fake_adc = self.model.generator(pseudo_healthy, lesion_mask)
                 
-                # Predikce diskriminátoru pro falešná data
-                disc_fake_pred = self.model.discriminator(pseudo_healthy, lesion_mask, fake_adc)
+                # Predikce diskriminátoru pro falešná data s kontrolou tvarů
+                if fake_adc.shape[1] != 1:
+                    fake_adc_d = fake_adc[:, 0:1]
+                else:
+                    fake_adc_d = fake_adc
+                
+                disc_fake_pred = self.model.discriminator(pseudo_healthy_d, lesion_mask_d, fake_adc_d)
                 
                 # Loss generátoru
                 g_loss, g_adv_loss, g_l1_loss, g_identity_loss, g_ssim_loss, g_edge_loss = \
@@ -1295,8 +1361,29 @@ class LesionInpaintingTrainer:
                     # Generování falešných ADC map
                     fake_adc = self.model.generator(pseudo_healthy, lesion_mask)
                     
+                    # Kontrola a zajištění správných tvarů tensorů před předáním diskriminátoru
+                    if pseudo_healthy.shape[1] != 1:
+                        pseudo_healthy_d = pseudo_healthy[:, 0:1]
+                    else:
+                        pseudo_healthy_d = pseudo_healthy
+                        
+                    if lesion_mask.shape[1] != 1:
+                        lesion_mask_d = lesion_mask[:, 0:1]
+                    else:
+                        lesion_mask_d = lesion_mask
+                        
+                    if real_adc.shape[1] != 1:
+                        real_adc_d = real_adc[:, 0:1]
+                    else:
+                        real_adc_d = real_adc
+                        
+                    if fake_adc.shape[1] != 1:
+                        fake_adc_d = fake_adc[:, 0:1]
+                    else:
+                        fake_adc_d = fake_adc
+                    
                     # Generator loss
-                    disc_fake_pred = self.model.discriminator(pseudo_healthy, lesion_mask, fake_adc)
+                    disc_fake_pred = self.model.discriminator(pseudo_healthy_d, lesion_mask_d, fake_adc_d)
                     
                     # Výpočet loss pro generátor se správnými argumenty
                     g_loss, g_adv_loss, g_l1_loss, g_identity_loss, g_ssim_loss, g_edge_loss = \
@@ -1306,9 +1393,9 @@ class LesionInpaintingTrainer:
                     
                     # Výpočet loss pro diskriminátor
                     # Získat predikci pro reálná data
-                    disc_real_pred = self.model.discriminator(pseudo_healthy, lesion_mask, real_adc)
+                    disc_real_pred = self.model.discriminator(pseudo_healthy_d, lesion_mask_d, real_adc_d)
                     d_loss = self.model.discriminator_loss(
-                        pseudo_healthy, lesion_mask, real_adc, fake_adc,
+                        pseudo_healthy, lesion_mask, real_adc, fake_adc, 
                         disc_real_pred, disc_fake_pred
                     )
                 
