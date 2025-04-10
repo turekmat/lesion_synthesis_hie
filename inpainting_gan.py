@@ -399,6 +399,11 @@ class LesionInpaintingDataset(Dataset):
             print(f"DEBUG: Finální tvary: pseudo_healthy={sample['pseudo_healthy'].shape}, "
                   f"adc={sample['adc'].shape}, lesion_mask={sample['lesion_mask'].shape}")
         
+        # Print each 50th sample shape to track diversity
+        if idx % 50 == 0:
+            print(f"Sample {idx} shapes: pseudo_healthy={sample['pseudo_healthy'].shape}, "
+                  f"adc={sample['adc'].shape}, lesion_mask={sample['lesion_mask'].shape}")
+        
         return sample
 
 class Generator(nn.Module):
@@ -1816,21 +1821,13 @@ def train_model(args):
             # Definice transformací pro data augmentaci
             train_transforms = Compose([
                 # Náhodné rotace o 90 stupňů v rovině (2D řezy)
-                # DŮLEŽITÉ: spatial_axes parametr závisí na formátu dat v době aplikace transformace
-                # Pro data ve formátu [C, D, H, W] (s kanálovou dimenzí):
-                #   - (1, 2) = rotace v rovině D-H (sagitální)
-                #   - (1, 3) = rotace v rovině D-W (koronální)
-                #   - (2, 3) = rotace v rovině H-W (axiální)
-                # Pro data ve formátu [D, H, W] (bez kanálové dimenze):
-                #   - (0, 1) = rotace v rovině D-H (sagitální)
-                #   - (0, 2) = rotace v rovině D-W (koronální)
-                #   - (1, 2) = rotace v rovině H-W (axiální)
-                RandRotate90d(
-                    keys=keys,
-                    prob=args.aug_rotate_prob,
-                    max_k=3,  # maximálně 3 rotace (0, 90, 180, 270 stupňů)
-                    spatial_axes=(0, 1)  # Opraveno - používáme (0, 1) pro první dvě dimenze
-                ),
+                # DŮLEŽITÉ: Odstraňujeme RandRotate90d, která způsobuje problémy s různými tvary
+                # RandRotate90d(
+                #     keys=keys,
+                #     prob=args.aug_rotate_prob,
+                #     max_k=3,  # maximálně 3 rotace (0, 90, 180, 270 stupňů)
+                #     spatial_axes=(0, 1)  # Opraveno - používáme (0, 1) pro první dvě dimenze
+                # ),
                 
                 # Náhodné překlápění (zrcadlení)
                 RandFlipd(
@@ -1881,273 +1878,33 @@ def train_model(args):
     print(f"ADC soubory: {adc_files[:5] if adc_files else []}... (zobrazeno prvních 5)")
     print(f"Lesion mask soubory: {lesion_files[:5] if lesion_files else []}... (zobrazeno prvních 5)")
     
-    # Načíst dataset
-    patch_size = None
-    if args.use_patches:
-        # Převeďte string na tuple celých čísel
-        patch_size = tuple(map(int, args.patch_size.split(',')))
-        print(f"Používám patch-based training s velikostí patche: {patch_size}")
-    
-    train_dataset = LesionInpaintingDataset(
-        pseudo_healthy_dir=args.pseudo_healthy_dir,
-        adc_dir=args.adc_dir,
-        lesion_mask_dir=args.lesion_mask_dir,
-        norm_range=(0, 1),
-        crop_foreground=args.crop_foreground,
-        transform=train_transforms,
-        patch_size=patch_size,
-        use_patches=args.use_patches
-    )
-    
-    # Kontrola, zda máme dostatek dat pro trénink
-    if len(train_dataset.file_triplets) == 0:
-        print("ERROR: Nebyly nalezeny žádné kompletní triplety souborů pro trénink.")
-        print("Zkontrolujte cesty k adresářům a formáty názvů souborů.")
-        print("Očekávaný formát ADC souborů: {patient_id}*-ADC_ss.mha")
-        print("Očekávaný formát lesion mask souborů: {patient_id}*_lesion.mha")
-        print("Ukončuji trénink.")
-        return
-    
-    # Rozdělit dataset na trénovací a validační část
-    dataset_size = len(train_dataset)
-    val_size = max(1, int(dataset_size * args.val_ratio))
-    train_size = dataset_size - val_size
-    
-    # Zajistit, že máme alespoň jeden vzorek pro trénování a jeden pro validaci
-    if train_size <= 0 or val_size <= 0:
-        print(f"ERROR: Nedostatek dat pro rozdělení na trénovací a validační část. Dataset má pouze {dataset_size} vzorků.")
-        print("Upravte val_ratio nebo použijte větší dataset.")
-        print("Ukončuji trénink.")
-        return
-    
-    # Najděme index pacienta MGHNICU_405, aby byl vždy ve validační sadě
-    mghnicu_405_index = None
-    for i, triplet in enumerate(train_dataset.file_triplets):
-        if 'MGHNICU_405' in triplet['patient_id']:
-            mghnicu_405_index = i
-            print(f"Nalezen pacient MGHNICU_405 na indexu {i}, bude vždy použit pro validaci")
-            break
-    
-    # Pro validační dataset nepoužíváme augmentace, musíme proto vytvořit nový dataset pro validaci
-    if args.use_augmentations and val_size > 0:
-        # Vytvoříme indexy pro rozdělení datasetu
-        indices = list(range(dataset_size))
+    # Definujeme vlastní collate funkci pro řešení problému s různými tvary tenzorů
+    def custom_collate_fn(batch):
+        """
+        Vlastní collate funkce, která upraví všechny tenzory na stejný tvar, než je seskupí.
+        Řeší problém 'stack expects each tensor to be equal size' když RandRotate90d změní tvar.
+        """
+        # Extrakt všech klíčů z prvního vzorku
+        keys = batch[0].keys()
         
-        # Zamíchat indexy a rozdělit je na trénovací a validační
-        np.random.seed(args.seed)
-        np.random.shuffle(indices)
-        
-        # Pokud jsme našli MGHNICU_405, zajistit, že je ve validační sadě
-        if mghnicu_405_index is not None:
-            # Odstranit MGHNICU_405 z indexů, pokud tam je
-            if mghnicu_405_index in indices:
-                indices.remove(mghnicu_405_index)
-            
-            # Rozdělit zbytek indexů
-            train_indices = indices[:train_size]
-            val_indices = indices[train_size:train_size + val_size - 1]  # Rezervovat místo pro MGHNICU_405
-            
-            # Přidat MGHNICU_405 do validační sady
-            val_indices.append(mghnicu_405_index)
-        else:
-            # Standardní rozdělení, pokud MGHNICU_405 není nalezen
-            train_indices = indices[:train_size]
-            val_indices = indices[train_size:train_size + val_size]
-        
-        # Vytvoříme zvlášť validační dataset bez augmentací
-        val_dataset = LesionInpaintingDataset(
-            pseudo_healthy_dir=args.pseudo_healthy_dir,
-            adc_dir=args.adc_dir,
-            lesion_mask_dir=args.lesion_mask_dir,
-            norm_range=(0, 1),
-            crop_foreground=args.crop_foreground,
-            transform=None,  # bez augmentací pro validaci
-            patch_size=patch_size,
-            use_patches=args.use_patches
-        )
-        
-        # Použijeme SubsetRandomSampler pro vytvoření dataloaderu pouze s požadovanými indexy
-        from torch.utils.data import SubsetRandomSampler
-        train_sampler = SubsetRandomSampler(train_indices)
-        val_sampler = SubsetRandomSampler(val_indices)
-        
-        # Dataloadery s příslušnými samplery
-        train_dataloader = DataLoader(
-            train_dataset,
-            batch_size=args.batch_size,
-            sampler=train_sampler,
-            num_workers=args.num_workers,
-            pin_memory=True
-        )
-        
-        val_dataloader = DataLoader(
-            val_dataset,
-            batch_size=1,  # Pro validaci je vhodnější batch size 1
-            sampler=val_sampler,
-            num_workers=args.num_workers,
-            pin_memory=True
-        )
-    else:
-        # Pokud nepoužíváme augmentace nebo nemáme validaci, použijeme původní přístup
-        # s úpravou pro vždy zařazení MGHNICU_405 do validační sady
-        if mghnicu_405_index is not None:
-            # Vytvoříme vlastní rozdělení s MGHNICU_405 vždy ve validační sadě
-            from torch.utils.data import Subset
-            
-            # Vytvoříme indexy pro rozdělení datasetu
-            indices = list(range(dataset_size))
-            
-            # Odstranit MGHNICU_405 z indexů, pokud tam je
-            if mghnicu_405_index in indices:
-                indices.remove(mghnicu_405_index)
+        # Pro každý klíč, který obsahuje tenzor, najdeme maximální rozměry
+        result = {}
+        for key in keys:
+            if isinstance(batch[0][key], (torch.Tensor, np.ndarray)):
+                # Získat tvary všech tenzorů pro tento klíč
+                shapes = [sample[key].shape for sample in batch]
+                print(f"DEBUG: Tvary pro klíč {key}: {shapes}")
                 
-            # Zamíchat zbývající indexy
-            np.random.seed(args.seed)
-            np.random.shuffle(indices)
-            
-            # Rozdělit zbytek indexů
-            train_indices = indices[:train_size]
-            val_indices = indices[train_size:train_size + val_size - 1]
-            
-            # Přidat MGHNICU_405 do validační sady
-            val_indices.append(mghnicu_405_index)
-            
-            # Vytvořit Subset datasety
-            train_dataset = Subset(train_dataset, train_indices)
-            val_dataset = Subset(train_dataset, val_indices)
-        else:
-            # Standardní rozdělení pomocí random_split
-            train_dataset, val_dataset = torch.utils.data.random_split(
-                train_dataset, [train_size, val_size],
-                generator=torch.Generator().manual_seed(args.seed)
-            )
-        
-        train_dataloader = DataLoader(
-            train_dataset,
-            batch_size=args.batch_size,
-            shuffle=True,
-            num_workers=args.num_workers,
-            pin_memory=True
-        )
-        
-        val_dataloader = DataLoader(
-            val_dataset,
-            batch_size=1,  # Pro validaci je vhodnější batch size 1
-            shuffle=False,
-            num_workers=args.num_workers,
-            pin_memory=True
-        )
-    
-    print(f"Velikost trénovacího datasetu: {train_size}")
-    print(f"Velikost validačního datasetu: {val_size}")
-    
-    # Inicializovat model s novými rozměry
-    model = LesionInpaintingGAN(
-        img_size=model_input_size,  # Použít správnou velikost podle typu tréninku
-        gen_features=args.gen_features,
-        disc_base_filters=args.disc_base_filters,
-        disc_n_layers=args.disc_n_layers,
-        lambda_l1=args.lambda_l1,
-        lambda_identity=args.lambda_identity,
-        lambda_ssim=args.lambda_ssim,
-        lambda_edge=args.lambda_edge
-    ).to(device)
-    
-    # Vytvořit optimalizátory
-    optimizer_g = torch.optim.Adam(
-        model.generator.parameters(),
-        lr=args.lr_g,
-        betas=(args.beta1, args.beta2)
-    )
-    
-    optimizer_d = torch.optim.Adam(
-        model.discriminator.parameters(),
-        lr=args.lr_d,
-        betas=(args.beta1, args.beta2)
-    )
-    
-    # Vytvořit scheduler pro learning rate
-    if args.use_lr_scheduler:
-        scheduler_g = torch.optim.lr_scheduler.StepLR(
-            optimizer_g, step_size=args.lr_step, gamma=args.lr_gamma
-        )
-        
-        scheduler_d = torch.optim.lr_scheduler.StepLR(
-            optimizer_d, step_size=args.lr_step, gamma=args.lr_gamma
-        )
-    else:
-        scheduler_g = None
-        scheduler_d = None
-    
-    # Inicializovat trainer
-    trainer = LesionInpaintingTrainer(
-        model=model,
-        optimizer_g=optimizer_g,
-        optimizer_d=optimizer_d,
-        device=device,
-        output_dir=args.output_dir,
-        use_amp=args.use_amp,
-        visualize_interval=args.visualize_interval
-    )
-    
-    # Načíst checkpoint, pokud je zadán
-    start_epoch = 0
-    if args.checkpoint:
-        start_epoch = trainer.load_model(args.checkpoint)
-    
-    # Trénovat model
-    trainer.train(
-        train_dataloader=train_dataloader,
-        val_dataloader=val_dataloader,
-        num_epochs=args.num_epochs,
-        start_epoch=start_epoch,
-        checkpoint_interval=args.checkpoint_interval
-    )
-
-
-def save_mha_file(data, reference_image, output_path):
-    """Uloží numpy array jako MHA soubor s použitím metadat z reference_image"""
-    out_img = sitk.GetImageFromArray(data)
-    out_img.CopyInformation(reference_image)
-    sitk.WriteImage(out_img, str(output_path))
-
-
-def generate_inpainted_brain(model, pseudo_healthy_path, lesion_mask_path, output_path, existing_lesion_path=None, output_combined_mask_path=None, device='cuda'):
-    """
-    Generuje inpaintovaný mozek s lézí pomocí naučeného modelu
-    
-    Args:
-        model (LesionInpaintingGAN): Naučený model
-        pseudo_healthy_path (str): Cesta k pseudo-zdravému mozku
-        lesion_mask_path (str): Cesta k masce léze, kterou chceme přidat
-        output_path (str): Cesta pro uložení výstupu (ADC mapa s lézemi)
-        existing_lesion_path (str, optional): Cesta k masce již existujících lézí
-        output_combined_mask_path (str, optional): Cesta pro uložení kombinované masky lézí
-        device (str): Zařízení pro inferenci
-    """
-    # Načíst data
-    ph_img = sitk.ReadImage(str(pseudo_healthy_path))
-    ph_data = sitk.GetArrayFromImage(ph_img).astype(np.float32)
-    
-    mask_img = sitk.ReadImage(str(lesion_mask_path))
-    mask_data = sitk.GetArrayFromImage(mask_img).astype(np.float32)
-    
-    # Binarizovat masku nové léze
-    mask_data = (mask_data > 0).astype(np.float32)
-    
-    # Načíst existující léze, pokud jsou specifikovány
-    if existing_lesion_path:
-        existing_lesion_img = sitk.ReadImage(str(existing_lesion_path))
-        existing_lesion_data = sitk.GetArrayFromImage(existing_lesion_img).astype(np.float32)
-        existing_lesion_data = (existing_lesion_data > 0).astype(np.float32)
-        
-        # Vytvořit kombinovanou masku, která zachovává existující léze
-        # a přidává nové léze pouze tam, kde neexistují původní
-        combined_mask_data = np.maximum(existing_lesion_data, mask_data)
-        
-        # Vytvořit masku pro nové léze (pouze oblasti, kde nejsou existující léze)
-        new_lesion_mask_data = mask_data * (1 - existing_lesion_data)
-    else:
+                # Pokud mají všechny stejný tvar, můžeme je jednoduše seskupit
+                if all(shape == shapes[0] for shape in shapes):
+                    result[key] = torch.stack([sample[key] for sample in batch])
+                else:
+                    # Musíme je upravit na stejný tvar
+                    # Strategie: Změníme pořadí dimenzí, aby vždy byly seřazeny od největší po nejmenší
+                    # (kromě kanálové dimenze, kterou necháme na začátku)
+                    processed_tensors = []
+                    for sample in batch:
+                        tensor = sample[key]
         # Pokud neexistují existující léze, použijeme původní masku nové léze
         combined_mask_data = mask_data
         new_lesion_mask_data = mask_data
