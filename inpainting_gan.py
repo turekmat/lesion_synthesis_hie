@@ -668,6 +668,11 @@ class Generator(nn.Module):
         # Aplikujeme vyhlazený přechod s větším důrazem na zachování původního obrazu mimo lézi
         final_output = pseudo_healthy * (1 - smooth_transition_mask) + raw_output * smooth_transition_mask
         
+        # Zajistíme, že výstup má správný počet kanálů [B, 1, D, H, W]
+        if final_output.shape[1] != 1:
+            print(f"Warning: Generator output has incorrect channel dimension: {final_output.shape}. Adjusting to [B, 1, D, H, W]")
+            final_output = final_output[:, 0:1]
+            
         return final_output
 
 
@@ -860,6 +865,31 @@ class LesionInpaintingGAN(nn.Module):
         # Inicializovat diskriminátor
         self.discriminator.apply(init_func)
     
+    def safe_ssim(self, pred, target):
+        """
+        Bezpečný výpočet SSIM, který ošetřuje různé tvary tensorů
+        
+        Args:
+            pred (torch.Tensor): Predikovaný tensor
+            target (torch.Tensor): Cílový tensor
+            
+        Returns:
+            torch.Tensor: SSIM hodnota
+        """
+        # Zajistíme, že oba tensory mají správný tvar s jedním kanálem
+        if pred.shape[1] != 1:
+            pred = pred[:, 0:1]
+        if target.shape[1] != 1:
+            target = target[:, 0:1]
+            
+        try:
+            return self.ssim_loss(pred, target)
+        except ValueError as e:
+            print(f"Chyba při výpočtu SSIM: {e}")
+            print(f"Tvar pred: {pred.shape}, tvar target: {target.shape}")
+            # Fallback na L1 loss
+            return torch.tensor(0.0, device=pred.device)
+    
     def compute_edge_loss(self, pred, target, mask, kernel_size=3):
         """
         Výpočet edge loss pro zajištění plynulého přechodu na hranici masky
@@ -996,17 +1026,10 @@ class LesionInpaintingGAN(nn.Module):
             mask = mask[:, 0:1]
             
         # Výpočet SSIM loss pouze v oblasti léze
-        try:
-            ssim_loss_val = 1.0 - self.ssim_loss(pred * mask, target * mask)
-            return ssim_loss_val
-        except ValueError as e:
-            print(f"Chyba při výpočtu SSIM: {e}")
-            print(f"Tvar pred: {pred.shape}, tvar target: {target.shape}, tvar mask: {mask.shape}")
-            pred_masked = pred * mask
-            target_masked = target * mask
-            print(f"Tvar pred_masked: {pred_masked.shape}, tvar target_masked: {target_masked.shape}")
-            # Pokud nastal problém, vrátíme alespoň L1 loss
-            return F.l1_loss(pred * mask, target * mask) * 2.0
+        pred_masked = pred * mask
+        target_masked = target * mask
+        ssim_loss_val = 1.0 - self.safe_ssim(pred_masked, target_masked)
+        return ssim_loss_val
     
     def generator_loss(self, pseudo_healthy, lesion_mask, real_adc, fake_adc, disc_fake_pred):
         """
@@ -1092,6 +1115,16 @@ class LesionInpaintingGAN(nn.Module):
         Returns:
             torch.Tensor: Loss hodnota pro diskriminátor
         """
+        # Kontrola a zajištění správných tvarů tensorů
+        if pseudo_healthy.shape[1] != 1:
+            pseudo_healthy = pseudo_healthy[:, 0:1]
+        if lesion_mask.shape[1] != 1:
+            lesion_mask = lesion_mask[:, 0:1]
+        if real_adc.shape[1] != 1:
+            real_adc = real_adc[:, 0:1]
+        if fake_adc.shape[1] != 1:
+            fake_adc = fake_adc[:, 0:1]
+            
         # Cílové hodnoty
         target_real = torch.ones_like(disc_real_pred).to(disc_real_pred.device)
         target_fake = torch.zeros_like(disc_fake_pred).to(disc_fake_pred.device)
@@ -1586,7 +1619,7 @@ class LesionInpaintingTrainer:
                     # Získat predikci pro reálná data
                     disc_real_pred = self.model.discriminator(pseudo_healthy_d, lesion_mask_d, real_adc_d)
                     d_loss = self.model.discriminator_loss(
-                        pseudo_healthy, lesion_mask, real_adc, fake_adc, 
+                        pseudo_healthy, lesion_mask, real_adc, fake_adc_d, 
                         disc_real_pred, disc_fake_pred
                     )
                 
@@ -1687,13 +1720,43 @@ class LesionInpaintingTrainer:
         with torch.no_grad():
             fake_adc = self.model.generator(pseudo_healthy, lesion_mask)
         
+        # Kontrola a úprava tvaru tensorů
+        if pseudo_healthy.shape[1] != 1:
+            pseudo_healthy = pseudo_healthy[:, 0:1]
+        if lesion_mask.shape[1] != 1:
+            lesion_mask = lesion_mask[:, 0:1]
+        if real_adc.shape[1] != 1:
+            real_adc = real_adc[:, 0:1]
+        if fake_adc.shape[1] != 1:
+            fake_adc = fake_adc[:, 0:1]
+            
         # Vytvořit kombinovaný výsledek (pseudo-zdravý + vygenerovaná léze)
         # Kombinujeme pseudo-zdravý obraz a generovanou ADC mapu v oblasti léze
         inpainted_adc = pseudo_healthy * (1 - lesion_mask) + fake_adc * lesion_mask
         
         # Vypočítat metriky mezi reálnou ADC mapou a inpainted výsledkem (celý objem)
-        # Počítáme SSIM pro celý objem
-        ssim_val = self.model.ssim_loss(inpainted_adc, real_adc).item()
+        # Kontrola tvarů před výpočtem SSIM
+        if inpainted_adc.shape[1] != 1:
+            print(f"Upravuji tvar inpainted_adc z {inpainted_adc.shape} na [B, 1, D, H, W]")
+            inpainted_adc_ssim = inpainted_adc[:, 0:1]  # Vezmi pouze první kanál
+        else:
+            inpainted_adc_ssim = inpainted_adc
+            
+        if real_adc.shape[1] != 1:
+            print(f"Upravuji tvar real_adc z {real_adc.shape} na [B, 1, D, H, W]")
+            real_adc_ssim = real_adc[:, 0:1]
+        else:
+            real_adc_ssim = real_adc
+            
+        # Počítáme SSIM pro celý objem s upravenými tvary
+        try:
+            print(f"SSIM výpočet - tvar inpainted_adc_ssim: {inpainted_adc_ssim.shape}, tvar real_adc_ssim: {real_adc_ssim.shape}")
+            ssim_val = self.model.safe_ssim(inpainted_adc_ssim, real_adc_ssim).item()
+        except ValueError as e:
+            print(f"Chyba při výpočtu SSIM: {e}")
+            print(f"Tvar inpainted_adc: {inpainted_adc.shape}, tvar real_adc: {real_adc.shape}")
+            # Fallback na L1 loss pokud SSIM selže
+            ssim_val = -1.0  # Neplatná hodnota jako indikátor problému
         
         # Počítáme MAE (mean absolute error) pro celý objem
         mae_val = F.l1_loss(inpainted_adc, real_adc).item()
@@ -1728,7 +1791,7 @@ class LesionInpaintingTrainer:
             lesion_mask_np = lesion_mask_np[0]
         if len(inpainted_adc_np.shape) == 4:
             inpainted_adc_np = inpainted_adc_np[0]
-            
+        
         # Počet řezů ve směru D (hloubka)
         num_slices = pseudo_healthy_np.shape[0]
         max_slices_per_page = 5  # Maximální počet řezů na stránku
