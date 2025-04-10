@@ -1454,7 +1454,7 @@ def train(args):
 
 def visualize_results(pseudo_healthy, label, output, target, output_path, metrics=None):
     """
-    Simplified visualization function that generates a valid PDF with minimal processing
+    Simplified visualization function that generates a PDF with the key images
     
     Args:
         pseudo_healthy: Tensor of pseudo-healthy input
@@ -1462,10 +1462,10 @@ def visualize_results(pseudo_healthy, label, output, target, output_path, metric
         output: Tensor of model output
         target: Tensor of target data
         output_path: Path to save the PDF
-        metrics: Dictionary of metrics to include in the PDF, e.g. {'lesion_loss': 0.1, 'dice': 0.85, ...}
+        metrics: Dictionary of metrics to include in the PDF
     """
     try:
-        # Save a very basic PDF without complex processing
+        # Save a simplified PDF with just the essential visualizations
         with PdfPages(output_path) as pdf:
             # Create a metrics summary page if metrics are provided
             if metrics is not None and isinstance(metrics, dict):
@@ -1480,36 +1480,9 @@ def visualize_results(pseudo_healthy, label, output, target, output_path, metric
                     plt.text(0.7, y_pos, formatted_value, fontsize=12)
                     y_pos -= 0.05
                 
-                # Draw a border around metrics
-                metrics_border = plt.Rectangle((0.05, y_pos), 0.9, 0.9-y_pos, 
-                                              fill=False, color='gray', linestyle='--', transform=plt.gca().transAxes)
-                plt.gca().add_patch(metrics_border)
-                
-                # Add explanations about metrics
-                plt.text(0.5, y_pos-0.1, "Metrics Explanations:", ha='center', fontsize=12, weight='bold')
-                explanations = [
-                    "Lesion MAE (original scale): Lower is better, Mean Absolute Error in original data scale",
-                    "Lesion L1 Loss: Lower is better, measures pixel-wise reconstruction accuracy",
-                    "Lesion Dice: Higher is better (max 1.0), measures overlap between output and target",
-                    "Lesion SSIM: Higher is better (max 1.0), measures structural similarity"
-                ]
-                for i, explanation in enumerate(explanations):
-                    plt.text(0.1, y_pos-0.2-(i*0.05), explanation, fontsize=10)
-                
                 plt.axis('off')
                 pdf.savefig()
                 plt.close()
-            
-            # Create a single summary page to ensure the PDF is valid
-            plt.figure(figsize=(8, 6))
-            plt.text(0.5, 0.8, "Reconstruction Visualization", ha='center', fontsize=16, weight='bold')
-            plt.text(0.5, 0.6, "Input shape: " + str(pseudo_healthy.shape), ha='center')
-            plt.text(0.5, 0.5, "Label shape: " + str(label.shape), ha='center')
-            plt.text(0.5, 0.4, "Output shape: " + str(output.shape), ha='center')
-            plt.text(0.5, 0.3, "Target shape: " + str(target.shape), ha='center')
-            plt.axis('off')
-            pdf.savefig()
-            plt.close()
             
             # Convert data to numpy with minimal processing
             try:
@@ -1528,24 +1501,9 @@ def visualize_results(pseudo_healthy, label, output, target, output_path, metric
                 while len(tgt_np.shape) > 3:
                     tgt_np = tgt_np[0]
                 
-                # Add dimension information page
-                plt.figure(figsize=(8, 6))
-                plt.text(0.5, 0.9, "Processed Data Shapes", ha='center', fontsize=16)
-                plt.text(0.5, 0.7, f"Pseudo-healthy: {ph_np.shape}", ha='center')
-                plt.text(0.5, 0.6, f"Label: {lbl_np.shape}", ha='center')
-                plt.text(0.5, 0.5, f"Output: {out_np.shape}", ha='center')
-                plt.text(0.5, 0.4, f"Target: {tgt_np.shape}", ha='center')
-                plt.axis('off')
-                pdf.savefig()
-                plt.close()
-                
                 # Get minimum depth to avoid index errors
                 depths = [ph_np.shape[0], lbl_np.shape[0], out_np.shape[0], tgt_np.shape[0]]
                 depth = min(depths)
-                
-                # Limit number of slices to visualize
-                num_slices = min(10, depth)  # Maximum 10 slices
-                slice_indices = list(range(0, depth, max(1, depth // num_slices)))[:num_slices]
                 
                 # Find slices with lesions for visualization
                 lesion_slices = []
@@ -1553,25 +1511,19 @@ def visualize_results(pseudo_healthy, label, output, target, output_path, metric
                     if np.any(lbl_np[z] > 0):
                         lesion_slices.append(z)
                 
-                # Prioritize lesion slices but limit total
+                # Prioritize lesion slices
                 if lesion_slices:
-                    # Always include some lesion slices
-                    final_slices = lesion_slices[:min(5, len(lesion_slices))]
-                    
-                    # Add non-lesion slices if needed to get to num_slices
-                    if len(final_slices) < num_slices:
-                        non_lesion_slices = [z for z in slice_indices if z not in lesion_slices]
-                        final_slices.extend(non_lesion_slices[:num_slices - len(final_slices)])
-                    
-                    # Sort slices for sequential viewing
-                    slice_indices = sorted(final_slices)
+                    # Just use lesion slices (max 10)
+                    slice_indices = lesion_slices[:min(10, len(lesion_slices))]
                 else:
-                    # If no lesion slices, use default slice_indices
-                    pass
+                    # If no lesion slices found, use evenly spaced slices
+                    num_slices = min(10, depth)
+                    slice_indices = list(range(0, depth, max(1, depth // num_slices)))[:num_slices]
                 
                 # Add pages showing slices for each volume
                 for z_idx, z in enumerate(slice_indices):
                     try:
+                        # Create a 2x2 grid for the 4 key images
                         fig, axes = plt.subplots(2, 2, figsize=(10, 8))
                         axes = axes.flatten()
                         
@@ -1595,12 +1547,12 @@ def visualize_results(pseudo_healthy, label, output, target, output_path, metric
                         has_lesion = np.any(lbl_slice > 0)
                         slice_title = f"Slice {z}" + (" (contains lesion)" if has_lesion else "")
                         
-                        # Display each image
+                        # 1. Pseudo-healthy
                         axes[0].imshow(ph_slice, cmap='gray')
                         axes[0].set_title('Pseudo-healthy')
                         axes[0].axis('off')
                         
-                        # For label, use a red overlay
+                        # 2. Label Overlay
                         axes[1].imshow(ph_slice, cmap='gray')  # Background
                         if has_lesion:  # Only add overlay if there's a lesion
                             mask = lbl_slice > 0
@@ -1612,100 +1564,33 @@ def visualize_results(pseudo_healthy, label, output, target, output_path, metric
                         axes[1].set_title('Label Overlay')
                         axes[1].axis('off')
                         
-                        # OPRAVENO: Správné vytvoření výstupního obrázku (mozek s inpaintovanými lézemi)
-                        # Použij originální pseudo-healthy a nahraď pouze oblasti s lézemi z výstupu modelu
-                        combined_slice = np.copy(ph_slice)  # Klonovat celý mozek
+                        # 3. Inpainted Brain (output only replaces lesion areas)
+                        # First, create a clean copy of the pseudo-healthy slice
+                        inpainted_slice = np.copy(ph_slice)
                         
+                        # Only replace voxels in the lesion area with the output from generator
                         if has_lesion:
-                            # Maska léze
                             lesion_mask = lbl_slice > 0
-                            
-                            # Nahraď pouze oblasti s lézemi výstupem modelu
-                            combined_slice[lesion_mask] = out_slice[lesion_mask]
-                            
-                            # Pro debugging: ukaž rozsah hodnot
-                            print(f"Slice {z} - Ph range: [{np.min(ph_slice):.4f}, {np.max(ph_slice):.4f}], "
-                                  f"Output range: [{np.min(out_slice):.4f}, {np.max(out_slice):.4f}], "
-                                  f"Combined range: [{np.min(combined_slice):.4f}, {np.max(combined_slice):.4f}]")
-                                
-                        # Pro output a target
-                        im_out = axes[2].imshow(combined_slice, cmap='gray')
+                            inpainted_slice[lesion_mask] = out_slice[lesion_mask]
+                        
+                        # Show inpainted result
+                        axes[2].imshow(inpainted_slice, cmap='gray')
                         axes[2].set_title('Output (Inpainted Brain)')
                         axes[2].axis('off')
-                        plt.colorbar(im_out, ax=axes[2], fraction=0.046, pad=0.04)
                         
-                        im_tgt = axes[3].imshow(tgt_slice, cmap='gray')
+                        # 4. Target
+                        axes[3].imshow(tgt_slice, cmap='gray')
                         axes[3].set_title('Target')
                         axes[3].axis('off')
-                        plt.colorbar(im_tgt, ax=axes[3], fraction=0.046, pad=0.04)
                         
-                        # Show difference image if it's a lesion slice
-                        if has_lesion:
-                            # Add a 5th plot for the difference in lesion region
-                            fig.set_size_inches(10, 10)  # Increase figure size
-                            ax_diff = fig.add_subplot(3, 2, 5)  # Add a new subplot
-                            
-                            # Calculate absolute difference in lesion region
-                            diff = np.abs(combined_slice - tgt_slice)
-                            masked_diff = diff * lbl_slice
-                            
-                            im_diff = ax_diff.imshow(masked_diff, cmap='hot')
-                            ax_diff.set_title('Absolute Difference in Lesion')
-                            ax_diff.axis('off')
-                            plt.colorbar(im_diff, ax=ax_diff, fraction=0.046, pad=0.04)
-                            
-                            # Add text for slice-specific metrics if available
-                            if metrics is not None:
-                                ax_text = fig.add_subplot(3, 2, 6)
-                                ax_text.axis('off')
-                                ax_text.text(0.1, 0.8, "Slice Lesion Stats:", fontsize=12, weight='bold')
-                                y_pos = 0.7
-                                
-                                # Get original data range if available
-                                orig_range = None
-                                if "Original ADC Range" in metrics:
-                                    range_text = metrics["Original ADC Range"]
-                                    if isinstance(range_text, str) and "to" in range_text:
-                                        try:
-                                            parts = range_text.split("to")
-                                            min_val = float(parts[0].strip())
-                                            max_val = float(parts[1].strip())
-                                            orig_range = (min_val, max_val)
-                                            print(f"Parsed original range: {min_val:.4f} to {max_val:.4f}")
-                                        except Exception as e:
-                                            print(f"Error parsing range: {e}")
-                                            pass
-                                
-                                # Calculate slice-specific metrics
-                                mean_error = np.mean(masked_diff) if np.sum(lbl_slice) > 0 else 0
-                                # Denormalize mean error if possible
-                                if orig_range is not None:
-                                    orig_min, orig_max = orig_range
-                                    denorm_mean_error = mean_error * (orig_max - orig_min)
-                                    error_label = f"Mean Error (MAE): {mean_error:.4f} (normalized), {denorm_mean_error:.4f} (original scale)"
-                                else:
-                                    error_label = f"Mean Error (MAE): {mean_error:.4f}"
-                                    
-                                slice_metrics = {
-                                    error_label: "",
-                                    "Max Error": np.max(masked_diff) if np.sum(lbl_slice) > 0 else 0,
-                                    "% of Lesion Voxels": 100 * np.sum(lbl_slice) / lbl_slice.size
-                                }
-                                
-                                for name, value in slice_metrics.items():
-                                    if value == "":  # For the custom error label
-                                        ax_text.text(0.1, y_pos, name, fontsize=10)
-                                    else:
-                                        ax_text.text(0.1, y_pos, f"{name}: {value:.4f}", fontsize=10)
-                                    y_pos -= 0.1
-                        
+                        # Set overall title
                         plt.suptitle(slice_title, fontsize=16)
                         plt.tight_layout()
                         pdf.savefig(fig)
                         plt.close(fig)
                     except Exception as slice_error:
                         print(f"Error visualizing slice {z}: {slice_error}")
-                        # Continue to next slice
+                        continue
             
             except Exception as data_error:
                 print(f"Error processing data: {data_error}")
