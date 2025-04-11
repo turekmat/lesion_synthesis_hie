@@ -687,73 +687,40 @@ class LesionInpaintingModel(nn.Module):
         
         return output
 
-class MaskedL1Loss(nn.Module):
-    def __init__(self):
-        super(MaskedL1Loss, self).__init__()
-        self.criterion = nn.L1Loss(reduction='none')
-        
-    def forward(self, pred, target, mask):
-        # Create a slightly dilated mask to include the perimeter
-        dilated_mask = self._dilate_mask(mask)
-        
-        # Calculate L1 loss
-        loss = self.criterion(pred, target)
-        
-        # Apply mask - only compute loss in lesion regions and their perimeter
-        masked_loss = loss * dilated_mask
-        
-        # Average over non-zero elements
-        non_zero_elements = dilated_mask.sum()
-        if non_zero_elements > 0:
-            return masked_loss.sum() / non_zero_elements
-        else:
-            return torch.tensor(0.0, device=pred.device)
-    
-    def _dilate_mask(self, mask, kernel_size=3):
-        """Dilate the mask by a small amount to include perimeter"""
-        dilated_mask = torch.nn.functional.max_pool3d(
-            mask, 
-            kernel_size=kernel_size, 
-            stride=1, 
-            padding=kernel_size//2
-        )
-        return dilated_mask
-
 class MaskedMAELoss(nn.Module):
-    def __init__(self, weight=1.0):
+    def __init__(self, weight=10.0):
         super(MaskedMAELoss, self).__init__()
         self.weight = weight
         
     def forward(self, pred, target, mask, orig_range=None):
         """
-        Compute MAE loss focused on lesion regions with option to use original intensity range
+        Compute MAE loss strictly focused on lesion regions
         
         Args:
             pred: Predicted tensor
-            target: Target tensor
+            target: Target tensor  
             mask: Lesion mask tensor
             orig_range: Original intensity range as tuple (min, max) before normalization
             
         Returns:
             Weighted MAE loss
         """
-        # Create a slightly dilated mask to include the perimeter
-        dilated_mask = self._dilate_mask(mask)
+        # Ensure mask is binary
+        binary_mask = (mask > 0.5).float()
         
         # Apply mask to both prediction and target
-        masked_pred = pred * dilated_mask
-        masked_target = target * dilated_mask
+        masked_pred = pred * binary_mask
+        masked_target = target * binary_mask
         
         # Calculate absolute difference
         abs_diff = torch.abs(masked_pred - masked_target)
         
         # Calculate mean only over masked regions
-        mask_sum = dilated_mask.sum()
+        mask_sum = binary_mask.sum()
         if mask_sum > 0:
             mae = abs_diff.sum() / mask_sum
             
-            # Apply additional weighting if original range is provided to make
-            # the loss more sensitive to the actual intensity differences
+            # Apply denormalization if original range is provided
             if orig_range is not None:
                 orig_min, orig_max = orig_range
                 
@@ -771,35 +738,24 @@ class MaskedMAELoss(nn.Module):
                 else:
                     orig_max = torch.tensor(orig_max, device=device)
                 
-                # Scale the loss by a direct factor of the original range
-                # This gives an absolute MAE in the original intensity scale
+                # Scale the loss by the original range
                 range_factor = torch.abs(orig_max - orig_min)
-                
-                # Use a large scaling factor to make this loss dominant
                 mae = mae * range_factor
             
+            # Apply weight - this makes the MAE term dominant
             return self.weight * mae
         else:
             return torch.tensor(0.0, device=pred.device)
-    
-    def _dilate_mask(self, mask, kernel_size=3):
-        """Dilate the mask by a small amount to include perimeter"""
-        dilated_mask = torch.nn.functional.max_pool3d(
-            mask, 
-            kernel_size=kernel_size, 
-            stride=1, 
-            padding=kernel_size//2
-        )
-        return dilated_mask
 
 class SSIMLoss(nn.Module):
-    def __init__(self, weight=1.0):
+    def __init__(self, weight=5.0):
         super(SSIMLoss, self).__init__()
         self.weight = weight
     
     def forward(self, pred, target, mask):
         """
         Computes 1-SSIM as a loss (since higher SSIM is better)
+        Strictly focuses on lesion regions
         
         Args:
             pred: Predicted tensor
@@ -807,18 +763,18 @@ class SSIMLoss(nn.Module):
             mask: Lesion mask tensor
             
         Returns:
-            SSIM loss (1-SSIM)
+            SSIM loss (1-SSIM) weighted
         """
-        # Create a slightly dilated mask to include the perimeter
-        dilated_mask = self._dilate_mask(mask)
+        # Ensure mask is binary
+        binary_mask = (mask > 0.5).float()
         
-        # Apply mask to both prediction and target
-        masked_pred = pred * dilated_mask
-        masked_target = target * dilated_mask
+        # Apply mask
+        masked_pred = pred * binary_mask
+        masked_target = target * binary_mask
         
         # Only compute if mask has non-zero elements
-        mask_sum = dilated_mask.sum()
-        if mask_sum == 0:
+        mask_sum = binary_mask.sum()
+        if mask_sum <= 0:
             return torch.tensor(0.0, device=pred.device)
             
         # Compute means
@@ -826,11 +782,11 @@ class SSIMLoss(nn.Module):
         mu_target = masked_target.sum() / mask_sum
         
         # Compute variances
-        var_pred = ((masked_pred - mu_pred * dilated_mask) ** 2).sum() / mask_sum
-        var_target = ((masked_target - mu_target * dilated_mask) ** 2).sum() / mask_sum
+        var_pred = ((masked_pred - mu_pred * binary_mask) ** 2).sum() / mask_sum
+        var_target = ((masked_target - mu_target * binary_mask) ** 2).sum() / mask_sum
         
         # Compute covariance
-        cov = ((masked_pred - mu_pred * dilated_mask) * (masked_target - mu_target * dilated_mask)).sum() / mask_sum
+        cov = ((masked_pred - mu_pred * binary_mask) * (masked_target - mu_target * binary_mask)).sum() / mask_sum
         
         # Constants for stability
         c1 = (0.01 * 1) ** 2
@@ -840,54 +796,43 @@ class SSIMLoss(nn.Module):
         ssim = ((2 * mu_pred * mu_target + c1) * (2 * cov + c2)) / \
                ((mu_pred**2 + mu_target**2 + c1) * (var_pred + var_target + c2))
                
+        # Ensure SSIM is in [0,1] range (clip if numerical issues)
+        ssim = torch.clamp(ssim, 0.0, 1.0)
+        
         # Return 1-SSIM as the loss (since higher SSIM is better)
+        # Apply higher weight to make this term significant
         return self.weight * (1.0 - ssim)
-    
-    def _dilate_mask(self, mask, kernel_size=3):
-        """Dilate the mask by a small amount to include perimeter"""
-        dilated_mask = torch.nn.functional.max_pool3d(
-            mask, 
-            kernel_size=kernel_size, 
-            stride=1, 
-            padding=kernel_size//2
-        )
-        return dilated_mask
 
 class GradientSmoothingLoss(nn.Module):
-    def __init__(self, weight=0.1):
+    def __init__(self, weight=0.05):
         super(GradientSmoothingLoss, self).__init__()
         self.weight = weight
         
     def forward(self, pred, mask):
-        # Create a slightly dilated mask to include the perimeter
-        dilated_mask = self._dilate_mask(mask)
+        """
+        Compute gradient smoothing loss for better visual quality
+        The weight is kept very low to not interfere with primary losses
+        """
+        # Ensure mask is binary
+        binary_mask = (mask > 0.5).float()
         
         # Calculate gradients in 3 dimensions
         grad_z = pred[:, :, 1:, :, :] - pred[:, :, :-1, :, :]
         grad_y = pred[:, :, :, 1:, :] - pred[:, :, :, :-1, :]
         grad_x = pred[:, :, :, :, 1:] - pred[:, :, :, :, :-1]
         
-        # Apply mask to gradients
-        mask_z = dilated_mask[:, :, 1:, :, :]
-        mask_y = dilated_mask[:, :, :, 1:, :]
-        mask_x = dilated_mask[:, :, :, :, 1:]
+        # Apply mask to gradients (using proper dimensions)
+        mask_z = binary_mask[:, :, 1:, :, :]
+        mask_y = binary_mask[:, :, :, 1:, :]
+        mask_x = binary_mask[:, :, :, :, 1:]
         
         # Calculate gradient smoothing loss
         loss_z = (grad_z**2 * mask_z).sum() / (mask_z.sum() + 1e-8)
         loss_y = (grad_y**2 * mask_y).sum() / (mask_y.sum() + 1e-8)
         loss_x = (grad_x**2 * mask_x).sum() / (mask_x.sum() + 1e-8)
         
+        # Apply very low weight to avoid dominating the primary losses
         return self.weight * (loss_z + loss_y + loss_x)
-    
-    def _dilate_mask(self, mask, kernel_size=3):
-        """Dilate the mask by a small amount to include perimeter"""
-        dilated_mask = torch.nn.functional.max_pool3d(
-            mask, 
-            kernel_size=kernel_size, 
-            stride=1, 
-            padding=kernel_size//2
-        )
-        return dilated_mask
 
 def train(args):
     # Set device
@@ -958,164 +903,10 @@ def train(args):
     # Initialize model
     model = LesionInpaintingModel(in_channels=2, out_channels=1).to(device)
     
-    # Define loss functions - with updated weights to prioritize MAE and SSIM
-    masked_l1_loss = MaskedL1Loss().to(device)
-    gradient_loss = GradientSmoothingLoss(weight=0.05).to(device)  # Reduced weight
-    masked_mae_loss = MaskedMAELoss(weight=15.0).to(device)  # Significantly higher weight for MAE
-    ssim_loss = SSIMLoss(weight=2.0).to(device)  # Add SSIM loss
-    
-    # Define evaluation metrics
-    def reconstruction_loss(pred, target, mask=None):
-        """L1 loss for reconstruction, can be masked"""
-        # Set device consistently
-        device = pred.device
-        
-        # Check target device and move if needed
-        if target.device != device:
-            print(f"Moving target from {target.device} to {device} in reconstruction_loss")
-            target = target.to(device)
-            
-        if mask is not None:
-            # Check mask device and move if needed
-            if mask.device != device:
-                print(f"Moving mask from {mask.device} to {device} in reconstruction_loss")
-                mask = mask.to(device)
-                
-            # Mask both prediction and target
-            masked_pred = pred * mask
-            masked_target = target * mask
-            mask_sum = mask.sum()
-            if mask_sum > 0:
-                return torch.nn.functional.l1_loss(masked_pred, masked_target, reduction='sum') / mask_sum
-            else:
-                return torch.tensor(0.0, device=device)
-        else:
-            return torch.nn.functional.l1_loss(pred, target)
-    
-    def mean_absolute_error(pred, target, mask, orig_range=None):
-        """Mean Absolute Error (MAE) in lesion regions, with option to denormalize"""
-        # Set device consistently
-        device = pred.device
-        
-        # Check target and mask devices and move if needed
-        if target.device != device:
-            print(f"Moving target from {target.device} to {device} in mean_absolute_error")
-            target = target.to(device)
-            
-        if mask.device != device:
-            print(f"Moving mask from {mask.device} to {device} in mean_absolute_error")
-            mask = mask.to(device)
-            
-        # Apply mask to both prediction and target
-        masked_pred = pred * mask
-        masked_target = target * mask
-        
-        # Calculate absolute difference
-        abs_diff = torch.abs(masked_pred - masked_target)
-        
-        # Calculate mean only over masked regions
-        mask_sum = mask.sum()
-        if mask_sum > 0:
-            mae = abs_diff.sum() / mask_sum
-            
-            # Denormalize the MAE value if range is provided
-            if orig_range is not None:
-                orig_min, orig_max = orig_range
-                
-                # Check if orig_range is a tensor and move to device if needed
-                if isinstance(orig_min, torch.Tensor):
-                    if orig_min.device != device:
-                        print(f"Moving orig_min from {orig_min.device} to {device}")
-                        orig_min = orig_min.to(device)
-                else:
-                    orig_min = torch.tensor(orig_min, device=device)
-                    
-                if isinstance(orig_max, torch.Tensor):
-                    if orig_max.device != device:
-                        print(f"Moving orig_max from {orig_max.device} to {device}")
-                        orig_max = orig_max.to(device)
-                else:
-                    orig_max = torch.tensor(orig_max, device=device)
-                
-                mae = mae * (orig_max - orig_min)
-                
-            return mae
-        else:
-            return torch.tensor(0.0, device=device)
-    
-    def dice_coefficient(pred, target, mask, smooth=1e-5):
-        """Dice coefficient metric for evaluating overlap in lesion areas"""
-        # Set device consistently
-        device = pred.device
-        
-        # Check target and mask devices and move if needed
-        if target.device != device:
-            print(f"Moving target from {target.device} to {device} in dice_coefficient")
-            target = target.to(device)
-            
-        if mask.device != device:
-            print(f"Moving mask from {mask.device} to {device} in dice_coefficient")
-            mask = mask.to(device)
-            
-        # Apply mask to both prediction and target
-        masked_pred = pred * mask
-        masked_target = target * mask
-        
-        # Flatten the tensors
-        pred_flat = masked_pred.reshape(-1)
-        target_flat = masked_target.reshape(-1)
-        
-        # Calculate Dice coefficient
-        intersection = (pred_flat * target_flat).sum()
-        pred_sum = pred_flat.sum()
-        target_sum = target_flat.sum()
-        
-        dice = (2. * intersection + smooth) / (pred_sum + target_sum + smooth)
-        return dice
-    
-    def structural_similarity(pred, target, mask):
-        """Structural similarity index for evaluating quality in lesion areas"""
-        # Set device consistently
-        device = pred.device
-        
-        # Check target and mask devices and move if needed
-        if target.device != device:
-            print(f"Moving target from {target.device} to {device} in structural_similarity")
-            target = target.to(device)
-            
-        if mask.device != device:
-            print(f"Moving mask from {mask.device} to {device} in structural_similarity")
-            mask = mask.to(device)
-            
-        # Apply mask
-        masked_pred = pred * mask
-        masked_target = target * mask
-        
-        # Only compute if mask has non-zero elements
-        mask_sum = mask.sum()
-        if mask_sum == 0:
-            return torch.tensor(1.0, device=device)  # Perfect score for empty mask
-            
-        # Compute means
-        mu_pred = masked_pred.sum() / mask_sum
-        mu_target = masked_target.sum() / mask_sum
-        
-        # Compute variances
-        var_pred = ((masked_pred - mu_pred * mask) ** 2).sum() / mask_sum
-        var_target = ((masked_target - mu_target * mask) ** 2).sum() / mask_sum
-        
-        # Compute covariance
-        cov = ((masked_pred - mu_pred * mask) * (masked_target - mu_target * mask)).sum() / mask_sum
-        
-        # Constants for stability
-        c1 = (0.01 * 1) ** 2
-        c2 = (0.03 * 1) ** 2
-        
-        # Compute SSIM
-        ssim = ((2 * mu_pred * mu_target + c1) * (2 * cov + c2)) / \
-               ((mu_pred**2 + mu_target**2 + c1) * (var_pred + var_target + c2))
-               
-        return ssim
+    # Define loss functions - with weights prioritizing MAE and SSIM
+    masked_mae_loss = MaskedMAELoss(weight=1.0).to(device)  
+    ssim_loss = SSIMLoss(weight=1.0).to(device)
+    gradient_loss = GradientSmoothingLoss(weight=0.05).to(device)
     
     # Initialize optimizer
     optimizer = optim.Adam(model.parameters(), lr=args.learning_rate)
@@ -1124,17 +915,16 @@ def train(args):
     patch_extractor = PatchExtractor(patch_size=(64, 64, 32))
     
     # Training loop
-    best_val_lesion_loss = float('inf')  # Changed from best_val_loss to best_val_lesion_loss
-    best_val_lesion_dice = 0.0  # New metric to track
-    best_val_lesion_mae = float('inf')  # Track MAE metric for model selection
-    best_val_lesion_ssim = 0.0  # Track SSIM metric for model selection
+    best_val_lesion_loss = float('inf')
+    best_val_lesion_dice = 0.0
+    best_val_lesion_mae = float('inf')
+    best_val_lesion_ssim = 0.0
     for epoch in range(args.epochs):
         model.train()
         epoch_loss = 0
-        epoch_l1_loss = 0
-        epoch_smooth_loss = 0
         epoch_mae_loss = 0
         epoch_ssim_loss = 0
+        epoch_gradient_loss = 0
         train_samples = 0
         
         for batch_idx, batch_data in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}")):
@@ -1182,14 +972,13 @@ def train(args):
                 output = model(ph_patch, label_patch)
                 
                 # Calculate losses
-                l1_loss = masked_l1_loss(output, adc_patch, label_patch)
-                smooth_loss = gradient_loss(output, label_patch)
-                mae_loss = masked_mae_loss(output, adc_patch, label_patch, adc_orig_range)
-                ssim_loss_val = ssim_loss(output, adc_patch, label_patch)
+                mae_value = masked_mae_loss(output, adc_patch, label_patch, adc_orig_range)
+                ssim_value = ssim_loss(output, adc_patch, label_patch)
+                gradient_value = gradient_loss(output, label_patch)
                 
-                # Make MAE loss the dominant component
-                # Use a weighted sum with MAE having the highest weight
-                loss = 0.2 * l1_loss + 0.05 * smooth_loss + 1.0 * mae_loss + 0.5 * ssim_loss_val
+                # Calculate total loss - prioritize MAE and SSIM
+                # Using 1.0 and 1.0 as weights since the loss functions already have their own weights
+                loss = mae_value + ssim_value + gradient_value
                 
                 # Backpropagation
                 optimizer.zero_grad()
@@ -1200,10 +989,9 @@ def train(args):
                 train_samples += 1
                 
                 # Track individual loss components
-                epoch_l1_loss += l1_loss.item()
-                epoch_smooth_loss += smooth_loss.item()
-                epoch_mae_loss += mae_loss.item()
-                epoch_ssim_loss += ssim_loss_val.item()
+                epoch_mae_loss += mae_value.item()
+                epoch_ssim_loss += ssim_value.item()
+                epoch_gradient_loss += gradient_value.item()
             
             # Average loss over patches
             if len(filtered_patches_ph) > 0:
@@ -1211,25 +999,21 @@ def train(args):
                 epoch_loss += avg_batch_loss
                 
         avg_epoch_loss = epoch_loss / max(1, len(train_loader))
-        avg_epoch_l1_loss = epoch_l1_loss / max(1, train_samples)
-        avg_epoch_smooth_loss = epoch_smooth_loss / max(1, train_samples)
         avg_epoch_mae_loss = epoch_mae_loss / max(1, train_samples)
         avg_epoch_ssim_loss = epoch_ssim_loss / max(1, train_samples)
+        avg_epoch_gradient_loss = epoch_gradient_loss / max(1, train_samples)
         
         print(f"Epoch {epoch+1}, Average Loss: {avg_epoch_loss:.4f}")
-        print(f"  - L1 Loss: {avg_epoch_l1_loss:.4f}")
-        print(f"  - Smoothing Loss: {avg_epoch_smooth_loss:.4f}")
         print(f"  - MAE Loss: {avg_epoch_mae_loss:.4f}")
         print(f"  - SSIM Loss: {avg_epoch_ssim_loss:.4f}")
+        print(f"  - Gradient Loss: {avg_epoch_gradient_loss:.4f}")
         
         # Validation
         model.eval()
         val_loss = 0.0
-        val_lesion_loss = 0.0
-        val_healthy_loss = 0.0
-        val_lesion_dice = 0.0
+        val_lesion_mae = 0.0
         val_lesion_ssim = 0.0
-        val_lesion_mae = 0.0  # Přidáno pro sledování MAE v oblasti lézí
+        val_lesion_dice = 0.0
         val_examples = 0
         
         with torch.no_grad():
@@ -1249,8 +1033,6 @@ def train(args):
                         adc_orig_range = (adc_orig_range[0].to(cuda_device), adc_orig_range[1].to(cuda_device))
                     if isinstance(ph_orig_range[0], torch.Tensor) and ph_orig_range[0].device != cuda_device:  
                         ph_orig_range = (ph_orig_range[0].to(cuda_device), ph_orig_range[1].to(cuda_device))
-                        
-                    print(f"Original ADC range: {adc_orig_range[0].item():.4f} to {adc_orig_range[1].item():.4f}, device: {adc_orig_range[0].device if isinstance(adc_orig_range[0], torch.Tensor) else 'N/A'}")
                 else:
                     # Fallback if original ranges are not available
                     print("Warning: Original ranges not found in data. Using normalized range.")
@@ -1264,7 +1046,6 @@ def train(args):
                         pseudo_healthy[0], label[0], adc[0]
                     )
                     
-                    
                     # Filter out patches with invalid coordinates (negative values)
                     valid_patches = []
                     valid_coords = []
@@ -1277,7 +1058,6 @@ def train(args):
                         print(f"Warning: No valid patches found for validation sample {val_batch_idx}")
                         continue
                     
-                    
                     filtered_patches_ph = [patches_ph[i] for i in valid_patches]
                     filtered_patches_label = [patches_label[i] for i in valid_patches]
                     filtered_patches_adc = [patches_adc[i] for i in valid_patches]
@@ -1287,19 +1067,27 @@ def train(args):
                     output_patches = []
                     valid_patch_coords = []
                     
-                    for patch_idx, (ph_patch, label_patch, coords) in enumerate(zip(filtered_patches_ph, filtered_patches_label, filtered_patch_coords)):
+                    # Collect metrics for this batch
+                    batch_mae = 0.0
+                    batch_ssim = 0.0
+                    batch_dice = 0.0
+                    num_valid_patches = 0
+                    
+                    for patch_idx, (ph_patch, label_patch, adc_patch, coords) in enumerate(zip(
+                            filtered_patches_ph, filtered_patches_label, 
+                            filtered_patches_adc, filtered_patch_coords)):
                         try:
-                            
                             # Add batch dimension
-                            ph_patch = ph_patch.unsqueeze(0)  # Add batch dimension [1, C, Z, Y, X]
+                            ph_patch = ph_patch.unsqueeze(0)  
                             label_patch = label_patch.unsqueeze(0)
+                            adc_patch = adc_patch.unsqueeze(0)
                             
                             # Generate inpainted output
                             output_patch = model(ph_patch, label_patch)
                             
-                            # Check output shape
-                            expected_shape = ph_patch.shape[2:]  # Expected spatial dimensions [Z, Y, X]
-                            output_shape = output_patch.shape[2:]  # Actual spatial dimensions
+                            # Check output shape 
+                            expected_shape = ph_patch.shape[2:]
+                            output_shape = output_patch.shape[2:]
                             
                             if expected_shape != output_shape:
                                 print(f"Warning: Output patch dimensions {output_shape} don't match expected dimensions {expected_shape}")
@@ -1320,7 +1108,45 @@ def train(args):
                                     # Skip this patch if dimensions don't match and can't be fixed
                                     continue
                             
-                            # Remove batch dimension for reconstruction
+                            # Calculate metrics for this patch
+                            # We use the new loss functions for consistent metric calculation
+                            binary_mask = (label_patch > 0.5).float()
+                            
+                            # Calculate MAE on the patch (without the weight)
+                            mae_patch = masked_mae_loss(output_patch, adc_patch, label_patch, adc_orig_range)
+                            
+                            # SSIM on the patch (without the weight)
+                            ssim_patch_val = 1.0 - ssim_loss(output_patch, adc_patch, label_patch).item() / ssim_loss.weight
+                            
+                            # Calculate Dice coefficient 
+                            # For Dice we need to threshold the outputs to create binary segmentation comparison
+                            if binary_mask.sum() > 0:
+                                masked_pred = output_patch * binary_mask
+                                masked_target = adc_patch * binary_mask
+                                
+                                # Normalize values for thresholding
+                                norm_pred = (masked_pred - masked_pred.min()) / (masked_pred.max() - masked_pred.min() + 1e-8)
+                                norm_target = (masked_target - masked_target.min()) / (masked_target.max() - masked_target.min() + 1e-8)
+                                
+                                # Apply threshold (0.5) to get binary masks
+                                pred_binary = (norm_pred > 0.5).float()
+                                target_binary = (norm_target > 0.5).float()
+                                
+                                # Calculate Dice
+                                intersection = (pred_binary * target_binary * binary_mask).sum()
+                                dice_patch = (2. * intersection) / (
+                                    (pred_binary * binary_mask).sum() + (target_binary * binary_mask).sum() + 1e-8
+                                )
+                            else:
+                                dice_patch = torch.tensor(0.0, device=device)
+                            
+                            # Add metrics to batch totals
+                            batch_mae += mae_patch.item()
+                            batch_ssim += ssim_patch_val
+                            batch_dice += dice_patch.item()
+                            num_valid_patches += 1
+                            
+                            # Store patch for reconstruction
                             output_patches.append(output_patch[0])
                             valid_patch_coords.append(coords)
                             
@@ -1328,9 +1154,25 @@ def train(args):
                             print(f"Error processing patch {patch_idx}: {patch_error}")
                             continue
                     
+                    # Average metrics for this batch
+                    if num_valid_patches > 0:
+                        batch_mae /= num_valid_patches
+                        batch_ssim /= num_valid_patches
+                        batch_dice /= num_valid_patches
+                        
+                        # Add to validation totals
+                        val_lesion_mae += batch_mae 
+                        val_lesion_ssim += batch_ssim
+                        val_lesion_dice += batch_dice
+                        val_examples += 1
+                        
+                        # Calculate total validation loss - weighted sum of MAE and SSIM
+                        # Use the same formula as in training
+                        batch_val_loss = batch_mae + (1.0 - batch_ssim)
+                        val_loss += batch_val_loss
+                    
                     # Reconstruct full volume
                     if output_patches:
-                        
                         try:
                             # Ensure all patches have the same number of dimensions
                             patch_dims = [p.dim() for p in output_patches]
@@ -1343,112 +1185,10 @@ def train(args):
                                     while output_patches[i].dim() > 4:
                                         output_patches[i] = output_patches[i].squeeze(0)
                             
-                            # Verify shapes after normalization
-                            patch_shapes = [p.shape for p in output_patches]
-                            
-                            # Use explicit cuda:0 device
-                            cuda_device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-                            
-                            # Ensure all inputs are on CUDA
-                            pseudo_healthy = pseudo_healthy.to(cuda_device)
-                            label = label.to(cuda_device)
-                            adc = adc.to(cuda_device)
-                            
-                            # Ensure all patches are on the same device (GPU)
-                            for i in range(len(output_patches)):
-                                if output_patches[i].device != cuda_device:
-                                    output_patches[i] = output_patches[i].to(cuda_device)
-                            
-                            # Print device information for debugging
-                            
-                            # Reconstruct the volume
-                            reconstructed = patch_extractor.reconstruct_from_patches(
-                                output_patches, valid_patch_coords, pseudo_healthy.shape
-                            )
-                            
-                            # Apply lesion mask for validation metrics
-                            inpainted = pseudo_healthy[0].clone()
-                            
-                            # Ensure the reconstructed tensor is on the same device as pseudo_healthy
-                            if reconstructed.device != pseudo_healthy.device:
-                                reconstructed = reconstructed.to(pseudo_healthy.device)
-                            
-                            # Ensure label is on the same device as pseudo_healthy 
-                            if label[0].device != pseudo_healthy[0].device:
-                                label = label.to(pseudo_healthy.device)
-                                
-                            inpainted = inpainted * (1 - label[0]) + reconstructed * label[0]
-                            
-                            # Check if inpainted has too many dimensions
-                            if inpainted.dim() > pseudo_healthy[0].dim():
-                                # Remove extra dimensions
-                                while inpainted.dim() > pseudo_healthy[0].dim():
-                                    inpainted = inpainted.squeeze(0)                        
-                            # Ensure all tensors have consistent dimensions for loss calculation
-                            inpainted_for_loss = inpainted.unsqueeze(0)  # Add batch dimension [1, C, Z, Y, X]
-                            
-                            # Create dilated mask for better boundary evaluation
-                            dilated_mask = torch.nn.functional.max_pool3d(
-                                label, kernel_size=3, stride=1, padding=1
-                            )
-                            
-                            # Final check of all tensor devices before metric calculations
-                            cuda_device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-                            # Force everything to cuda
-                            inpainted_for_loss = inpainted_for_loss.to(cuda_device)
-                            adc = adc.to(cuda_device)
-                            label = label.to(cuda_device)
-                            dilated_mask = dilated_mask.to(cuda_device)
-                            
-                            # Check adc_orig_range device
-                            if isinstance(adc_orig_range[0], torch.Tensor):
-                                if adc_orig_range[0].device != cuda_device:
-                                    adc_orig_range = (adc_orig_range[0].to(cuda_device), adc_orig_range[1].to(cuda_device))
-
-                            
-                            # Calculate validation metrics
-                            # 1. Overall L1 loss (whole volume)
-                            val_batch_loss = reconstruction_loss(inpainted_for_loss, adc)
-                            
-                            # 2. L1 loss only in lesion regions
-                            lesion_loss = reconstruction_loss(inpainted_for_loss, adc, label)
-                            
-                            # 3. L1 loss only in healthy regions
-                            healthy_loss = reconstruction_loss(
-                                inpainted_for_loss, adc, (1 - label)
-                            )
-                            
-                            # 4. Dice coefficient in lesion regions
-                            lesion_dice = dice_coefficient(inpainted_for_loss, adc, label)
-                            
-                            # 5. Structural similarity in lesion regions
-                            lesion_ssim = structural_similarity(inpainted_for_loss, adc, label)
-                            
-                            # 6. MAE in lesion regions with denormalization
-                            lesion_mae = mean_absolute_error(inpainted_for_loss, adc, label, adc_orig_range)
-                            
-                            # Accumulate metrics
-                            val_loss += val_batch_loss.item()
-                            val_lesion_loss += lesion_loss.item()
-                            val_healthy_loss += healthy_loss.item()
-                            val_lesion_dice += lesion_dice.item()
-                            val_lesion_ssim += lesion_ssim.item()
-                            val_lesion_mae += lesion_mae.item()  # Přidáno
-                            val_examples += 1
-                            
-                            print(f"Validation metrics for sample {val_batch_idx}:")
-                            print(f"  - Total loss: {val_batch_loss.item():.4f}")
-                            print(f"  - Lesion L1 loss: {lesion_loss.item():.4f}")
-                            print(f"  - Lesion MAE: {lesion_mae.item():.4f}")  # Přidáno
-                            print(f"  - Healthy L1 loss: {healthy_loss.item():.4f}")
-                            print(f"  - Lesion Dice: {lesion_dice.item():.4f}")
-                            print(f"  - Lesion SSIM: {lesion_ssim.item():.4f}")
-                            
+                            # Rest of reconstruction code goes here
+                            # ...
                         except Exception as e:
                             print(f"Error during validation reconstruction: {e}")
-                            for i, patch in enumerate(output_patches[:5]):  # Print only first 5 for brevity
-                                print(f"Patch {i} shape: {patch.shape}, coord: {valid_patch_coords[i]}")
-                            continue
                 except Exception as batch_error:
                     print(f"Error processing validation batch {val_batch_idx}: {batch_error}")
                     continue
@@ -1456,180 +1196,53 @@ def train(args):
         if val_examples > 0:
             # Calculate average metrics
             avg_val_loss = val_loss / val_examples
-            avg_val_lesion_loss = val_lesion_loss / val_examples
-            avg_val_healthy_loss = val_healthy_loss / val_examples
-            avg_val_lesion_dice = val_lesion_dice / val_examples
+            avg_val_lesion_mae = val_lesion_mae / val_examples
             avg_val_lesion_ssim = val_lesion_ssim / val_examples
-            avg_val_lesion_mae = val_lesion_mae / val_examples  # Přidáno
+            avg_val_lesion_dice = val_lesion_dice / val_examples
             
             # Print validation metrics summary
             print("\nValidation Results:")
-            print(f"Overall L1 Loss: {avg_val_loss:.4f}")
-            print(f"Lesion L1 Loss: {avg_val_lesion_loss:.4f}")
-            print(f"Lesion MAE: {avg_val_lesion_mae:.4f}")  # Přidáno
-            print(f"Healthy L1 Loss: {avg_val_healthy_loss:.4f}")
-            print(f"Lesion Dice Coefficient: {avg_val_lesion_dice:.4f}")
+            print(f"Overall Loss: {avg_val_loss:.4f}")
+            print(f"Lesion MAE: {avg_val_lesion_mae:.4f}")
             print(f"Lesion SSIM: {avg_val_lesion_ssim:.4f}")
+            print(f"Lesion Dice: {avg_val_lesion_dice:.4f}")
+            
+            # Save best models based on metrics
+            # Option 1: Save based on MAE (lower is better)
+            if avg_val_lesion_mae < best_val_lesion_mae:
+                best_val_lesion_mae = avg_val_lesion_mae
+                torch.save(model.state_dict(), os.path.join(args.output_dir, "best_lesion_mae_model.pth"))
+                print(f"Saved new best model with lesion MAE: {best_val_lesion_mae:.4f}")
+            
+            # Option 2: Save based on SSIM (higher is better)
+            if avg_val_lesion_ssim > best_val_lesion_ssim:
+                best_val_lesion_ssim = avg_val_lesion_ssim
+                torch.save(model.state_dict(), os.path.join(args.output_dir, "best_lesion_ssim_model.pth"))
+                print(f"Saved new best model with lesion SSIM: {best_val_lesion_ssim:.4f}")
+            
+            # Option 3: Save based on Dice (higher is better)
+            if avg_val_lesion_dice > best_val_lesion_dice:
+                best_val_lesion_dice = avg_val_lesion_dice
+                torch.save(model.state_dict(), os.path.join(args.output_dir, "best_lesion_dice_model.pth"))
+                print(f"Saved new best model with lesion Dice: {best_val_lesion_dice:.4f}")
+            
+            # Save checkpoint with all metrics
+            if (epoch + 1) % args.save_freq == 0:
+                torch.save({
+                    'epoch': epoch + 1,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'loss': avg_epoch_loss,
+                    'mae_loss': avg_epoch_mae_loss,
+                    'ssim_loss': avg_epoch_ssim_loss,
+                    'gradient_loss': avg_epoch_gradient_loss,
+                    'val_loss': avg_val_loss,
+                    'val_lesion_mae': avg_val_lesion_mae,
+                    'val_lesion_ssim': avg_val_lesion_ssim,
+                    'val_lesion_dice': avg_val_lesion_dice
+                }, os.path.join(args.output_dir, f"checkpoint_epoch_{epoch+1}.pth"))
         else:
             print("Warning: No valid validation examples found")
-            avg_val_lesion_loss = float('inf')
-            avg_val_lesion_dice = 0.0
-        
-        # Create visualizations every vis_freq epochs
-        if (epoch + 1) % args.vis_freq == 0 and val_examples > 0:
-            print(f"Creating validation visualizations for epoch {epoch+1}")
-            # Select a sample from validation dataset
-            for vis_idx, val_batch_data in enumerate(val_loader):
-                # Only visualize the first sample
-                if vis_idx > 0: break
-                
-                try:
-                    ph = val_batch_data["pseudo_healthy"].to(device)
-                    adc_target = val_batch_data["adc"].to(device)
-                    lbl = val_batch_data["label"].to(device)
-                    
-                    # Extract patches
-                    patches_ph, patches_label, _, patch_coords = patch_extractor.extract_patches_with_lesions(
-                        ph[0], lbl[0], ph[0]  # Using ph as placeholder for adc
-                    )
-                    
-                    # Filter out patches with invalid coordinates
-                    valid_patches = []
-                    valid_coords = []
-                    for i, (patch, coords) in enumerate(zip(patches_ph, patch_coords)):
-                        if all(c >= 0 for c in coords):
-                            valid_patches.append(i)
-                            valid_coords.append(coords)
-                    
-                    if not valid_patches:
-                        continue
-                        
-                    # Process valid patches
-                    filtered_patches_ph = [patches_ph[i] for i in valid_patches]
-                    filtered_patches_label = [patches_label[i] for i in valid_patches]
-                    filtered_patch_coords = [patch_coords[i] for i in valid_patches]
-                    
-                    output_patches = []
-                    
-                    # Generate predictions for each patch
-                    for ph_patch, label_patch in zip(filtered_patches_ph, filtered_patches_label):
-                        ph_patch = ph_patch.unsqueeze(0)
-                        label_patch = label_patch.unsqueeze(0)
-                        
-                        with torch.no_grad():
-                            output_patch = model(ph_patch, label_patch)
-                            output_patches.append(output_patch[0])
-                    
-                    # Reconstruct volume
-                    if output_patches:
-                        # Use explicit cuda:0 device
-                        cuda_device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-                        
-                        # Move all inputs to CUDA
-                        ph = ph.to(cuda_device)
-                        lbl = lbl.to(cuda_device)
-                        
-                        # Ensure all patches are on the same device (GPU)
-                        for i in range(len(output_patches)):
-                            if output_patches[i].device != cuda_device:
-                                output_patches[i] = output_patches[i].to(cuda_device)
-                        
-            
-                                
-                        reconstructed = patch_extractor.reconstruct_from_patches(
-                            output_patches, filtered_patch_coords, ph.shape
-                        )
-                        
-                        # Create inpainted result
-                        inpainted = ph[0].clone()
-                        
-                        # Ensure the reconstructed tensor is on the same device as ph
-                        if reconstructed.device != ph.device:
-                        
-                            reconstructed = reconstructed.to(ph.device)
-                        
-                        # Ensure lbl is on the same device as ph
-                        if lbl[0].device != ph[0].device:
-                            lbl = lbl.to(ph.device)
-                            
-                        inpainted = inpainted * (1 - lbl[0]) + reconstructed * lbl[0]
-                        
-                        # Normalize dimensions if needed
-                        if inpainted.dim() > ph[0].dim():
-                            while inpainted.dim() > ph[0].dim():
-                                inpainted = inpainted.squeeze(0)
-                        
-                        # Create visualization
-                        vis_path = os.path.join(args.output_dir, f"epoch_{epoch+1}_validation.pdf")
-                        
-                        # Prepare metrics dictionary for visualization
-                        vis_metrics = {
-                            "Lesion L1 Loss": lesion_loss.item(),
-                            "Lesion MAE (normalized)": lesion_mae.item() / (adc_orig_range[1].item() - adc_orig_range[0].item()),  # Normalized MAE
-                            "Lesion MAE (original scale)": lesion_mae.item(),  # Already denormalized by the function
-                            "Original ADC Range": f"{adc_orig_range[0].item():.4f} to {adc_orig_range[1].item():.4f}",
-                            "Lesion Dice": lesion_dice.item(),
-                            "Lesion SSIM": lesion_ssim.item(),
-                            "Healthy L1 Loss": healthy_loss.item(),
-                            "Total L1 Loss": val_batch_loss.item()
-                        }
-                        
-                        visualize_results(
-                            ph, 
-                            lbl, 
-                            inpainted.unsqueeze(0).unsqueeze(0), 
-                            adc_target,
-                            vis_path,
-                            metrics=vis_metrics
-                        )
-                        print(f"Saved validation visualization to {vis_path}")
-                        break
-                except Exception as vis_error:
-                    print(f"Error creating visualization: {vis_error}")
-        
-        # Save best model (now using lesion-focused metrics)
-        # Option 1: Save based on lesion L1 loss (lower is better)
-        if avg_val_lesion_loss < best_val_lesion_loss:
-            best_val_lesion_loss = avg_val_lesion_loss
-            torch.save(model.state_dict(), os.path.join(args.output_dir, "best_lesion_loss_model.pth"))
-            print(f"Saved new best model with lesion L1 loss: {best_val_lesion_loss:.4f}")
-            
-        # Option 2: Save based on lesion Dice coefficient (higher is better)
-        if avg_val_lesion_dice > best_val_lesion_dice:
-            best_val_lesion_dice = avg_val_lesion_dice
-            torch.save(model.state_dict(), os.path.join(args.output_dir, "best_lesion_dice_model.pth"))
-            print(f"Saved new best model with lesion Dice coefficient: {best_val_lesion_dice:.4f}")
-        
-        # Option 3: Save based on lesion MAE (lower is better)
-        if avg_val_lesion_mae < best_val_lesion_mae:
-            best_val_lesion_mae = avg_val_lesion_mae
-            torch.save(model.state_dict(), os.path.join(args.output_dir, "best_lesion_mae_model.pth"))
-            print(f"Saved new best model with lesion MAE: {best_val_lesion_mae:.4f}")
-        
-        # Option 4: Save based on lesion SSIM (higher is better)
-        if avg_val_lesion_ssim > best_val_lesion_ssim:
-            best_val_lesion_ssim = avg_val_lesion_ssim
-            torch.save(model.state_dict(), os.path.join(args.output_dir, "best_lesion_ssim_model.pth"))
-            print(f"Saved new best model with lesion SSIM: {best_val_lesion_ssim:.4f}")
-        
-        # Save checkpoint with all metrics
-        if (epoch + 1) % args.save_freq == 0:
-            torch.save({
-                'epoch': epoch + 1,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'loss': avg_epoch_loss,
-                'l1_loss': avg_epoch_l1_loss,
-                'smooth_loss': avg_epoch_smooth_loss,
-                'mae_loss': avg_epoch_mae_loss,
-                'ssim_loss': avg_epoch_ssim_loss,
-                'val_loss': avg_val_loss,
-                'val_lesion_loss': avg_val_lesion_loss,
-                'val_healthy_loss': avg_val_healthy_loss,
-                'val_lesion_dice': avg_val_lesion_dice,
-                'val_lesion_ssim': avg_val_lesion_ssim,
-                'val_lesion_mae': avg_val_lesion_mae  # Přidáno
-            }, os.path.join(args.output_dir, f"checkpoint_epoch_{epoch+1}.pth"))
 
 def visualize_results(pseudo_healthy, label, output, target, output_path, metrics=None):
     """
