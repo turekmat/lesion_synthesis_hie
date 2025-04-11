@@ -1101,7 +1101,6 @@ def train(args):
                 # Use random sampling
                 random.seed(epoch * 1000 + batch_idx)  # For reproducibility but different each epoch
                 valid_patches = random.sample(valid_patches, args.max_patches)
-                print(f"Limiting from {len(patches_ph)} to {args.max_patches} patches for image (at batch {batch_idx})")
             
             # Filter patches based on valid_patches
             filtered_patches_ph = [patches_ph[i] for i in valid_patches]
@@ -1112,7 +1111,6 @@ def train(args):
             # Debug info about lesion content
             if len(filtered_patches_label) > 0:
                 avg_lesion_voxels = sum(patch.sum().item() for patch in filtered_patches_label) / len(filtered_patches_label)
-                print(f"Image {batch_idx}: {len(filtered_patches_label)} patches, avg lesion voxels per patch: {avg_lesion_voxels:.1f}")
             
             batch_loss = 0
             for ph_patch, label_patch, adc_patch in zip(filtered_patches_ph, filtered_patches_label, filtered_patches_adc):
@@ -1260,7 +1258,8 @@ def train(args):
                     filtered_patches_ph = [p.to(device) for p in filtered_patches_ph]
                     filtered_patches_label = [p.to(device) for p in filtered_patches_label]
                     filtered_patches_adc = [p.to(device) for p in filtered_patches_adc]
-                    patch_coords = [c.to(device) for c in patch_coords]
+                    # DO NOT move patch coordinates to device - they are tuples not tensors
+                    # filtered_patch_coords are left as tuples of integers
                     
                     # Process patches one by one
                     output_patches = []
@@ -1437,8 +1436,14 @@ def train(args):
                                     while output_patches[i].dim() > 4:
                                         output_patches[i] = output_patches[i].squeeze(0)
                             
-                            # Rest of reconstruction code goes here
-                            # ...
+                            # Reconstruct validation volume
+                            reconstructed = patch_extractor.reconstruct_from_patches(
+                                output_patches, filtered_patch_coords, pseudo_healthy.shape
+                            )
+                            
+                            # Apply mask to show inpainted regions
+                            # Rest of reconstruction code...
+                            
                         except Exception as e:
                             print(f"Error during validation reconstruction: {e}")
                 except Exception as batch_error:
