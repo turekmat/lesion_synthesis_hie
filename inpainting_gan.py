@@ -1248,6 +1248,97 @@ def train(args):
             print(f"Lesion SSIM: {avg_val_lesion_ssim:.4f}")
             print(f"Lesion Dice: {avg_val_lesion_dice:.4f}")
             
+            # Generate and save validation visualizations based on vis_freq
+            if (epoch + 1) % args.vis_freq == 0:
+                # Sample a few validation cases for visualization
+                vis_indices = random.sample(range(len(val_loader)), min(3, len(val_loader)))
+                
+                for vis_idx in vis_indices:
+                    try:
+                        # Get a sample from validation set
+                        vis_data = list(val_loader)[vis_idx]
+                        
+                        vis_ph = vis_data["pseudo_healthy"].to(device)
+                        vis_adc = vis_data["adc"].to(device)
+                        vis_label = vis_data["label"].to(device)
+                        
+                        # Generate reconstruction for visualization
+                        with torch.no_grad():
+                            # Extract patches
+                            vis_patches_ph, vis_patches_label, vis_patches_adc, vis_patch_coords = patch_extractor.extract_patches_with_lesions(
+                                vis_ph[0], vis_label[0], vis_adc[0]
+                            )
+                            
+                            # Only use patches that contain lesions
+                            vis_out_patches = []
+                            filtered_vis_coords = []
+                            
+                            for p_idx, (patch_ph, patch_label) in enumerate(zip(vis_patches_ph, vis_patches_label)):
+                                # Only process if contains lesion
+                                if patch_label.sum() > 0:
+                                    # Add batch dimension
+                                    p_ph = patch_ph.unsqueeze(0).to(device)
+                                    p_label = patch_label.unsqueeze(0).to(device)
+                                    
+                                    # Generate output
+                                    p_out = model(p_ph, p_label)
+                                    vis_out_patches.append(p_out[0])
+                                    filtered_vis_coords.append(vis_patch_coords[p_idx])
+                        
+                            # Skip if no patches with lesions
+                            if len(vis_out_patches) == 0:
+                                continue
+                                
+                            # Reconstruct full volume
+                            reconstructed = patch_extractor.reconstruct_from_patches(
+                                vis_out_patches, filtered_vis_coords, vis_ph.shape
+                            )
+                            
+                            # Apply the lesion mask to only modify lesion regions
+                            dilated_mask = torch.nn.functional.max_pool3d(
+                                vis_label.unsqueeze(0), kernel_size=3, stride=1, padding=1
+                            )
+                            
+                            # Create final output - copy pseudo-healthy and replace only in lesion regions
+                            final_output = vis_ph.unsqueeze(0).clone()
+                            final_output = final_output * (1 - dilated_mask) + reconstructed * dilated_mask
+                            
+                            # Get the original ranges for metrics
+                            adc_orig_range_str = None
+                            if "original_ranges" in vis_data and "adc" in vis_data["original_ranges"]:
+                                orig_range = vis_data["original_ranges"]["adc"]
+                                adc_orig_range_str = f"{float(orig_range[0]):.4f} to {float(orig_range[1]):.4f}"
+                            
+                            # Create metrics dictionary for visualization
+                            vis_metrics = {
+                                "Epoch": epoch + 1,
+                                "Dataset": "Validation",
+                                "Sample": f"{vis_idx+1}/{len(val_loader)}",
+                                "Lesion MAE": avg_val_lesion_mae,
+                                "Lesion SSIM": avg_val_lesion_ssim,
+                                "Lesion Dice": avg_val_lesion_dice,
+                                "Original ADC Range": adc_orig_range_str if adc_orig_range_str else "Not available"
+                            }
+                            
+                            # Save visualization
+                            vis_output_file = os.path.join(
+                                args.output_dir, 
+                                f"val_visualization_epoch{epoch+1}_sample{vis_idx+1}.pdf"
+                            )
+                            
+                            visualize_results(
+                                vis_ph, 
+                                vis_label, 
+                                final_output[0], 
+                                vis_adc, 
+                                vis_output_file,
+                                metrics=vis_metrics
+                            )
+                            
+                            print(f"Saved validation visualization to {vis_output_file}")
+                    except Exception as vis_error:
+                        print(f"Error creating visualization for validation sample {vis_idx}: {vis_error}")
+            
             # Save best models based on metrics
             # Option 1: Save based on MAE (lower is better)
             if avg_val_lesion_mae < best_val_lesion_mae:
