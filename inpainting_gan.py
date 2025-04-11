@@ -7,7 +7,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 import monai
-from monai.networks.nets import SwinUNETR
+from monai.networks.nets import SwinUNETR, AttentionUnet
 from monai.losses import DiceLoss
 from monai.transforms import (
     Compose,
@@ -110,7 +110,7 @@ class LesionInpaintingDataset(Dataset):
         return data_dict
 
 class PatchExtractor:
-    def __init__(self, patch_size=(64, 64, 32), overlap=0.5, augment_patches=True, num_augmented_patches=3):
+    def __init__(self, patch_size=(16, 16, 16), overlap=0.5, augment_patches=True, num_augmented_patches=3):
         self.patch_size = patch_size
         self.overlap = overlap
         self.augment_patches = augment_patches
@@ -331,20 +331,27 @@ class PatchExtractor:
         # These offsets are relative to the center and give different context around the lesion
         offsets = []
         
-        # Add offsets with different shifts in each dimension
-        for i in range(self.num_augmented_patches):
-            # Random offset in each dimension, but not too large to lose the lesion
-            z_offset = random.randint(-self.patch_size[0]//4, self.patch_size[0]//4)
-            y_offset = random.randint(-self.patch_size[1]//4, self.patch_size[1]//4)
-            x_offset = random.randint(-self.patch_size[2]//4, self.patch_size[2]//4)
+        # For smaller patches, we need to be more careful with offsets to not lose the lesion
+        # Smaller random offsets for 16x16x16 patches to avoid losing the lesion
+        for i in range(self.num_augmented_patches + 2):  # Add more augmented patches for small lesions
+            # Random offset in each dimension, but smaller to ensure lesion is captured
+            z_offset = random.randint(-self.patch_size[0]//6, self.patch_size[0]//6)
+            y_offset = random.randint(-self.patch_size[1]//6, self.patch_size[1]//6)
+            x_offset = random.randint(-self.patch_size[2]//6, self.patch_size[2]//6)
             offsets.append((z_offset, y_offset, x_offset))
         
-        # Add diagonal offsets to see lesion from corner views
+        # Add very small offsets to see lesion from multiple angles
         offsets.extend([
-            (self.patch_size[0]//6, self.patch_size[1]//6, self.patch_size[2]//6),
-            (-self.patch_size[0]//6, -self.patch_size[1]//6, -self.patch_size[2]//6),
-            (self.patch_size[0]//6, -self.patch_size[1]//6, self.patch_size[2]//6),
-            (-self.patch_size[0]//6, self.patch_size[1]//6, -self.patch_size[2]//6)
+            (self.patch_size[0]//10, self.patch_size[1]//10, self.patch_size[2]//10),
+            (-self.patch_size[0]//10, -self.patch_size[1]//10, -self.patch_size[2]//10),
+            (self.patch_size[0]//10, -self.patch_size[1]//10, self.patch_size[2]//10),
+            (-self.patch_size[0]//10, self.patch_size[1]//10, -self.patch_size[2]//10),
+            (0, self.patch_size[1]//10, 0),  # Subtle y-axis shifts
+            (0, -self.patch_size[1]//10, 0),
+            (self.patch_size[0]//10, 0, 0),  # Subtle z-axis shifts
+            (-self.patch_size[0]//10, 0, 0),
+            (0, 0, self.patch_size[2]//10),  # Subtle x-axis shifts
+            (0, 0, -self.patch_size[2]//10)
         ])
         
         # Generate augmented patches with each offset
@@ -366,10 +373,13 @@ class PatchExtractor:
                 patches_ph, patches_label, patches_adc, patch_coords
             )
     
-    def _cluster_lesion_voxels(self, non_zero_indices, min_distance=16):
+    def _cluster_lesion_voxels(self, non_zero_indices, min_distance=8):
         """Simple clustering of lesion voxels to find centers"""
         if len(non_zero_indices) == 0:
             return []
+        
+        # Use smaller min_distance for smaller patches to identify more clusters
+        # 8 is half of our patch dimension (16x16x16)
         
         # Convert to list of lists to avoid recursion issues with torch tensors
         indices_list = [idx.tolist() for idx in non_zero_indices]
@@ -389,6 +399,33 @@ class PatchExtractor:
             if is_new_center:
                 centers.append(idx)
         
+        # For very small lesions with few centers, add the arithmetic mean of all voxels
+        # as an additional center to ensure coverage
+        if len(centers) <= 2 and len(indices_list) > 3:
+            z_sum, y_sum, x_sum = 0, 0, 0
+            for idx in indices_list:
+                z_sum += idx[0]
+                y_sum += idx[1]
+                x_sum += idx[2]
+            mean_center = [
+                z_sum // len(indices_list),
+                y_sum // len(indices_list),
+                x_sum // len(indices_list)
+            ]
+            
+            # Only add if not too close to existing centers
+            is_unique = True
+            for center in centers:
+                distance = ((mean_center[0] - center[0])**2 + 
+                           (mean_center[1] - center[1])**2 + 
+                           (mean_center[2] - center[2])**2)**0.5
+                if distance < min_distance // 2:  # Use smaller threshold
+                    is_unique = False
+                    break
+            
+            if is_unique:
+                centers.append(mean_center)
+                
         return centers
     
     def _pad_patch(self, patch):
@@ -653,13 +690,17 @@ class LesionInpaintingModel(nn.Module):
     def __init__(self, in_channels=2, out_channels=1):
         super(LesionInpaintingModel, self).__init__()
         
-        # SwinUNETR as the generator
-        self.generator = SwinUNETR(
-            img_size=(64, 64, 32),
+        # AttentionUnet as the generator instead of SwinUNETR
+        # Better suited for smaller patch sizes and focusing on small lesions
+        self.generator = AttentionUnet(
+            spatial_dims=3,  # 3D model
             in_channels=in_channels,  # Pseudo-healthy and lesion mask
             out_channels=out_channels,  # Inpainted ADC
-            feature_size=48,
-            use_checkpoint=True
+            channels=(16, 32, 64, 128, 256),  # Channel sequence for smaller network (fits 16x16x16 patches)
+            strides=(2, 2, 2, 2),  # Standard strides
+            kernel_size=3,
+            up_kernel_size=3,
+            dropout=0.2  # Small dropout to prevent overfitting
         )
         
         # Initialize weights
@@ -912,7 +953,7 @@ def train(args):
     optimizer = optim.Adam(model.parameters(), lr=args.learning_rate)
     
     # Initialize patch extractor
-    patch_extractor = PatchExtractor(patch_size=(64, 64, 32))
+    patch_extractor = PatchExtractor(patch_size=(16, 16, 16))
     
     # Training loop
     best_val_lesion_loss = float('inf')
@@ -1499,7 +1540,7 @@ def inference(args):
     model.eval()
     
     # Initialize patch extractor
-    patch_extractor = PatchExtractor(patch_size=(64, 64, 32))
+    patch_extractor = PatchExtractor(patch_size=(16, 16, 16))
     
     # Perform inference
     with torch.no_grad():
