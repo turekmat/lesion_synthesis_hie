@@ -1045,8 +1045,11 @@ def train(args):
         avg_epoch_mae_loss = epoch_mae_loss / max(1, train_samples)
         avg_epoch_gradient_loss = epoch_gradient_loss / max(1, train_samples)
         
+        # Get actual MAE by dividing by the weight (25.0) for display purposes only
+        actual_mae = avg_epoch_mae_loss / 25.0
+        
         print(f"Epoch {epoch+1}, Average Loss: {avg_epoch_loss:.4f}")
-        print(f"  - MAE Loss: {avg_epoch_mae_loss:.4f}")
+        print(f"  - MAE: {actual_mae:.4f} (unweighted)")
         print(f"  - Gradient Loss: {avg_epoch_gradient_loss:.4f}")
         
         # Validation
@@ -1267,9 +1270,12 @@ def train(args):
             avg_val_lesion_ssim = val_lesion_ssim / val_examples
             avg_val_lesion_dice = val_lesion_dice / val_examples
             
+            # Note: No need to divide by 25.0 here as these are already raw MAE values,
+            # not weighted loss values like in the training loop
+            
             # Print validation metrics summary
             print("\nValidation Results:")
-            print(f"Overall Loss (MAE): {avg_val_loss:.4f}")
+            print(f"Overall MAE: {avg_val_loss:.4f}")
             print(f"Lesion MAE: {avg_val_lesion_mae:.4f}")
             print(f"Lesion Dice: {avg_val_lesion_dice:.4f}")
             print(f"Lesion SSIM: {avg_val_lesion_ssim:.4f} (informační metrika, neoptimalizováno)")
