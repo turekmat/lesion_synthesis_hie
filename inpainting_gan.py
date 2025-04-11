@@ -928,8 +928,142 @@ class FocalLoss(nn.Module):
         # Apply weight
         return self.weight * focal_loss
 
+class PerceptualLoss(nn.Module):
+    def __init__(self, weight=10.0):
+        super(PerceptualLoss, self).__init__()
+        self.weight = weight
+        
+        # Využijeme konvoluční vrstvy jako extraktory příznaků
+        # Pro 3D data s malými patch rozměry (16x16x16) použijeme 3D konvoluce s menšími filtry
+        self.feature_extractor = nn.Sequential(
+            # První vrstva - zachycení základních textur (16x16x16 -> 14x14x14)
+            nn.Conv3d(1, 8, kernel_size=3, stride=1, padding=0),
+            nn.InstanceNorm3d(8),
+            nn.LeakyReLU(0.2, inplace=True),
+            
+            # Druhá vrstva - zachycení středních detailů (14x14x14 -> 12x12x12)
+            nn.Conv3d(8, 16, kernel_size=3, stride=1, padding=0),
+            nn.InstanceNorm3d(16),
+            nn.LeakyReLU(0.2, inplace=True),
+            
+            # Třetí vrstva - zachycení vyšších detailů (12x12x12 -> 10x10x10)
+            nn.Conv3d(16, 32, kernel_size=3, stride=1, padding=0),
+            nn.InstanceNorm3d(32),
+            nn.LeakyReLU(0.2, inplace=True),
+        )
+        
+        # Zmrazíme parametry feature extraktoru - nebudeme je aktualizovat během tréninku
+        for param in self.feature_extractor.parameters():
+            param.requires_grad = False
+    
+    def forward(self, pred, target, mask, orig_range=None):
+        """
+        Výpočet perceptuálního lossu - porovnává příznaky extrahované z predikce a cíle
+        Zaměřujeme se POUZE na oblast léze (použití masky)
+        
+        Args:
+            pred: Predikovaný 3D obraz
+            target: Cílový 3D obraz
+            mask: Maska léze
+            orig_range: Původní rozsah intenzit (pro škálování)
+            
+        Returns:
+            Vážená perceptuální ztráta
+        """
+        # Ensure mask is binary
+        binary_mask = (mask > 0.5).float()
+        
+        # Check if mask contains any lesions
+        mask_sum = binary_mask.sum()
+        if mask_sum <= 0:
+            # If no lesions, return zero loss
+            return torch.tensor(0.0, device=pred.device)
+        
+        # Aplikujeme masku - počítáme loss pouze v oblasti léze
+        masked_pred = pred * binary_mask
+        masked_target = target * binary_mask
+        
+        # Extrahujeme příznaky pouze z oblasti léze
+        try:
+            # Extrakce příznaků
+            pred_features = self.feature_extractor(masked_pred)
+            target_features = self.feature_extractor(masked_target)
+            
+            # Vytvoříme upravenou masku pro feature mapy
+            # Původní maska je 16x16x16, feature mapy jsou 10x10x10
+            # Proto musíme přizpůsobit masku
+            if binary_mask.shape[-1] == 16:  # Pokud je maska 16x16x16
+                # Feature mapa je 10x10x10 po třech konvolucích 3x3
+                feature_mask = torch.nn.functional.interpolate(
+                    binary_mask, 
+                    size=(10, 10, 10), 
+                    mode='trilinear', 
+                    align_corners=False
+                )
+                feature_mask = (feature_mask > 0.5).float()
+            else:
+                # Pro jiné velikosti masek - potřebujeme výpočet nové velikosti
+                # Po třech vrstvách s kernelem 3x3 bez paddingu se každá dimenze zmenší o 6
+                d, h, w = binary_mask.shape[2:]
+                new_d, new_h, new_w = d-6, h-6, w-6
+                
+                # Interpolace na novou velikost
+                if new_d > 0 and new_h > 0 and new_w > 0:
+                    feature_mask = torch.nn.functional.interpolate(
+                        binary_mask, 
+                        size=(new_d, new_h, new_w), 
+                        mode='trilinear', 
+                        align_corners=False
+                    )
+                    feature_mask = (feature_mask > 0.5).float()
+                else:
+                    # Pokud jsou rozměry příliš malé, tuto loss nemůžeme použít
+                    return torch.tensor(0.0, device=pred.device)
+            
+            # L1 loss na příznacích vážené maskou
+            feature_diff = torch.abs(pred_features - target_features)
+            masked_feature_diff = feature_diff * feature_mask
+            
+            # Průměrujeme pouze přes platné voxely léze v feature mapách
+            feature_mask_sum = feature_mask.sum()
+            if feature_mask_sum > 0:
+                perceptual_loss = masked_feature_diff.sum() / feature_mask_sum
+            else:
+                perceptual_loss = torch.tensor(0.0, device=pred.device)
+            
+            # Škálování podle původního rozsahu
+            if orig_range is not None:
+                orig_min, orig_max = orig_range
+                if isinstance(orig_min, torch.Tensor):
+                    if orig_min.device != pred.device:
+                        orig_min = orig_min.to(pred.device)
+                else:
+                    orig_min = torch.tensor(orig_min, device=pred.device)
+                    
+                if isinstance(orig_max, torch.Tensor):
+                    if orig_max.device != pred.device:
+                        orig_max = orig_max.to(pred.device)
+                else:
+                    orig_max = torch.tensor(orig_max, device=pred.device)
+                
+                range_factor = torch.abs(orig_max - orig_min)
+                perceptual_loss = perceptual_loss * range_factor
+                
+                # Zpracování NaN/Inf pro debugging
+                if torch.isnan(perceptual_loss).any() or torch.isinf(perceptual_loss).any():
+                    print(f"Warning: NaN/Inf in Perceptual loss! Range: {orig_min.item()} to {orig_max.item()}")
+                    return torch.tensor(1.0, device=pred.device) * self.weight
+            
+            # Vracíme váženou ztrátu
+            return self.weight * perceptual_loss
+            
+        except Exception as e:
+            print(f"Error in perceptual loss calculation: {e}")
+            # V případě chyby vrátíme nulovou ztrátu
+            return torch.tensor(0.0, device=pred.device)
+
 class GradientSmoothingLoss(nn.Module):
-    def __init__(self, weight=0.05):
+    def __init__(self, weight=0.02):
         super(GradientSmoothingLoss, self).__init__()
         self.weight = weight
         
@@ -1118,6 +1252,9 @@ def train(args):
     dynamic_mae_loss = DynamicWeightedMAELoss(base_weight=30.0, scaling_factor=8.0).to(device)  # Zvýšené hodnoty
     gradient_loss = GradientSmoothingLoss(weight=0.02).to(device)  # Snížená váha
     
+    # Inicializace perceptuálního lossu
+    perceptual_loss = PerceptualLoss(weight=10.0).to(device)
+    
     # Initialize optimizer with added weight decay for L2 regularization
     optimizer = optim.Adam(model.parameters(), lr=args.learning_rate, weight_decay=1e-5)
     
@@ -1140,6 +1277,7 @@ def train(args):
         epoch_focal_loss = 0
         epoch_dynamic_mae_loss = 0
         epoch_gradient_loss = 0
+        epoch_perceptual_loss = 0
         train_samples = 0
         
         for batch_idx, batch_data in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}")):
@@ -1205,35 +1343,40 @@ def train(args):
                     focal_value = torch.tensor(0.0, device=device)  # Not used
                     dynamic_mae_value = torch.tensor(0.0, device=device)  # Not used
                     gradient_value = gradient_loss(output, label_patch)
-                    loss = mae_value + gradient_value
+                    perceptual_value = perceptual_loss(output, adc_patch, label_patch, adc_orig_range)
+                    loss = mae_value + gradient_value + perceptual_value
                     
                 elif loss_type == 'focal':
                     mae_value = torch.tensor(0.0, device=device)  # Not used
                     focal_value = focal_loss(output, adc_patch, label_patch, adc_orig_range)
                     dynamic_mae_value = torch.tensor(0.0, device=device)  # Not used
                     gradient_value = gradient_loss(output, label_patch)
-                    loss = focal_value + gradient_value
+                    perceptual_value = perceptual_loss(output, adc_patch, label_patch, adc_orig_range)
+                    loss = focal_value + gradient_value + perceptual_value
                     
                 elif loss_type == 'dynamic_mae':
                     mae_value = torch.tensor(0.0, device=device)  # Not used
                     focal_value = torch.tensor(0.0, device=device)  # Not used
                     dynamic_mae_value = dynamic_mae_loss(output, adc_patch, label_patch, adc_orig_range)
                     gradient_value = gradient_loss(output, label_patch)
-                    loss = dynamic_mae_value + gradient_value
+                    perceptual_value = perceptual_loss(output, adc_patch, label_patch, adc_orig_range)
+                    loss = dynamic_mae_value + gradient_value + perceptual_value
                     
                 elif loss_type == 'combined':
                     mae_value = masked_mae_loss(output, adc_patch, label_patch, adc_orig_range) * 0.5  # Reduced weight
                     focal_value = focal_loss(output, adc_patch, label_patch, adc_orig_range) * 0.5     # Reduced weight
                     dynamic_mae_value = torch.tensor(0.0, device=device)  # Not used
                     gradient_value = gradient_loss(output, label_patch)
-                    loss = mae_value + focal_value + gradient_value
+                    perceptual_value = perceptual_loss(output, adc_patch, label_patch, adc_orig_range)
+                    loss = mae_value + focal_value + gradient_value + perceptual_value
                     
                 else:  # Default to MAE
                     mae_value = masked_mae_loss(output, adc_patch, label_patch, adc_orig_range)
                     focal_value = torch.tensor(0.0, device=device)  # Not used
                     dynamic_mae_value = torch.tensor(0.0, device=device)  # Not used
                     gradient_value = gradient_loss(output, label_patch)
-                    loss = mae_value + gradient_value
+                    perceptual_value = perceptual_loss(output, adc_patch, label_patch, adc_orig_range)
+                    loss = mae_value + gradient_value + perceptual_value
                 
                 # Backpropagation
                 optimizer.zero_grad()
@@ -1248,6 +1391,7 @@ def train(args):
                 epoch_focal_loss += focal_value.item() if loss_type != 'mae' and loss_type != 'dynamic_mae' else 0
                 epoch_dynamic_mae_loss += dynamic_mae_value.item() if loss_type == 'dynamic_mae' else 0
                 epoch_gradient_loss += gradient_value.item()
+                epoch_perceptual_loss += perceptual_value.item()
             
             # Average loss over patches
             if len(filtered_patches_ph) > 0:
@@ -1259,6 +1403,7 @@ def train(args):
         avg_epoch_focal_loss = epoch_focal_loss / max(1, train_samples) if loss_type not in ['mae', 'dynamic_mae'] else 0
         avg_epoch_dynamic_mae_loss = epoch_dynamic_mae_loss / max(1, train_samples) if loss_type == 'dynamic_mae' else 0
         avg_epoch_gradient_loss = epoch_gradient_loss / max(1, train_samples)
+        avg_epoch_perceptual_loss = epoch_perceptual_loss / max(1, train_samples)
         
         # Get actual values by dividing by the weight (25.0) for display purposes only
         actual_mae = avg_epoch_mae_loss / 25.0 if loss_type not in ['focal', 'dynamic_mae'] else 0
@@ -1273,6 +1418,7 @@ def train(args):
         if loss_type == 'dynamic_mae':
             print(f"  - Dynamic MAE: {actual_dynamic_mae:.4f} (unweighted)")
         print(f"  - Gradient Loss: {avg_epoch_gradient_loss:.4f}")
+        print(f"  - Perceptual Loss: {avg_epoch_perceptual_loss:.4f}")
         
         # Validation
         model.eval()
@@ -1282,6 +1428,7 @@ def train(args):
         val_lesion_dynamic_mae = 0.0
         val_lesion_ssim = 0.0
         val_lesion_dice = 0.0
+        val_lesion_perceptual = 0.0
         val_examples = 0
         
         with torch.no_grad():
@@ -1362,6 +1509,7 @@ def train(args):
                     batch_dice = 0.0
                     batch_focal = 0.0
                     batch_dynamic_mae = 0.0
+                    batch_perceptual = 0.0
                     num_valid_patches = 0
                     
                     for patch_idx, (ph_patch, label_patch, adc_patch, coords) in enumerate(zip(
@@ -1488,6 +1636,16 @@ def train(args):
                             else:
                                 dynamic_mae_patch = 0.0
                             
+                            # Calculate Perceptual Loss for validation if using perceptual loss
+                            if loss_type in ['combined', 'perceptual']:
+                                try:
+                                    perceptual_patch = perceptual_loss(output_patch, adc_patch, label_patch, adc_orig_range).item() / 10.0  # Divide by weight for raw value
+                                except Exception as e:
+                                    print(f"Error calculating perceptual loss: {e}")
+                                    perceptual_patch = 0.0
+                            else:
+                                perceptual_patch = 0.0
+                            
                             # Add metrics to batch totals
                             # Always add MAE regardless of loss type for validation (for comparison)
                             batch_mae += mae_patch.item()
@@ -1497,6 +1655,8 @@ def train(args):
                                 batch_focal += focal_patch
                             if loss_type in ['dynamic_mae']:
                                 batch_dynamic_mae += dynamic_mae_patch
+                            if loss_type in ['combined', 'perceptual']:
+                                batch_perceptual += perceptual_patch
                             num_valid_patches += 1
                             
                             # Store patch for reconstruction
@@ -1517,6 +1677,8 @@ def train(args):
                             batch_focal /= num_valid_patches
                         if loss_type in ['dynamic_mae']:
                             batch_dynamic_mae /= num_valid_patches
+                        if loss_type in ['combined', 'perceptual']:
+                            batch_perceptual /= num_valid_patches
                         
                         # Add to validation totals
                         # Always add MAE to validation totals for comparison
@@ -1527,6 +1689,8 @@ def train(args):
                             val_lesion_focal += batch_focal
                         if loss_type in ['dynamic_mae']:
                             val_lesion_dynamic_mae += batch_dynamic_mae
+                        if loss_type in ['combined', 'perceptual']:
+                            val_lesion_perceptual += batch_perceptual
                         val_examples += 1
                         
                         # Calculate total validation loss based on loss_type
@@ -1537,7 +1701,9 @@ def train(args):
                         elif loss_type == 'dynamic_mae':
                             batch_val_loss = batch_dynamic_mae
                         elif loss_type == 'combined':
-                            batch_val_loss = batch_mae * 0.5 + batch_focal * 0.5
+                            batch_val_loss = batch_mae * 0.5 + batch_focal * 0.5 + batch_perceptual * 0.5
+                        elif loss_type == 'perceptual':
+                            batch_val_loss = batch_perceptual
                         else:  # Default to MAE
                             batch_val_loss = batch_mae
                             
@@ -1594,6 +1760,7 @@ def train(args):
                 
             avg_val_lesion_ssim = val_lesion_ssim / val_examples
             avg_val_lesion_dice = val_lesion_dice / val_examples
+            avg_val_lesion_perceptual = val_lesion_perceptual / val_examples
             
             # Divide overall loss by the weight factor (25.0) to match training display
             avg_val_loss = avg_val_loss / 25.0
@@ -1617,6 +1784,9 @@ def train(args):
                 print(f"Overall Combined Loss: {avg_val_loss:.4f}")
                 print(f"Lesion MAE: {avg_val_lesion_mae:.4f}")
                 print(f"Lesion Focal: {avg_val_lesion_focal:.4f}")
+            elif loss_type == 'perceptual':
+                print(f"Overall Perceptual Loss: {avg_val_loss:.4f}")
+                print(f"Lesion Perceptual: {avg_val_lesion_perceptual:.4f}")
             else:
                 print(f"Overall Loss: {avg_val_loss:.4f}")
                 print(f"Lesion MAE: {avg_val_lesion_mae:.4f}")
@@ -1730,6 +1900,10 @@ def train(args):
                             if loss_type in ['focal', 'combined']:
                                 vis_metrics["Lesion Focal"] = avg_val_lesion_focal
                                 
+                            # Add perceptual loss to visualization metrics
+                            if loss_type in ['perceptual', 'combined']:
+                                vis_metrics["Lesion Perceptual"] = avg_val_lesion_perceptual
+                                
                             # Add remaining metrics
                             vis_metrics["Lesion Dice"] = avg_val_lesion_dice
                             vis_metrics["Lesion SSIM (info)"] = avg_val_lesion_ssim
@@ -1810,6 +1984,7 @@ def train(args):
                     'mae_loss': avg_epoch_mae_loss,
                     'focal_loss': avg_epoch_focal_loss,
                     'gradient_loss': avg_epoch_gradient_loss,
+                    'perceptual_loss': avg_epoch_perceptual_loss,
                     'val_loss': avg_val_loss,
                     'val_lesion_mae': avg_val_lesion_mae,
                     'val_lesion_focal': avg_val_lesion_focal,
@@ -2213,7 +2388,7 @@ def main():
     train_parser.add_argument("--learning_rate", type=float, default=0.0001, help="Learning rate")
     train_parser.add_argument("--save_freq", type=int, default=10, help="Save checkpoint frequency")
     train_parser.add_argument("--vis_freq", type=int, default=1, help="Visualization frequency")
-    train_parser.add_argument("--loss_type", type=str, default="mae", choices=["mae", "focal", "combined", "dynamic_mae"], help="Loss type (mae, focal, combined, dynamic_mae)")
+    train_parser.add_argument("--loss_type", type=str, default="mae", choices=["mae", "focal", "combined", "dynamic_mae", "perceptual"], help="Loss type (mae, focal, combined, dynamic_mae, perceptual)")
     train_parser.add_argument("--max_patches", type=int, default=32, help="Maximum number of patches per volume")
     
     # Inference arguments
