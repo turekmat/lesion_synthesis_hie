@@ -523,7 +523,6 @@ class PatchExtractor:
         
         # Force CUDA device - use the exact string "cuda:0" which is more reliable
         cuda_device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-        print(f"Forcing device {cuda_device} for reconstruction")
         
         # Validate that all patch coordinates are non-negative
         for i, (z, y, x) in enumerate(patch_coords):
@@ -539,10 +538,6 @@ class PatchExtractor:
             working_shape = output_shape
             has_batch_dim = False
             
-        # Log information for debugging
-        print(f"Reconstructing from {len(patches)} patches to output shape {output_shape}")
-        print(f"First patch shape: {patches[0].shape}, device: {patches[0].device}")
-        
         # Force move all patches to the CUDA device
         cuda_patches = []
         for i, patch in enumerate(patches):
@@ -1240,7 +1235,6 @@ def train(args):
                         seed = 42 + val_batch_idx
                         random.seed(seed)
                         valid_patches = random.sample(valid_patches, max_val_patches)
-                        print(f"Limiting from {total_valid_patches} to {max_val_patches} patches for validation image (at batch {val_batch_idx})")
                     
                     # Filter patches based on valid_patches list
                     filtered_patches_ph = [patches_ph[i] for i in valid_patches]
@@ -1251,8 +1245,6 @@ def train(args):
                     # Debug info about lesion content
                     if len(filtered_patches_label) > 0:
                         avg_lesion_voxels = sum(patch.sum().item() for patch in filtered_patches_label) / len(filtered_patches_label)
-                        print(f"Validation image {val_batch_idx}: {len(filtered_patches_label)} patches, " 
-                              f"avg lesion voxels per patch: {avg_lesion_voxels:.1f}")
                     
                     # Convert patches to tensors and move to device
                     filtered_patches_ph = [p.to(device) for p in filtered_patches_ph]
