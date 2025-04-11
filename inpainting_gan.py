@@ -54,10 +54,6 @@ class LesionInpaintingDataset(Dataset):
                     "label_file": label_file
                 })
         
-        # Optional: Cache data for faster loading
-        self.use_cache = False
-        self.data_cache = {}
-        
         print(f"{'Training' if train else 'Validation'} dataset contains {len(self.data)} samples")
 
     def __len__(self):
@@ -66,11 +62,7 @@ class LesionInpaintingDataset(Dataset):
     def __getitem__(self, idx):
         file_dict = self.data[idx]
         
-        # Check if data is already cached
-        if self.use_cache and idx in self.data_cache:
-            return self.data_cache[idx]
-        
-        # Load data using SimpleITK with explicit reader creation (faster for repeated loads)
+        # Load data using SimpleITK
         pseudo_healthy_img = sitk.ReadImage(file_dict["pseudo_healthy_file"])
         adc_img = sitk.ReadImage(file_dict["adc_file"])
         label_img = sitk.ReadImage(file_dict["label_file"])
@@ -115,22 +107,7 @@ class LesionInpaintingDataset(Dataset):
         if self.transform:
             data_dict = self.transform(data_dict)
         
-        # Cache the data if enabled
-        if self.use_cache:
-            self.data_cache[idx] = data_dict
-            
         return data_dict
-        
-    def enable_cache(self, enabled=True):
-        """Enable or disable data caching to avoid reloading from disk"""
-        self.use_cache = enabled
-        if not enabled:
-            # Clear the cache if disabling
-            self.data_cache = {}
-            
-    def clear_cache(self):
-        """Clear the data cache"""
-        self.data_cache = {}
 
 class PatchExtractor:
     def __init__(self, patch_size=(64, 64, 32), overlap=0.5, augment_patches=True, num_augmented_patches=3):
@@ -138,11 +115,6 @@ class PatchExtractor:
         self.overlap = overlap
         self.augment_patches = augment_patches
         self.num_augmented_patches = num_augmented_patches
-        
-        # Cache to avoid reconstructing multiple times
-        self.patches_cache = {}
-        # Cache for fully processed volumes
-        self.reconstructed_cache = {}
     
     def extract_patches_with_lesions(self, pseudo_healthy, label, adc, max_attempts=3, current_attempt=0):
         """
@@ -161,15 +133,6 @@ class PatchExtractor:
             patches_adc: list of adc patches
             patch_coords: list of patch coordinates (for reconstruction)
         """
-        # Create a cache key based on tensor content hash
-        # This avoids recomputing patches for the same input data
-        cache_key = self._generate_cache_key(pseudo_healthy, label, adc)
-        
-        # Check if we already have these patches cached
-        if cache_key in self.patches_cache:
-            # Return cached results
-            return self.patches_cache[cache_key]
-        
         # Get non-zero indices from the label
         non_zero_indices = torch.nonzero(label[0])
         
@@ -201,9 +164,7 @@ class PatchExtractor:
                 label_patch = self._pad_patch(label_patch)
                 adc_patch = self._pad_patch(adc_patch)
             
-            result = [ph_patch], [label_patch], [adc_patch], [(z_start, y_start, x_start)]
-            self.patches_cache[cache_key] = result
-            return result
+            return [ph_patch], [label_patch], [adc_patch], [(z_start, y_start, x_start)]
         
         # Get bounding box of the lesion to ensure we capture entire lesions
         z_indices = non_zero_indices[:, 0]
@@ -266,7 +227,7 @@ class PatchExtractor:
             
             return self.extract_patches_with_lesions(pseudo_healthy, label, adc, max_attempts, current_attempt + 1)
         elif len(patches_ph) == 0:
-            # If still no patches found, return a single random patch
+            # If still no patches with lesions after max attempts, return random patch
             d, h, w = pseudo_healthy.shape[1:]
             z_start = random.randint(0, max(0, d - self.patch_size[0]))
             y_start = random.randint(0, max(0, h - self.patch_size[1]))
@@ -293,13 +254,9 @@ class PatchExtractor:
                 label_patch = self._pad_patch(label_patch)
                 adc_patch = self._pad_patch(adc_patch)
             
-            result = [ph_patch], [label_patch], [adc_patch], [(z_start, y_start, x_start)]
-            self.patches_cache[cache_key] = result
-            return result
+            return [ph_patch], [label_patch], [adc_patch], [(z_start, y_start, x_start)]
         
-        result = patches_ph, patches_label, patches_adc, patch_coords
-        self.patches_cache[cache_key] = result
-        return result
+        return patches_ph, patches_label, patches_adc, patch_coords
     
     def _extract_and_add_patch(self, pseudo_healthy, label, adc, z_start, y_start, x_start, 
                               patches_ph, patches_label, patches_adc, patch_coords):
@@ -501,22 +458,6 @@ class PatchExtractor:
         
         # If patch size already matches or is larger, return as is
         return patch
-    
-    def _generate_cache_key(self, pseudo_healthy, label, adc):
-        """Generate a cache key based on tensor shapes and contents hash"""
-        # Use shape and sum as a simple hash
-        ph_shape = pseudo_healthy.shape
-        label_shape = label.shape
-        adc_shape = adc.shape
-        
-        # Including data statistics helps differentiate volumes
-        # Without computing expensive full hashes
-        ph_sum = pseudo_healthy.sum().item()
-        label_sum = label.sum().item()
-        adc_sum = adc.sum().item()
-        
-        # Combine into a unique key
-        return f"{ph_shape}_{label_shape}_{adc_shape}_{ph_sum:.2f}_{label_sum:.2f}_{adc_sum:.2f}"
 
     def reconstruct_from_patches(self, patches, patch_coords, output_shape):
         """
@@ -536,18 +477,6 @@ class PatchExtractor:
         torch.Tensor
             Reconstructed volume
         """
-        # Create a cache key for the reconstruction
-        # Add hash of the first few patch contents to distinguish different reconstructions
-        if len(patches) > 0:
-            first_patch_sum = patches[0].sum().item()
-            cache_key = f"{str(output_shape)}_{len(patches)}_{first_patch_sum:.2f}"
-        else:
-            cache_key = f"{str(output_shape)}_{len(patches)}"
-        
-        # Check if we have this reconstruction cached
-        if cache_key in self.reconstructed_cache:
-            return self.reconstructed_cache[cache_key]
-        
         # Validate inputs
         if len(patches) == 0:
             raise ValueError("No patches provided for reconstruction")
@@ -704,9 +633,6 @@ class PatchExtractor:
             # Final device verification
             print(f"Reconstruction complete. Output tensor shape: {reconstructed.shape}, device: {reconstructed.device}")
             
-            # Cache the result
-            self.reconstructed_cache[cache_key] = reconstructed
-            
             return reconstructed
             
         except Exception as e:
@@ -762,7 +688,7 @@ class LesionInpaintingModel(nn.Module):
         return output
 
 class MaskedMAELoss(nn.Module):
-    def __init__(self, weight=1.0):
+    def __init__(self, weight=10.0):
         super(MaskedMAELoss, self).__init__()
         self.weight = weight
         
@@ -816,13 +742,69 @@ class MaskedMAELoss(nn.Module):
                 range_factor = torch.abs(orig_max - orig_min)
                 mae = mae * range_factor
             
-            # Apply weight
+            # Apply weight - this makes the MAE term dominant
             return self.weight * mae
         else:
             return torch.tensor(0.0, device=pred.device)
 
+class SSIMLoss(nn.Module):
+    def __init__(self, weight=5.0):
+        super(SSIMLoss, self).__init__()
+        self.weight = weight
+    
+    def forward(self, pred, target, mask):
+        """
+        Computes 1-SSIM as a loss (since higher SSIM is better)
+        Strictly focuses on lesion regions
+        
+        Args:
+            pred: Predicted tensor
+            target: Target tensor
+            mask: Lesion mask tensor
+            
+        Returns:
+            SSIM loss (1-SSIM) weighted
+        """
+        # Ensure mask is binary
+        binary_mask = (mask > 0.5).float()
+        
+        # Apply mask
+        masked_pred = pred * binary_mask
+        masked_target = target * binary_mask
+        
+        # Only compute if mask has non-zero elements
+        mask_sum = binary_mask.sum()
+        if mask_sum <= 0:
+            return torch.tensor(0.0, device=pred.device)
+            
+        # Compute means
+        mu_pred = masked_pred.sum() / mask_sum
+        mu_target = masked_target.sum() / mask_sum
+        
+        # Compute variances
+        var_pred = ((masked_pred - mu_pred * binary_mask) ** 2).sum() / mask_sum
+        var_target = ((masked_target - mu_target * binary_mask) ** 2).sum() / mask_sum
+        
+        # Compute covariance
+        cov = ((masked_pred - mu_pred * binary_mask) * (masked_target - mu_target * binary_mask)).sum() / mask_sum
+        
+        # Constants for stability
+        c1 = (0.01 * 1) ** 2
+        c2 = (0.03 * 1) ** 2
+        
+        # Compute SSIM
+        ssim = ((2 * mu_pred * mu_target + c1) * (2 * cov + c2)) / \
+               ((mu_pred**2 + mu_target**2 + c1) * (var_pred + var_target + c2))
+               
+        # Ensure SSIM is in [0,1] range (clip if numerical issues)
+        ssim = torch.clamp(ssim, 0.0, 1.0)
+        
+        # Return 1-SSIM as the loss (since higher SSIM is better)
+        # Apply higher weight to make this term significant
+        return self.weight * (1.0 - ssim)
+
 class GradientSmoothingLoss(nn.Module):
-    def __init__(self, weight=0.01):
+    def __init__(self, weight=0.05):
         super(GradientSmoothingLoss, self).__init__()
         self.weight = weight
         
@@ -902,10 +884,6 @@ def train(args):
         full_dataset, [train_size, val_size]
     )
     
-    # Enable caching for datasets to avoid repeated file I/O
-    # The underlying dataset is the same for both splits
-    full_dataset.enable_cache(True)
-    
     train_loader = DataLoader(
         train_dataset, 
         batch_size=1,  # Process one volume at a time
@@ -925,14 +903,15 @@ def train(args):
     # Initialize model
     model = LesionInpaintingModel(in_channels=2, out_channels=1).to(device)
     
-    # Define loss functions - focus primarily on MAE
+    # Define loss functions - with weights prioritizing MAE and SSIM
     masked_mae_loss = MaskedMAELoss(weight=1.0).to(device)  
-    gradient_loss = GradientSmoothingLoss(weight=0.01).to(device)
+    ssim_loss = SSIMLoss(weight=1.0).to(device)
+    gradient_loss = GradientSmoothingLoss(weight=0.05).to(device)
     
     # Initialize optimizer
     optimizer = optim.Adam(model.parameters(), lr=args.learning_rate)
     
-    # Initialize patch extractor with caching
+    # Initialize patch extractor
     patch_extractor = PatchExtractor(patch_size=(64, 64, 32))
     
     # Training loop
@@ -940,144 +919,312 @@ def train(args):
     best_val_lesion_dice = 0.0
     best_val_lesion_mae = float('inf')
     best_val_lesion_ssim = 0.0
-    
-    # Track previously processed volumes to avoid duplicate work
-    processed_volumes = {}
-    
-    try:
-        for epoch in range(args.epochs):
-            model.train()
-            epoch_loss = 0
-            epoch_mae_loss = 0
-            epoch_gradient_loss = 0
-            train_samples = 0
+    for epoch in range(args.epochs):
+        model.train()
+        epoch_loss = 0
+        epoch_mae_loss = 0
+        epoch_ssim_loss = 0
+        epoch_gradient_loss = 0
+        train_samples = 0
+        
+        for batch_idx, batch_data in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}")):
+            pseudo_healthy = batch_data["pseudo_healthy"].to(device)
+            adc = batch_data["adc"].to(device)
+            label = batch_data["label"].to(device)
             
-            # Clear patch extractor cache at the start of each epoch to avoid memory issues
-            # Dataset cache is kept across epochs for faster loading
-            patch_extractor.clear_cache()
+            # Get the original ranges from the dataset for MAE loss calculation
+            adc_orig_range = None
+            if "original_ranges" in batch_data and "adc" in batch_data["original_ranges"]:
+                adc_orig_range = batch_data["original_ranges"]["adc"]
+                # Move ranges to the appropriate device
+                if isinstance(adc_orig_range[0], torch.Tensor) and adc_orig_range[0].device != device:
+                    adc_orig_range = (adc_orig_range[0].to(device), adc_orig_range[1].to(device))
             
-            for batch_idx, batch_data in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}")):
-                pseudo_healthy = batch_data["pseudo_healthy"].to(device)
-                adc = batch_data["adc"].to(device)
-                label = batch_data["label"].to(device)
+            # Extract patches containing lesions
+            patches_ph, patches_label, patches_adc, patch_coords = patch_extractor.extract_patches_with_lesions(
+                pseudo_healthy[0], label[0], adc[0]
+            )
+            
+            # Filter out patches with invalid coordinates (negative values)
+            valid_patches = []
+            for i, (patch, coords) in enumerate(zip(patches_ph, patch_coords)):
+                if all(c >= 0 for c in coords):
+                    valid_patches.append(i)
+            
+            # Skip if no valid patches
+            if not valid_patches:
+                print(f"Warning: No valid patches found for training sample {batch_idx}")
+                continue
                 
-                # Get the original ranges from the dataset for MAE loss calculation
-                adc_orig_range = None
-                if "original_ranges" in batch_data and "adc" in batch_data["original_ranges"]:
-                    adc_orig_range = batch_data["original_ranges"]["adc"]
+            # Use only valid patches
+            filtered_patches_ph = [patches_ph[i] for i in valid_patches]
+            filtered_patches_label = [patches_label[i] for i in valid_patches]
+            filtered_patches_adc = [patches_adc[i] for i in valid_patches]
+            
+            batch_loss = 0
+            for ph_patch, label_patch, adc_patch in zip(filtered_patches_ph, filtered_patches_label, filtered_patches_adc):
+                # Add batch dimension
+                ph_patch = ph_patch.unsqueeze(0)
+                label_patch = label_patch.unsqueeze(0)
+                adc_patch = adc_patch.unsqueeze(0)
+                
+                # Generate inpainted output
+                output = model(ph_patch, label_patch)
+                
+                # Calculate losses
+                mae_value = masked_mae_loss(output, adc_patch, label_patch, adc_orig_range)
+                ssim_value = ssim_loss(output, adc_patch, label_patch)
+                gradient_value = gradient_loss(output, label_patch)
+                
+                # Calculate total loss - prioritize MAE and SSIM
+                # Using 1.0 and 1.0 as weights since the loss functions already have their own weights
+                loss = mae_value + ssim_value + gradient_value
+                
+                # Backpropagation
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                
+                batch_loss += loss.item()
+                train_samples += 1
+                
+                # Track individual loss components
+                epoch_mae_loss += mae_value.item()
+                epoch_ssim_loss += ssim_value.item()
+                epoch_gradient_loss += gradient_value.item()
+            
+            # Average loss over patches
+            if len(filtered_patches_ph) > 0:
+                avg_batch_loss = batch_loss / len(filtered_patches_ph)
+                epoch_loss += avg_batch_loss
+                
+        avg_epoch_loss = epoch_loss / max(1, len(train_loader))
+        avg_epoch_mae_loss = epoch_mae_loss / max(1, train_samples)
+        avg_epoch_ssim_loss = epoch_ssim_loss / max(1, train_samples)
+        avg_epoch_gradient_loss = epoch_gradient_loss / max(1, train_samples)
+        
+        print(f"Epoch {epoch+1}, Average Loss: {avg_epoch_loss:.4f}")
+        print(f"  - MAE Loss: {avg_epoch_mae_loss:.4f}")
+        print(f"  - SSIM Loss: {avg_epoch_ssim_loss:.4f}")
+        print(f"  - Gradient Loss: {avg_epoch_gradient_loss:.4f}")
+        
+        # Validation
+        model.eval()
+        val_loss = 0.0
+        val_lesion_mae = 0.0
+        val_lesion_ssim = 0.0
+        val_lesion_dice = 0.0
+        val_examples = 0
+        
+        with torch.no_grad():
+            for val_batch_idx, val_batch_data in enumerate(val_loader):
+                pseudo_healthy = val_batch_data["pseudo_healthy"].to(device)
+                adc = val_batch_data["adc"].to(device)
+                label = val_batch_data["label"].to(device)
+                
+                # Get the original ranges from the dataset
+                if "original_ranges" in val_batch_data:
+                    ph_orig_range = val_batch_data["original_ranges"]["pseudo_healthy"]
+                    adc_orig_range = val_batch_data["original_ranges"]["adc"]
+                    
                     # Move ranges to the appropriate device
-                    if isinstance(adc_orig_range[0], torch.Tensor) and adc_orig_range[0].device != device:
-                        adc_orig_range = (adc_orig_range[0].to(device), adc_orig_range[1].to(device))
+                    cuda_device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+                    if isinstance(adc_orig_range[0], torch.Tensor) and adc_orig_range[0].device != cuda_device:
+                        adc_orig_range = (adc_orig_range[0].to(cuda_device), adc_orig_range[1].to(cuda_device))
+                    if isinstance(ph_orig_range[0], torch.Tensor) and ph_orig_range[0].device != cuda_device:  
+                        ph_orig_range = (ph_orig_range[0].to(cuda_device), ph_orig_range[1].to(cuda_device))
+                else:
+                    # Fallback if original ranges are not available
+                    print("Warning: Original ranges not found in data. Using normalized range.")
+                    cuda_device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+                    ph_orig_range = (torch.tensor(0.0, device=cuda_device), torch.tensor(1.0, device=cuda_device))
+                    adc_orig_range = (torch.tensor(0.0, device=cuda_device), torch.tensor(1.0, device=cuda_device))
                 
-                # Extract patches containing lesions
-                patches_ph, patches_label, patches_adc, patch_coords = patch_extractor.extract_patches_with_lesions(
-                    pseudo_healthy[0], label[0], adc[0]
-                )
-                
-                # Filter out patches with invalid coordinates (negative values)
-                valid_patches = []
-                for i, (patch, coords) in enumerate(zip(patches_ph, patch_coords)):
-                    if all(c >= 0 for c in coords):
-                        valid_patches.append(i)
-                
-                # Skip if no valid patches
-                if not valid_patches:
-                    print(f"Warning: No valid patches found for training sample {batch_idx}")
-                    continue
+                try:
+                    # Extract patches containing lesions, ensuring valid coordinates
+                    patches_ph, patches_label, patches_adc, patch_coords = patch_extractor.extract_patches_with_lesions(
+                        pseudo_healthy[0], label[0], adc[0]
+                    )
                     
-                # Use only valid patches
-                filtered_patches_ph = [patches_ph[i] for i in valid_patches]
-                filtered_patches_label = [patches_label[i] for i in valid_patches]
-                filtered_patches_adc = [patches_adc[i] for i in valid_patches]
-                
-                batch_loss = 0
-                for ph_patch, label_patch, adc_patch in zip(filtered_patches_ph, filtered_patches_label, filtered_patches_adc):
-                    # Add batch dimension
-                    ph_patch = ph_patch.unsqueeze(0)
-                    label_patch = label_patch.unsqueeze(0)
-                    adc_patch = adc_patch.unsqueeze(0)
+                    # Filter out patches with invalid coordinates (negative values)
+                    valid_patches = []
+                    valid_coords = []
+                    for i, (patch, coords) in enumerate(zip(patches_ph, patch_coords)):
+                        if all(c >= 0 for c in coords):
+                            valid_patches.append(i)
+                            valid_coords.append(coords)
                     
-                    # Generate inpainted output
-                    output = model(ph_patch, label_patch)
-                    
-                    # Calculate losses
-                    mae_value = masked_mae_loss(output, adc_patch, label_patch, adc_orig_range)
-                    gradient_value = gradient_loss(output, label_patch)
-                    
-                    # Calculate total loss - focus entirely on MAE with minimal smoothing
-                    loss = mae_value + gradient_value
-                    
-                    # Backpropagation
-                    optimizer.zero_grad()
-                    loss.backward()
-                    optimizer.step()
-                    
-                    batch_loss += loss.item()
-                    train_samples += 1
-                    
-                    # Track individual loss components
-                    epoch_mae_loss += mae_value.item()
-                    epoch_gradient_loss += gradient_value.item()
-                
-                # Average loss over patches
-                if len(filtered_patches_ph) > 0:
-                    avg_batch_loss = batch_loss / len(filtered_patches_ph)
-                    epoch_loss += avg_batch_loss
-                    
-            avg_epoch_loss = epoch_loss / max(1, len(train_loader))
-            avg_epoch_mae_loss = epoch_mae_loss / max(1, train_samples)
-            avg_epoch_gradient_loss = epoch_gradient_loss / max(1, train_samples)
-            
-            print(f"Epoch {epoch+1}, Average Loss: {avg_epoch_loss:.4f}")
-            print(f"  - MAE Loss: {avg_epoch_mae_loss:.4f}")
-            print(f"  - Gradient Loss: {avg_epoch_gradient_loss:.4f}")
-            
-            # Validation
-            model.eval()
-            val_loss = 0.0
-            val_lesion_mae = 0.0
-            val_lesion_ssim = 0.0
-            val_lesion_dice = 0.0
-            val_examples = 0
-            
-            # Clear patch extractor cache again before validation
-            patch_extractor.clear_cache()
-            
-            with torch.no_grad():
-                for val_batch_idx, val_batch_data in enumerate(val_loader):
-                    pseudo_healthy = val_batch_data["pseudo_healthy"].to(device)
-                    adc = val_batch_data["adc"].to(device)
-                    label = val_batch_data["label"].to(device)
-                    
-                    # Get the original ranges from the dataset
-                    if "original_ranges" in val_batch_data:
-                        ph_orig_range = val_batch_data["original_ranges"]["pseudo_healthy"]
-                        adc_orig_range = val_batch_data["original_ranges"]["adc"]
-                        
-                        # Move ranges to the appropriate device
-                        cuda_device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-                        if isinstance(adc_orig_range[0], torch.Tensor) and adc_orig_range[0].device != cuda_device:
-                            adc_orig_range = (adc_orig_range[0].to(cuda_device), adc_orig_range[1].to(cuda_device))
-                        if isinstance(ph_orig_range[0], torch.Tensor) and ph_orig_range[0].device != cuda_device:  
-                            ph_orig_range = (ph_orig_range[0].to(cuda_device), ph_orig_range[1].to(cuda_device))
-                    else:
-                        # Fallback if original ranges are not available
-                        print("Warning: Original ranges not found in data. Using normalized range.")
-                        cuda_device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-                        ph_orig_range = (torch.tensor(0.0, device=cuda_device), torch.tensor(1.0, device=cuda_device))
-                        adc_orig_range = (torch.tensor(0.0, device=cuda_device), torch.tensor(1.0, device=cuda_device))
-                    
-                    try:
-                        # Extract patches containing lesions, ensuring valid coordinates
-                        patches_ph, patches_label, patches_adc, patch_coords = patch_extractor.extract_patches_with_lesions(
-                            pseudo_healthy[0], label[0], adc[0]
-                        )
-                        
-                        # ... [rest of validation code continues] ...
-            
-                    except Exception as e:
-                        print(f"Error processing validation sample {val_batch_idx}: {e}")
+                    if not valid_patches:
+                        print(f"Warning: No valid patches found for validation sample {val_batch_idx}")
                         continue
+                    
+                    filtered_patches_ph = [patches_ph[i] for i in valid_patches]
+                    filtered_patches_label = [patches_label[i] for i in valid_patches]
+                    filtered_patches_adc = [patches_adc[i] for i in valid_patches]
+                    filtered_patch_coords = [patch_coords[i] for i in valid_patches]
+                    
+                    # Process patches one by one
+                    output_patches = []
+                    valid_patch_coords = []
+                    
+                    # Collect metrics for this batch
+                    batch_mae = 0.0
+                    batch_ssim = 0.0
+                    batch_dice = 0.0
+                    num_valid_patches = 0
+                    
+                    for patch_idx, (ph_patch, label_patch, adc_patch, coords) in enumerate(zip(
+                            filtered_patches_ph, filtered_patches_label, 
+                            filtered_patches_adc, filtered_patch_coords)):
+                        try:
+                            # Add batch dimension
+                            ph_patch = ph_patch.unsqueeze(0)  
+                            label_patch = label_patch.unsqueeze(0)
+                            adc_patch = adc_patch.unsqueeze(0)
+                            
+                            # Generate inpainted output
+                            output_patch = model(ph_patch, label_patch)
+                            
+                            # Check output shape 
+                            expected_shape = ph_patch.shape[2:]
+                            output_shape = output_patch.shape[2:]
+                            
+                            if expected_shape != output_shape:
+                                print(f"Warning: Output patch dimensions {output_shape} don't match expected dimensions {expected_shape}")
+                                # Try to fix dimensions using interpolation
+                                if len(output_shape) == len(expected_shape):
+                                    try:
+                                        # Use interpolate to resize to expected dimensions
+                                        output_patch = torch.nn.functional.interpolate(
+                                            output_patch,
+                                            size=expected_shape,
+                                            mode='trilinear',
+                                            align_corners=False
+                                        )
+                                    except Exception as resize_err:
+                                        print(f"Error resizing patch: {resize_err}")
+                                        continue
+                                else:
+                                    # Skip this patch if dimensions don't match and can't be fixed
+                                    continue
+                            
+                            # Calculate metrics for this patch
+                            # We use the new loss functions for consistent metric calculation
+                            binary_mask = (label_patch > 0.5).float()
+                            
+                            # Calculate MAE on the patch (without the weight)
+                            mae_patch = masked_mae_loss(output_patch, adc_patch, label_patch, adc_orig_range)
+                            
+                            # SSIM on the patch (without the weight)
+                            ssim_patch_val = 1.0 - ssim_loss(output_patch, adc_patch, label_patch).item() / ssim_loss.weight
+                            
+                            # Calculate Dice coefficient 
+                            # For Dice we need to threshold the outputs to create binary segmentation comparison
+                            if binary_mask.sum() > 0:
+                                masked_pred = output_patch * binary_mask
+                                masked_target = adc_patch * binary_mask
+                                
+                                # Normalize values for thresholding
+                                norm_pred = (masked_pred - masked_pred.min()) / (masked_pred.max() - masked_pred.min() + 1e-8)
+                                norm_target = (masked_target - masked_target.min()) / (masked_target.max() - masked_target.min() + 1e-8)
+                                
+                                # Apply threshold (0.5) to get binary masks
+                                pred_binary = (norm_pred > 0.5).float()
+                                target_binary = (norm_target > 0.5).float()
+                                
+                                # Calculate Dice
+                                intersection = (pred_binary * target_binary * binary_mask).sum()
+                                dice_patch = (2. * intersection) / (
+                                    (pred_binary * binary_mask).sum() + (target_binary * binary_mask).sum() + 1e-8
+                                )
+                            else:
+                                dice_patch = torch.tensor(0.0, device=device)
+                            
+                            # Add metrics to batch totals
+                            batch_mae += mae_patch.item()
+                            batch_ssim += ssim_patch_val
+                            batch_dice += dice_patch.item()
+                            num_valid_patches += 1
+                            
+                            # Store patch for reconstruction
+                            output_patches.append(output_patch[0])
+                            valid_patch_coords.append(coords)
+                            
+                        except Exception as patch_error:
+                            print(f"Error processing patch {patch_idx}: {patch_error}")
+                            continue
+                    
+                    # Average metrics for this batch
+                    if num_valid_patches > 0:
+                        batch_mae /= num_valid_patches
+                        batch_ssim /= num_valid_patches
+                        batch_dice /= num_valid_patches
+                        
+                        # Add to validation totals
+                        val_lesion_mae += batch_mae 
+                        val_lesion_ssim += batch_ssim
+                        val_lesion_dice += batch_dice
+                        val_examples += 1
+                        
+                        # Calculate total validation loss - weighted sum of MAE and SSIM
+                        # Use the same formula as in training
+                        batch_val_loss = batch_mae + (1.0 - batch_ssim)
+                        val_loss += batch_val_loss
+                    
+                    # Reconstruct full volume
+                    if output_patches:
+                        try:
+                            # Ensure all patches have the same number of dimensions
+                            patch_dims = [p.dim() for p in output_patches]
+                            if len(set(patch_dims)) > 1:
+                                print(f"Warning: Inconsistent patch dimensions: {patch_dims}")
+                                # Try to normalize dimensions
+                                for i in range(len(output_patches)):
+                                    while output_patches[i].dim() < 4:  # Ensure 4D [C, Z, Y, X]
+                                        output_patches[i] = output_patches[i].unsqueeze(0)
+                                    while output_patches[i].dim() > 4:
+                                        output_patches[i] = output_patches[i].squeeze(0)
+                            
+                            # Rest of reconstruction code goes here
+                            # ...
+                        except Exception as e:
+                            print(f"Error during validation reconstruction: {e}")
+                except Exception as batch_error:
+                    print(f"Error processing validation batch {val_batch_idx}: {batch_error}")
+                    continue
+        
+        if val_examples > 0:
+            # Calculate average metrics
+            avg_val_loss = val_loss / val_examples
+            avg_val_lesion_mae = val_lesion_mae / val_examples
+            avg_val_lesion_ssim = val_lesion_ssim / val_examples
+            avg_val_lesion_dice = val_lesion_dice / val_examples
+            
+            # Print validation metrics summary
+            print("\nValidation Results:")
+            print(f"Overall Loss: {avg_val_loss:.4f}")
+            print(f"Lesion MAE: {avg_val_lesion_mae:.4f}")
+            print(f"Lesion SSIM: {avg_val_lesion_ssim:.4f}")
+            print(f"Lesion Dice: {avg_val_lesion_dice:.4f}")
+            
+            # Save best models based on metrics
+            # Option 1: Save based on MAE (lower is better)
+            if avg_val_lesion_mae < best_val_lesion_mae:
+                best_val_lesion_mae = avg_val_lesion_mae
+                torch.save(model.state_dict(), os.path.join(args.output_dir, "best_lesion_mae_model.pth"))
+                print(f"Saved new best model with lesion MAE: {best_val_lesion_mae:.4f}")
+            
+            # Option 2: Save based on SSIM (higher is better)
+            if avg_val_lesion_ssim > best_val_lesion_ssim:
+                best_val_lesion_ssim = avg_val_lesion_ssim
+                torch.save(model.state_dict(), os.path.join(args.output_dir, "best_lesion_ssim_model.pth"))
+                print(f"Saved new best model with lesion SSIM: {best_val_lesion_ssim:.4f}")
+            
+            # Option 3: Save based on Dice (higher is better)
+            if avg_val_lesion_dice > best_val_lesion_dice:
+                best_val_lesion_dice = avg_val_lesion_dice
+                torch.save(model.state_dict(), os.path.join(args.output_dir, "best_lesion_dice_model.pth"))
+                print(f"Saved new best model with lesion Dice: {best_val_lesion_dice:.4f}")
             
             # Save checkpoint with all metrics
             if (epoch + 1) % args.save_freq == 0:
@@ -1087,19 +1234,15 @@ def train(args):
                     'optimizer_state_dict': optimizer.state_dict(),
                     'loss': avg_epoch_loss,
                     'mae_loss': avg_epoch_mae_loss,
+                    'ssim_loss': avg_epoch_ssim_loss,
                     'gradient_loss': avg_epoch_gradient_loss,
                     'val_loss': avg_val_loss,
                     'val_lesion_mae': avg_val_lesion_mae,
                     'val_lesion_ssim': avg_val_lesion_ssim,
                     'val_lesion_dice': avg_val_lesion_dice
                 }, os.path.join(args.output_dir, f"checkpoint_epoch_{epoch+1}.pth"))
-    
-    finally:
-        # Clean up cache when done to free memory
-        print("Cleaning up caches...")
-        full_dataset.clear_cache()
-        patch_extractor.clear_cache()
-        print("Cache cleanup complete.")
+        else:
+            print("Warning: No valid validation examples found")
 
 def visualize_results(pseudo_healthy, label, output, target, output_path, metrics=None):
     """
