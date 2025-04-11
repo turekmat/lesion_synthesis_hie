@@ -1445,16 +1445,16 @@ def train(args):
     dynamic_mae_loss = DynamicWeightedMAELoss(base_weight=7.5, scaling_factor=8.0).to(device)
     gradient_loss = GradientSmoothingLoss(weight=0.01).to(device)
     
-    # Inicializace perceptuálního lossu - také s nižší vahou
-    perceptual_loss = PerceptualLoss(weight=2.5).to(device)
+    # Inicializace perceptuálního lossu - drasticky snížená váha, protože měla příliš vysoké hodnoty
+    perceptual_loss = PerceptualLoss(weight=0.05).to(device)
     
     # Inicializace WGAN lossu pro adversariální trénink
     wgan_loss = WGANLoss(lambda_gp=10.0)
     
     # Váha adversariální loss - hlavní komponent GAN architektury
     # Higher weight emphasizes the adversarial aspect of the model
-    # Váha 10.0 dává adversariální složce dominantní roli oproti rekonstrukčním ztrátám (cca 5.0)
-    adv_weight = args.adv_weight if hasattr(args, 'adv_weight') else 10.0
+    # Váha 20.0 dává adversariální složce dominantní roli oproti rekonstrukčním ztrátám
+    adv_weight = args.adv_weight if hasattr(args, 'adv_weight') else 20.0
     print(f"Adversarial weight: {adv_weight}")
     
     # Initialize optimizers
@@ -1936,7 +1936,7 @@ def train(args):
                             # Calculate Perceptual Loss for validation if using perceptual loss
                             if loss_type in ['combined', 'perceptual']:
                                 try:
-                                    perceptual_patch = perceptual_loss(output_patch, adc_patch, label_patch, adc_orig_range).item() / 2.5  # Divide by weight for raw value
+                                    perceptual_patch = perceptual_loss(output_patch, adc_patch, label_patch, adc_orig_range).item() / 0.05  # Divide by weight for raw value
                                 except Exception as e:
                                     print(f"Error calculating perceptual loss: {e}")
                                     perceptual_patch = 0.0
@@ -2688,7 +2688,7 @@ def main():
     train_parser.add_argument("--vis_freq", type=int, default=1, help="Visualization frequency")
     train_parser.add_argument("--loss_type", type=str, default="mae", choices=["mae", "focal", "combined", "dynamic_mae", "perceptual"], help="Loss type (mae, focal, combined, dynamic_mae, perceptual)")
     train_parser.add_argument("--max_patches", type=int, default=32, help="Maximum number of patches per volume")
-    train_parser.add_argument("--adv_weight", type=float, default=10.0, help="Adversarial weight for WGAN-GP")
+    train_parser.add_argument("--adv_weight", type=float, default=20.0, help="Adversarial weight for WGAN-GP")
     train_parser.add_argument("--resume", type=str, help="Path to checkpoint for resuming training")
     
     # Inference arguments
