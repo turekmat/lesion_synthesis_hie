@@ -1048,12 +1048,16 @@ def train(args):
     # Initialize patch extractor
     patch_extractor = PatchExtractor(patch_size=(16, 16, 16))
     
+    # Define max patches per volume for training - this prevents excessive patch extraction
+    max_patches_per_volume = args.max_patches if hasattr(args, 'max_patches') else 32
+    max_val_patches_per_volume = 16  # Can use fewer patches for validation
+    
     # Training loop
     best_val_lesion_loss = float('inf')
     best_val_lesion_dice = 0.0
     best_val_lesion_mae = float('inf')
     best_val_lesion_ssim = 0.0
-    for epoch in range(args.epochs):
+    for epoch in range(args.start_epoch, args.epochs):
         model.train()
         epoch_loss = 0
         epoch_mae_loss = 0
@@ -1092,17 +1096,23 @@ def train(args):
                 print(f"Warning: No valid patches with lesions found for training sample {batch_idx}")
                 continue
                 
-            # Use only valid patches with lesions
+            # Limit the number of patches to prevent excessive memory usage and imbalanced training
+            if len(valid_patches) > args.max_patches:
+                # Use random sampling
+                random.seed(epoch * 1000 + batch_idx)  # For reproducibility but different each epoch
+                valid_patches = random.sample(valid_patches, args.max_patches)
+                print(f"Limiting from {len(patches_ph)} to {args.max_patches} patches for image (at batch {batch_idx})")
+            
+            # Filter patches based on valid_patches
             filtered_patches_ph = [patches_ph[i] for i in valid_patches]
             filtered_patches_label = [patches_label[i] for i in valid_patches]
             filtered_patches_adc = [patches_adc[i] for i in valid_patches]
+            filtered_patches_coords = [patch_coords[i] for i in valid_patches]
             
             # Debug info about lesion content
-            num_lesion_patches = sum(1 for patch in filtered_patches_label if patch.sum() > 0)
             if len(filtered_patches_label) > 0:
                 avg_lesion_voxels = sum(patch.sum().item() for patch in filtered_patches_label) / len(filtered_patches_label)
-                print(f"Batch {batch_idx}: {num_lesion_patches}/{len(filtered_patches_label)} patches contain lesions, " 
-                      f"avg lesion voxels per patch: {avg_lesion_voxels:.1f}")
+                print(f"Image {batch_idx}: {len(filtered_patches_label)} patches, avg lesion voxels per patch: {avg_lesion_voxels:.1f}")
             
             batch_loss = 0
             for ph_patch, label_patch, adc_patch in zip(filtered_patches_ph, filtered_patches_label, filtered_patches_adc):
@@ -1214,20 +1224,43 @@ def train(args):
                     
                     # Filter out patches with invalid coordinates (negative values)
                     valid_patches = []
-                    valid_coords = []
                     for i, (patch, coords) in enumerate(zip(patches_ph, patch_coords)):
                         if all(c >= 0 for c in coords):
-                            valid_patches.append(i)
-                            valid_coords.append(coords)
+                            # Only include patches that contain lesions
+                            if patches_label[i].sum() > 0:
+                                valid_patches.append(i)
                     
                     if not valid_patches:
-                        print(f"Warning: No valid patches found for validation sample {val_batch_idx}")
+                        print(f"Warning: No valid patches with lesions found for validation sample {val_batch_idx}")
                         continue
+                        
+                    # Limit the number of patches to prevent excessive validation on large lesions
+                    total_valid_patches = len(valid_patches)
+                    max_val_patches = 16  # Lower limit for validation to speed it up
+                    if total_valid_patches > max_val_patches:
+                        # Use deterministic sampling for validation (fixed seed for reproducibility)
+                        seed = 42 + val_batch_idx
+                        random.seed(seed)
+                        valid_patches = random.sample(valid_patches, max_val_patches)
+                        print(f"Limiting from {total_valid_patches} to {max_val_patches} patches for validation image (at batch {val_batch_idx})")
                     
+                    # Filter patches based on valid_patches list
                     filtered_patches_ph = [patches_ph[i] for i in valid_patches]
                     filtered_patches_label = [patches_label[i] for i in valid_patches]
                     filtered_patches_adc = [patches_adc[i] for i in valid_patches]
                     filtered_patch_coords = [patch_coords[i] for i in valid_patches]
+                    
+                    # Debug info about lesion content
+                    if len(filtered_patches_label) > 0:
+                        avg_lesion_voxels = sum(patch.sum().item() for patch in filtered_patches_label) / len(filtered_patches_label)
+                        print(f"Validation image {val_batch_idx}: {len(filtered_patches_label)} patches, " 
+                              f"avg lesion voxels per patch: {avg_lesion_voxels:.1f}")
+                    
+                    # Convert patches to tensors and move to device
+                    filtered_patches_ph = [p.to(device) for p in filtered_patches_ph]
+                    filtered_patches_label = [p.to(device) for p in filtered_patches_label]
+                    filtered_patches_adc = [p.to(device) for p in filtered_patches_adc]
+                    patch_coords = [c.to(device) for c in patch_coords]
                     
                     # Process patches one by one
                     output_patches = []
@@ -1278,7 +1311,7 @@ def train(args):
                             # Calculate metrics for this patch
                             binary_mask = (label_patch > 0.5).float()
                             
-                            # Calculate MAE on the patch (bez váhy pro metriku)
+                            # Always calculate MAE for validation regardless of loss type
                             mae_patch = torch.abs(output_patch - adc_patch).mean() if adc_orig_range is None else \
                                        torch.abs(output_patch - adc_patch).mean() * (adc_orig_range[1] - adc_orig_range[0])
                             
@@ -1344,10 +1377,12 @@ def train(args):
                                 focal_patch = 0.0
                             
                             # Add metrics to batch totals
+                            # Always add MAE regardless of loss type for validation
                             batch_mae += mae_patch.item()
                             batch_ssim += ssim_patch_val
                             batch_dice += dice_patch.item()
-                            batch_focal = focal_patch if loss_type in ['focal', 'combined'] else 0.0
+                            if loss_type in ['focal', 'combined']:
+                                batch_focal += focal_patch
                             num_valid_patches += 1
                             
                             # Store patch for reconstruction
@@ -1360,16 +1395,20 @@ def train(args):
                     
                     # Average metrics for this batch
                     if num_valid_patches > 0:
+                        # Always calculate average MAE for validation
                         batch_mae /= num_valid_patches
                         batch_ssim /= num_valid_patches
                         batch_dice /= num_valid_patches
-                        batch_focal = batch_focal / num_valid_patches if loss_type in ['focal', 'combined'] else 0.0
+                        if loss_type in ['focal', 'combined']:
+                            batch_focal /= num_valid_patches
                         
                         # Add to validation totals
+                        # Always add MAE to validation totals
                         val_lesion_mae += batch_mae 
                         val_lesion_ssim += batch_ssim
                         val_lesion_dice += batch_dice
-                        val_lesion_focal += batch_focal
+                        if loss_type in ['focal', 'combined']:
+                            val_lesion_focal += batch_focal
                         val_examples += 1
                         
                         # Calculate total validation loss based on loss_type
@@ -1409,21 +1448,43 @@ def train(args):
         if val_examples > 0:
             # Calculate average metrics
             avg_val_loss = val_loss / val_examples
+            
+            # Always calculate MAE for validation regardless of loss type
             avg_val_lesion_mae = val_lesion_mae / val_examples
-            avg_val_lesion_focal = val_lesion_focal / val_examples
+            # Divide by the weight factor (25.0) to match training MAE display
+            avg_val_lesion_mae = avg_val_lesion_mae / 25.0
+                
+            if loss_type in ['focal', 'combined']:
+                avg_val_lesion_focal = val_lesion_focal / val_examples
+            else:
+                # Set to zero if not using this metric
+                avg_val_lesion_focal = 0.0
+                
             avg_val_lesion_ssim = val_lesion_ssim / val_examples
             avg_val_lesion_dice = val_lesion_dice / val_examples
             
-            # Divide by the weight factor (25.0) to match training MAE display
-            avg_val_lesion_mae = avg_val_lesion_mae / 25.0
+            # Divide overall loss by the weight factor (25.0) to match training display
             avg_val_loss = avg_val_loss / 25.0
             
             # Print validation metrics summary
             print("\nValidation Results:")
-            print(f"Overall Loss: {avg_val_loss:.4f}")
-            print(f"Lesion MAE: {avg_val_lesion_mae:.4f}")
-            if loss_type in ['focal', 'combined']:
+            
+            # Make overall loss label more specific based on loss type but always show MAE
+            if loss_type == 'mae':
+                print(f"Overall MAE Loss: {avg_val_loss:.4f}")
+                print(f"Lesion MAE: {avg_val_lesion_mae:.4f}")
+            elif loss_type == 'focal':
+                print(f"Overall Focal Loss: {avg_val_loss:.4f}")
+                print(f"Lesion MAE: {avg_val_lesion_mae:.4f} (for comparison)")
                 print(f"Lesion Focal: {avg_val_lesion_focal:.4f}")
+            elif loss_type == 'combined':
+                print(f"Overall Combined Loss: {avg_val_loss:.4f}")
+                print(f"Lesion MAE: {avg_val_lesion_mae:.4f}")
+                print(f"Lesion Focal: {avg_val_lesion_focal:.4f}")
+            else:
+                print(f"Overall Loss: {avg_val_loss:.4f}")
+                print(f"Lesion MAE: {avg_val_lesion_mae:.4f}")
+                
             print(f"Lesion Dice: {avg_val_lesion_dice:.4f}")
             print(f"Lesion SSIM: {avg_val_lesion_ssim:.4f} (informační metrika, neoptimalizováno)")
             
@@ -1448,21 +1509,32 @@ def train(args):
                                 vis_ph[0], vis_label[0], vis_adc[0]
                             )
                             
+                            # Filter and limit patches for visualization
+                            valid_vis_patches = []
+                            for i, (patch, coords) in enumerate(zip(vis_patches_ph, vis_patch_coords)):
+                                if all(c >= 0 for c in coords) and vis_patches_label[i].sum() > 0:
+                                    valid_vis_patches.append(i)
+                            
+                            # Limit number of visualization patches - use even fewer to keep visualization manageable
+                            max_vis_patches = 8
+                            if len(valid_vis_patches) > max_vis_patches:
+                                # For visualization, use a deterministic sample
+                                random.seed(vis_idx * 10000)  # Fixed seed for reproducibility
+                                valid_vis_patches = random.sample(valid_vis_patches, max_vis_patches)
+                            
                             # Only use patches that contain lesions
                             vis_out_patches = []
                             filtered_vis_coords = []
                             
-                            for p_idx, (patch_ph, patch_label) in enumerate(zip(vis_patches_ph, vis_patches_label)):
-                                # Only process if contains lesion
-                                if patch_label.sum() > 0:
-                                    # Add batch dimension
-                                    p_ph = patch_ph.unsqueeze(0).to(device)
-                                    p_label = patch_label.unsqueeze(0).to(device)
-                                    
-                                    # Generate output
-                                    p_out = model(p_ph, p_label)
-                                    vis_out_patches.append(p_out[0])
-                                    filtered_vis_coords.append(vis_patch_coords[p_idx])
+                            for p_idx in valid_vis_patches:
+                                # Add batch dimension
+                                p_ph = vis_patches_ph[p_idx].unsqueeze(0).to(device)
+                                p_label = vis_patches_label[p_idx].unsqueeze(0).to(device)
+                                
+                                # Generate output
+                                p_out = model(p_ph, p_label)
+                                vis_out_patches.append(p_out[0])
+                                filtered_vis_coords.append(vis_patch_coords[p_idx])
                         
                             # Skip if no patches with lesions
                             if len(vis_out_patches) == 0:
@@ -1513,11 +1585,12 @@ def train(args):
                                 "Epoch": epoch + 1,
                                 "Dataset": "Validation",
                                 "Loss Type": loss_type,
-                                "Sample": f"{vis_idx+1}/{len(val_loader)}",
-                                "Lesion MAE": avg_val_lesion_mae
+                                "Sample": f"{vis_idx+1}/{len(val_loader)}"
                             }
                             
-                            # Add focal loss if using it
+                            # Always add MAE to metrics regardless of loss type for comparison
+                            vis_metrics["Lesion MAE"] = avg_val_lesion_mae
+                                
                             if loss_type in ['focal', 'combined']:
                                 vis_metrics["Lesion Focal"] = avg_val_lesion_focal
                                 
@@ -1882,8 +1955,39 @@ def inference(args):
             pseudo_healthy.unsqueeze(0)[0], label.unsqueeze(0)[0], pseudo_healthy.unsqueeze(0)[0]  # Use pseudo_healthy as placeholder for adc
         )
         
+        # Filter out patches with invalid coordinates (negative values)
+        valid_patches = []
+        for i, (patch, coords) in enumerate(zip(patches_ph, patch_coords)):
+            if all(c >= 0 for c in coords):
+                # Also ensure the patch actually contains lesions
+                if patches_label[i].sum() > 0:
+                    valid_patches.append(i)
+        
+        # Skip if no valid patches with lesions
+        if not valid_patches:
+            print(f"Warning: No valid patches with lesions found in the input image")
+            return
+            
+        # Limit the number of patches to prevent excessive memory usage
+        max_inference_patches = 32  # You can adjust this or make it a parameter
+        if len(valid_patches) > max_inference_patches:
+            # Use deterministic sampling for inference
+            random.seed(42)  # Fixed seed for reproducibility
+            valid_patches = random.sample(valid_patches, max_inference_patches)
+            print(f"Limiting from {len(patches_ph)} to {max_inference_patches} patches for inference")
+        
+        # Filter patches based on valid_patches list
+        filtered_patches_ph = [patches_ph[i] for i in valid_patches]
+        filtered_patches_label = [patches_label[i] for i in valid_patches]
+        filtered_patch_coords = [patch_coords[i] for i in valid_patches]
+        
+        # Debug info about lesion content
+        if len(filtered_patches_label) > 0:
+            avg_lesion_voxels = sum(patch.sum().item() for patch in filtered_patches_label) / len(filtered_patches_label)
+            print(f"Inference: {len(filtered_patches_label)} patches, avg lesion voxels per patch: {avg_lesion_voxels:.1f}")
+        
         output_patches = []
-        for ph_patch, label_patch in zip(patches_ph, patches_label):
+        for ph_patch, label_patch in zip(filtered_patches_ph, filtered_patches_label):
             # Move patches to CUDA
             ph_patch = ph_patch.to(cuda_device).unsqueeze(0)
             label_patch = label_patch.to(cuda_device).unsqueeze(0)
@@ -1903,7 +2007,7 @@ def inference(args):
             print(f"Inference: First patch device: {output_patches[0].device}, target device: {cuda_device}")
                     
             reconstructed = patch_extractor.reconstruct_from_patches(
-                output_patches, patch_coords, pseudo_healthy.shape
+                output_patches, filtered_patch_coords, pseudo_healthy.shape
             )
             
             # Apply the lesion mask to only modify lesion regions
@@ -1953,6 +2057,7 @@ def inference(args):
                 )
 
 def main():
+    # Create argument parser
     parser = argparse.ArgumentParser(description="3D Lesion Inpainting Model")
     
     # Common arguments
@@ -1967,11 +2072,13 @@ def main():
     train_parser.add_argument("--adc_dir", type=str, required=True, help="Directory with target ADC maps")
     train_parser.add_argument("--label_dir", type=str, required=True, help="Directory with lesion labels")
     train_parser.add_argument("--epochs", type=int, default=100, help="Number of training epochs")
+    train_parser.add_argument("--start_epoch", type=int, default=0, help="Starting epoch number")
     train_parser.add_argument("--batch_size", type=int, default=1, help="Batch size")
     train_parser.add_argument("--learning_rate", type=float, default=0.0001, help="Learning rate")
     train_parser.add_argument("--save_freq", type=int, default=10, help="Save checkpoint frequency")
     train_parser.add_argument("--vis_freq", type=int, default=1, help="Visualization frequency")
-    train_parser.add_argument("--loss_type", type=str, default="mae", help="Loss type (mae, focal, combined)")
+    train_parser.add_argument("--loss_type", type=str, default="mae", choices=["mae", "focal", "combined"], help="Loss type (mae, focal, combined)")
+    train_parser.add_argument("--max_patches", type=int, default=32, help="Maximum number of patches per volume")
     
     # Inference arguments
     infer_parser = subparsers.add_parser("infer", help="Inference mode")
