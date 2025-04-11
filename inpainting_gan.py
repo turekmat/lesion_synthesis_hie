@@ -16,7 +16,8 @@ from monai.transforms import (
     RandAffined,
     RandScaleIntensityd,
     EnsureTyped,
-    EnsureChannelFirstd
+    EnsureChannelFirstd,
+    RandFlipd
 )
 from monai.data import list_data_collate
 from monai.inferers import sliding_window_inference
@@ -895,7 +896,9 @@ def train(args):
     
     # Define transforms - all SimpleITK loading is handled in the dataset
     train_transforms = Compose([
+        # Normalization - keep this as it's not an augmentation but required preprocessing
         ScaleIntensityd(keys=["pseudo_healthy", "adc"], minv=0.0, maxv=1.0),
+        # Spatial augmentations only
         RandAffined(
             keys=["pseudo_healthy", "adc", "label"],
             prob=0.15,
@@ -904,7 +907,13 @@ def train(args):
             mode=("bilinear", "bilinear", "nearest"),
             padding_mode="zeros"
         ),
-        RandScaleIntensityd(keys=["pseudo_healthy", "adc"], factors=0.1, prob=0.15),
+        # Add random flips
+        RandFlipd(
+            keys=["pseudo_healthy", "adc", "label"],
+            spatial_axis=[0, 1, 2],
+            prob=0.15
+        ),
+        # Remove intensity augmentation: RandScaleIntensityd
         EnsureTyped(keys=["pseudo_healthy", "adc", "label"]),
     ])
     
