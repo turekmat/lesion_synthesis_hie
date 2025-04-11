@@ -961,7 +961,7 @@ def train(args):
     # Define loss functions - with updated weights to prioritize MAE and SSIM
     masked_l1_loss = MaskedL1Loss().to(device)
     gradient_loss = GradientSmoothingLoss(weight=0.05).to(device)  # Reduced weight
-    masked_mae_loss = MaskedMAELoss(weight=10.0).to(device)  # Significantly higher weight for MAE
+    masked_mae_loss = MaskedMAELoss(weight=15.0).to(device)  # Significantly higher weight for MAE
     ssim_loss = SSIMLoss(weight=2.0).to(device)  # Add SSIM loss
     
     # Define evaluation metrics
