@@ -1295,12 +1295,32 @@ def train(args):
                             )
                             
                             # Apply the lesion mask to only modify lesion regions
+                            # Oprava: Zajistíme, že tenzor má správné rozměry pro max_pool3d (5D tenzor [B,C,D,H,W])
+                            # Zkontrolujeme rozměry
+                            if vis_label.dim() == 4:  # [C,D,H,W]
+                                vis_label_5d = vis_label.unsqueeze(0)  # Přidáme batch dimenzi -> [1,C,D,H,W]
+                            elif vis_label.dim() == 5:  # [B,C,D,H,W]
+                                vis_label_5d = vis_label
+                            else:
+                                raise ValueError(f"Neočekávaný rozměr vis_label: {vis_label.shape}")
+                                
                             dilated_mask = torch.nn.functional.max_pool3d(
-                                vis_label.unsqueeze(0), kernel_size=3, stride=1, padding=1
+                                vis_label_5d, kernel_size=3, stride=1, padding=1
                             )
                             
+                            # Upravíme také tvar rekonstruovaného výstupu a pseudozdravého vstupu
+                            if reconstructed.dim() < 5:
+                                reconstructed = reconstructed.unsqueeze(0)
+                            
+                            if vis_ph.dim() == 4:  # [C,D,H,W]
+                                vis_ph_5d = vis_ph.unsqueeze(0)  # [1,C,D,H,W]
+                            elif vis_ph.dim() == 5:  # [B,C,D,H,W]
+                                vis_ph_5d = vis_ph
+                            else:
+                                raise ValueError(f"Neočekávaný rozměr vis_ph: {vis_ph.shape}")
+                            
                             # Create final output - copy pseudo-healthy and replace only in lesion regions
-                            final_output = vis_ph.unsqueeze(0).clone()
+                            final_output = vis_ph_5d.clone()
                             final_output = final_output * (1 - dilated_mask) + reconstructed * dilated_mask
                             
                             # Get the original ranges for metrics
@@ -1329,7 +1349,7 @@ def train(args):
                             visualize_results(
                                 vis_ph, 
                                 vis_label, 
-                                final_output[0], 
+                                final_output.squeeze(0) if final_output.dim() > 4 else final_output, 
                                 vis_adc, 
                                 vis_output_file,
                                 metrics=vis_metrics
