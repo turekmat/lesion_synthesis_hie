@@ -1457,8 +1457,11 @@ def train(args):
     best_val_lesion_mae = float('inf')
     best_val_lesion_ssim = 0.0
     
+    # Inicializace start_epoch pro případy, kdy není použit --resume
+    args.start_epoch = 0
+    
     # Načíst checkpoint, pokud je k dispozici
-    if args.resume and os.path.exists(args.resume):
+    if hasattr(args, 'resume') and args.resume and os.path.exists(args.resume):
         print(f"Loading checkpoint from {args.resume}")
         checkpoint = torch.load(args.resume, map_location=device)
         model.load_state_dict(checkpoint['model_state_dict'])
@@ -2665,6 +2668,7 @@ def main():
     train_parser.add_argument("--loss_type", type=str, default="mae", choices=["mae", "focal", "combined", "dynamic_mae", "perceptual"], help="Loss type (mae, focal, combined, dynamic_mae, perceptual)")
     train_parser.add_argument("--max_patches", type=int, default=32, help="Maximum number of patches per volume")
     train_parser.add_argument("--adv_weight", type=float, default=0.1, help="Adversarial weight for WGAN-GP")
+    train_parser.add_argument("--resume", type=str, help="Path to checkpoint for resuming training")
     
     # Inference arguments
     infer_parser = subparsers.add_parser("infer", help="Inference mode")
