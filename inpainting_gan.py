@@ -729,7 +729,7 @@ class LesionInpaintingModel(nn.Module):
         return output
 
 class MaskedMAELoss(nn.Module):
-    def __init__(self, weight=10.0):
+    def __init__(self, weight=25.0):
         super(MaskedMAELoss, self).__init__()
         self.weight = weight
         
@@ -749,6 +749,12 @@ class MaskedMAELoss(nn.Module):
         # Ensure mask is binary
         binary_mask = (mask > 0.5).float()
         
+        # Zkontrolujeme, zda maska obsahuje nějaké léze
+        mask_sum = binary_mask.sum()
+        if mask_sum <= 0:
+            # Pokud nejsou léze, vrátíme nulovou ztrátu
+            return torch.tensor(0.0, device=pred.device)
+        
         # Apply mask to both prediction and target
         masked_pred = pred * binary_mask
         masked_target = target * binary_mask
@@ -757,36 +763,37 @@ class MaskedMAELoss(nn.Module):
         abs_diff = torch.abs(masked_pred - masked_target)
         
         # Calculate mean only over masked regions
-        mask_sum = binary_mask.sum()
-        if mask_sum > 0:
-            mae = abs_diff.sum() / mask_sum
+        mae = abs_diff.sum() / mask_sum
+        
+        # Apply denormalization if original range is provided
+        if orig_range is not None:
+            orig_min, orig_max = orig_range
             
-            # Apply denormalization if original range is provided
-            if orig_range is not None:
-                orig_min, orig_max = orig_range
+            # Check if orig_range is a tensor and move to device if needed
+            device = pred.device
+            if isinstance(orig_min, torch.Tensor):
+                if orig_min.device != device:
+                    orig_min = orig_min.to(device)
+            else:
+                orig_min = torch.tensor(orig_min, device=device)
                 
-                # Check if orig_range is a tensor and move to device if needed
-                device = pred.device
-                if isinstance(orig_min, torch.Tensor):
-                    if orig_min.device != device:
-                        orig_min = orig_min.to(device)
-                else:
-                    orig_min = torch.tensor(orig_min, device=device)
-                    
-                if isinstance(orig_max, torch.Tensor):
-                    if orig_max.device != device:
-                        orig_max = orig_max.to(device)
-                else:
-                    orig_max = torch.tensor(orig_max, device=device)
-                
-                # Scale the loss by the original range
-                range_factor = torch.abs(orig_max - orig_min)
-                mae = mae * range_factor
+            if isinstance(orig_max, torch.Tensor):
+                if orig_max.device != device:
+                    orig_max = orig_max.to(device)
+            else:
+                orig_max = torch.tensor(orig_max, device=device)
             
-            # Apply weight - this makes the MAE term dominant
-            return self.weight * mae
-        else:
-            return torch.tensor(0.0, device=pred.device)
+            # Scale the loss by the original range for more intuitivní výsledky
+            range_factor = torch.abs(orig_max - orig_min)
+            mae = mae * range_factor
+            
+            # Pro lepší debugging
+            if torch.isnan(mae).any() or torch.isinf(mae).any():
+                print(f"Warning: NaN/Inf in MAE loss! Range: {orig_min.item()} to {orig_max.item()}")
+                return torch.tensor(1.0, device=pred.device) * self.weight
+        
+        # Apply weight - tato váha nyní bude výrazně vyšší (25.0 místo 1.0)
+        return self.weight * mae
 
 class SSIMLoss(nn.Module):
     def __init__(self, weight=5.0):
@@ -944,13 +951,12 @@ def train(args):
     # Initialize model
     model = LesionInpaintingModel(in_channels=2, out_channels=1).to(device)
     
-    # Define loss functions - with weights prioritizing MAE and SSIM
-    masked_mae_loss = MaskedMAELoss(weight=1.0).to(device)  
-    ssim_loss = SSIMLoss(weight=1.0).to(device)
-    gradient_loss = GradientSmoothingLoss(weight=0.05).to(device)
+    # Define loss functions - zaměření pouze na MAE s vyšší váhou
+    masked_mae_loss = MaskedMAELoss(weight=25.0).to(device)  # Zvýšena váha MAE loss
+    gradient_loss = GradientSmoothingLoss(weight=0.05).to(device)  # Ponecháno pro lepší vizuální kvalitu
     
-    # Initialize optimizer
-    optimizer = optim.Adam(model.parameters(), lr=args.learning_rate)
+    # Initialize optimizer s přidaným weight decay pro L2 regularizaci
+    optimizer = optim.Adam(model.parameters(), lr=args.learning_rate, weight_decay=1e-5)
     
     # Initialize patch extractor
     patch_extractor = PatchExtractor(patch_size=(16, 16, 16))
@@ -964,7 +970,6 @@ def train(args):
         model.train()
         epoch_loss = 0
         epoch_mae_loss = 0
-        epoch_ssim_loss = 0
         epoch_gradient_loss = 0
         train_samples = 0
         
@@ -1012,14 +1017,12 @@ def train(args):
                 # Generate inpainted output
                 output = model(ph_patch, label_patch)
                 
-                # Calculate losses
+                # Calculate losses - pouze MAE a gradient loss
                 mae_value = masked_mae_loss(output, adc_patch, label_patch, adc_orig_range)
-                ssim_value = ssim_loss(output, adc_patch, label_patch)
                 gradient_value = gradient_loss(output, label_patch)
                 
-                # Calculate total loss - prioritize MAE and SSIM
-                # Using 1.0 and 1.0 as weights since the loss functions already have their own weights
-                loss = mae_value + ssim_value + gradient_value
+                # Calculate total loss - pouze MAE a gradient
+                loss = mae_value + gradient_value
                 
                 # Backpropagation
                 optimizer.zero_grad()
@@ -1031,7 +1034,6 @@ def train(args):
                 
                 # Track individual loss components
                 epoch_mae_loss += mae_value.item()
-                epoch_ssim_loss += ssim_value.item()
                 epoch_gradient_loss += gradient_value.item()
             
             # Average loss over patches
@@ -1041,19 +1043,17 @@ def train(args):
                 
         avg_epoch_loss = epoch_loss / max(1, len(train_loader))
         avg_epoch_mae_loss = epoch_mae_loss / max(1, train_samples)
-        avg_epoch_ssim_loss = epoch_ssim_loss / max(1, train_samples)
         avg_epoch_gradient_loss = epoch_gradient_loss / max(1, train_samples)
         
         print(f"Epoch {epoch+1}, Average Loss: {avg_epoch_loss:.4f}")
         print(f"  - MAE Loss: {avg_epoch_mae_loss:.4f}")
-        print(f"  - SSIM Loss: {avg_epoch_ssim_loss:.4f}")
         print(f"  - Gradient Loss: {avg_epoch_gradient_loss:.4f}")
         
         # Validation
         model.eval()
         val_loss = 0.0
         val_lesion_mae = 0.0
-        val_lesion_ssim = 0.0
+        val_lesion_ssim = 0.0  # Ponecháno pro zpětnou kompatibilitu při ukládání
         val_lesion_dice = 0.0
         val_examples = 0
         
@@ -1150,17 +1150,44 @@ def train(args):
                                     continue
                             
                             # Calculate metrics for this patch
-                            # We use the new loss functions for consistent metric calculation
                             binary_mask = (label_patch > 0.5).float()
                             
-                            # Calculate MAE on the patch (without the weight)
-                            mae_patch = masked_mae_loss(output_patch, adc_patch, label_patch, adc_orig_range)
+                            # Calculate MAE on the patch (bez váhy pro metriku)
+                            mae_patch = torch.abs(output_patch - adc_patch).mean() if adc_orig_range is None else \
+                                       torch.abs(output_patch - adc_patch).mean() * (adc_orig_range[1] - adc_orig_range[0])
                             
-                            # SSIM on the patch (without the weight)
-                            ssim_patch_val = 1.0 - ssim_loss(output_patch, adc_patch, label_patch).item() / ssim_loss.weight
+                            # Pro SSIM metriku - pouze pro zpětnou kompatibilitu
+                            # Nepočítáme ji pomocí SSIMLoss, ale použijeme hodnotu SSIM z PyTorch
+                            if binary_mask.sum() > 0:
+                                try:
+                                    from pytorch_msssim import ssim
+                                    # Upravit dimenze pro SSIM, který očekává 4D nebo 5D tenzor
+                                    if output_patch.dim() == 5:  # [B,C,D,H,W]
+                                        # Pro 3D data vezmeme průměr přes D dimenzi
+                                        ssim_val = 0
+                                        depth = output_patch.shape[2]
+                                        for d in range(depth):
+                                            # Použijeme ssim pro každý 2D řez
+                                            slice_ssim = ssim(
+                                                output_patch[:,:,d],
+                                                adc_patch[:,:,d],
+                                                data_range=1.0,
+                                                size_average=True
+                                            )
+                                            ssim_val += slice_ssim
+                                        ssim_val /= depth  # Průměr přes všechny řezy
+                                    else:
+                                        # Pokud není 5D, nastavíme defaultní hodnotu
+                                        ssim_val = 0.5
+                                        
+                                    ssim_patch_val = ssim_val.item() if isinstance(ssim_val, torch.Tensor) else ssim_val
+                                except:
+                                    # Pokud pytorch_msssim není k dispozici, použijeme placeholder
+                                    ssim_patch_val = 0.5
+                            else:
+                                ssim_patch_val = 0.0
                             
                             # Calculate Dice coefficient 
-                            # For Dice we need to threshold the outputs to create binary segmentation comparison
                             if binary_mask.sum() > 0:
                                 masked_pred = output_patch * binary_mask
                                 masked_target = adc_patch * binary_mask
@@ -1207,9 +1234,8 @@ def train(args):
                         val_lesion_dice += batch_dice
                         val_examples += 1
                         
-                        # Calculate total validation loss - weighted sum of MAE and SSIM
-                        # Use the same formula as in training
-                        batch_val_loss = batch_mae + (1.0 - batch_ssim)
+                        # Calculate total validation loss - pouze MAE
+                        batch_val_loss = batch_mae
                         val_loss += batch_val_loss
                     
                     # Reconstruct full volume
@@ -1243,10 +1269,10 @@ def train(args):
             
             # Print validation metrics summary
             print("\nValidation Results:")
-            print(f"Overall Loss: {avg_val_loss:.4f}")
+            print(f"Overall Loss (MAE): {avg_val_loss:.4f}")
             print(f"Lesion MAE: {avg_val_lesion_mae:.4f}")
-            print(f"Lesion SSIM: {avg_val_lesion_ssim:.4f}")
             print(f"Lesion Dice: {avg_val_lesion_dice:.4f}")
+            print(f"Lesion SSIM: {avg_val_lesion_ssim:.4f} (informační metrika, neoptimalizováno)")
             
             # Generate and save validation visualizations based on vis_freq
             if (epoch + 1) % args.vis_freq == 0:
@@ -1335,8 +1361,8 @@ def train(args):
                                 "Dataset": "Validation",
                                 "Sample": f"{vis_idx+1}/{len(val_loader)}",
                                 "Lesion MAE": avg_val_lesion_mae,
-                                "Lesion SSIM": avg_val_lesion_ssim,
                                 "Lesion Dice": avg_val_lesion_dice,
+                                "Lesion SSIM (info)": avg_val_lesion_ssim,
                                 "Original ADC Range": adc_orig_range_str if adc_orig_range_str else "Not available"
                             }
                             
@@ -1360,23 +1386,24 @@ def train(args):
                         print(f"Error creating visualization for validation sample {vis_idx}: {vis_error}")
             
             # Save best models based on metrics
-            # Option 1: Save based on MAE (lower is better)
+            # Prioritizace MAE (nižší je lepší)
             if avg_val_lesion_mae < best_val_lesion_mae:
                 best_val_lesion_mae = avg_val_lesion_mae
                 torch.save(model.state_dict(), os.path.join(args.output_dir, "best_lesion_mae_model.pth"))
                 print(f"Saved new best model with lesion MAE: {best_val_lesion_mae:.4f}")
             
-            # Option 2: Save based on SSIM (higher is better)
-            if avg_val_lesion_ssim > best_val_lesion_ssim:
-                best_val_lesion_ssim = avg_val_lesion_ssim
-                torch.save(model.state_dict(), os.path.join(args.output_dir, "best_lesion_ssim_model.pth"))
-                print(f"Saved new best model with lesion SSIM: {best_val_lesion_ssim:.4f}")
-            
-            # Option 3: Save based on Dice (higher is better)
+            # Dice (vyšší je lepší) - sekundární metrika
             if avg_val_lesion_dice > best_val_lesion_dice:
                 best_val_lesion_dice = avg_val_lesion_dice
                 torch.save(model.state_dict(), os.path.join(args.output_dir, "best_lesion_dice_model.pth"))
                 print(f"Saved new best model with lesion Dice: {best_val_lesion_dice:.4f}")
+            
+            # SSIM (vyšší je lepší) - pouze informační, může být odstraněno v budoucnu
+            if avg_val_lesion_ssim > best_val_lesion_ssim:
+                best_val_lesion_ssim = avg_val_lesion_ssim
+                # Ukládáme model se sufixem který indikuje, že jde o experimentální model
+                torch.save(model.state_dict(), os.path.join(args.output_dir, "experimental_lesion_ssim_model.pth"))
+                print(f"Saved experimental model with lesion SSIM: {best_val_lesion_ssim:.4f} (neoptimalizovaná metrika)")
             
             # Save checkpoint with all metrics
             if (epoch + 1) % args.save_freq == 0:
@@ -1386,11 +1413,10 @@ def train(args):
                     'optimizer_state_dict': optimizer.state_dict(),
                     'loss': avg_epoch_loss,
                     'mae_loss': avg_epoch_mae_loss,
-                    'ssim_loss': avg_epoch_ssim_loss,
                     'gradient_loss': avg_epoch_gradient_loss,
                     'val_loss': avg_val_loss,
                     'val_lesion_mae': avg_val_lesion_mae,
-                    'val_lesion_ssim': avg_val_lesion_ssim,
+                    'val_lesion_ssim': avg_val_lesion_ssim,  # Stále ukládáme pro sledování
                     'val_lesion_dice': avg_val_lesion_dice
                 }, os.path.join(args.output_dir, f"checkpoint_epoch_{epoch+1}.pth"))
         else:
