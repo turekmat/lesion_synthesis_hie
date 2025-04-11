@@ -851,6 +851,88 @@ class SSIMLoss(nn.Module):
         # Apply higher weight to make this term significant
         return self.weight * (1.0 - ssim)
 
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=0.25, gamma=2.0, weight=25.0):
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.weight = weight
+        
+    def forward(self, pred, target, mask, orig_range=None):
+        """
+        Compute Focal Loss for regression, focusing more on difficult examples (large errors)
+        
+        Args:
+            pred: Predicted tensor
+            target: Target tensor  
+            mask: Lesion mask tensor (to focus only on lesions)
+            orig_range: Original intensity range as tuple (min, max) before normalization
+            
+        Returns:
+            Weighted Focal Loss
+        """
+        # Ensure mask is binary
+        binary_mask = (mask > 0.5).float()
+        
+        # Check if mask contains any lesions
+        mask_sum = binary_mask.sum()
+        if mask_sum <= 0:
+            # If no lesions, return zero loss
+            return torch.tensor(0.0, device=pred.device)
+        
+        # Apply mask to both prediction and target
+        masked_pred = pred * binary_mask
+        masked_target = target * binary_mask
+        
+        # Calculate absolute difference
+        abs_diff = torch.abs(masked_pred - masked_target)
+        
+        # Normalize the diff to [0, 1] for the focal weight calculation
+        if orig_range is not None:
+            orig_min, orig_max = orig_range
+            
+            # Check if orig_range is a tensor and move to device if needed
+            device = pred.device
+            if isinstance(orig_min, torch.Tensor):
+                if orig_min.device != device:
+                    orig_min = orig_min.to(device)
+            else:
+                orig_min = torch.tensor(orig_min, device=device)
+                
+            if isinstance(orig_max, torch.Tensor):
+                if orig_max.device != device:
+                    orig_max = orig_max.to(device)
+            else:
+                orig_max = torch.tensor(orig_max, device=device)
+            
+            range_factor = torch.abs(orig_max - orig_min)
+            norm_diff = abs_diff / range_factor
+        else:
+            # Assume data is already normalized
+            norm_diff = abs_diff
+        
+        # Apply focal weight: (1 - e^(-norm_diff))^gamma
+        # This gives higher weight to larger errors
+        focal_weight = (1 - torch.exp(-norm_diff * 5.0)).pow(self.gamma)  # Multiply by 5 to make the curve steeper
+        
+        # Apply alpha weighting for positive examples
+        weighted_loss = self.alpha * focal_weight * abs_diff
+        
+        # Take mean over masked region
+        focal_loss = weighted_loss.sum() / mask_sum
+        
+        # Apply denormalization if original range is provided
+        if orig_range is not None:
+            focal_loss = focal_loss * range_factor
+            
+            # Handle NaN/Inf for debugging
+            if torch.isnan(focal_loss).any() or torch.isinf(focal_loss).any():
+                print(f"Warning: NaN/Inf in Focal loss! Range: {orig_min.item()} to {orig_max.item()}")
+                return torch.tensor(1.0, device=pred.device) * self.weight
+        
+        # Apply weight
+        return self.weight * focal_loss
+
 class GradientSmoothingLoss(nn.Module):
     def __init__(self, weight=0.05):
         super(GradientSmoothingLoss, self).__init__()
@@ -951,11 +1033,16 @@ def train(args):
     # Initialize model
     model = LesionInpaintingModel(in_channels=2, out_channels=1).to(device)
     
-    # Define loss functions - zaměření pouze na MAE s vyšší váhou
-    masked_mae_loss = MaskedMAELoss(weight=25.0).to(device)  # Zvýšena váha MAE loss
-    gradient_loss = GradientSmoothingLoss(weight=0.05).to(device)  # Ponecháno pro lepší vizuální kvalitu
+    # Define loss functions based on the selected loss type
+    loss_type = args.loss_type if hasattr(args, 'loss_type') else 'mae'
+    print(f"Using loss type: {loss_type}")
     
-    # Initialize optimizer s přidaným weight decay pro L2 regularizaci
+    # Initialize loss functions
+    masked_mae_loss = MaskedMAELoss(weight=25.0).to(device)
+    focal_loss = FocalLoss(alpha=0.75, gamma=2.0, weight=25.0).to(device)
+    gradient_loss = GradientSmoothingLoss(weight=0.05).to(device)
+    
+    # Initialize optimizer with added weight decay for L2 regularization
     optimizer = optim.Adam(model.parameters(), lr=args.learning_rate, weight_decay=1e-5)
     
     # Initialize patch extractor
@@ -970,6 +1057,7 @@ def train(args):
         model.train()
         epoch_loss = 0
         epoch_mae_loss = 0
+        epoch_focal_loss = 0
         epoch_gradient_loss = 0
         train_samples = 0
         
@@ -978,7 +1066,7 @@ def train(args):
             adc = batch_data["adc"].to(device)
             label = batch_data["label"].to(device)
             
-            # Get the original ranges from the dataset for MAE loss calculation
+            # Get the original ranges from the dataset for loss calculation
             adc_orig_range = None
             if "original_ranges" in batch_data and "adc" in batch_data["original_ranges"]:
                 adc_orig_range = batch_data["original_ranges"]["adc"]
@@ -995,17 +1083,26 @@ def train(args):
             valid_patches = []
             for i, (patch, coords) in enumerate(zip(patches_ph, patch_coords)):
                 if all(c >= 0 for c in coords):
-                    valid_patches.append(i)
+                    # Also ensure the patch actually contains lesions
+                    if patches_label[i].sum() > 0:
+                        valid_patches.append(i)
             
-            # Skip if no valid patches
+            # Skip if no valid patches with lesions
             if not valid_patches:
-                print(f"Warning: No valid patches found for training sample {batch_idx}")
+                print(f"Warning: No valid patches with lesions found for training sample {batch_idx}")
                 continue
                 
-            # Use only valid patches
+            # Use only valid patches with lesions
             filtered_patches_ph = [patches_ph[i] for i in valid_patches]
             filtered_patches_label = [patches_label[i] for i in valid_patches]
             filtered_patches_adc = [patches_adc[i] for i in valid_patches]
+            
+            # Debug info about lesion content
+            num_lesion_patches = sum(1 for patch in filtered_patches_label if patch.sum() > 0)
+            if len(filtered_patches_label) > 0:
+                avg_lesion_voxels = sum(patch.sum().item() for patch in filtered_patches_label) / len(filtered_patches_label)
+                print(f"Batch {batch_idx}: {num_lesion_patches}/{len(filtered_patches_label)} patches contain lesions, " 
+                      f"avg lesion voxels per patch: {avg_lesion_voxels:.1f}")
             
             batch_loss = 0
             for ph_patch, label_patch, adc_patch in zip(filtered_patches_ph, filtered_patches_label, filtered_patches_adc):
@@ -1017,12 +1114,30 @@ def train(args):
                 # Generate inpainted output
                 output = model(ph_patch, label_patch)
                 
-                # Calculate losses - pouze MAE a gradient loss
-                mae_value = masked_mae_loss(output, adc_patch, label_patch, adc_orig_range)
-                gradient_value = gradient_loss(output, label_patch)
-                
-                # Calculate total loss - pouze MAE a gradient
-                loss = mae_value + gradient_value
+                # Calculate losses based on selected loss type
+                if loss_type == 'mae':
+                    mae_value = masked_mae_loss(output, adc_patch, label_patch, adc_orig_range)
+                    focal_value = torch.tensor(0.0, device=device)  # Not used
+                    gradient_value = gradient_loss(output, label_patch)
+                    loss = mae_value + gradient_value
+                    
+                elif loss_type == 'focal':
+                    mae_value = torch.tensor(0.0, device=device)  # Not used
+                    focal_value = focal_loss(output, adc_patch, label_patch, adc_orig_range)
+                    gradient_value = gradient_loss(output, label_patch)
+                    loss = focal_value + gradient_value
+                    
+                elif loss_type == 'combined':
+                    mae_value = masked_mae_loss(output, adc_patch, label_patch, adc_orig_range) * 0.5  # Reduced weight
+                    focal_value = focal_loss(output, adc_patch, label_patch, adc_orig_range) * 0.5     # Reduced weight
+                    gradient_value = gradient_loss(output, label_patch)
+                    loss = mae_value + focal_value + gradient_value
+                    
+                else:  # Default to MAE
+                    mae_value = masked_mae_loss(output, adc_patch, label_patch, adc_orig_range)
+                    focal_value = torch.tensor(0.0, device=device)  # Not used
+                    gradient_value = gradient_loss(output, label_patch)
+                    loss = mae_value + gradient_value
                 
                 # Backpropagation
                 optimizer.zero_grad()
@@ -1033,7 +1148,8 @@ def train(args):
                 train_samples += 1
                 
                 # Track individual loss components
-                epoch_mae_loss += mae_value.item()
+                epoch_mae_loss += mae_value.item() if loss_type != 'focal' else 0
+                epoch_focal_loss += focal_value.item() if loss_type != 'mae' else 0
                 epoch_gradient_loss += gradient_value.item()
             
             # Average loss over patches
@@ -1042,21 +1158,27 @@ def train(args):
                 epoch_loss += avg_batch_loss
                 
         avg_epoch_loss = epoch_loss / max(1, len(train_loader))
-        avg_epoch_mae_loss = epoch_mae_loss / max(1, train_samples)
+        avg_epoch_mae_loss = epoch_mae_loss / max(1, train_samples) if loss_type != 'focal' else 0
+        avg_epoch_focal_loss = epoch_focal_loss / max(1, train_samples) if loss_type != 'mae' else 0
         avg_epoch_gradient_loss = epoch_gradient_loss / max(1, train_samples)
         
         # Get actual MAE by dividing by the weight (25.0) for display purposes only
-        actual_mae = avg_epoch_mae_loss / 25.0
+        actual_mae = avg_epoch_mae_loss / 25.0 if loss_type != 'focal' else 0
+        actual_focal = avg_epoch_focal_loss / 25.0 if loss_type != 'mae' else 0
         
         print(f"Epoch {epoch+1}, Average Loss: {avg_epoch_loss:.4f}")
-        print(f"  - MAE: {actual_mae:.4f} (unweighted)")
+        if loss_type != 'focal':
+            print(f"  - MAE: {actual_mae:.4f} (unweighted)")
+        if loss_type != 'mae':
+            print(f"  - Focal: {actual_focal:.4f} (unweighted)")
         print(f"  - Gradient Loss: {avg_epoch_gradient_loss:.4f}")
         
         # Validation
         model.eval()
         val_loss = 0.0
         val_lesion_mae = 0.0
-        val_lesion_ssim = 0.0  # Ponecháno pro zpětnou kompatibilitu při ukládání
+        val_lesion_focal = 0.0
+        val_lesion_ssim = 0.0
         val_lesion_dice = 0.0
         val_examples = 0
         
@@ -1115,6 +1237,7 @@ def train(args):
                     batch_mae = 0.0
                     batch_ssim = 0.0
                     batch_dice = 0.0
+                    batch_focal = 0.0
                     num_valid_patches = 0
                     
                     for patch_idx, (ph_patch, label_patch, adc_patch, coords) in enumerate(zip(
@@ -1160,7 +1283,6 @@ def train(args):
                                        torch.abs(output_patch - adc_patch).mean() * (adc_orig_range[1] - adc_orig_range[0])
                             
                             # Pro SSIM metriku - pouze pro zpětnou kompatibilitu
-                            # Nepočítáme ji pomocí SSIMLoss, ale použijeme hodnotu SSIM z PyTorch
                             if binary_mask.sum() > 0:
                                 try:
                                     from pytorch_msssim import ssim
@@ -1211,10 +1333,21 @@ def train(args):
                             else:
                                 dice_patch = torch.tensor(0.0, device=device)
                             
+                            # Calculate Focal Loss for validation if using focal loss
+                            if loss_type in ['focal', 'combined']:
+                                try:
+                                    focal_patch = focal_loss(output_patch, adc_patch, label_patch, adc_orig_range).item() / 25.0  # Divide by weight for raw value
+                                except Exception as e:
+                                    print(f"Error calculating focal loss: {e}")
+                                    focal_patch = 0.0
+                            else:
+                                focal_patch = 0.0
+                            
                             # Add metrics to batch totals
                             batch_mae += mae_patch.item()
                             batch_ssim += ssim_patch_val
                             batch_dice += dice_patch.item()
+                            batch_focal = focal_patch if loss_type in ['focal', 'combined'] else 0.0
                             num_valid_patches += 1
                             
                             # Store patch for reconstruction
@@ -1230,15 +1363,25 @@ def train(args):
                         batch_mae /= num_valid_patches
                         batch_ssim /= num_valid_patches
                         batch_dice /= num_valid_patches
+                        batch_focal = batch_focal / num_valid_patches if loss_type in ['focal', 'combined'] else 0.0
                         
                         # Add to validation totals
                         val_lesion_mae += batch_mae 
                         val_lesion_ssim += batch_ssim
                         val_lesion_dice += batch_dice
+                        val_lesion_focal += batch_focal
                         val_examples += 1
                         
-                        # Calculate total validation loss - pouze MAE
-                        batch_val_loss = batch_mae
+                        # Calculate total validation loss based on loss_type
+                        if loss_type == 'mae':
+                            batch_val_loss = batch_mae
+                        elif loss_type == 'focal':
+                            batch_val_loss = batch_focal
+                        elif loss_type == 'combined':
+                            batch_val_loss = batch_mae * 0.5 + batch_focal * 0.5
+                        else:  # Default to MAE
+                            batch_val_loss = batch_mae
+                            
                         val_loss += batch_val_loss
                     
                     # Reconstruct full volume
@@ -1267,6 +1410,7 @@ def train(args):
             # Calculate average metrics
             avg_val_loss = val_loss / val_examples
             avg_val_lesion_mae = val_lesion_mae / val_examples
+            avg_val_lesion_focal = val_lesion_focal / val_examples
             avg_val_lesion_ssim = val_lesion_ssim / val_examples
             avg_val_lesion_dice = val_lesion_dice / val_examples
             
@@ -1276,8 +1420,10 @@ def train(args):
             
             # Print validation metrics summary
             print("\nValidation Results:")
-            print(f"Overall MAE: {avg_val_loss:.4f}")
+            print(f"Overall Loss: {avg_val_loss:.4f}")
             print(f"Lesion MAE: {avg_val_lesion_mae:.4f}")
+            if loss_type in ['focal', 'combined']:
+                print(f"Lesion Focal: {avg_val_lesion_focal:.4f}")
             print(f"Lesion Dice: {avg_val_lesion_dice:.4f}")
             print(f"Lesion SSIM: {avg_val_lesion_ssim:.4f} (informační metrika, neoptimalizováno)")
             
@@ -1366,12 +1512,19 @@ def train(args):
                             vis_metrics = {
                                 "Epoch": epoch + 1,
                                 "Dataset": "Validation",
+                                "Loss Type": loss_type,
                                 "Sample": f"{vis_idx+1}/{len(val_loader)}",
-                                "Lesion MAE": avg_val_lesion_mae,
-                                "Lesion Dice": avg_val_lesion_dice,
-                                "Lesion SSIM (info)": avg_val_lesion_ssim,
-                                "Original ADC Range": adc_orig_range_str if adc_orig_range_str else "Not available"
+                                "Lesion MAE": avg_val_lesion_mae
                             }
+                            
+                            # Add focal loss if using it
+                            if loss_type in ['focal', 'combined']:
+                                vis_metrics["Lesion Focal"] = avg_val_lesion_focal
+                                
+                            # Add remaining metrics
+                            vis_metrics["Lesion Dice"] = avg_val_lesion_dice
+                            vis_metrics["Lesion SSIM (info)"] = avg_val_lesion_ssim
+                            vis_metrics["Original ADC Range"] = adc_orig_range_str if adc_orig_range_str else "Not available"
                             
                             # Save visualization
                             vis_output_file = os.path.join(
@@ -1393,22 +1546,48 @@ def train(args):
                         print(f"Error creating visualization for validation sample {vis_idx}: {vis_error}")
             
             # Save best models based on metrics
-            # Prioritizace MAE (nižší je lepší)
-            if avg_val_lesion_mae < best_val_lesion_mae:
-                best_val_lesion_mae = avg_val_lesion_mae
-                torch.save(model.state_dict(), os.path.join(args.output_dir, "best_lesion_mae_model.pth"))
-                print(f"Saved new best model with lesion MAE: {best_val_lesion_mae:.4f}")
+            # Track the best value for each metric type
+            best_val_lesion_focal = getattr(train, 'best_val_lesion_focal', float('inf')) if loss_type in ['focal', 'combined'] else float('inf')
             
-            # Dice (vyšší je lepší) - sekundární metrika
+            # Prioritize metric based on loss type
+            if loss_type == 'mae':
+                # Prioritize MAE (lower is better)
+                if avg_val_lesion_mae < best_val_lesion_mae:
+                    best_val_lesion_mae = avg_val_lesion_mae
+                    torch.save(model.state_dict(), os.path.join(args.output_dir, "best_lesion_mae_model.pth"))
+                    print(f"Saved new best model with lesion MAE: {best_val_lesion_mae:.4f}")
+                    
+            elif loss_type == 'focal':
+                # Prioritize Focal Loss (lower is better)
+                if avg_val_lesion_focal < best_val_lesion_focal:
+                    best_val_lesion_focal = avg_val_lesion_focal
+                    train.best_val_lesion_focal = best_val_lesion_focal  # Store for future comparisons
+                    torch.save(model.state_dict(), os.path.join(args.output_dir, "best_lesion_focal_model.pth"))
+                    print(f"Saved new best model with lesion Focal: {best_val_lesion_focal:.4f}")
+                    
+            elif loss_type == 'combined':
+                # Save both metrics
+                if avg_val_lesion_mae < best_val_lesion_mae:
+                    best_val_lesion_mae = avg_val_lesion_mae
+                    torch.save(model.state_dict(), os.path.join(args.output_dir, "best_lesion_mae_model.pth"))
+                    print(f"Saved new best model with lesion MAE: {best_val_lesion_mae:.4f}")
+                    
+                if avg_val_lesion_focal < best_val_lesion_focal:
+                    best_val_lesion_focal = avg_val_lesion_focal
+                    train.best_val_lesion_focal = best_val_lesion_focal  # Store for future comparisons
+                    torch.save(model.state_dict(), os.path.join(args.output_dir, "best_lesion_focal_model.pth"))
+                    print(f"Saved new best model with lesion Focal: {best_val_lesion_focal:.4f}")
+            
+            # Always save Dice as a secondary metric (higher is better)
             if avg_val_lesion_dice > best_val_lesion_dice:
                 best_val_lesion_dice = avg_val_lesion_dice
                 torch.save(model.state_dict(), os.path.join(args.output_dir, "best_lesion_dice_model.pth"))
                 print(f"Saved new best model with lesion Dice: {best_val_lesion_dice:.4f}")
             
-            # SSIM (vyšší je lepší) - pouze informační, může být odstraněno v budoucnu
+            # SSIM is just informational now
             if avg_val_lesion_ssim > best_val_lesion_ssim:
                 best_val_lesion_ssim = avg_val_lesion_ssim
-                # Ukládáme model se sufixem který indikuje, že jde o experimentální model
+                # Save with experimental suffix
                 torch.save(model.state_dict(), os.path.join(args.output_dir, "experimental_lesion_ssim_model.pth"))
                 print(f"Saved experimental model with lesion SSIM: {best_val_lesion_ssim:.4f} (neoptimalizovaná metrika)")
             
@@ -1420,10 +1599,12 @@ def train(args):
                     'optimizer_state_dict': optimizer.state_dict(),
                     'loss': avg_epoch_loss,
                     'mae_loss': avg_epoch_mae_loss,
+                    'focal_loss': avg_epoch_focal_loss,
                     'gradient_loss': avg_epoch_gradient_loss,
                     'val_loss': avg_val_loss,
                     'val_lesion_mae': avg_val_lesion_mae,
-                    'val_lesion_ssim': avg_val_lesion_ssim,  # Stále ukládáme pro sledování
+                    'val_lesion_focal': avg_val_lesion_focal,
+                    'val_lesion_ssim': avg_val_lesion_ssim,  # Still save for tracking
                     'val_lesion_dice': avg_val_lesion_dice
                 }, os.path.join(args.output_dir, f"checkpoint_epoch_{epoch+1}.pth"))
         else:
@@ -1790,6 +1971,7 @@ def main():
     train_parser.add_argument("--learning_rate", type=float, default=0.0001, help="Learning rate")
     train_parser.add_argument("--save_freq", type=int, default=10, help="Save checkpoint frequency")
     train_parser.add_argument("--vis_freq", type=int, default=1, help="Visualization frequency")
+    train_parser.add_argument("--loss_type", type=str, default="mae", help="Loss type (mae, focal, combined)")
     
     # Inference arguments
     infer_parser = subparsers.add_parser("infer", help="Inference mode")
