@@ -1439,24 +1439,25 @@ def train(args):
     print(f"Using loss type: {loss_type}")
     
     # Initialize loss functions
-    masked_mae_loss = MaskedMAELoss(weight=25.0).to(device)
-    focal_loss = FocalLoss(alpha=0.75, gamma=2.0, weight=25.0).to(device)
-    dynamic_mae_loss = DynamicWeightedMAELoss(base_weight=30.0, scaling_factor=8.0).to(device)  # Zvýšené hodnoty
-    gradient_loss = GradientSmoothingLoss(weight=0.02).to(device)  # Snížená váha
+    masked_mae_loss = MaskedMAELoss(weight=10.0).to(device)
+    focal_loss = FocalLoss(alpha=0.75, gamma=2.0, weight=10.0).to(device)
+    dynamic_mae_loss = DynamicWeightedMAELoss(base_weight=15.0, scaling_factor=8.0).to(device)
+    gradient_loss = GradientSmoothingLoss(weight=0.02).to(device)
     
     # Inicializace perceptuálního lossu
-    perceptual_loss = PerceptualLoss(weight=10.0).to(device)
+    perceptual_loss = PerceptualLoss(weight=5.0).to(device)
     
     # Inicializace WGAN lossu pro adversariální trénink
     wgan_loss = WGANLoss(lambda_gp=10.0)
     
-    # Váha adversariálního lossu
-    adv_weight = args.adv_weight if hasattr(args, 'adv_weight') else 0.1
+    # Váha adversariální loss - hlavní komponent GAN architektury
+    # Higher weight emphasizes the adversarial aspect of the model
+    adv_weight = args.adv_weight if hasattr(args, 'adv_weight') else 1.0
     print(f"Adversarial weight: {adv_weight}")
     
     # Initialize optimizers
     optimizer_G = optim.Adam(model.parameters(), lr=args.learning_rate, weight_decay=1e-5)
-    optimizer_D = optim.Adam(discriminator.parameters(), lr=args.learning_rate * 0.5, weight_decay=1e-5)
+    optimizer_D = optim.Adam(discriminator.parameters(), lr=args.learning_rate, weight_decay=1e-5)
     
     # Initialize patch extractor
     patch_extractor = PatchExtractor(patch_size=(16, 16, 16))
@@ -1501,6 +1502,7 @@ def train(args):
         epoch_gradient_loss = 0
         epoch_perceptual_loss = 0
         epoch_adv_loss = 0
+        epoch_d_loss = 0
         train_samples = 0
         
         for batch_idx, batch_data in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}")):
@@ -1560,7 +1562,7 @@ def train(args):
                 # ------
                 # KROK 1: Trénink diskriminátoru (WGAN-GP)
                 # ------
-                for _ in range(1):  # Trénujeme diskriminátor 1 krok pro urychlení tréninku
+                for _ in range(5):  # Train discriminator 5 times per generator update for WGAN-GP
                     optimizer_D.zero_grad()
                     
                     # Generovat fake výstup
@@ -1678,6 +1680,7 @@ def train(args):
                 epoch_gradient_loss += gradient_value.item()
                 epoch_perceptual_loss += perceptual_value.item()
                 epoch_adv_loss += g_adv_loss.item()  # Přidání adversariální ztráty pro monitoring
+                epoch_d_loss += d_total_loss.item()  # Přidání diskriminátor ztráty pro monitoring
                 train_samples += 1
             
             # Average loss over patches
@@ -1692,11 +1695,12 @@ def train(args):
         avg_epoch_gradient_loss = epoch_gradient_loss / max(1, train_samples)
         avg_epoch_perceptual_loss = epoch_perceptual_loss / max(1, train_samples)
         avg_epoch_adv_loss = epoch_adv_loss / max(1, train_samples)  # Průměrná adversariální ztráta
+        avg_epoch_d_loss = epoch_d_loss / max(1, train_samples)  # Průměrná diskriminátor ztráta
         
-        # Get actual values by dividing by the weight (25.0) for display purposes only
-        actual_mae = avg_epoch_mae_loss / 25.0 if loss_type not in ['focal', 'dynamic_mae'] else 0
-        actual_focal = avg_epoch_focal_loss / 25.0 if loss_type not in ['mae', 'dynamic_mae'] else 0
-        actual_dynamic_mae = avg_epoch_dynamic_mae_loss / 25.0 if loss_type == 'dynamic_mae' else 0
+        # Get actual values by dividing by the weight for display purposes only
+        actual_mae = avg_epoch_mae_loss / 10.0 if loss_type not in ['focal', 'dynamic_mae'] else 0
+        actual_focal = avg_epoch_focal_loss / 10.0 if loss_type not in ['mae', 'dynamic_mae'] else 0
+        actual_dynamic_mae = avg_epoch_dynamic_mae_loss / 15.0 if loss_type == 'dynamic_mae' else 0
         
         print(f"Epoch {epoch+1}, Average Loss: {avg_epoch_loss:.4f}")
         if loss_type not in ['focal', 'dynamic_mae']:
@@ -1708,6 +1712,7 @@ def train(args):
         print(f"  - Gradient Loss: {avg_epoch_gradient_loss:.4f}")
         print(f"  - Perceptual Loss: {avg_epoch_perceptual_loss:.4f}")
         print(f"  - Adversarial Loss: {avg_epoch_adv_loss:.4f}")
+        print(f"  - Discriminator Loss: {avg_epoch_d_loss:.4f}")
         
         # Validation
         model.eval()
@@ -1919,7 +1924,7 @@ def train(args):
                             # Calculate Dynamic MAE for validation if using dynamic_mae loss
                             if loss_type in ['dynamic_mae']:
                                 try:
-                                    dynamic_mae_patch = dynamic_mae_loss(output_patch, adc_patch, label_patch, adc_orig_range).item() / 25.0  # Divide by base_weight for raw value
+                                    dynamic_mae_patch = dynamic_mae_loss(output_patch, adc_patch, label_patch, adc_orig_range).item() / 15.0  # Divide by base_weight for raw value
                                 except Exception as e:
                                     print(f"Error calculating dynamic mae loss: {e}")
                                     dynamic_mae_patch = 0.0
@@ -1929,7 +1934,7 @@ def train(args):
                             # Calculate Perceptual Loss for validation if using perceptual loss
                             if loss_type in ['combined', 'perceptual']:
                                 try:
-                                    perceptual_patch = perceptual_loss(output_patch, adc_patch, label_patch, adc_orig_range).item() / 10.0  # Divide by weight for raw value
+                                    perceptual_patch = perceptual_loss(output_patch, adc_patch, label_patch, adc_orig_range).item() / 5.0  # Divide by weight for raw value
                                 except Exception as e:
                                     print(f"Error calculating perceptual loss: {e}")
                                     perceptual_patch = 0.0
@@ -2034,7 +2039,7 @@ def train(args):
             # Always calculate MAE for validation regardless of loss type
             avg_val_lesion_mae = val_lesion_mae / val_examples
             # Divide by the weight factor (25.0) to match training MAE display
-            avg_val_lesion_mae = avg_val_lesion_mae / 25.0
+            avg_val_lesion_mae = avg_val_lesion_mae
                 
             if loss_type in ['focal', 'combined']:
                 avg_val_lesion_focal = val_lesion_focal / val_examples
@@ -2681,7 +2686,7 @@ def main():
     train_parser.add_argument("--vis_freq", type=int, default=1, help="Visualization frequency")
     train_parser.add_argument("--loss_type", type=str, default="mae", choices=["mae", "focal", "combined", "dynamic_mae", "perceptual"], help="Loss type (mae, focal, combined, dynamic_mae, perceptual)")
     train_parser.add_argument("--max_patches", type=int, default=32, help="Maximum number of patches per volume")
-    train_parser.add_argument("--adv_weight", type=float, default=0.1, help="Adversarial weight for WGAN-GP")
+    train_parser.add_argument("--adv_weight", type=float, default=1.0, help="Adversarial weight for WGAN-GP")
     train_parser.add_argument("--resume", type=str, help="Path to checkpoint for resuming training")
     
     # Inference arguments
