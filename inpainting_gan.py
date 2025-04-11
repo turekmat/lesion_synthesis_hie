@@ -959,6 +959,86 @@ class GradientSmoothingLoss(nn.Module):
         # Apply very low weight to avoid dominating the primary losses
         return self.weight * (loss_z + loss_y + loss_x)
 
+class DynamicWeightedMAELoss(nn.Module):
+    def __init__(self, base_weight=25.0, scaling_factor=5.0):
+        super(DynamicWeightedMAELoss, self).__init__()
+        self.base_weight = base_weight
+        self.scaling_factor = scaling_factor
+        
+    def forward(self, pred, target, mask, orig_range=None):
+        """
+        Compute MAE loss with dynamic weighting based on lesion size
+        Smaller lesions receive higher weights to ensure they're not overlooked
+        
+        Args:
+            pred: Predicted tensor
+            target: Target tensor  
+            mask: Lesion mask tensor
+            orig_range: Original intensity range as tuple (min, max) before normalization
+            
+        Returns:
+            Dynamically weighted MAE loss
+        """
+        # Ensure mask is binary
+        binary_mask = (mask > 0.5).float()
+        
+        # Zjistit relativní velikost léze v patchi
+        lesion_voxels = binary_mask.sum()
+        total_voxels = torch.numel(binary_mask)
+        lesion_ratio = lesion_voxels / total_voxels
+        
+        # Zkontrolujeme, zda maska obsahuje nějaké léze
+        if lesion_voxels <= 0:
+            # Pokud nejsou léze, vrátíme nulovou ztrátu
+            return torch.tensor(0.0, device=pred.device)
+            
+        # Dynamicky zvýšit váhu při malém podílu léze (inverzní vztah)
+        # Čím menší léze, tím větší váha (ale zachovává minimální váhu base_weight)
+        dynamic_weight = self.base_weight * (1.0 + self.scaling_factor * (1.0 - lesion_ratio))
+        
+        # Apply mask to both prediction and target
+        masked_pred = pred * binary_mask
+        masked_target = target * binary_mask
+        
+        # Calculate absolute difference
+        abs_diff = torch.abs(masked_pred - masked_target)
+        
+        # Calculate mean only over masked regions
+        mae = abs_diff.sum() / lesion_voxels
+        
+        # Apply denormalization if original range is provided
+        if orig_range is not None:
+            orig_min, orig_max = orig_range
+            
+            # Check if orig_range is a tensor and move to device if needed
+            device = pred.device
+            if isinstance(orig_min, torch.Tensor):
+                if orig_min.device != device:
+                    orig_min = orig_min.to(device)
+            else:
+                orig_min = torch.tensor(orig_min, device=device)
+                
+            if isinstance(orig_max, torch.Tensor):
+                if orig_max.device != device:
+                    orig_max = orig_max.to(device)
+            else:
+                orig_max = torch.tensor(orig_max, device=device)
+            
+            # Scale the loss by the original range for more intuitive results
+            range_factor = torch.abs(orig_max - orig_min)
+            mae = mae * range_factor
+            
+            # Pro lepší debugging
+            if torch.isnan(mae).any() or torch.isinf(mae).any():
+                print(f"Warning: NaN/Inf in Dynamic MAE loss! Range: {orig_min.item()} to {orig_max.item()}")
+                return torch.tensor(1.0, device=pred.device) * self.base_weight
+        
+        # Pro debugování - výpis aktuální váhy
+        # print(f"Lesion ratio: {lesion_ratio.item():.4f}, Dynamic weight: {dynamic_weight.item():.2f}")
+        
+        # Apply dynamic weight
+        return dynamic_weight * mae
+
 def train(args):
     # Set device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -1035,6 +1115,7 @@ def train(args):
     # Initialize loss functions
     masked_mae_loss = MaskedMAELoss(weight=25.0).to(device)
     focal_loss = FocalLoss(alpha=0.75, gamma=2.0, weight=25.0).to(device)
+    dynamic_mae_loss = DynamicWeightedMAELoss(base_weight=25.0, scaling_factor=5.0).to(device)
     gradient_loss = GradientSmoothingLoss(weight=0.05).to(device)
     
     # Initialize optimizer with added weight decay for L2 regularization
@@ -1057,6 +1138,7 @@ def train(args):
         epoch_loss = 0
         epoch_mae_loss = 0
         epoch_focal_loss = 0
+        epoch_dynamic_mae_loss = 0
         epoch_gradient_loss = 0
         train_samples = 0
         
@@ -1121,24 +1203,35 @@ def train(args):
                 if loss_type == 'mae':
                     mae_value = masked_mae_loss(output, adc_patch, label_patch, adc_orig_range)
                     focal_value = torch.tensor(0.0, device=device)  # Not used
+                    dynamic_mae_value = torch.tensor(0.0, device=device)  # Not used
                     gradient_value = gradient_loss(output, label_patch)
                     loss = mae_value + gradient_value
                     
                 elif loss_type == 'focal':
                     mae_value = torch.tensor(0.0, device=device)  # Not used
                     focal_value = focal_loss(output, adc_patch, label_patch, adc_orig_range)
+                    dynamic_mae_value = torch.tensor(0.0, device=device)  # Not used
                     gradient_value = gradient_loss(output, label_patch)
                     loss = focal_value + gradient_value
+                    
+                elif loss_type == 'dynamic_mae':
+                    mae_value = torch.tensor(0.0, device=device)  # Not used
+                    focal_value = torch.tensor(0.0, device=device)  # Not used
+                    dynamic_mae_value = dynamic_mae_loss(output, adc_patch, label_patch, adc_orig_range)
+                    gradient_value = gradient_loss(output, label_patch)
+                    loss = dynamic_mae_value + gradient_value
                     
                 elif loss_type == 'combined':
                     mae_value = masked_mae_loss(output, adc_patch, label_patch, adc_orig_range) * 0.5  # Reduced weight
                     focal_value = focal_loss(output, adc_patch, label_patch, adc_orig_range) * 0.5     # Reduced weight
+                    dynamic_mae_value = torch.tensor(0.0, device=device)  # Not used
                     gradient_value = gradient_loss(output, label_patch)
                     loss = mae_value + focal_value + gradient_value
                     
                 else:  # Default to MAE
                     mae_value = masked_mae_loss(output, adc_patch, label_patch, adc_orig_range)
                     focal_value = torch.tensor(0.0, device=device)  # Not used
+                    dynamic_mae_value = torch.tensor(0.0, device=device)  # Not used
                     gradient_value = gradient_loss(output, label_patch)
                     loss = mae_value + gradient_value
                 
@@ -1151,8 +1244,9 @@ def train(args):
                 train_samples += 1
                 
                 # Track individual loss components
-                epoch_mae_loss += mae_value.item() if loss_type != 'focal' else 0
-                epoch_focal_loss += focal_value.item() if loss_type != 'mae' else 0
+                epoch_mae_loss += mae_value.item() if loss_type != 'focal' and loss_type != 'dynamic_mae' else 0
+                epoch_focal_loss += focal_value.item() if loss_type != 'mae' and loss_type != 'dynamic_mae' else 0
+                epoch_dynamic_mae_loss += dynamic_mae_value.item() if loss_type == 'dynamic_mae' else 0
                 epoch_gradient_loss += gradient_value.item()
             
             # Average loss over patches
@@ -1161,19 +1255,23 @@ def train(args):
                 epoch_loss += avg_batch_loss
                 
         avg_epoch_loss = epoch_loss / max(1, len(train_loader))
-        avg_epoch_mae_loss = epoch_mae_loss / max(1, train_samples) if loss_type != 'focal' else 0
-        avg_epoch_focal_loss = epoch_focal_loss / max(1, train_samples) if loss_type != 'mae' else 0
+        avg_epoch_mae_loss = epoch_mae_loss / max(1, train_samples) if loss_type not in ['focal', 'dynamic_mae'] else 0
+        avg_epoch_focal_loss = epoch_focal_loss / max(1, train_samples) if loss_type not in ['mae', 'dynamic_mae'] else 0
+        avg_epoch_dynamic_mae_loss = epoch_dynamic_mae_loss / max(1, train_samples) if loss_type == 'dynamic_mae' else 0
         avg_epoch_gradient_loss = epoch_gradient_loss / max(1, train_samples)
         
-        # Get actual MAE by dividing by the weight (25.0) for display purposes only
-        actual_mae = avg_epoch_mae_loss / 25.0 if loss_type != 'focal' else 0
-        actual_focal = avg_epoch_focal_loss / 25.0 if loss_type != 'mae' else 0
+        # Get actual values by dividing by the weight (25.0) for display purposes only
+        actual_mae = avg_epoch_mae_loss / 25.0 if loss_type not in ['focal', 'dynamic_mae'] else 0
+        actual_focal = avg_epoch_focal_loss / 25.0 if loss_type not in ['mae', 'dynamic_mae'] else 0
+        actual_dynamic_mae = avg_epoch_dynamic_mae_loss / 25.0 if loss_type == 'dynamic_mae' else 0
         
         print(f"Epoch {epoch+1}, Average Loss: {avg_epoch_loss:.4f}")
-        if loss_type != 'focal':
+        if loss_type not in ['focal', 'dynamic_mae']:
             print(f"  - MAE: {actual_mae:.4f} (unweighted)")
-        if loss_type != 'mae':
+        if loss_type not in ['mae', 'dynamic_mae']:
             print(f"  - Focal: {actual_focal:.4f} (unweighted)")
+        if loss_type == 'dynamic_mae':
+            print(f"  - Dynamic MAE: {actual_dynamic_mae:.4f} (unweighted)")
         print(f"  - Gradient Loss: {avg_epoch_gradient_loss:.4f}")
         
         # Validation
@@ -1181,6 +1279,7 @@ def train(args):
         val_loss = 0.0
         val_lesion_mae = 0.0
         val_lesion_focal = 0.0
+        val_lesion_dynamic_mae = 0.0
         val_lesion_ssim = 0.0
         val_lesion_dice = 0.0
         val_examples = 0
@@ -1262,6 +1361,7 @@ def train(args):
                     batch_ssim = 0.0
                     batch_dice = 0.0
                     batch_focal = 0.0
+                    batch_dynamic_mae = 0.0
                     num_valid_patches = 0
                     
                     for patch_idx, (ph_patch, label_patch, adc_patch, coords) in enumerate(zip(
@@ -1367,13 +1467,25 @@ def train(args):
                             else:
                                 focal_patch = 0.0
                             
+                            # Calculate Dynamic MAE for validation if using dynamic_mae loss
+                            if loss_type in ['dynamic_mae']:
+                                try:
+                                    dynamic_mae_patch = dynamic_mae_loss(output_patch, adc_patch, label_patch, adc_orig_range).item() / 25.0  # Divide by base_weight for raw value
+                                except Exception as e:
+                                    print(f"Error calculating dynamic mae loss: {e}")
+                                    dynamic_mae_patch = 0.0
+                            else:
+                                dynamic_mae_patch = 0.0
+                            
                             # Add metrics to batch totals
-                            # Always add MAE regardless of loss type for validation
+                            # Always add MAE regardless of loss type for validation (for comparison)
                             batch_mae += mae_patch.item()
                             batch_ssim += ssim_patch_val
                             batch_dice += dice_patch.item()
                             if loss_type in ['focal', 'combined']:
                                 batch_focal += focal_patch
+                            if loss_type in ['dynamic_mae']:
+                                batch_dynamic_mae += dynamic_mae_patch
                             num_valid_patches += 1
                             
                             # Store patch for reconstruction
@@ -1392,14 +1504,18 @@ def train(args):
                         batch_dice /= num_valid_patches
                         if loss_type in ['focal', 'combined']:
                             batch_focal /= num_valid_patches
+                        if loss_type in ['dynamic_mae']:
+                            batch_dynamic_mae /= num_valid_patches
                         
                         # Add to validation totals
-                        # Always add MAE to validation totals
+                        # Always add MAE to validation totals for comparison
                         val_lesion_mae += batch_mae 
                         val_lesion_ssim += batch_ssim
                         val_lesion_dice += batch_dice
                         if loss_type in ['focal', 'combined']:
                             val_lesion_focal += batch_focal
+                        if loss_type in ['dynamic_mae']:
+                            val_lesion_dynamic_mae += batch_dynamic_mae
                         val_examples += 1
                         
                         # Calculate total validation loss based on loss_type
@@ -1407,6 +1523,8 @@ def train(args):
                             batch_val_loss = batch_mae
                         elif loss_type == 'focal':
                             batch_val_loss = batch_focal
+                        elif loss_type == 'dynamic_mae':
+                            batch_val_loss = batch_dynamic_mae
                         elif loss_type == 'combined':
                             batch_val_loss = batch_mae * 0.5 + batch_focal * 0.5
                         else:  # Default to MAE
@@ -1457,6 +1575,12 @@ def train(args):
                 # Set to zero if not using this metric
                 avg_val_lesion_focal = 0.0
                 
+            if loss_type in ['dynamic_mae']:
+                avg_val_lesion_dynamic_mae = val_lesion_dynamic_mae / val_examples
+            else:
+                # Set to zero if not using this metric
+                avg_val_lesion_dynamic_mae = 0.0
+                
             avg_val_lesion_ssim = val_lesion_ssim / val_examples
             avg_val_lesion_dice = val_lesion_dice / val_examples
             
@@ -1474,6 +1598,10 @@ def train(args):
                 print(f"Overall Focal Loss: {avg_val_loss:.4f}")
                 print(f"Lesion MAE: {avg_val_lesion_mae:.4f} (for comparison)")
                 print(f"Lesion Focal: {avg_val_lesion_focal:.4f}")
+            elif loss_type == 'dynamic_mae':
+                print(f"Overall Dynamic MAE Loss: {avg_val_loss:.4f}")
+                print(f"Lesion MAE: {avg_val_lesion_mae:.4f} (for comparison)")
+                print(f"Lesion Dynamic MAE: {avg_val_lesion_dynamic_mae:.4f}")
             elif loss_type == 'combined':
                 print(f"Overall Combined Loss: {avg_val_loss:.4f}")
                 print(f"Lesion MAE: {avg_val_lesion_mae:.4f}")
@@ -2074,7 +2202,7 @@ def main():
     train_parser.add_argument("--learning_rate", type=float, default=0.0001, help="Learning rate")
     train_parser.add_argument("--save_freq", type=int, default=10, help="Save checkpoint frequency")
     train_parser.add_argument("--vis_freq", type=int, default=1, help="Visualization frequency")
-    train_parser.add_argument("--loss_type", type=str, default="mae", choices=["mae", "focal", "combined"], help="Loss type (mae, focal, combined)")
+    train_parser.add_argument("--loss_type", type=str, default="mae", choices=["mae", "focal", "combined", "dynamic_mae"], help="Loss type (mae, focal, combined, dynamic_mae)")
     train_parser.add_argument("--max_patches", type=int, default=32, help="Maximum number of patches per volume")
     
     # Inference arguments
