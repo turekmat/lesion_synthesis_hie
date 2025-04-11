@@ -719,9 +719,97 @@ class LesionInpaintingModel(nn.Module):
         x = torch.cat([pseudo_healthy, label], dim=1)
         
         # Generate inpainted output
-        output = self.generator(x)
+        raw_output = self.generator(x)
         
-        return output
+        # DŮLEŽITÉ: Použijeme masku k vytvoření finálního výstupu
+        # Pouze oblast léze je nahrazena generátorem, zbytek zůstává stejný
+        final_output = pseudo_healthy * (1.0 - label) + raw_output * label
+        
+        return final_output
+
+class LesionDiscriminator(nn.Module):
+    """
+    Diskriminátor pro CGAN, který se zaměřuje pouze na oblasti lézí.
+    Hodnotí pouze reálnost vygenerovaných lézí, ignoruje zbytek mozku.
+    """
+    def __init__(self, in_channels=3):
+        super(LesionDiscriminator, self).__init__()
+        
+        # Vstup: [pseudo_healthy, label, adc], kde adc může být reálné nebo generované
+        
+        # Konvoluční bloky optimalizované pro malé patche 16x16x16
+        self.conv_blocks = nn.Sequential(
+            # První blok - zmenšit velikost
+            nn.Conv3d(in_channels, 32, kernel_size=3, stride=1, padding=1),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv3d(32, 32, kernel_size=3, stride=1, padding=1),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.AvgPool3d(kernel_size=2, stride=2),  # 16x16x16 -> 8x8x8
+            
+            # Druhý blok
+            nn.Conv3d(32, 64, kernel_size=3, stride=1, padding=1),
+            nn.InstanceNorm3d(64),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv3d(64, 64, kernel_size=3, stride=1, padding=1),
+            nn.InstanceNorm3d(64),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.AvgPool3d(kernel_size=2, stride=2),  # 8x8x8 -> 4x4x4
+            
+            # Třetí blok
+            nn.Conv3d(64, 128, kernel_size=3, stride=1, padding=1),
+            nn.InstanceNorm3d(128),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv3d(128, 128, kernel_size=3, stride=1, padding=1),
+            nn.InstanceNorm3d(128),
+            nn.LeakyReLU(0.2, inplace=True),
+            
+            # Finální predikce - full patch output (4x4x4 -> 4x4x4)
+            nn.Conv3d(128, 1, kernel_size=3, stride=1, padding=1)
+        )
+        
+        # Inicializace vah pro stabilnější trénink
+        self.apply(self._init_weights)
+    
+    def _init_weights(self, m):
+        if isinstance(m, nn.Conv3d):
+            nn.init.normal_(m.weight, 0.0, 0.02)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.InstanceNorm3d):
+            if m.weight is not None:
+                nn.init.normal_(m.weight, 1.0, 0.02)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+    
+    def forward(self, pseudo_healthy, label, adc):
+        """
+        Forward pass diskriminátoru.
+        
+        Args:
+            pseudo_healthy: vstupní pseudo-zdravý obraz
+            label: maska léze
+            adc: skutečná nebo generovaná ADC mapa
+        
+        Returns:
+            Diskriminační skóre zaměřené jen na oblast léze
+        """
+        # Spojení vstupů podél kanálové dimenze
+        x = torch.cat([pseudo_healthy, label, adc], dim=1)
+        
+        # Průchod konvolučními bloky
+        patch_predictions = self.conv_blocks(x)
+        
+        # Aplikovat masku na predikce - hodnotíme pouze oblasti léze
+        masked_predictions = patch_predictions * label
+        
+        # Průměrování pouze přes maskované oblasti
+        mask_sum = torch.sum(label)
+        if mask_sum > 0:
+            masked_score = torch.sum(masked_predictions) / mask_sum
+        else:
+            masked_score = torch.tensor(0.0, device=x.device)
+        
+        return masked_score
 
 class MaskedMAELoss(nn.Module):
     def __init__(self, weight=25.0):
@@ -1173,6 +1261,93 @@ class DynamicWeightedMAELoss(nn.Module):
         # Apply dynamic weight
         return dynamic_weight * mae
 
+class WGANLoss:
+    """
+    Implementace WGAN-GP loss pro stabilní trénink GAN.
+    Používá Wasserstein vzdálenost a gradient penalty.
+    """
+    def __init__(self, lambda_gp=10.0):
+        """
+        Inicializace WGAN-GP loss.
+        
+        Args:
+            lambda_gp: Váha gradient penalty
+        """
+        self.lambda_gp = lambda_gp
+    
+    def discriminator_loss(self, real_validity, fake_validity):
+        """
+        Wasserstein loss pro diskriminátor.
+        
+        Args:
+            real_validity: Skóre diskriminátoru pro reálné vzorky
+            fake_validity: Skóre diskriminátoru pro vygenerované vzorky
+            
+        Returns:
+            Loss pro diskriminátor
+        """
+        # Kritérium Wasserstein distance: max E[D(real)] - E[D(fake)]
+        # Implementováno jako minimalizace: E[D(fake)] - E[D(real)]
+        return torch.mean(fake_validity) - torch.mean(real_validity)
+    
+    def generator_loss(self, fake_validity):
+        """
+        Wasserstein loss pro generátor.
+        
+        Args:
+            fake_validity: Skóre diskriminátoru pro vygenerované vzorky
+            
+        Returns:
+            Loss pro generátor
+        """
+        # Kritérium Wasserstein distance: min -E[D(fake)]
+        # Implementováno jako minimalizace: -E[D(fake)]
+        return -torch.mean(fake_validity)
+    
+    def compute_gradient_penalty(self, discriminator, real_samples, fake_samples, pseudo_healthy, label):
+        """
+        Výpočet gradient penalty pro WGAN-GP.
+        
+        Args:
+            discriminator: Diskriminátor model
+            real_samples: Reálné ADC mapy
+            fake_samples: Vygenerované ADC mapy
+            pseudo_healthy: Pseudo-zdravé vstupy
+            label: Masky lézí
+            
+        Returns:
+            Gradient penalty term
+        """
+        # Náhodná váha pro interpolaci mezi reálnými a generovanými vzorky
+        batch_size = real_samples.size(0)
+        alpha = torch.rand(batch_size, 1, 1, 1, 1, device=real_samples.device)
+        
+        # Získáme náhodné body na přímce mezi reálnými a generovanými vzorky
+        interpolates = alpha * real_samples + (1 - alpha) * fake_samples
+        interpolates.requires_grad_(True)
+        
+        # Vyhodnotíme diskriminátor v interpolovaných bodech
+        d_interpolates = discriminator(pseudo_healthy, label, interpolates)
+        
+        # Automatický výpočet gradientů
+        gradients = torch.autograd.grad(
+            outputs=d_interpolates,
+            inputs=interpolates,
+            grad_outputs=torch.ones_like(d_interpolates),
+            create_graph=True,
+            retain_graph=True,
+            only_inputs=True
+        )[0]
+        
+        # Spočítáme normu gradientu pro každý batch
+        gradients = gradients.view(batch_size, -1)
+        gradient_norm = gradients.norm(2, dim=1)
+        
+        # Gradient penalty: (||∇D(x)||_2 - 1)^2
+        gradient_penalty = ((gradient_norm - 1) ** 2).mean()
+        
+        return gradient_penalty * self.lambda_gp
+
 def train(args):
     # Set device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -1242,6 +1417,9 @@ def train(args):
     # Initialize model
     model = LesionInpaintingModel(in_channels=2, out_channels=1).to(device)
     
+    # Inicializace diskriminátoru pro CGAN
+    discriminator = LesionDiscriminator(in_channels=3).to(device)
+    
     # Define loss functions based on the selected loss type
     loss_type = args.loss_type if hasattr(args, 'loss_type') else 'mae'
     print(f"Using loss type: {loss_type}")
@@ -1255,8 +1433,16 @@ def train(args):
     # Inicializace perceptuálního lossu
     perceptual_loss = PerceptualLoss(weight=10.0).to(device)
     
-    # Initialize optimizer with added weight decay for L2 regularization
-    optimizer = optim.Adam(model.parameters(), lr=args.learning_rate, weight_decay=1e-5)
+    # Inicializace WGAN lossu pro adversariální trénink
+    wgan_loss = WGANLoss(lambda_gp=10.0)
+    
+    # Váha adversariálního lossu
+    adv_weight = args.adv_weight if hasattr(args, 'adv_weight') else 0.1
+    print(f"Adversarial weight: {adv_weight}")
+    
+    # Initialize optimizers
+    optimizer_G = optim.Adam(model.parameters(), lr=args.learning_rate, weight_decay=1e-5)
+    optimizer_D = optim.Adam(discriminator.parameters(), lr=args.learning_rate * 0.5, weight_decay=1e-5)
     
     # Initialize patch extractor
     patch_extractor = PatchExtractor(patch_size=(16, 16, 16))
@@ -1270,14 +1456,34 @@ def train(args):
     best_val_lesion_dice = 0.0
     best_val_lesion_mae = float('inf')
     best_val_lesion_ssim = 0.0
+    
+    # Načíst checkpoint, pokud je k dispozici
+    if args.resume and os.path.exists(args.resume):
+        print(f"Loading checkpoint from {args.resume}")
+        checkpoint = torch.load(args.resume, map_location=device)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        discriminator.load_state_dict(checkpoint.get('discriminator_state_dict', {}))  # Bude fungovat i pro starší checkpointy
+        optimizer_G.load_state_dict(checkpoint['optimizer_state_dict'])
+        if 'discriminator_optimizer_state_dict' in checkpoint:
+            optimizer_D.load_state_dict(checkpoint['discriminator_optimizer_state_dict'])
+        
+        args.start_epoch = checkpoint.get('epoch', 0)
+        best_val_lesion_loss = checkpoint.get('best_val_lesion_loss', float('inf'))
+        best_val_lesion_mae = checkpoint.get('best_val_lesion_mae', float('inf'))
+        best_val_lesion_dice = checkpoint.get('best_val_lesion_dice', 0.0)
+        best_val_lesion_ssim = checkpoint.get('best_val_lesion_ssim', 0.0)
+        print(f"Resuming from epoch {args.start_epoch}")
+    
     for epoch in range(args.start_epoch, args.epochs):
         model.train()
+        discriminator.train()
         epoch_loss = 0
         epoch_mae_loss = 0
         epoch_focal_loss = 0
         epoch_dynamic_mae_loss = 0
         epoch_gradient_loss = 0
         epoch_perceptual_loss = 0
+        epoch_adv_loss = 0
         train_samples = 0
         
         for batch_idx, batch_data in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}")):
@@ -1330,12 +1536,50 @@ def train(args):
             batch_loss = 0
             for ph_patch, label_patch, adc_patch in zip(filtered_patches_ph, filtered_patches_label, filtered_patches_adc):
                 # Add batch dimension
-                ph_patch = ph_patch.unsqueeze(0)
-                label_patch = label_patch.unsqueeze(0)
-                adc_patch = adc_patch.unsqueeze(0)
+                ph_patch = ph_patch.unsqueeze(0).to(device)
+                label_patch = label_patch.unsqueeze(0).to(device)
+                adc_patch = adc_patch.unsqueeze(0).to(device)
                 
-                # Generate inpainted output
+                # ------
+                # KROK 1: Trénink diskriminátoru (WGAN-GP)
+                # ------
+                for _ in range(3):  # Trénujeme diskriminátor více kroků
+                    optimizer_D.zero_grad()
+                    
+                    # Generovat fake výstup
+                    with torch.no_grad():
+                        fake_adc = model(ph_patch, label_patch)
+                    
+                    # Spočítat validitu pro real a fake
+                    real_validity = discriminator(ph_patch, label_patch, adc_patch)
+                    fake_validity = discriminator(ph_patch, label_patch, fake_adc.detach())
+                    
+                    # Wasserstein loss pro diskriminátor
+                    d_loss = wgan_loss.discriminator_loss(real_validity, fake_validity)
+                    
+                    # Gradient penalty
+                    gp = wgan_loss.compute_gradient_penalty(
+                        discriminator, adc_patch, fake_adc.detach(), ph_patch, label_patch
+                    )
+                    
+                    # Celková loss pro diskriminátor
+                    d_total_loss = d_loss + gp
+                    
+                    # Backpropagation pro diskriminátor
+                    d_total_loss.backward()
+                    optimizer_D.step()
+                
+                # ------
+                # KROK 2: Trénink generátoru
+                # ------
+                optimizer_G.zero_grad()
+                
+                # Generovat fake výstup
                 output = model(ph_patch, label_patch)
+                
+                # Adversariální loss - WGAN
+                fake_validity = discriminator(ph_patch, label_patch, output)
+                g_adv_loss = wgan_loss.generator_loss(fake_validity)
                 
                 # Calculate losses based on selected loss type
                 if loss_type == 'mae':
@@ -1344,31 +1588,54 @@ def train(args):
                     dynamic_mae_value = torch.tensor(0.0, device=device)  # Not used
                     gradient_value = gradient_loss(output, label_patch)
                     perceptual_value = perceptual_loss(output, adc_patch, label_patch, adc_orig_range)
-                    loss = mae_value + gradient_value + perceptual_value
+                    
+                    # Kombinace rekonstrukční a adversariální loss
+                    recon_loss = mae_value + gradient_value + perceptual_value
+                    loss = recon_loss + adv_weight * g_adv_loss
                     
                 elif loss_type == 'focal':
-                    mae_value = torch.tensor(0.0, device=device)  # Not used
+                    mae_value = masked_mae_loss(output, adc_patch, label_patch, adc_orig_range)  # For tracking
                     focal_value = focal_loss(output, adc_patch, label_patch, adc_orig_range)
                     dynamic_mae_value = torch.tensor(0.0, device=device)  # Not used
                     gradient_value = gradient_loss(output, label_patch)
                     perceptual_value = perceptual_loss(output, adc_patch, label_patch, adc_orig_range)
-                    loss = focal_value + gradient_value + perceptual_value
+                    
+                    # Kombinace rekonstrukční a adversariální loss
+                    recon_loss = focal_value + gradient_value + perceptual_value
+                    loss = recon_loss + adv_weight * g_adv_loss
                     
                 elif loss_type == 'dynamic_mae':
-                    mae_value = torch.tensor(0.0, device=device)  # Not used
+                    mae_value = masked_mae_loss(output, adc_patch, label_patch, adc_orig_range)  # For tracking
                     focal_value = torch.tensor(0.0, device=device)  # Not used
                     dynamic_mae_value = dynamic_mae_loss(output, adc_patch, label_patch, adc_orig_range)
                     gradient_value = gradient_loss(output, label_patch)
                     perceptual_value = perceptual_loss(output, adc_patch, label_patch, adc_orig_range)
-                    loss = dynamic_mae_value + gradient_value + perceptual_value
+                    
+                    # Kombinace rekonstrukční a adversariální loss
+                    recon_loss = dynamic_mae_value + gradient_value + perceptual_value
+                    loss = recon_loss + adv_weight * g_adv_loss
                     
                 elif loss_type == 'combined':
-                    mae_value = masked_mae_loss(output, adc_patch, label_patch, adc_orig_range) * 0.5  # Reduced weight
-                    focal_value = focal_loss(output, adc_patch, label_patch, adc_orig_range) * 0.5     # Reduced weight
+                    mae_value = masked_mae_loss(output, adc_patch, label_patch, adc_orig_range)
+                    focal_value = focal_loss(output, adc_patch, label_patch, adc_orig_range)
                     dynamic_mae_value = torch.tensor(0.0, device=device)  # Not used
                     gradient_value = gradient_loss(output, label_patch)
                     perceptual_value = perceptual_loss(output, adc_patch, label_patch, adc_orig_range)
-                    loss = mae_value + focal_value + gradient_value + perceptual_value
+                    
+                    # Kombinace rekonstrukční a adversariální loss
+                    recon_loss = mae_value + focal_value + gradient_value + perceptual_value
+                    loss = recon_loss + adv_weight * g_adv_loss
+                    
+                elif loss_type == 'perceptual':
+                    mae_value = masked_mae_loss(output, adc_patch, label_patch, adc_orig_range)  # For tracking
+                    focal_value = torch.tensor(0.0, device=device)  # Not used
+                    dynamic_mae_value = torch.tensor(0.0, device=device)  # Not used
+                    gradient_value = gradient_loss(output, label_patch)
+                    perceptual_value = perceptual_loss(output, adc_patch, label_patch, adc_orig_range)
+                    
+                    # Kombinace rekonstrukční a adversariální loss
+                    recon_loss = perceptual_value + gradient_value
+                    loss = recon_loss + adv_weight * g_adv_loss
                     
                 else:  # Default to MAE
                     mae_value = masked_mae_loss(output, adc_patch, label_patch, adc_orig_range)
@@ -1376,22 +1643,25 @@ def train(args):
                     dynamic_mae_value = torch.tensor(0.0, device=device)  # Not used
                     gradient_value = gradient_loss(output, label_patch)
                     perceptual_value = perceptual_loss(output, adc_patch, label_patch, adc_orig_range)
-                    loss = mae_value + gradient_value + perceptual_value
+                    
+                    # Kombinace rekonstrukční a adversariální loss
+                    recon_loss = mae_value + gradient_value + perceptual_value
+                    loss = recon_loss + adv_weight * g_adv_loss
                 
-                # Backpropagation
-                optimizer.zero_grad()
+                # Backpropagation pro generátor
                 loss.backward()
-                optimizer.step()
+                optimizer_G.step()
                 
+                # Přidání hodnot lossu pro monitoring
                 batch_loss += loss.item()
-                train_samples += 1
-                
-                # Track individual loss components
-                epoch_mae_loss += mae_value.item() if loss_type != 'focal' and loss_type != 'dynamic_mae' else 0
-                epoch_focal_loss += focal_value.item() if loss_type != 'mae' and loss_type != 'dynamic_mae' else 0
+                epoch_loss += loss.item()
+                epoch_mae_loss += mae_value.item() if loss_type in ['mae', 'combined'] else 0
+                epoch_focal_loss += focal_value.item() if loss_type in ['focal', 'combined'] else 0
                 epoch_dynamic_mae_loss += dynamic_mae_value.item() if loss_type == 'dynamic_mae' else 0
                 epoch_gradient_loss += gradient_value.item()
                 epoch_perceptual_loss += perceptual_value.item()
+                epoch_adv_loss += g_adv_loss.item()  # Přidání adversariální ztráty pro monitoring
+                train_samples += 1
             
             # Average loss over patches
             if len(filtered_patches_ph) > 0:
@@ -1404,6 +1674,7 @@ def train(args):
         avg_epoch_dynamic_mae_loss = epoch_dynamic_mae_loss / max(1, train_samples) if loss_type == 'dynamic_mae' else 0
         avg_epoch_gradient_loss = epoch_gradient_loss / max(1, train_samples)
         avg_epoch_perceptual_loss = epoch_perceptual_loss / max(1, train_samples)
+        avg_epoch_adv_loss = epoch_adv_loss / max(1, train_samples)  # Průměrná adversariální ztráta
         
         # Get actual values by dividing by the weight (25.0) for display purposes only
         actual_mae = avg_epoch_mae_loss / 25.0 if loss_type not in ['focal', 'dynamic_mae'] else 0
@@ -1419,9 +1690,11 @@ def train(args):
             print(f"  - Dynamic MAE: {actual_dynamic_mae:.4f} (unweighted)")
         print(f"  - Gradient Loss: {avg_epoch_gradient_loss:.4f}")
         print(f"  - Perceptual Loss: {avg_epoch_perceptual_loss:.4f}")
+        print(f"  - Adversarial Loss: {avg_epoch_adv_loss:.4f}")
         
         # Validation
         model.eval()
+        discriminator.eval()
         val_loss = 0.0
         val_lesion_mae = 0.0
         val_lesion_focal = 0.0
@@ -1979,7 +2252,8 @@ def train(args):
                 torch.save({
                     'epoch': epoch + 1,
                     'model_state_dict': model.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
+                    'optimizer_state_dict': optimizer_G.state_dict(),
+                    'discriminator_state_dict': discriminator.state_dict(),
                     'loss': avg_epoch_loss,
                     'mae_loss': avg_epoch_mae_loss,
                     'focal_loss': avg_epoch_focal_loss,
@@ -2390,6 +2664,7 @@ def main():
     train_parser.add_argument("--vis_freq", type=int, default=1, help="Visualization frequency")
     train_parser.add_argument("--loss_type", type=str, default="mae", choices=["mae", "focal", "combined", "dynamic_mae", "perceptual"], help="Loss type (mae, focal, combined, dynamic_mae, perceptual)")
     train_parser.add_argument("--max_patches", type=int, default=32, help="Maximum number of patches per volume")
+    train_parser.add_argument("--adv_weight", type=float, default=0.1, help="Adversarial weight for WGAN-GP")
     
     # Inference arguments
     infer_parser = subparsers.add_parser("infer", help="Inference mode")
