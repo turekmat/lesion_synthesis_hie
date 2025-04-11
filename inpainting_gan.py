@@ -960,15 +960,15 @@ class GradientSmoothingLoss(nn.Module):
         return self.weight * (loss_z + loss_y + loss_x)
 
 class DynamicWeightedMAELoss(nn.Module):
-    def __init__(self, base_weight=25.0, scaling_factor=5.0):
+    def __init__(self, base_weight=30.0, scaling_factor=8.0):
         super(DynamicWeightedMAELoss, self).__init__()
         self.base_weight = base_weight
         self.scaling_factor = scaling_factor
         
     def forward(self, pred, target, mask, orig_range=None):
         """
-        Compute MAE loss with dynamic weighting based on lesion size
-        Smaller lesions receive higher weights to ensure they're not overlooked
+        Compute MAE loss STRICTLY in lesion areas only with dynamic weighting based on lesion size.
+        Smaller lesions receive higher weights to ensure they're properly inpainted.
         
         Args:
             pred: Predicted tensor
@@ -977,7 +977,7 @@ class DynamicWeightedMAELoss(nn.Module):
             orig_range: Original intensity range as tuple (min, max) before normalization
             
         Returns:
-            Dynamically weighted MAE loss
+            Dynamically weighted MAE loss (calculated ONLY in lesion voxels)
         """
         # Ensure mask is binary
         binary_mask = (mask > 0.5).float()
@@ -996,14 +996,14 @@ class DynamicWeightedMAELoss(nn.Module):
         # Čím menší léze, tím větší váha (ale zachovává minimální váhu base_weight)
         dynamic_weight = self.base_weight * (1.0 + self.scaling_factor * (1.0 - lesion_ratio))
         
-        # Apply mask to both prediction and target
+        # DŮLEŽITÉ: Aplikujeme masku, aby se počítala ztráta POUZE v oblasti léze
         masked_pred = pred * binary_mask
         masked_target = target * binary_mask
         
-        # Calculate absolute difference
+        # Calculate absolute difference POUZE v oblasti léze
         abs_diff = torch.abs(masked_pred - masked_target)
         
-        # Calculate mean only over masked regions
+        # Calculate mean only over masked regions - POUZE v oblasti léze
         mae = abs_diff.sum() / lesion_voxels
         
         # Apply denormalization if original range is provided
@@ -1115,8 +1115,8 @@ def train(args):
     # Initialize loss functions
     masked_mae_loss = MaskedMAELoss(weight=25.0).to(device)
     focal_loss = FocalLoss(alpha=0.75, gamma=2.0, weight=25.0).to(device)
-    dynamic_mae_loss = DynamicWeightedMAELoss(base_weight=25.0, scaling_factor=5.0).to(device)
-    gradient_loss = GradientSmoothingLoss(weight=0.05).to(device)
+    dynamic_mae_loss = DynamicWeightedMAELoss(base_weight=30.0, scaling_factor=8.0).to(device)  # Zvýšené hodnoty
+    gradient_loss = GradientSmoothingLoss(weight=0.02).to(device)  # Snížená váha
     
     # Initialize optimizer with added weight decay for L2 regularization
     optimizer = optim.Adam(model.parameters(), lr=args.learning_rate, weight_decay=1e-5)
@@ -1403,8 +1403,19 @@ def train(args):
                             binary_mask = (label_patch > 0.5).float()
                             
                             # Always calculate MAE for validation regardless of loss type
-                            mae_patch = torch.abs(output_patch - adc_patch).mean() if adc_orig_range is None else \
-                                       torch.abs(output_patch - adc_patch).mean() * (adc_orig_range[1] - adc_orig_range[0])
+                            lesion_voxels = binary_mask.sum()
+                            if lesion_voxels > 0:
+                                # Calculate MAE only in lesion areas (masked)
+                                masked_pred = output_patch * binary_mask
+                                masked_target = adc_patch * binary_mask
+                                abs_diff = torch.abs(masked_pred - masked_target)
+                                mae_patch = abs_diff.sum() / lesion_voxels  # Average only over lesion voxels
+                                
+                                # Apply scaling if original range is provided
+                                if adc_orig_range is not None:
+                                    mae_patch = mae_patch * (adc_orig_range[1] - adc_orig_range[0])
+                            else:
+                                mae_patch = torch.tensor(0.0, device=device)
                             
                             # Pro SSIM metriku - pouze pro zpětnou kompatibilitu
                             if binary_mask.sum() > 0:
