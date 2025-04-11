@@ -690,14 +690,14 @@ class LesionInpaintingModel(nn.Module):
     def __init__(self, in_channels=2, out_channels=1):
         super(LesionInpaintingModel, self).__init__()
         
-        # AttentionUnet as the generator instead of SwinUNETR
-        # Better suited for smaller patch sizes and focusing on small lesions
+        # AttentionUnet jako generátor, optimalizovaný pro malé patche 16x16x16
+        # Upraveno pro předejití problému s batch normalizací při malých prostorových rozměrech
         self.generator = AttentionUnet(
             spatial_dims=3,  # 3D model
             in_channels=in_channels,  # Pseudo-healthy and lesion mask
             out_channels=out_channels,  # Inpainted ADC
-            channels=(16, 32, 64, 128, 256),  # Channel sequence for smaller network (fits 16x16x16 patches)
-            strides=(2, 2, 2, 2),  # Standard strides
+            channels=(16, 32, 48, 64),  # Méně kanálů a méně vrstev
+            strides=(2, 2, 2),  # Jen tři úrovně downsamplingu místo čtyř
             kernel_size=3,
             up_kernel_size=3,
             dropout=0.2  # Small dropout to prevent overfitting
