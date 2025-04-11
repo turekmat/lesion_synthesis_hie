@@ -799,8 +799,22 @@ class LesionDiscriminator(nn.Module):
         # Průchod konvolučními bloky
         patch_predictions = self.conv_blocks(x)
         
+        # Uložíme si velikost původní masky
+        original_shape = label.shape
+        
+        # Interpolace predikcí zpět na původní velikost masky
+        if patch_predictions.shape[2:] != label.shape[2:]:
+            upsampled_predictions = torch.nn.functional.interpolate(
+                patch_predictions,
+                size=label.shape[2:],
+                mode='trilinear',
+                align_corners=False
+            )
+        else:
+            upsampled_predictions = patch_predictions
+        
         # Aplikovat masku na predikce - hodnotíme pouze oblasti léze
-        masked_predictions = patch_predictions * label
+        masked_predictions = upsampled_predictions * label
         
         # Průměrování pouze přes maskované oblasti
         mask_sum = torch.sum(label)
@@ -1546,7 +1560,7 @@ def train(args):
                 # ------
                 # KROK 1: Trénink diskriminátoru (WGAN-GP)
                 # ------
-                for _ in range(3):  # Trénujeme diskriminátor více kroků
+                for _ in range(1):  # Trénujeme diskriminátor 1 krok pro urychlení tréninku
                     optimizer_D.zero_grad()
                     
                     # Generovat fake výstup
