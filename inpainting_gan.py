@@ -1270,8 +1270,9 @@ def train(args):
             avg_val_lesion_ssim = val_lesion_ssim / val_examples
             avg_val_lesion_dice = val_lesion_dice / val_examples
             
-            # Note: No need to divide by 25.0 here as these are already raw MAE values,
-            # not weighted loss values like in the training loop
+            # Divide by the weight factor (25.0) to match training MAE display
+            avg_val_lesion_mae = avg_val_lesion_mae / 25.0
+            avg_val_loss = avg_val_loss / 25.0
             
             # Print validation metrics summary
             print("\nValidation Results:")
