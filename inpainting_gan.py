@@ -770,15 +770,77 @@ class MaskedMAELoss(nn.Module):
                 else:
                     orig_max = torch.tensor(orig_max, device=device)
                 
-                # Scale the loss by a factor based on the original range
-                # This helps the loss be more reflective of actual intensity differences
-                # Use log scaling to prevent the loss from becoming too large
-                range_factor = torch.log(torch.abs(orig_max - orig_min) + 1.0)
+                # Scale the loss by a direct factor of the original range
+                # This gives an absolute MAE in the original intensity scale
+                range_factor = torch.abs(orig_max - orig_min)
+                
+                # Use a large scaling factor to make this loss dominant
                 mae = mae * range_factor
             
             return self.weight * mae
         else:
             return torch.tensor(0.0, device=pred.device)
+    
+    def _dilate_mask(self, mask, kernel_size=3):
+        """Dilate the mask by a small amount to include perimeter"""
+        dilated_mask = torch.nn.functional.max_pool3d(
+            mask, 
+            kernel_size=kernel_size, 
+            stride=1, 
+            padding=kernel_size//2
+        )
+        return dilated_mask
+
+class SSIMLoss(nn.Module):
+    def __init__(self, weight=1.0):
+        super(SSIMLoss, self).__init__()
+        self.weight = weight
+    
+    def forward(self, pred, target, mask):
+        """
+        Computes 1-SSIM as a loss (since higher SSIM is better)
+        
+        Args:
+            pred: Predicted tensor
+            target: Target tensor
+            mask: Lesion mask tensor
+            
+        Returns:
+            SSIM loss (1-SSIM)
+        """
+        # Create a slightly dilated mask to include the perimeter
+        dilated_mask = self._dilate_mask(mask)
+        
+        # Apply mask to both prediction and target
+        masked_pred = pred * dilated_mask
+        masked_target = target * dilated_mask
+        
+        # Only compute if mask has non-zero elements
+        mask_sum = dilated_mask.sum()
+        if mask_sum == 0:
+            return torch.tensor(0.0, device=pred.device)
+            
+        # Compute means
+        mu_pred = masked_pred.sum() / mask_sum
+        mu_target = masked_target.sum() / mask_sum
+        
+        # Compute variances
+        var_pred = ((masked_pred - mu_pred * dilated_mask) ** 2).sum() / mask_sum
+        var_target = ((masked_target - mu_target * dilated_mask) ** 2).sum() / mask_sum
+        
+        # Compute covariance
+        cov = ((masked_pred - mu_pred * dilated_mask) * (masked_target - mu_target * dilated_mask)).sum() / mask_sum
+        
+        # Constants for stability
+        c1 = (0.01 * 1) ** 2
+        c2 = (0.03 * 1) ** 2
+        
+        # Compute SSIM
+        ssim = ((2 * mu_pred * mu_target + c1) * (2 * cov + c2)) / \
+               ((mu_pred**2 + mu_target**2 + c1) * (var_pred + var_target + c2))
+               
+        # Return 1-SSIM as the loss (since higher SSIM is better)
+        return self.weight * (1.0 - ssim)
     
     def _dilate_mask(self, mask, kernel_size=3):
         """Dilate the mask by a small amount to include perimeter"""
@@ -887,11 +949,11 @@ def train(args):
     # Initialize model
     model = LesionInpaintingModel(in_channels=2, out_channels=1).to(device)
     
-    # Define loss functions
+    # Define loss functions - with updated weights to prioritize MAE and SSIM
     masked_l1_loss = MaskedL1Loss().to(device)
-    gradient_loss = GradientSmoothingLoss(weight=0.1).to(device)
-    # Add MAE loss with a relatively high weight to emphasize it
-    masked_mae_loss = MaskedMAELoss(weight=2.0).to(device)
+    gradient_loss = GradientSmoothingLoss(weight=0.05).to(device)  # Reduced weight
+    masked_mae_loss = MaskedMAELoss(weight=10.0).to(device)  # Significantly higher weight for MAE
+    ssim_loss = SSIMLoss(weight=2.0).to(device)  # Add SSIM loss
     
     # Define evaluation metrics
     def reconstruction_loss(pred, target, mask=None):
@@ -1056,12 +1118,14 @@ def train(args):
     best_val_lesion_loss = float('inf')  # Changed from best_val_loss to best_val_lesion_loss
     best_val_lesion_dice = 0.0  # New metric to track
     best_val_lesion_mae = float('inf')  # Track MAE metric for model selection
+    best_val_lesion_ssim = 0.0  # Track SSIM metric for model selection
     for epoch in range(args.epochs):
         model.train()
         epoch_loss = 0
         epoch_l1_loss = 0
         epoch_smooth_loss = 0
         epoch_mae_loss = 0
+        epoch_ssim_loss = 0
         train_samples = 0
         
         for batch_idx, batch_data in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}")):
@@ -1112,7 +1176,11 @@ def train(args):
                 l1_loss = masked_l1_loss(output, adc_patch, label_patch)
                 smooth_loss = gradient_loss(output, label_patch)
                 mae_loss = masked_mae_loss(output, adc_patch, label_patch, adc_orig_range)
-                loss = l1_loss + smooth_loss + mae_loss
+                ssim_loss_val = ssim_loss(output, adc_patch, label_patch)
+                
+                # Make MAE loss the dominant component
+                # Use a weighted sum with MAE having the highest weight
+                loss = 0.2 * l1_loss + 0.05 * smooth_loss + 1.0 * mae_loss + 0.5 * ssim_loss_val
                 
                 # Backpropagation
                 optimizer.zero_grad()
@@ -1126,6 +1194,7 @@ def train(args):
                 epoch_l1_loss += l1_loss.item()
                 epoch_smooth_loss += smooth_loss.item()
                 epoch_mae_loss += mae_loss.item()
+                epoch_ssim_loss += ssim_loss_val.item()
             
             # Average loss over patches
             if len(filtered_patches_ph) > 0:
@@ -1136,11 +1205,13 @@ def train(args):
         avg_epoch_l1_loss = epoch_l1_loss / max(1, train_samples)
         avg_epoch_smooth_loss = epoch_smooth_loss / max(1, train_samples)
         avg_epoch_mae_loss = epoch_mae_loss / max(1, train_samples)
+        avg_epoch_ssim_loss = epoch_ssim_loss / max(1, train_samples)
         
         print(f"Epoch {epoch+1}, Average Loss: {avg_epoch_loss:.4f}")
         print(f"  - L1 Loss: {avg_epoch_l1_loss:.4f}")
         print(f"  - Smoothing Loss: {avg_epoch_smooth_loss:.4f}")
         print(f"  - MAE Loss: {avg_epoch_mae_loss:.4f}")
+        print(f"  - SSIM Loss: {avg_epoch_ssim_loss:.4f}")
         
         # Validation
         model.eval()
@@ -1526,6 +1597,12 @@ def train(args):
             torch.save(model.state_dict(), os.path.join(args.output_dir, "best_lesion_mae_model.pth"))
             print(f"Saved new best model with lesion MAE: {best_val_lesion_mae:.4f}")
         
+        # Option 4: Save based on lesion SSIM (higher is better)
+        if avg_val_lesion_ssim > best_val_lesion_ssim:
+            best_val_lesion_ssim = avg_val_lesion_ssim
+            torch.save(model.state_dict(), os.path.join(args.output_dir, "best_lesion_ssim_model.pth"))
+            print(f"Saved new best model with lesion SSIM: {best_val_lesion_ssim:.4f}")
+        
         # Save checkpoint with all metrics
         if (epoch + 1) % args.save_freq == 0:
             torch.save({
@@ -1536,6 +1613,7 @@ def train(args):
                 'l1_loss': avg_epoch_l1_loss,
                 'smooth_loss': avg_epoch_smooth_loss,
                 'mae_loss': avg_epoch_mae_loss,
+                'ssim_loss': avg_epoch_ssim_loss,
                 'val_loss': avg_val_loss,
                 'val_lesion_loss': avg_val_lesion_loss,
                 'val_healthy_loss': avg_val_healthy_loss,
