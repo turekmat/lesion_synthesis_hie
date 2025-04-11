@@ -718,6 +718,78 @@ class MaskedL1Loss(nn.Module):
         )
         return dilated_mask
 
+class MaskedMAELoss(nn.Module):
+    def __init__(self, weight=1.0):
+        super(MaskedMAELoss, self).__init__()
+        self.weight = weight
+        
+    def forward(self, pred, target, mask, orig_range=None):
+        """
+        Compute MAE loss focused on lesion regions with option to use original intensity range
+        
+        Args:
+            pred: Predicted tensor
+            target: Target tensor
+            mask: Lesion mask tensor
+            orig_range: Original intensity range as tuple (min, max) before normalization
+            
+        Returns:
+            Weighted MAE loss
+        """
+        # Create a slightly dilated mask to include the perimeter
+        dilated_mask = self._dilate_mask(mask)
+        
+        # Apply mask to both prediction and target
+        masked_pred = pred * dilated_mask
+        masked_target = target * dilated_mask
+        
+        # Calculate absolute difference
+        abs_diff = torch.abs(masked_pred - masked_target)
+        
+        # Calculate mean only over masked regions
+        mask_sum = dilated_mask.sum()
+        if mask_sum > 0:
+            mae = abs_diff.sum() / mask_sum
+            
+            # Apply additional weighting if original range is provided to make
+            # the loss more sensitive to the actual intensity differences
+            if orig_range is not None:
+                orig_min, orig_max = orig_range
+                
+                # Check if orig_range is a tensor and move to device if needed
+                device = pred.device
+                if isinstance(orig_min, torch.Tensor):
+                    if orig_min.device != device:
+                        orig_min = orig_min.to(device)
+                else:
+                    orig_min = torch.tensor(orig_min, device=device)
+                    
+                if isinstance(orig_max, torch.Tensor):
+                    if orig_max.device != device:
+                        orig_max = orig_max.to(device)
+                else:
+                    orig_max = torch.tensor(orig_max, device=device)
+                
+                # Scale the loss by a factor based on the original range
+                # This helps the loss be more reflective of actual intensity differences
+                # Use log scaling to prevent the loss from becoming too large
+                range_factor = torch.log(torch.abs(orig_max - orig_min) + 1.0)
+                mae = mae * range_factor
+            
+            return self.weight * mae
+        else:
+            return torch.tensor(0.0, device=pred.device)
+    
+    def _dilate_mask(self, mask, kernel_size=3):
+        """Dilate the mask by a small amount to include perimeter"""
+        dilated_mask = torch.nn.functional.max_pool3d(
+            mask, 
+            kernel_size=kernel_size, 
+            stride=1, 
+            padding=kernel_size//2
+        )
+        return dilated_mask
+
 class GradientSmoothingLoss(nn.Module):
     def __init__(self, weight=0.1):
         super(GradientSmoothingLoss, self).__init__()
@@ -818,6 +890,8 @@ def train(args):
     # Define loss functions
     masked_l1_loss = MaskedL1Loss().to(device)
     gradient_loss = GradientSmoothingLoss(weight=0.1).to(device)
+    # Add MAE loss with a relatively high weight to emphasize it
+    masked_mae_loss = MaskedMAELoss(weight=2.0).to(device)
     
     # Define evaluation metrics
     def reconstruction_loss(pred, target, mask=None):
@@ -981,15 +1055,27 @@ def train(args):
     # Training loop
     best_val_lesion_loss = float('inf')  # Changed from best_val_loss to best_val_lesion_loss
     best_val_lesion_dice = 0.0  # New metric to track
+    best_val_lesion_mae = float('inf')  # Track MAE metric for model selection
     for epoch in range(args.epochs):
         model.train()
         epoch_loss = 0
+        epoch_l1_loss = 0
+        epoch_smooth_loss = 0
+        epoch_mae_loss = 0
         train_samples = 0
         
         for batch_idx, batch_data in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}")):
             pseudo_healthy = batch_data["pseudo_healthy"].to(device)
             adc = batch_data["adc"].to(device)
             label = batch_data["label"].to(device)
+            
+            # Get the original ranges from the dataset for MAE loss calculation
+            adc_orig_range = None
+            if "original_ranges" in batch_data and "adc" in batch_data["original_ranges"]:
+                adc_orig_range = batch_data["original_ranges"]["adc"]
+                # Move ranges to the appropriate device
+                if isinstance(adc_orig_range[0], torch.Tensor) and adc_orig_range[0].device != device:
+                    adc_orig_range = (adc_orig_range[0].to(device), adc_orig_range[1].to(device))
             
             # Extract patches containing lesions
             patches_ph, patches_label, patches_adc, patch_coords = patch_extractor.extract_patches_with_lesions(
@@ -1025,7 +1111,8 @@ def train(args):
                 # Calculate losses
                 l1_loss = masked_l1_loss(output, adc_patch, label_patch)
                 smooth_loss = gradient_loss(output, label_patch)
-                loss = l1_loss + smooth_loss
+                mae_loss = masked_mae_loss(output, adc_patch, label_patch, adc_orig_range)
+                loss = l1_loss + smooth_loss + mae_loss
                 
                 # Backpropagation
                 optimizer.zero_grad()
@@ -1034,6 +1121,11 @@ def train(args):
                 
                 batch_loss += loss.item()
                 train_samples += 1
+                
+                # Track individual loss components
+                epoch_l1_loss += l1_loss.item()
+                epoch_smooth_loss += smooth_loss.item()
+                epoch_mae_loss += mae_loss.item()
             
             # Average loss over patches
             if len(filtered_patches_ph) > 0:
@@ -1041,7 +1133,14 @@ def train(args):
                 epoch_loss += avg_batch_loss
                 
         avg_epoch_loss = epoch_loss / max(1, len(train_loader))
+        avg_epoch_l1_loss = epoch_l1_loss / max(1, train_samples)
+        avg_epoch_smooth_loss = epoch_smooth_loss / max(1, train_samples)
+        avg_epoch_mae_loss = epoch_mae_loss / max(1, train_samples)
+        
         print(f"Epoch {epoch+1}, Average Loss: {avg_epoch_loss:.4f}")
+        print(f"  - L1 Loss: {avg_epoch_l1_loss:.4f}")
+        print(f"  - Smoothing Loss: {avg_epoch_smooth_loss:.4f}")
+        print(f"  - MAE Loss: {avg_epoch_mae_loss:.4f}")
         
         # Validation
         model.eval()
@@ -1421,6 +1520,12 @@ def train(args):
             torch.save(model.state_dict(), os.path.join(args.output_dir, "best_lesion_dice_model.pth"))
             print(f"Saved new best model with lesion Dice coefficient: {best_val_lesion_dice:.4f}")
         
+        # Option 3: Save based on lesion MAE (lower is better)
+        if avg_val_lesion_mae < best_val_lesion_mae:
+            best_val_lesion_mae = avg_val_lesion_mae
+            torch.save(model.state_dict(), os.path.join(args.output_dir, "best_lesion_mae_model.pth"))
+            print(f"Saved new best model with lesion MAE: {best_val_lesion_mae:.4f}")
+        
         # Save checkpoint with all metrics
         if (epoch + 1) % args.save_freq == 0:
             torch.save({
@@ -1428,6 +1533,9 @@ def train(args):
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'loss': avg_epoch_loss,
+                'l1_loss': avg_epoch_l1_loss,
+                'smooth_loss': avg_epoch_smooth_loss,
+                'mae_loss': avg_epoch_mae_loss,
                 'val_loss': avg_val_loss,
                 'val_lesion_loss': avg_val_lesion_loss,
                 'val_healthy_loss': avg_val_healthy_loss,
