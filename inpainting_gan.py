@@ -1169,7 +1169,6 @@ def train(args):
                             
                             # Use explicit cuda:0 device
                             cuda_device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-                            print(f"Validation using device: {cuda_device}")
                             
                             # Ensure all inputs are on CUDA
                             pseudo_healthy = pseudo_healthy.to(cuda_device)
@@ -1179,11 +1178,9 @@ def train(args):
                             # Ensure all patches are on the same device (GPU)
                             for i in range(len(output_patches)):
                                 if output_patches[i].device != cuda_device:
-                                    print(f"Moving patch {i} from {output_patches[i].device} to {cuda_device}")
                                     output_patches[i] = output_patches[i].to(cuda_device)
                             
                             # Print device information for debugging
-                            print(f"Validation: First patch device: {output_patches[0].device}, target device: {cuda_device}")
                             
                             # Reconstruct the volume
                             reconstructed = patch_extractor.reconstruct_from_patches(
@@ -1195,12 +1192,10 @@ def train(args):
                             
                             # Ensure the reconstructed tensor is on the same device as pseudo_healthy
                             if reconstructed.device != pseudo_healthy.device:
-                                print(f"Moving reconstructed from {reconstructed.device} to {pseudo_healthy.device}")
                                 reconstructed = reconstructed.to(pseudo_healthy.device)
                             
                             # Ensure label is on the same device as pseudo_healthy 
                             if label[0].device != pseudo_healthy[0].device:
-                                print(f"Moving label from {label[0].device} to {pseudo_healthy[0].device}")
                                 label = label.to(pseudo_healthy.device)
                                 
                             inpainted = inpainted * (1 - label[0]) + reconstructed * label[0]
@@ -1220,12 +1215,6 @@ def train(args):
                             
                             # Final check of all tensor devices before metric calculations
                             cuda_device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-                            print(f"Device check before metrics - cuda_device: {cuda_device}")
-                            print(f"  - inpainted_for_loss: {inpainted_for_loss.device}")
-                            print(f"  - adc: {adc.device}")
-                            print(f"  - label: {label.device}")
-                            print(f"  - dilated_mask: {dilated_mask.device}")
-                            
                             # Force everything to cuda
                             inpainted_for_loss = inpainted_for_loss.to(cuda_device)
                             adc = adc.to(cuda_device)
@@ -1234,10 +1223,9 @@ def train(args):
                             
                             # Check adc_orig_range device
                             if isinstance(adc_orig_range[0], torch.Tensor):
-                                print(f"  - adc_orig_range[0]: {adc_orig_range[0].device}")
                                 if adc_orig_range[0].device != cuda_device:
                                     adc_orig_range = (adc_orig_range[0].to(cuda_device), adc_orig_range[1].to(cuda_device))
-                                    print(f"    - moved to {adc_orig_range[0].device}")
+
                             
                             # Calculate validation metrics
                             # 1. Overall L1 loss (whole volume)
@@ -1357,7 +1345,6 @@ def train(args):
                     if output_patches:
                         # Use explicit cuda:0 device
                         cuda_device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-                        print(f"Visualization using device: {cuda_device}")
                         
                         # Move all inputs to CUDA
                         ph = ph.to(cuda_device)
@@ -1366,11 +1353,9 @@ def train(args):
                         # Ensure all patches are on the same device (GPU)
                         for i in range(len(output_patches)):
                             if output_patches[i].device != cuda_device:
-                                print(f"Moving visualization patch {i} from {output_patches[i].device} to {cuda_device}")
                                 output_patches[i] = output_patches[i].to(cuda_device)
                         
-                        # Print device information for debugging
-                        print(f"Visualization: First patch device: {output_patches[0].device}, target device: {cuda_device}")
+            
                                 
                         reconstructed = patch_extractor.reconstruct_from_patches(
                             output_patches, filtered_patch_coords, ph.shape
@@ -1381,12 +1366,11 @@ def train(args):
                         
                         # Ensure the reconstructed tensor is on the same device as ph
                         if reconstructed.device != ph.device:
-                            print(f"Viz: Moving reconstructed from {reconstructed.device} to {ph.device}")
+                        
                             reconstructed = reconstructed.to(ph.device)
                         
                         # Ensure lbl is on the same device as ph
                         if lbl[0].device != ph[0].device:
-                            print(f"Viz: Moving label from {lbl[0].device} to {ph[0].device}")
                             lbl = lbl.to(ph.device)
                             
                         inpainted = inpainted * (1 - lbl[0]) + reconstructed * lbl[0]
@@ -1739,7 +1723,6 @@ def inference(args):
             # Ensure all patches are on the same device (GPU)
             for i in range(len(output_patches)):
                 if output_patches[i].device != cuda_device:
-                    print(f"Moving inference patch {i} from {output_patches[i].device} to {cuda_device}")
                     output_patches[i] = output_patches[i].to(cuda_device)
             
             # Print device information
@@ -1756,12 +1739,10 @@ def inference(args):
             
             # Ensure the reconstructed tensor is on the same device as pseudo_healthy
             if reconstructed.device != pseudo_healthy.device:
-                print(f"Inference: Moving reconstructed from {reconstructed.device} to {pseudo_healthy.device}")
                 reconstructed = reconstructed.to(pseudo_healthy.device)
             
             # Ensure dilated_mask is on the same device as pseudo_healthy
             if dilated_mask.device != pseudo_healthy.device:
-                print(f"Inference: Moving dilated_mask from {dilated_mask.device} to {pseudo_healthy.device}")
                 dilated_mask = dilated_mask.to(pseudo_healthy.device)
                 
             # Create final inpainted image - copy pseudo-healthy and replace only in lesion regions
