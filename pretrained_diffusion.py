@@ -772,6 +772,128 @@ def visualize_full_subject(dataset, model, subject_id, epoch, output_dir, device
     nib.save(nii_img, nii_path)
     print(f"Reconstructed volume saved to: {nii_path}")
 
+def create_dataset_csv(pseudo_healthy_dir, adc_dir, label_dir, output_csv_path):
+    """
+    Creates a CSV file with paths to corresponding files for training.
+    
+    Args:
+        pseudo_healthy_dir: Directory with pseudo-healthy ADC images (.mha)
+        adc_dir: Directory with target ADC images (.mha)
+        label_dir: Directory with lesion masks (.mha)
+        output_csv_path: Path to output CSV file
+    
+    Returns:
+        Path to created CSV file
+    """
+    import glob
+    import re
+    import os
+    import pandas as pd
+    
+    print(f"Creating dataset CSV file...")
+    print(f"Pseudo-healthy directory: {pseudo_healthy_dir}")
+    print(f"ADC directory: {adc_dir}")
+    print(f"Lesion mask directory: {label_dir}")
+    
+    # Check if directories exist
+    for directory in [pseudo_healthy_dir, adc_dir, label_dir]:
+        if not os.path.exists(directory):
+            raise ValueError(f"Directory not found: {directory}")
+    
+    # Get lists of files
+    ph_files = sorted(glob.glob(os.path.join(pseudo_healthy_dir, "*.mha")))
+    adc_files = sorted(glob.glob(os.path.join(adc_dir, "*.mha")))
+    lesion_files = sorted(glob.glob(os.path.join(label_dir, "*.mha")))
+    
+    print(f"Found files: Pseudo-healthy: {len(ph_files)}, ADC: {len(adc_files)}, Lesions: {len(lesion_files)}")
+    
+    # Try to match files based on common ID patterns
+    matched_data = []
+    
+    # Try to match using common ID pattern in filenames
+    for ph_file in ph_files:
+        ph_basename = os.path.basename(ph_file)
+        
+        # Try to extract ID from filename using regex - adjust pattern as needed
+        # This looks for patterns like "MGHNICU_123-VISIT_456" in filenames
+        match = re.search(r'(MGHNICU_\d+-VISIT_\d+)', ph_basename)
+        
+        if match:
+            pattern_id = match.group(1)
+            # Look for corresponding ADC and lesion files
+            adc_pattern = os.path.join(adc_dir, f"{pattern_id}*ADC_ss.mha")
+            lesion_pattern = os.path.join(label_dir, f"{pattern_id}*lesion.mha")
+            
+            adc_matches = glob.glob(adc_pattern)
+            lesion_matches = glob.glob(lesion_pattern)
+            
+            if adc_matches and lesion_matches:
+                matched_data.append({
+                    'subject_id': pattern_id,
+                    'pseudo_healthy': ph_file,
+                    'adc': adc_matches[0],
+                    'lesion': lesion_matches[0]
+                })
+                print(f"Found match for: {pattern_id}")
+    
+    # If no matches found with regex, try more flexible matching
+    if not matched_data:
+        print("No matches found with ID pattern. Trying more flexible matching...")
+        
+        # For each pseudo-healthy file
+        for ph_file in ph_files:
+            ph_basename = os.path.basename(ph_file)
+            
+            # Extract base name without extension and specific markers
+            base_name = ph_basename.replace('-PSEUDO_HEALTHY.mha', '').replace('_PSEUDO_HEALTHY.mha', '')
+            
+            # Find corresponding files by base name
+            for adc_file in adc_files:
+                adc_basename = os.path.basename(adc_file)
+                
+                # Check if ADC file contains the base name
+                if base_name in adc_basename:
+                    # Look for corresponding lesion file
+                    for lesion_file in lesion_files:
+                        lesion_basename = os.path.basename(lesion_file)
+                        
+                        # Check if lesion file contains the base name
+                        if base_name in lesion_basename:
+                            matched_data.append({
+                                'subject_id': base_name,
+                                'pseudo_healthy': ph_file,
+                                'adc': adc_file,
+                                'lesion': lesion_file
+                            })
+                            break  # After finding lesion, move to next ADC
+    
+    # If still no matches, try simple index-based matching (last resort)
+    if not matched_data:
+        print("No matches found with flexible matching. Using simple index-based matching...")
+        
+        # Get the minimum number of files among the three directories
+        min_files = min(len(ph_files), len(adc_files), len(lesion_files))
+        
+        for i in range(min_files):
+            matched_data.append({
+                'subject_id': f'subject_{i+1}',
+                'pseudo_healthy': ph_files[i],
+                'adc': adc_files[i],
+                'lesion': lesion_files[i]
+            })
+    
+    # Create dataframe and save to CSV
+    df = pd.DataFrame(matched_data)
+    
+    # Create output directory if it doesn't exist
+    os.makedirs(os.path.dirname(output_csv_path), exist_ok=True)
+    
+    # Save to CSV
+    df.to_csv(output_csv_path, index=False)
+    print(f"Created CSV file with {len(df)} records at: {output_csv_path}")
+    
+    return output_csv_path
+
 def train_model(args):
     """
     Main training function for MRI autoencoder model.
@@ -963,13 +1085,19 @@ def main():
     """
     parser = argparse.ArgumentParser(description="Train MRI autoencoder for lesion synthesis")
     
-    # Dataset and model paths
-    parser.add_argument('--csv_path', type=str, required=True,
-                        help='Path to CSV file with dataset information')
+    # Data directories and output paths
+    parser.add_argument('--pseudo_healthy_dir', type=str, default=None,
+                        help='Directory containing pseudo-healthy ADC images (.mha)')
+    parser.add_argument('--adc_dir', type=str, default=None, 
+                        help='Directory containing target ADC images (.mha)')
+    parser.add_argument('--label_dir', type=str, default=None,
+                        help='Directory containing lesion masks (.mha)')
+    parser.add_argument('--csv_path', type=str, default=None,
+                        help='Path to existing CSV file with dataset information. If not provided, will be created from directories.')
     parser.add_argument('--model_path', type=str, default="microsoft/mri-autoencoder-v0.1",
                         help='Path or HF model ID for the MRI autoencoder model')
     parser.add_argument('--output_dir', type=str, default='./output',
-                        help='Directory to save model checkpoints and outputs')
+                        help='Directory to save model checkpoints, visualizations and outputs')
     
     # Training parameters
     parser.add_argument('--num_epochs', type=int, default=50,
@@ -992,6 +1120,21 @@ def main():
                         help='Whether to generate visualizations during training')
     
     args = parser.parse_args()
+    
+    # Either use existing CSV or create a new one from directories
+    if args.csv_path is None:
+        # Check if directories are provided
+        if args.pseudo_healthy_dir is None or args.adc_dir is None or args.label_dir is None:
+            parser.error("Either provide --csv_path or all of --pseudo_healthy_dir, --adc_dir, and --label_dir")
+        
+        # Create CSV file
+        csv_path = os.path.join(args.output_dir, 'dataset.csv')
+        args.csv_path = create_dataset_csv(
+            args.pseudo_healthy_dir,
+            args.adc_dir,
+            args.label_dir,
+            csv_path
+        )
     
     # Print configuration
     print("Configuration:")
