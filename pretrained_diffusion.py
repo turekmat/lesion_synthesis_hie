@@ -90,7 +90,7 @@ def load_mha_image(file_path):
             raise Exception(f"Failed to load {file_path} with both SimpleITK and nibabel: {e2}")
 
 class BrainLesionDataset(Dataset):
-    def __init__(self, csv_file, patch_size=(64, 64, 64), transformation=None, max_patches_per_volume=10):
+    def __init__(self, csv_file, patch_size=(64, 64, 64), transformation=None, max_patches_per_volume=10, adaptive_patch_size=True):
         """
         Dataset class for brain lesion data
         
@@ -99,11 +99,13 @@ class BrainLesionDataset(Dataset):
             patch_size (tuple): Size of the patches to extract
             transformation: Transformation to apply to the data
             max_patches_per_volume (int): Maximum number of patches to extract per volume
+            adaptive_patch_size (bool): If True, adapts patch size to match data dimensions when necessary
         """
         self.df = pd.read_csv(csv_file)
         self.patch_size = np.array(patch_size)
         self.transformation = transformation
         self.max_patches_per_volume = max_patches_per_volume
+        self.adaptive_patch_size = adaptive_patch_size
         
         self.patches = []
         
@@ -161,17 +163,42 @@ class BrainLesionDataset(Dataset):
                     print(f"  No lesions found for subject {i+1}")
                     continue
                 
+                # Adapt patch size if necessary
+                adapted_patch_size = self.patch_size.copy()
+                if self.adaptive_patch_size:
+                    # Check if any dimension is smaller than requested patch size
+                    for dim in range(3):
+                        if pseudo_healthy_data.shape[dim] < self.patch_size[dim]:
+                            print(f"  Adapting patch size for dimension {dim}: {self.patch_size[dim]} -> {pseudo_healthy_data.shape[dim]}")
+                            adapted_patch_size[dim] = pseudo_healthy_data.shape[dim]
+                    
+                    if not np.array_equal(adapted_patch_size, self.patch_size):
+                        print(f"  Using adapted patch size: {tuple(adapted_patch_size)} instead of {tuple(self.patch_size)}")
+                
                 # Sample coordinates from the lesion
                 num_lesion_voxels = len(lesion_coords[0])
                 indices = np.random.choice(num_lesion_voxels, min(num_lesion_voxels, self.max_patches_per_volume), replace=False)
                 
+                patches_added = 0
                 for idx in indices:
                     center = np.array([lesion_coords[0][idx], lesion_coords[1][idx], lesion_coords[2][idx]])
                     
                     # Define the bounding box
-                    lower_bound = np.maximum(center - self.patch_size // 2, 0)
-                    upper_bound = np.minimum(lower_bound + self.patch_size, pseudo_healthy_data.shape)
-                    lower_bound = np.maximum(upper_bound - self.patch_size, 0)
+                    lower_bound = np.maximum(center - adapted_patch_size // 2, 0)
+                    upper_bound = np.minimum(lower_bound + adapted_patch_size, pseudo_healthy_data.shape)
+                    
+                    # We need to ensure we get exactly the patch size we want
+                    # If upper_bound - lower_bound != patch_size, adjust lower_bound
+                    actual_size = upper_bound - lower_bound
+                    if not np.array_equal(actual_size, adapted_patch_size):
+                        # Adjust lower_bound to get exact patch size
+                        lower_bound = np.maximum(upper_bound - adapted_patch_size, 0)
+                        # And then recalculate upper_bound
+                        upper_bound = np.minimum(lower_bound + adapted_patch_size, pseudo_healthy_data.shape)
+                        # Final check - if still not matching, we skip this patch
+                        if not np.array_equal(upper_bound - lower_bound, adapted_patch_size):
+                            print(f"  Cannot create exact patch size at center {center}, skipping")
+                            continue
                     
                     # Extract the patches
                     ph_patch = pseudo_healthy_data[lower_bound[0]:upper_bound[0], 
@@ -179,16 +206,16 @@ class BrainLesionDataset(Dataset):
                                                  lower_bound[2]:upper_bound[2]]
                     
                     adc_patch = adc_data[lower_bound[0]:upper_bound[0], 
-                                       lower_bound[1]:upper_bound[1], 
-                                       lower_bound[2]:upper_bound[2]]
+                                        lower_bound[1]:upper_bound[1], 
+                                        lower_bound[2]:upper_bound[2]]
                     
                     lesion_patch = lesion_data[lower_bound[0]:upper_bound[0], 
-                                             lower_bound[1]:upper_bound[1], 
-                                             lower_bound[2]:upper_bound[2]]
+                                              lower_bound[1]:upper_bound[1], 
+                                              lower_bound[2]:upper_bound[2]]
                     
-                    # Check if patch size is correct
-                    if ph_patch.shape != tuple(self.patch_size) or adc_patch.shape != tuple(self.patch_size) or lesion_patch.shape != tuple(self.patch_size):
-                        print(f"  Skipping patch with invalid shape: {ph_patch.shape}, {adc_patch.shape}, {lesion_patch.shape}")
+                    # Verify patch shape matches the adapted size
+                    if ph_patch.shape != tuple(adapted_patch_size) or adc_patch.shape != tuple(adapted_patch_size) or lesion_patch.shape != tuple(adapted_patch_size):
+                        print(f"  Unexpected patch shape: {ph_patch.shape}, expected {tuple(adapted_patch_size)}, skipping")
                         continue
                     
                     # Add the patches to the list
@@ -199,13 +226,16 @@ class BrainLesionDataset(Dataset):
                         'subject_id': i,
                         'center': center,
                         'lower_bound': lower_bound,
-                        'upper_bound': upper_bound
+                        'upper_bound': upper_bound,
+                        'patch_size': adapted_patch_size
                     })
+                    patches_added += 1
                 
-                print(f"  Added {len(indices)} patches for subject {i+1}")
+                print(f"  Added {patches_added} patches for subject {i+1}")
                 
             except Exception as e:
                 print(f"  Error processing subject {i+1}: {e}")
+                import traceback
                 traceback.print_exc()
                 continue
         
@@ -214,6 +244,7 @@ class BrainLesionDataset(Dataset):
         # Add at least one dummy patch if no patches were created to avoid DataLoader errors
         if len(self.patches) == 0:
             print("WARNING: No valid patches created. Adding dummy patch to avoid DataLoader errors.")
+            # Use a default patch size that works with most models
             dummy_shape = tuple(self.patch_size)
             self.patches.append({
                 'pseudo_healthy': np.zeros(dummy_shape, dtype=np.float32),
@@ -222,7 +253,8 @@ class BrainLesionDataset(Dataset):
                 'subject_id': 0,
                 'center': np.zeros(3, dtype=np.int32),
                 'lower_bound': np.zeros(3, dtype=np.int32),
-                'upper_bound': np.array(dummy_shape, dtype=np.int32)
+                'upper_bound': np.array(dummy_shape, dtype=np.int32),
+                'patch_size': self.patch_size
             })
             
     def __len__(self):
@@ -231,10 +263,38 @@ class BrainLesionDataset(Dataset):
     def __getitem__(self, idx):
         patch = self.patches[idx]
         
-        # Convert to tensor
-        ph_tensor = torch.from_numpy(patch['pseudo_healthy']).float().unsqueeze(0)
-        adc_tensor = torch.from_numpy(patch['adc']).float().unsqueeze(0)
-        lesion_tensor = torch.from_numpy(patch['lesion']).float().unsqueeze(0)
+        # Get the patch data
+        ph_patch = patch['pseudo_healthy']
+        adc_patch = patch['adc']
+        lesion_patch = patch['lesion']
+        patch_size = patch['patch_size']
+        
+        # Check if we need to pad to match the expected model input size
+        if not np.array_equal(patch_size, self.patch_size):
+            # Create padded arrays of the target size
+            ph_padded = np.zeros(tuple(self.patch_size), dtype=np.float32)
+            adc_padded = np.zeros(tuple(self.patch_size), dtype=np.float32)
+            lesion_padded = np.zeros(tuple(self.patch_size), dtype=np.float32)
+            
+            # Calculate padding slices
+            slices = tuple(slice(0, min(patch_size[i], self.patch_size[i])) for i in range(3))
+            
+            # Copy data to padded arrays
+            ph_padded[slices] = ph_patch[slices]
+            adc_padded[slices] = adc_patch[slices]
+            lesion_padded[slices] = lesion_patch[slices]
+            
+            # Update the patch data with padded versions
+            ph_patch = ph_padded
+            adc_patch = adc_padded
+            lesion_patch = lesion_padded
+            
+            print(f"Padded patch from {tuple(patch_size)} to {tuple(self.patch_size)}")
+        
+        # Convert to tensor and add channel dimension
+        ph_tensor = torch.from_numpy(ph_patch).float().unsqueeze(0)
+        adc_tensor = torch.from_numpy(adc_patch).float().unsqueeze(0)
+        lesion_tensor = torch.from_numpy(lesion_patch).float().unsqueeze(0)
         
         if self.transformation:
             ph_tensor = self.transformation(ph_tensor)
@@ -827,7 +887,12 @@ def train_model(args):
     writer = SummaryWriter(log_dir=os.path.join(args.output_dir, 'tensorboard'))
     
     # Create dataset and dataloader
-    dataset = BrainLesionDataset(args.csv_path, patch_size=tuple(args.patch_size))
+    dataset = BrainLesionDataset(
+        args.csv_path, 
+        patch_size=tuple(args.patch_size),
+        max_patches_per_volume=args.max_patches_per_volume if hasattr(args, 'max_patches_per_volume') else 10,
+        adaptive_patch_size=args.adaptive_patch_size if hasattr(args, 'adaptive_patch_size') else True
+    )
     
     # Split dataset into train and validation sets
     num_samples = len(dataset)
@@ -1035,6 +1100,10 @@ def main():
                         help='Frequency of saving model checkpoints (in epochs)')
     parser.add_argument('--visualize', action='store_true',
                         help='Whether to generate visualizations during training')
+    parser.add_argument('--max_patches_per_volume', type=int, default=10,
+                        help='Maximum number of patches to extract per volume')
+    parser.add_argument('--adaptive_patch_size', type=bool, default=True,
+                        help='Automatically adapt patch size to match data dimensions')
     
     args = parser.parse_args()
     
