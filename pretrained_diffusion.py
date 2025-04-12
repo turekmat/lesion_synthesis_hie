@@ -360,10 +360,10 @@ def apply_smoothing(outputs, masks, inputs, sigma=0.8, iterations=2):
     inputs_np = inputs.detach().cpu().numpy()
     
     for b in range(outputs.shape[0]):
-        # Get data for current batch
-        curr_output = outputs_np[b, 0]
-        curr_mask = masks_np[b, 0]
-        curr_input = inputs_np[b, 0]
+        # Process each 3D volume separately
+        curr_output = outputs_np[b, 0]  # shape: (D, H, W)
+        curr_mask = masks_np[b, 0]      # shape: (D, H, W)
+        curr_input = inputs_np[b, 0]    # shape: (D, H, W)
         
         # Create binary brain mask - everywhere input has non-zero value
         brain_mask = (curr_input > 0.01).astype(np.float32)
@@ -375,13 +375,13 @@ def apply_smoothing(outputs, masks, inputs, sigma=0.8, iterations=2):
         dilated_mask = binary_dilation(lesion_mask, iterations=iterations).astype(np.float32)
         
         # Create mask only for lesion surroundings (dilated area minus original lesion)
-        # This is key change - separate lesion surroundings from lesion itself
         transition_zone_mask = dilated_mask - lesion_mask
         
         # Ensure transition zone remains within brain mask
         transition_zone_mask = transition_zone_mask * brain_mask
         
         # Apply Gaussian smoothing to entire output
+        # We apply 3D Gaussian filter to maintain consistency across slices
         smoothed = gaussian_filter(curr_output, sigma=sigma)
         
         # Ensure smoothed output remains within brain mask
@@ -466,23 +466,62 @@ class MRIAutoencoder(nn.Module):
             raise Exception("Failed to load the MRI autoencoder model")
     
     def forward(self, x, mask):
-        # If we're in training mode, we need gradients from encoder
-        if self.training:
-            z_mu, z_sigma = self.vae.encode(x)
-        else:
-            with torch.no_grad():
-                z_mu, z_sigma = self.vae.encode(x)
+        """
+        Process 3D volumes using a 2D VAE model.
         
-        # Decode from latent representation
-        decoded = self.vae.decode(z_mu)
+        Args:
+            x: Input tensor of shape [batch_size, 1, D, H, W]
+            mask: Mask tensor of shape [batch_size, 1, D, H, W]
+            
+        Returns:
+            Output tensor of shape [batch_size, 1, D, H, W]
+        """
+        # Get shapes for processing
+        batch_size, channels, depth, height, width = x.shape
         
-        # Ensure output has same shape as input
-        if decoded.shape != x.shape:
-            decoded = F.interpolate(decoded, size=x.shape[2:], mode='trilinear', align_corners=False)
+        # Process each slice separately and store results
+        decoded_slices = []
         
-        # Use mask to blend original input (pseudo-healthy) with decoded output
-        # Keep original where mask is 0, use decoded where mask is 1
-        raw_output = x * (1 - mask) + decoded * mask
+        for d in range(depth):
+            # Extract 2D slices for current depth - shape: [batch_size, 1, H, W]
+            slice_x = x[:, :, d, :, :]
+            
+            # Handle empty slices (all zeros) to avoid NaN issues
+            if torch.sum(slice_x) < 1e-6:
+                # If the slice is empty, just pass it through
+                decoded_slices.append(slice_x)
+                continue
+            
+            # Encode 2D slice
+            if self.training:
+                z_mu, z_sigma = self.vae.encode(slice_x)
+            else:
+                with torch.no_grad():
+                    z_mu, z_sigma = self.vae.encode(slice_x)
+            
+            # Decode from latent representation
+            decoded_slice = self.vae.decode(z_mu)
+            
+            # Ensure output slice has same shape as input slice
+            if decoded_slice.shape != slice_x.shape:
+                decoded_slice = F.interpolate(decoded_slice, size=slice_x.shape[2:], mode='bilinear', align_corners=False)
+            
+            decoded_slices.append(decoded_slice)
+        
+        # Stack the processed slices back into a 3D volume
+        decoded = torch.stack(decoded_slices, dim=2)  # shape: [batch_size, 1, D, H, W]
+        
+        # Extract mask slices and apply them to create the final output
+        raw_output = torch.zeros_like(x)
+        
+        for d in range(depth):
+            slice_mask = mask[:, :, d, :, :]
+            slice_x = x[:, :, d, :, :]
+            slice_decoded = decoded[:, :, d, :, :]
+            
+            # Blend original and decoded based on mask for each slice
+            # Keep original where mask is 0, use decoded where mask is 1
+            raw_output[:, :, d, :, :] = slice_x * (1 - slice_mask) + slice_decoded * slice_mask
         
         return raw_output
 
@@ -1090,8 +1129,8 @@ def main():
                         help='Learning rate')
     parser.add_argument('--lesion_weight', type=float, default=10.0,
                         help='Weight for lesion areas in loss function')
-    parser.add_argument('--patch_size', nargs=3, type=int, default=[80, 96, 80],
-                        help='Patch size for 3D patches [depth, height, width]')
+    parser.add_argument('--patch_size', nargs=3, type=int, default=[64, 96, 80],
+                        help='Patch size for 3D patches [depth, height, width]. Note: 2D processing is done slice by slice.')
     parser.add_argument('--device', type=str, default='cuda:0',
                         help='Device to train on (cuda:0, cuda:1, cpu, etc.)')
     parser.add_argument('--num_workers', type=int, default=4,
@@ -1127,6 +1166,9 @@ def main():
     print("Configuration:")
     for arg in vars(args):
         print(f"  {arg}: {getattr(args, arg)}")
+    
+    print("\nNOTE: The model processes 3D data slice by slice due to the limitations of the VAE architecture.")
+    print("      Each 2D slice will be processed independently and then combined into a 3D volume.\n")
     
     # Start training
     train_model(args)
