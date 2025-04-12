@@ -1195,15 +1195,21 @@ class GradientSmoothingLoss(nn.Module):
         return self.weight * (loss_z + loss_y + loss_x)
 
 class DynamicWeightedMAELoss(nn.Module):
-    def __init__(self, base_weight=30.0, scaling_factor=8.0):
+    def __init__(self, base_weight=30.0, scaling_factor=8.0, neighbor_radius=2, high_penalty_factor=3.0, min_threshold=0.05, low_penalty_factor=2.0):
         super(DynamicWeightedMAELoss, self).__init__()
         self.base_weight = base_weight
         self.scaling_factor = scaling_factor
+        self.neighbor_radius = neighbor_radius  # Radius pro výpočet průměrných hodnot okolí
+        self.high_penalty_factor = high_penalty_factor  # Penalizace pro hodnoty vyšší než okolí
+        self.min_threshold = min_threshold  # Minimální přijatelná hodnota
+        self.low_penalty_factor = low_penalty_factor  # Penalizace pro příliš nízké hodnoty
         
     def forward(self, pred, target, mask, orig_range=None):
         """
         Compute MAE loss STRICTLY in lesion areas only with dynamic weighting based on lesion size.
         Smaller lesions receive higher weights to ensure they're properly inpainted.
+        Also applies medical knowledge: penalizes values higher than surrounding tissue
+        and values too close to zero.
         
         Args:
             pred: Predicted tensor
@@ -1226,7 +1232,7 @@ class DynamicWeightedMAELoss(nn.Module):
         if lesion_voxels <= 0:
             # Pokud nejsou léze, vrátíme nulovou ztrátu
             return torch.tensor(0.0, device=pred.device)
-            
+             
         # Dynamicky zvýšit váhu při malém podílu léze (inverzní vztah)
         # Čím menší léze, tím větší váha (ale zachovává minimální váhu base_weight)
         dynamic_weight = self.base_weight * (1.0 + self.scaling_factor * (1.0 - lesion_ratio))
@@ -1238,8 +1244,31 @@ class DynamicWeightedMAELoss(nn.Module):
         # Calculate absolute difference POUZE v oblasti léze
         abs_diff = torch.abs(masked_pred - masked_target)
         
+        # NOVÉ: Výpočet průměrných hodnot okolí pro srovnání s predikcí
+        kernel_size = 2 * self.neighbor_radius + 1
+        padding = self.neighbor_radius
+        
+        # Použijeme průměrový pooling pro výpočet okolních hodnot (mimo lézi)
+        neighbor_values = F.avg_pool3d(
+            target * (1 - binary_mask),  # Pouze hodnoty mimo lézi
+            kernel_size=kernel_size,
+            stride=1,
+            padding=padding
+        )
+        
+        # Identifikace míst, kde predikce je vyšší než okolí
+        # Což je proti medicínskému očekávání (léze mají nižší ADC)
+        higher_than_neighbors = (pred > neighbor_values) * binary_mask
+        
+        # Identifikace míst, kde předpověď je příliš blízko nule
+        too_low_values = (pred < self.min_threshold) * binary_mask
+        
+        # Aplikace vyšší penalizace podle apriorní znalosti
+        biased_diff = abs_diff * (1 + (self.high_penalty_factor - 1) * higher_than_neighbors 
+                                + (self.low_penalty_factor - 1) * too_low_values)
+        
         # Calculate mean only over masked regions - POUZE v oblasti léze
-        mae = abs_diff.sum() / lesion_voxels
+        mae = biased_diff.sum() / lesion_voxels
         
         # Apply denormalization if original range is provided
         if orig_range is not None:
