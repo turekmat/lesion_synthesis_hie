@@ -15,6 +15,7 @@ from matplotlib.colors import Normalize
 from diffusers.models import AutoencoderKL
 import torch.serialization
 from scipy import ndimage
+import SimpleITK as sitk
 
 # Try to load numpy types if needed for safe deserialization
 try:
@@ -33,431 +34,222 @@ try:
 except ImportError:
     print("Warning: Could not import some numpy types for serialization")
 
+def load_mha_image(file_path):
+    """
+    Load a medical image using SimpleITK
+    
+    Args:
+        file_path: Path to the image file (MHA, NIfTI) or directory (DICOM)
+        
+    Returns:
+        Object mimicking nibabel's NiftiImage
+    """
+    try:
+        # Check if it's a directory (potentially DICOM)
+        if os.path.isdir(file_path):
+            return convert_dicom_to_array(file_path)
+        
+        # Try loading with SimpleITK for other file types
+        sitk_img = sitk.ReadImage(file_path)
+        
+        # Convert to numpy array
+        data = sitk.GetArrayFromImage(sitk_img)
+        
+        # Create affine matrix from SimpleITK information
+        direction = np.array(sitk_img.GetDirection()).reshape(3, 3)
+        spacing = np.array(sitk_img.GetSpacing())
+        origin = np.array(sitk_img.GetOrigin())
+        
+        # Create affine matrix
+        affine = np.eye(4)
+        affine[:3, :3] = direction * np.expand_dims(spacing, 1)
+        affine[:3, 3] = origin
+        
+        # SimpleITK uses different axis ordering (z,y,x), so we transpose the data
+        # to match nibabel convention (x,y,z)
+        # data = np.transpose(data, (2, 1, 0))
+        
+        # Create a simple wrapper class to mimic nibabel's NiftiImage
+        class MHAImage:
+            def __init__(self, data, affine, shape):
+                self.data = data
+                self.affine = affine
+                self.shape = shape
+                
+            def get_fdata(self):
+                return self.data
+        
+        return MHAImage(data, affine, data.shape)
+        
+    except Exception as e:
+        print(f"Error loading file with SimpleITK: {e}")
+        # Fall back to nibabel if SimpleITK fails
+        try:
+            return nib.load(file_path)
+        except Exception as e2:
+            raise Exception(f"Failed to load {file_path} with both SimpleITK and nibabel: {e2}")
+
 class BrainLesionDataset(Dataset):
-    def __init__(self, csv_path, target_shape=(80, 96, 80), patch_overlap=0.5):
+    def __init__(self, csv_file, patch_size=(64, 64, 64), transformation=None, max_patches_per_volume=10):
         """
-        Dataset for training a patch-based model for brain lesions.
+        Dataset class for brain lesion data
         
         Args:
-            csv_path: Path to CSV file with data
-            target_shape: Target patch shape (D, H, W)
-            patch_overlap: Overlap between neighboring patches (0-1)
+            csv_file (str): Path to the CSV file with the data paths
+            patch_size (tuple): Size of the patches to extract
+            transformation: Transformation to apply to the data
+            max_patches_per_volume (int): Maximum number of patches to extract per volume
         """
-        self.data = pd.read_csv(csv_path)
-        self.target_shape = target_shape
-        self.patch_overlap = patch_overlap
+        self.df = pd.read_csv(csv_file)
+        self.patch_size = np.array(patch_size)
+        self.transformation = transformation
+        self.max_patches_per_volume = max_patches_per_volume
         
-        # List of all patches for all subjects
-        self.all_patches = []
+        self.patches = []
         
-        # Dictionary mapping subject_id -> original data and shapes
-        self.subject_data = {}
+        print(f"Loading {len(self.df)} subjects for training...")
         
-        # Precompute all patches for all subjects
-        print("Preparing patches for all subjects...")
-        for idx, row in self.data.iterrows():
-            subject_id = row['subject_id']
-            print(f"Processing subject {subject_id} ({idx+1}/{len(self.data)})")
-            
-            # Load original data without modifications
+        # Extract patches for each subject
+        for i, row in self.df.iterrows():
             try:
-                ph_img = nib.load(row['pseudo_healthy'])
-                adc_img = nib.load(row['adc'])
-                lesion_img = nib.load(row['lesion'])
+                print(f"Processing subject {i+1}/{len(self.df)}: {os.path.basename(row['pseudo_healthy'])}")
                 
-                # Check if all images have the same affine matrix and dimensions
-                if not np.allclose(ph_img.affine, adc_img.affine) or not np.allclose(ph_img.affine, lesion_img.affine):
-                    print(f"  WARNING: Images for subject {subject_id} have different affine matrices! Performing resampling...")
-                    
-                    # Use pseudo_healthy affine as reference
-                    ref_affine = ph_img.affine
-                    ref_shape = ph_img.shape
-                    
-                    # Resampling adc and lesion images to reference image space
-                    # For ADC use linear interpolation
-                    adc_data = np.array(adc_img.get_fdata())
-                    adc_data = np.clip(adc_data, 0, None)
-                    if adc_data.max() > 0: 
-                        adc_data = adc_data / adc_data.max()
-                    
-                    # For lesion mask use nearest-neighbor interpolation to keep it binary
-                    lesion_data = np.array(lesion_img.get_fdata())
-                    lesion_data = (lesion_data > 0.1).astype(np.float32)
-                    
-                    # Try to use nibabel resample_to_img function if available, otherwise use custom implementation
-                    try:
-                        from nibabel.processing import resample_to_img
-                        
-                        # Resampling adc image (linear interpolation)
-                        new_adc_img = resample_to_img(adc_img, ph_img, interpolation='linear')
-                        adc_data = np.array(new_adc_img.get_fdata())
-                        
-                        # Resampling lesion image (nearest neighbor to keep it binary)
-                        new_lesion_img = resample_to_img(lesion_img, ph_img, interpolation='nearest')
-                        lesion_data = (np.array(new_lesion_img.get_fdata()) > 0.1).astype(np.float32)
-                        
-                    except (ImportError, AttributeError):
-                        print("  nibabel.processing.resample_to_img not available, using SciPy for resampling...")
-                        
-                        # Alternative resampling using scipy
-                        from scipy.ndimage import map_coordinates
-                        
-                        # Create grid for transformation from source to target coordinates
-                        ijk_dest = np.mgrid[0:ref_shape[0], 0:ref_shape[1], 0:ref_shape[2]]
-                        ijk_dest = ijk_dest.reshape(3, -1)
-                        
-                        # Add homogeneous coordinate
-                        ijk_dest_homog = np.vstack((ijk_dest, np.ones((1, ijk_dest.shape[1]))))
-                        
-                        # Transform from target voxel coordinates to world (mm)
-                        xyz_dest = ref_affine @ ijk_dest_homog
-                        
-                        # Transform from world (mm) to source voxel coordinates
-                        ijk_src_adc = np.linalg.inv(adc_img.affine) @ xyz_dest
-                        ijk_src_lesion = np.linalg.inv(lesion_img.affine) @ xyz_dest
-                        
-                        # Resample data
-                        adc_data_resampled = np.zeros(ref_shape)
-                        lesion_data_resampled = np.zeros(ref_shape)
-                        
-                        # Trilinear interpolation for ADC data
-                        map_coordinates(adc_data, ijk_src_adc[:3], output=adc_data_resampled.ravel(), order=1)
-                        
-                        # Nearest neighbor interpolation for lesion mask
-                        map_coordinates(lesion_data, ijk_src_lesion[:3], output=lesion_data_resampled.ravel(), order=0)
-                        
-                        adc_data = adc_data_resampled
-                        lesion_data = (lesion_data_resampled > 0.1).astype(np.float32)
-                    
-                    # Get data from pseudo_healthy
-                    ph_data = np.array(ph_img.get_fdata())
-                    if ph_data.max() > 0: 
-                        ph_data = ph_data / ph_data.max()
-                    
-                else:
-                    # If they have the same affine matrices, use data directly
-                    ph_data = np.array(ph_img.get_fdata())
-                    adc_data = np.array(adc_img.get_fdata())
-                    lesion_data = np.array(lesion_img.get_fdata())
-                    
-                    # Normalization (only for image data)
-                    if ph_data.max() > 0: ph_data = ph_data / ph_data.max()
-                    if adc_data.max() > 0: adc_data = adc_data / adc_data.max()
-                    
-                    # Normalize masks - ensure they are binary (0 or 1)
-                    lesion_data = (lesion_data > 0.1).astype(np.float32)
+                # Load data
+                pseudo_healthy_path = row['pseudo_healthy']
+                adc_path = row['adc']
+                lesion_path = row['lesion']
                 
-                if ph_img.shape != adc_img.shape or ph_img.shape != lesion_img.shape:
-                    print(f"  WARNING: Images for subject {subject_id} have different dimensions! Using dimensions from pseudo_healthy.")
+                # Determine if we're dealing with files or directories
+                is_dicom_dataset = any([os.path.isdir(p) for p in [pseudo_healthy_path, adc_path, lesion_path]])
                 
-                # Save original data and its shape to dictionary
-                self.subject_data[subject_id] = {
-                    'ph_data': ph_data,
-                    'adc_data': adc_data,
-                    'lesion_data': lesion_data,
-                    'orig_shape': ph_data.shape,
-                    'affine': ph_img.affine
-                }
+                if is_dicom_dataset:
+                    print(f"  Detected DICOM directories for subject {i+1}")
                 
-                # Find all lesions and their centers
-                lesion_centers = self._find_all_lesion_centers(lesion_data)
+                # Load the images
+                try:
+                    pseudo_healthy_img = load_mha_image(pseudo_healthy_path)
+                    adc_img = load_mha_image(adc_path)
+                    lesion_img = load_mha_image(lesion_path)
+                except Exception as e:
+                    print(f"  Error loading data for subject {i+1}: {e}")
+                    continue
                 
-                if not lesion_centers:
-                    print(f"  Subject {subject_id}: No lesions found, creating patch in volume center")
-                    # If no lesions, create at least one patch in the center of volume
-                    center = [d // 2 for d in lesion_data.shape]
-                    patch_info = {
-                        'subject_id': subject_id,
+                # Get the data and affine matrix
+                pseudo_healthy_data = pseudo_healthy_img.get_fdata()
+                adc_data = adc_img.get_fdata()
+                lesion_data = lesion_img.get_fdata()
+                
+                # Print shapes for debugging
+                print(f"  Pseudo-healthy shape: {pseudo_healthy_data.shape}")
+                print(f"  ADC shape: {adc_data.shape}")
+                print(f"  Lesion shape: {lesion_data.shape}")
+                
+                # Ensure data is normalized
+                if np.max(pseudo_healthy_data) > 1.0:
+                    pseudo_healthy_data = pseudo_healthy_data / np.max(pseudo_healthy_data)
+                
+                if np.max(adc_data) > 1.0:
+                    adc_data = adc_data / np.max(adc_data)
+                
+                # Ensure lesion is binary
+                lesion_data = (lesion_data > 0.5).astype(np.float32)
+                
+                # Get the coordinates of the lesions
+                lesion_coords = np.where(lesion_data > 0.5)
+                
+                if len(lesion_coords[0]) == 0:
+                    print(f"  No lesions found for subject {i+1}")
+                    continue
+                
+                # Sample coordinates from the lesion
+                num_lesion_voxels = len(lesion_coords[0])
+                indices = np.random.choice(num_lesion_voxels, min(num_lesion_voxels, self.max_patches_per_volume), replace=False)
+                
+                for idx in indices:
+                    center = np.array([lesion_coords[0][idx], lesion_coords[1][idx], lesion_coords[2][idx]])
+                    
+                    # Define the bounding box
+                    lower_bound = np.maximum(center - self.patch_size // 2, 0)
+                    upper_bound = np.minimum(lower_bound + self.patch_size, pseudo_healthy_data.shape)
+                    lower_bound = np.maximum(upper_bound - self.patch_size, 0)
+                    
+                    # Extract the patches
+                    ph_patch = pseudo_healthy_data[lower_bound[0]:upper_bound[0], 
+                                                 lower_bound[1]:upper_bound[1], 
+                                                 lower_bound[2]:upper_bound[2]]
+                    
+                    adc_patch = adc_data[lower_bound[0]:upper_bound[0], 
+                                       lower_bound[1]:upper_bound[1], 
+                                       lower_bound[2]:upper_bound[2]]
+                    
+                    lesion_patch = lesion_data[lower_bound[0]:upper_bound[0], 
+                                             lower_bound[1]:upper_bound[1], 
+                                             lower_bound[2]:upper_bound[2]]
+                    
+                    # Check if patch size is correct
+                    if ph_patch.shape != tuple(self.patch_size) or adc_patch.shape != tuple(self.patch_size) or lesion_patch.shape != tuple(self.patch_size):
+                        print(f"  Skipping patch with invalid shape: {ph_patch.shape}, {adc_patch.shape}, {lesion_patch.shape}")
+                        continue
+                    
+                    # Add the patches to the list
+                    self.patches.append({
+                        'pseudo_healthy': ph_patch,
+                        'adc': adc_patch,
+                        'lesion': lesion_patch,
+                        'subject_id': i,
                         'center': center,
-                        'has_lesion': False
-                    }
-                    self.all_patches.append(patch_info)
-                else:
-                    print(f"  Subject {subject_id}: Found {len(lesion_centers)} lesion centers")
-                    
-                    # Create patch for each lesion center
-                    for i, center in enumerate(lesion_centers):
-                        patch_info = {
-                            'subject_id': subject_id,
-                            'center': center,
-                            'has_lesion': True
-                        }
-                        self.all_patches.append(patch_info)
-                    
-                    # Look for large lesions that might require multiple patches
-                    labeled_lesions, num_lesions = ndimage.label(lesion_data)
-                    
-                    for i in range(1, num_lesions + 1):
-                        lesion_mask = labeled_lesions == i
-                        lesion_size = np.sum(lesion_mask)
-                        
-                        # If lesion is larger than half the patch size, it might require multiple patches
-                        if lesion_size > np.prod(self.target_shape) * 0.5:
-                            print(f"  Subject {subject_id}: Lesion {i} is large ({lesion_size} voxels), generating additional patches")
-                            
-                            # Find lesion boundaries
-                            indices = np.where(lesion_mask)
-                            min_bounds = [np.min(idx) for idx in indices]
-                            max_bounds = [np.max(idx) for idx in indices]
-                            
-                            # Create grid of points to cover lesion
-                            # Determine step between patches (considering overlap)
-                            steps = [int(ts * (1 - self.patch_overlap)) for ts in self.target_shape]
-                            
-                            # Calculate starting positions (extended by half a patch on each side)
-                            start_positions = []
-                            for dim, (min_b, max_b, step, ts) in enumerate(zip(min_bounds, max_bounds, steps, self.target_shape)):
-                                half_size = ts // 2
-                                start = max(0, min_b - half_size)
-                                end = min(lesion_data.shape[dim] - step, max_b + half_size)
-                                positions = list(range(start, end, step))
-                                if not positions or end > positions[-1]:
-                                    positions.append(min(end, lesion_data.shape[dim] - ts))
-                                start_positions.append(positions)
-                            
-                            # Create all combinations of starting positions for all dimensions
-                            for start_z, start_y, start_x in product(start_positions[0], start_positions[1], start_positions[2]):
-                                # Calculate patch center
-                                center = [
-                                    start_z + self.target_shape[0] // 2,
-                                    start_y + self.target_shape[1] // 2,
-                                    start_x + self.target_shape[2] // 2
-                                ]
-                                
-                                # Check if patch contains at least part of the lesion
-                                patch_mask = self._extract_patch(lesion_mask.astype(float), center)
-                                if np.sum(patch_mask) > 0:
-                                    patch_info = {
-                                        'subject_id': subject_id,
-                                        'center': center,
-                                        'has_lesion': True,
-                                        'patch_id': f"lesion{i}_z{start_z}_y{start_y}_x{start_x}"
-                                    }
-                                    # Add only if similar patch doesn't already exist
-                                    if not any(self._is_similar_patch(p, patch_info) for p in self.all_patches):
-                                        self.all_patches.append(patch_info)
-            
+                        'lower_bound': lower_bound,
+                        'upper_bound': upper_bound
+                    })
+                
+                print(f"  Added {len(indices)} patches for subject {i+1}")
+                
             except Exception as e:
-                print(f"  ERROR processing subject {subject_id}: {e}")
+                print(f"  Error processing subject {i+1}: {e}")
+                traceback.print_exc()
+                continue
         
-        print(f"Total patches created: {len(self.all_patches)} for {len(self.data)} subjects")
-    
-    def _is_similar_patch(self, patch1, patch2, distance_threshold=20):
-        """Checks if two patches are similar (close centers)"""
-        if patch1['subject_id'] != patch2['subject_id']:
-            return False
+        print(f"Created {len(self.patches)} patches from {len(self.df)} subjects")
+        
+        # Add at least one dummy patch if no patches were created to avoid DataLoader errors
+        if len(self.patches) == 0:
+            print("WARNING: No valid patches created. Adding dummy patch to avoid DataLoader errors.")
+            dummy_shape = tuple(self.patch_size)
+            self.patches.append({
+                'pseudo_healthy': np.zeros(dummy_shape, dtype=np.float32),
+                'adc': np.zeros(dummy_shape, dtype=np.float32),
+                'lesion': np.zeros(dummy_shape, dtype=np.float32),
+                'subject_id': 0,
+                'center': np.zeros(3, dtype=np.int32),
+                'lower_bound': np.zeros(3, dtype=np.int32),
+                'upper_bound': np.array(dummy_shape, dtype=np.int32)
+            })
             
-        center1 = patch1['center']
-        center2 = patch2['center']
-        
-        # Calculate Euclidean distance between centers
-        distance = np.sqrt(sum((c1 - c2) ** 2 for c1, c2 in zip(center1, center2)))
-        return distance < distance_threshold
-    
     def __len__(self):
-        return len(self.all_patches)
+        return len(self.patches)
     
     def __getitem__(self, idx):
-        """Returns specific patch by its index"""
-        patch_info = self.all_patches[idx]
-        subject_id = patch_info['subject_id']
-        center = patch_info['center']
+        patch = self.patches[idx]
         
-        # Get subject data from dictionary
-        subject_data = self.subject_data[subject_id]
+        # Convert to tensor
+        ph_tensor = torch.from_numpy(patch['pseudo_healthy']).float().unsqueeze(0)
+        adc_tensor = torch.from_numpy(patch['adc']).float().unsqueeze(0)
+        lesion_tensor = torch.from_numpy(patch['lesion']).float().unsqueeze(0)
         
-        # Create patch centered on lesion
-        ph_patch = self._extract_patch(subject_data['ph_data'], center)
-        adc_patch = self._extract_patch(subject_data['adc_data'], center)
-        lesion_patch = self._extract_patch(subject_data['lesion_data'], center)
-        
-        # Convert to tensors and add channel dimension
-        ph_tensor = torch.from_numpy(ph_patch).float().unsqueeze(0)
-        adc_tensor = torch.from_numpy(adc_patch).float().unsqueeze(0)
-        lesion_tensor = torch.from_numpy(lesion_patch).float().unsqueeze(0)
-        
-        # Prepare patch metadata for reconstruction
-        patch_meta = {
-            'subject_id': subject_id,
-            'center': center,
-            'patch_id': patch_info.get('patch_id', f"patch_{idx}"),
-            'has_lesion': patch_info['has_lesion'],
-            'orig_shape': subject_data['orig_shape'],
-            'patch_shape': self.target_shape
-        }
+        if self.transformation:
+            ph_tensor = self.transformation(ph_tensor)
+            adc_tensor = self.transformation(adc_tensor)
+            lesion_tensor = self.transformation(lesion_tensor)
         
         return {
-            'input': ph_tensor,
-            'target': adc_tensor,
-            'mask': lesion_tensor,
-            'subject_id': subject_id,
-            'patch_meta': patch_meta
+            'pseudo_healthy': ph_tensor,
+            'adc': adc_tensor,
+            'lesion': lesion_tensor,
+            'subject_id': patch['subject_id'],
+            'center': patch['center'],
+            'lower_bound': patch['lower_bound'],
+            'upper_bound': patch['upper_bound']
         }
-    
-    def _find_all_lesion_centers(self, mask):
-        """Finds centers of all connected lesions in mask"""
-        # If mask contains no lesions, return empty list
-        if np.max(mask) == 0:
-            return []
-        
-        # Label connected regions in binary mask
-        binary_mask = mask > 0.1
-        labeled_mask, num_features = ndimage.label(binary_mask)
-        
-        centers = []
-        # For each connected region find center
-        for i in range(1, num_features + 1):
-            region_mask = labeled_mask == i
-            if np.sum(region_mask) > 10:  # Ignore very small lesions (less than 10 voxels)
-                center = ndimage.center_of_mass(region_mask)
-                centers.append([int(c) for c in center])
-        
-        return centers
-    
-    def _extract_patch(self, data, center, padding_value=0):
-        """Extracts fixed-size patch from data around specified center without interpolation"""
-        # Convert center to integer indices
-        center = [int(c) for c in center]
-        
-        # Create empty patch of target size
-        patch = np.ones(self.target_shape, dtype=np.float32) * padding_value
-        
-        # For each dimension calculate boundaries of the crop
-        data_starts = []  # Starting indices in original data
-        data_ends = []    # Ending indices in original data
-        patch_starts = [] # Starting indices in patch
-        patch_ends = []   # Ending indices in patch
-        
-        for dim, (center_pos, target_size, data_size) in enumerate(zip(center, self.target_shape, data.shape)):
-            # Half size of target shape for dimension
-            half_size = target_size // 2
-            
-            # Calculate boundaries in original data
-            data_start = max(0, center_pos - half_size)
-            data_end = min(data_size, center_pos + half_size + (target_size % 2))
-            
-            # Calculate corresponding boundaries in patch
-            patch_start = max(0, half_size - center_pos)
-            patch_end = patch_start + (data_end - data_start)
-            
-            data_starts.append(data_start)
-            data_ends.append(data_end)
-            patch_starts.append(patch_start)
-            patch_ends.append(patch_end)
-        
-        # Copy data from original image to patch WITHOUT INTERPOLATION
-        patch[patch_starts[0]:patch_ends[0], 
-              patch_starts[1]:patch_ends[1], 
-              patch_starts[2]:patch_ends[2]] = data[data_starts[0]:data_ends[0], 
-                                                   data_starts[1]:data_ends[1], 
-                                                   data_starts[2]:data_ends[2]]
-        
-        return patch
-    
-    def get_full_subject_data(self, subject_id):
-        """Returns original data for given subject"""
-        return self.subject_data.get(subject_id, None)
-    
-    def get_patch_locations(self, subject_id):
-        """Returns list of all patch locations for given subject"""
-        return [p for p in self.all_patches if p['subject_id'] == subject_id]
-    
-    def reconstruct_full_volume(self, patches, patch_centers, orig_shape, blend_weights=True):
-        """
-        Reconstructs full volume from patches.
-        
-        Args:
-            patches: List of patches (numpy arrays)
-            patch_centers: List of patch centers in original volume
-            orig_shape: Shape of original volume
-            blend_weights: Whether to use weighted averaging for overlapping areas
-            
-        Returns:
-            Reconstructed volume
-        """
-        # Initialize empty output volume and weight volume for weighted averaging
-        output_volume = np.zeros(orig_shape, dtype=np.float32)
-        weight_volume = np.zeros(orig_shape, dtype=np.float32)
-        
-        # For each patch
-        for patch, center in zip(patches, patch_centers):
-            # Create weight mask for this patch
-            if blend_weights:
-                # Create Gaussian weight, higher in patch center and lower at edges
-                weight_mask = np.ones(self.target_shape, dtype=np.float32)
-                
-                # For each dimension create Gaussian profile
-                for dim in range(3):
-                    # Create coordinate grid for dimension
-                    coords = np.linspace(-1, 1, self.target_shape[dim])
-                    
-                    # Gaussian profile: exp(-x^2/sigma^2)
-                    sigma = 0.4  # Width of Gaussian curve
-                    gauss_profile = np.exp(-(coords**2) / (2 * sigma**2))
-                    
-                    # Expand profile to right shape for multiplication
-                    if dim == 0:
-                        gauss_profile = gauss_profile.reshape(-1, 1, 1)
-                    elif dim == 1:
-                        gauss_profile = gauss_profile.reshape(1, -1, 1)
-                    else:
-                        gauss_profile = gauss_profile.reshape(1, 1, -1)
-                    
-                    # Multiply current weight mask by Gaussian profile
-                    weight_mask = weight_mask * gauss_profile
-                
-                # Normalize weights to 0-1 range
-                weight_mask = weight_mask / np.max(weight_mask)
-            else:
-                # Uniform weight for entire patch
-                weight_mask = np.ones(self.target_shape, dtype=np.float32)
-            
-            # Calculate boundaries for inserting patch into original volume
-            data_starts = []
-            data_ends = []
-            patch_starts = []
-            patch_ends = []
-            
-            for dim, (center_pos, target_size) in enumerate(zip(center, self.target_shape)):
-                half_size = target_size // 2
-                
-                # Calculate boundaries in original volume
-                data_start = max(0, center_pos - half_size)
-                data_end = min(orig_shape[dim], center_pos + half_size + (target_size % 2))
-                
-                # Calculate corresponding boundaries in patch
-                patch_start = max(0, half_size - center_pos)
-                patch_end = patch_start + (data_end - data_start)
-                
-                data_starts.append(data_start)
-                data_ends.append(data_end)
-                patch_starts.append(patch_start)
-                patch_ends.append(patch_end)
-            
-            # Add weighted patch to output volume
-            output_volume[data_starts[0]:data_ends[0], 
-                          data_starts[1]:data_ends[1], 
-                          data_starts[2]:data_ends[2]] += \
-                patch[patch_starts[0]:patch_ends[0], 
-                      patch_starts[1]:patch_ends[1], 
-                      patch_starts[2]:patch_ends[2]] * \
-                weight_mask[patch_starts[0]:patch_ends[0], 
-                           patch_starts[1]:patch_ends[1], 
-                           patch_starts[2]:patch_ends[2]]
-            
-            # Add weights to weight volume
-            weight_volume[data_starts[0]:data_ends[0], 
-                          data_starts[1]:data_ends[1], 
-                          data_starts[2]:data_ends[2]] += \
-                weight_mask[patch_starts[0]:patch_ends[0], 
-                           patch_starts[1]:patch_ends[1], 
-                           patch_starts[2]:patch_ends[2]]
-        
-        # Normalize output volume by weights (avoid division by zero)
-        valid_mask = weight_volume > 0
-        output_volume[valid_mask] = output_volume[valid_mask] / weight_volume[valid_mask]
-        
-        return output_volume
 
 def weighted_lesion_loss(outputs, targets, masks, lesion_weight=10.0):
     """
@@ -772,15 +564,63 @@ def visualize_full_subject(dataset, model, subject_id, epoch, output_dir, device
     nib.save(nii_img, nii_path)
     print(f"Reconstructed volume saved to: {nii_path}")
 
-def create_dataset_csv(pseudo_healthy_dir, adc_dir, label_dir, output_csv_path):
+def convert_dicom_to_array(dicom_directory):
+    """
+    Convert a directory of DICOM files to a 3D numpy array.
+    
+    Args:
+        dicom_directory: Path to directory containing DICOM files for a single volume
+        
+    Returns:
+        tuple: (data_array, affine_matrix)
+    """
+    try:
+        # Read the DICOM directory
+        reader = sitk.ImageSeriesReader()
+        dicom_names = reader.GetGDCMSeriesFileNames(dicom_directory)
+        if not dicom_names:
+            raise ValueError(f"No DICOM series found in {dicom_directory}")
+        
+        reader.SetFileNames(dicom_names)
+        image = reader.Execute()
+        
+        # Get the image data
+        data = sitk.GetArrayFromImage(image)
+        
+        # Create affine matrix
+        direction = np.array(image.GetDirection()).reshape(3, 3)
+        spacing = np.array(image.GetSpacing())
+        origin = np.array(image.GetOrigin())
+        
+        affine = np.eye(4)
+        affine[:3, :3] = direction * np.expand_dims(spacing, 1)
+        affine[:3, 3] = origin
+        
+        # Create a wrapper to mimic nibabel's NiftiImage
+        class DicomImage:
+            def __init__(self, data, affine, shape):
+                self.data = data
+                self.affine = affine
+                self.shape = shape
+            
+            def get_fdata(self):
+                return self.data
+        
+        return DicomImage(data, affine, data.shape)
+        
+    except Exception as e:
+        raise Exception(f"Failed to convert DICOM directory {dicom_directory}: {e}")
+
+def create_dataset_csv(pseudo_healthy_dir, adc_dir, label_dir, output_csv_path, file_type="mha"):
     """
     Creates a CSV file with paths to corresponding files for training.
     
     Args:
-        pseudo_healthy_dir: Directory with pseudo-healthy ADC images (.mha)
-        adc_dir: Directory with target ADC images (.mha)
-        label_dir: Directory with lesion masks (.mha)
+        pseudo_healthy_dir: Directory with pseudo-healthy ADC images (.mha or DICOM dirs)
+        adc_dir: Directory with target ADC images (.mha or DICOM dirs)
+        label_dir: Directory with lesion masks (.mha or DICOM dirs)
         output_csv_path: Path to output CSV file
+        file_type: Type of files to look for ('mha', 'nii', 'nii.gz', or 'dicom')
     
     Returns:
         Path to created CSV file
@@ -794,18 +634,89 @@ def create_dataset_csv(pseudo_healthy_dir, adc_dir, label_dir, output_csv_path):
     print(f"Pseudo-healthy directory: {pseudo_healthy_dir}")
     print(f"ADC directory: {adc_dir}")
     print(f"Lesion mask directory: {label_dir}")
+    print(f"File type: {file_type}")
     
     # Check if directories exist
     for directory in [pseudo_healthy_dir, adc_dir, label_dir]:
         if not os.path.exists(directory):
             raise ValueError(f"Directory not found: {directory}")
     
-    # Get lists of files
-    ph_files = sorted(glob.glob(os.path.join(pseudo_healthy_dir, "*.mha")))
-    adc_files = sorted(glob.glob(os.path.join(adc_dir, "*.mha")))
-    lesion_files = sorted(glob.glob(os.path.join(label_dir, "*.mha")))
+    # Get lists of files based on file type
+    if file_type.lower() == 'dicom':
+        # For DICOM, we look for directories that contain DICOM files
+        ph_dirs = [d for d in os.listdir(pseudo_healthy_dir) 
+                  if os.path.isdir(os.path.join(pseudo_healthy_dir, d))]
+        ph_files = [os.path.join(pseudo_healthy_dir, d) for d in ph_dirs]
+        
+        adc_dirs = [d for d in os.listdir(adc_dir) 
+                  if os.path.isdir(os.path.join(adc_dir, d))]
+        adc_files = [os.path.join(adc_dir, d) for d in adc_dirs]
+        
+        lesion_dirs = [d for d in os.listdir(label_dir) 
+                      if os.path.isdir(os.path.join(label_dir, d))]
+        lesion_files = [os.path.join(label_dir, d) for d in lesion_dirs]
+    else:
+        # For other formats, look for files with the right extension
+        ph_files = sorted(glob.glob(os.path.join(pseudo_healthy_dir, f"*.{file_type}")))
+        adc_files = sorted(glob.glob(os.path.join(adc_dir, f"*.{file_type}")))
+        lesion_files = sorted(glob.glob(os.path.join(label_dir, f"*.{file_type}")))
     
     print(f"Found files: Pseudo-healthy: {len(ph_files)}, ADC: {len(adc_files)}, Lesions: {len(lesion_files)}")
+    
+    # Verify that files can be opened
+    valid_ph_files = []
+    for file_path in ph_files:
+        try:
+            if file_type.lower() == 'dicom':
+                # Check if the directory contains valid DICOM files
+                dicom_names = sitk.ImageSeriesReader.GetGDCMSeriesFileNames(file_path)
+                if dicom_names:
+                    valid_ph_files.append(file_path)
+                else:
+                    print(f"Warning: No DICOM series found in {file_path}")
+            else:
+                # Try to open with SimpleITK
+                sitk.ReadImage(file_path)
+                valid_ph_files.append(file_path)
+        except Exception as e:
+            print(f"Warning: Could not open {os.path.basename(file_path)}: {e}")
+    
+    valid_adc_files = []
+    for file_path in adc_files:
+        try:
+            if file_type.lower() == 'dicom':
+                dicom_names = sitk.ImageSeriesReader.GetGDCMSeriesFileNames(file_path)
+                if dicom_names:
+                    valid_adc_files.append(file_path)
+                else:
+                    print(f"Warning: No DICOM series found in {file_path}")
+            else:
+                sitk.ReadImage(file_path)
+                valid_adc_files.append(file_path)
+        except Exception as e:
+            print(f"Warning: Could not open {os.path.basename(file_path)}: {e}")
+    
+    valid_lesion_files = []
+    for file_path in lesion_files:
+        try:
+            if file_type.lower() == 'dicom':
+                dicom_names = sitk.ImageSeriesReader.GetGDCMSeriesFileNames(file_path)
+                if dicom_names:
+                    valid_lesion_files.append(file_path)
+                else:
+                    print(f"Warning: No DICOM series found in {file_path}")
+            else:
+                sitk.ReadImage(file_path)
+                valid_lesion_files.append(file_path)
+        except Exception as e:
+            print(f"Warning: Could not open {os.path.basename(file_path)}: {e}")
+    
+    print(f"Valid files: Pseudo-healthy: {len(valid_ph_files)}/{len(ph_files)}, ADC: {len(valid_adc_files)}/{len(adc_files)}, Lesions: {len(valid_lesion_files)}/{len(lesion_files)}")
+    
+    # Use valid files for matching
+    ph_files = valid_ph_files
+    adc_files = valid_adc_files
+    lesion_files = valid_lesion_files
     
     # Try to match files based on common ID patterns
     matched_data = []
@@ -821,11 +732,8 @@ def create_dataset_csv(pseudo_healthy_dir, adc_dir, label_dir, output_csv_path):
         if match:
             pattern_id = match.group(1)
             # Look for corresponding ADC and lesion files
-            adc_pattern = os.path.join(adc_dir, f"{pattern_id}*ADC_ss.mha")
-            lesion_pattern = os.path.join(label_dir, f"{pattern_id}*lesion.mha")
-            
-            adc_matches = glob.glob(adc_pattern)
-            lesion_matches = glob.glob(lesion_pattern)
+            adc_matches = [f for f in adc_files if pattern_id in os.path.basename(f)]
+            lesion_matches = [f for f in lesion_files if pattern_id in os.path.basename(f)]
             
             if adc_matches and lesion_matches:
                 matched_data.append({
@@ -846,19 +754,23 @@ def create_dataset_csv(pseudo_healthy_dir, adc_dir, label_dir, output_csv_path):
             
             # Extract base name without extension and specific markers
             base_name = ph_basename.replace('-PSEUDO_HEALTHY.mha', '').replace('_PSEUDO_HEALTHY.mha', '')
+            if file_type.lower() == 'dicom':
+                # For DICOM dirs, the basename might be different
+                base_name = ph_basename
             
             # Find corresponding files by base name
             for adc_file in adc_files:
                 adc_basename = os.path.basename(adc_file)
                 
-                # Check if ADC file contains the base name
-                if base_name in adc_basename:
+                # Check if ADC file contains the base name or vice versa
+                if base_name in adc_basename or adc_basename in base_name:
                     # Look for corresponding lesion file
                     for lesion_file in lesion_files:
                         lesion_basename = os.path.basename(lesion_file)
                         
-                        # Check if lesion file contains the base name
-                        if base_name in lesion_basename:
+                        # Check if lesion file contains the base name or ADC name
+                        if (base_name in lesion_basename or adc_basename in lesion_basename or 
+                            lesion_basename in base_name or lesion_basename in adc_basename):
                             matched_data.append({
                                 'subject_id': base_name,
                                 'pseudo_healthy': ph_file,
@@ -892,6 +804,9 @@ def create_dataset_csv(pseudo_healthy_dir, adc_dir, label_dir, output_csv_path):
     df.to_csv(output_csv_path, index=False)
     print(f"Created CSV file with {len(df)} records at: {output_csv_path}")
     
+    if len(df) == 0:
+        print("WARNING: No valid matches found! Please check your data files.")
+    
     return output_csv_path
 
 def train_model(args):
@@ -912,7 +827,7 @@ def train_model(args):
     writer = SummaryWriter(log_dir=os.path.join(args.output_dir, 'tensorboard'))
     
     # Create dataset and dataloader
-    dataset = BrainLesionDataset(args.csv_path, target_shape=tuple(args.patch_size))
+    dataset = BrainLesionDataset(args.csv_path, patch_size=tuple(args.patch_size))
     
     # Split dataset into train and validation sets
     num_samples = len(dataset)
@@ -965,9 +880,9 @@ def train_model(args):
         train_samples = 0
         
         for batch in train_loader:
-            inputs = batch['input'].to(device)
-            targets = batch['target'].to(device)
-            masks = batch['mask'].to(device)
+            inputs = batch['pseudo_healthy'].to(device)
+            targets = batch['adc'].to(device)
+            masks = batch['lesion'].to(device)
             
             # Forward pass
             outputs = model(inputs, masks)
@@ -1009,9 +924,9 @@ def train_model(args):
         
         with torch.no_grad():
             for batch in val_loader:
-                inputs = batch['input'].to(device)
-                targets = batch['target'].to(device)
-                masks = batch['mask'].to(device)
+                inputs = batch['pseudo_healthy'].to(device)
+                targets = batch['adc'].to(device)
+                masks = batch['lesion'].to(device)
                 
                 # Forward pass
                 outputs = model(inputs, masks)
@@ -1098,6 +1013,8 @@ def main():
                         help='Path or HF model ID for the MRI autoencoder model')
     parser.add_argument('--output_dir', type=str, default='./output',
                         help='Directory to save model checkpoints, visualizations and outputs')
+    parser.add_argument('--file_type', type=str, default='mha',
+                        help='Type of files to process: mha, nii, nii.gz, or dicom')
     
     # Training parameters
     parser.add_argument('--num_epochs', type=int, default=50,
@@ -1133,7 +1050,8 @@ def main():
             args.pseudo_healthy_dir,
             args.adc_dir,
             args.label_dir,
-            csv_path
+            csv_path,
+            file_type=args.file_type
         )
     
     # Print configuration
