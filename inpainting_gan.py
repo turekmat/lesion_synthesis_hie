@@ -662,8 +662,6 @@ class PatchExtractor:
             if has_batch_dim:
                 reconstructed = reconstructed.unsqueeze(0)
             
-            # Final device verification
-            print(f"Reconstruction complete. Output tensor shape: {reconstructed.shape}, device: {reconstructed.device}")
             
             return reconstructed
             
@@ -1505,6 +1503,8 @@ def train(args):
         epoch_perceptual_loss = 0
         epoch_adv_loss = 0
         epoch_d_loss = 0
+        epoch_g_raw_loss = 0  # Čistá generátor loss bez váhy
+        epoch_d_raw_loss = 0  # Diskriminátor loss bez GP
         train_samples = 0
         
         for batch_idx, batch_data in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}")):
@@ -1683,6 +1683,8 @@ def train(args):
                 epoch_perceptual_loss += perceptual_value.item()
                 epoch_adv_loss += g_adv_loss.item()  # Přidání adversariální ztráty pro monitoring
                 epoch_d_loss += d_total_loss.item()  # Přidání diskriminátor ztráty pro monitoring
+                epoch_g_raw_loss += g_adv_loss.item()  # Čistá WGAN generátor loss
+                epoch_d_raw_loss += d_loss.item()  # Čistá WGAN diskriminátor loss
                 train_samples += 1
             
             # Average loss over patches
@@ -1698,6 +1700,8 @@ def train(args):
         avg_epoch_perceptual_loss = epoch_perceptual_loss / max(1, train_samples)
         avg_epoch_adv_loss = epoch_adv_loss / max(1, train_samples)  # Průměrná adversariální ztráta
         avg_epoch_d_loss = epoch_d_loss / max(1, train_samples)  # Průměrná diskriminátor ztráta
+        avg_epoch_g_raw_loss = epoch_g_raw_loss / max(1, train_samples)  # Průměrná čistá generátor loss
+        avg_epoch_d_raw_loss = epoch_d_raw_loss / max(1, train_samples)  # Průměrná čistá diskriminátor loss
         
         # Get actual values by dividing by the weight for display purposes only
         actual_mae = avg_epoch_mae_loss / 5.0 if loss_type not in ['focal', 'dynamic_mae'] else 0
@@ -1713,8 +1717,15 @@ def train(args):
             print(f"  - Dynamic MAE: {actual_dynamic_mae:.4f} (unweighted)")
         print(f"  - Gradient Loss: {avg_epoch_gradient_loss:.4f}")
         print(f"  - Perceptual Loss: {avg_epoch_perceptual_loss:.4f}")
-        print(f"  - Adversarial Loss: {avg_epoch_adv_loss:.4f}")
-        print(f"  - Discriminator Loss: {avg_epoch_d_loss:.4f}")
+        
+        # Výpis GAN komponent
+        print(f"\n  ===== GAN PERFORMANCE =====")
+        print(f"  - Generator Loss (weighted): {adv_weight * avg_epoch_g_raw_loss:.4f}")
+        print(f"  - Discriminator Loss (total): {avg_epoch_d_loss:.4f}")
+        print(f"  -----------------------")
+        print(f"  - Generator WGAN Raw:   {avg_epoch_g_raw_loss:.4f}")
+        print(f"  - Discriminator WGAN Raw: {avg_epoch_d_raw_loss:.4f}")
+        print(f"  ===========================\n")
         
         # Validation
         model.eval()
