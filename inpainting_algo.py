@@ -322,10 +322,10 @@ def add_synthetic_lesion(adc_data, original_label_data, synthetic_lesion_data, p
     labeled_synthetic_lesions, num_synthetic_lesions = ndimage.label(valid_synthetic_lesion_mask)
     
     # Parameters for lesion application
-    TARGET_RATIO = 0.95  # How much of the target value to apply (increased from 0.8)
+    TARGET_RATIO = 0.85  # How much of the target value to apply (increased from 0.8)
     EDGE_THRESHOLD = 0.08  # Boundary between lesion interior and edge
-    EDGE_BLEND_FACTOR = 0.85  # Factor for edge blending (increased from 0.7)
-    BOOST_FACTOR = 1.1  # Factor to adjust offset strength (increased from 0.85)
+    EDGE_BLEND_FACTOR = 0.80  # Factor for edge blending (increased from 0.7)
+    BOOST_FACTOR = 0.95  # Factor to adjust offset strength (increased from 0.85)
     
     # Generate Perlin noise for the entire volume
     noise = generate_perlin_noise(adc_data.shape, scale=5.0, octaves=3)
