@@ -747,8 +747,8 @@ def process_dataset(adc_dir, label_dir, pseudo_healthy_dir, synthetic_lesions_di
     # Set random seed for reproducibility
     np.random.seed(42)
     
-    # Flag for first patient processed
-    first_patient_processed = False
+    # Flag for first lesion processed
+    first_lesion_processed = False
     
     # Process each ADC file
     for adc_file in tqdm(adc_files):
@@ -784,95 +784,90 @@ def process_dataset(adc_dir, label_dir, pseudo_healthy_dir, synthetic_lesions_di
         adc_data, adc_img = load_mha_file(adc_path)
         label_data, _ = load_mha_file(label_path)
         
-        # *** Random reference selection for offset calculation ***
-        # Randomly select a reference patient (that is not the current patient)
+        # Create list of valid reference patients (excluding current patient)
         valid_references = [p for p in valid_patients if p['patient_id'] != patient_id]
         if not valid_references:
             print(f"Warning: No valid reference patients available, using self-reference")
-            reference_patient = next((p for p in valid_patients if p['patient_id'] == patient_id), None)
-        else:
-            reference_patient = np.random.choice(valid_references)
-        
-        # Load reference patient data for offset calculation
-        reference_id = reference_patient['patient_id']
-        print(f"Using random reference patient {reference_id} for offset calculation")
-        
-        reference_adc_path = os.path.join(adc_dir, reference_patient['adc_file'])
-        reference_label_path = os.path.join(label_dir, reference_patient['label_file'])
-        reference_healthy_path = os.path.join(pseudo_healthy_dir, reference_patient['pseudo_healthy_file'])
-        
-        reference_adc_data, _ = load_mha_file(reference_adc_path)
-        reference_label_data, _ = load_mha_file(reference_label_path)
-        reference_healthy_data, _ = load_mha_file(reference_healthy_path)
-        
-        # Calculate global offset value from reference patient's lesions
-        global_offset = None
-        if np.any(reference_label_data > 0):
-            global_offset = calculate_lesion_offset(reference_adc_data, reference_healthy_data, reference_label_data > 0)
-        else:
-            print(f"Warning: No lesions found in reference patient, using default offset")
-        
-        # Create a copy of the ADC data for modification
-        modified_adc = adc_data.copy()
-        
-        # Create a copy of the label data for combining labels
-        combined_label = label_data.copy()
-        
-        # For comprehensive visualization of first patient
-        first_synth_lesion_data = None
-        
-        # Process each synthetic lesion
+            valid_references = [next((p for p in valid_patients if p['patient_id'] == patient_id), None)]
+            
+        # Process each synthetic lesion INDIVIDUALLY
         for i, lesion_file in enumerate(synthetic_lesion_files):
-            print(f"Adding synthetic lesion: {os.path.basename(lesion_file)}")
+            lesion_basename = os.path.basename(lesion_file).replace(".mha", "")
+            print(f"Processing synthetic lesion: {lesion_basename}")
+            
+            # *** Random reference selection for offset calculation (UNIQUE FOR EACH LESION) ***
+            # Randomly select a reference patient for this specific lesion
+            reference_patient = np.random.choice(valid_references)
+            
+            # Load reference patient data for offset calculation
+            reference_id = reference_patient['patient_id']
+            print(f"Using random reference patient {reference_id} for offset calculation (lesion: {lesion_basename})")
+            
+            reference_adc_path = os.path.join(adc_dir, reference_patient['adc_file'])
+            reference_label_path = os.path.join(label_dir, reference_patient['label_file'])
+            reference_healthy_path = os.path.join(pseudo_healthy_dir, reference_patient['pseudo_healthy_file'])
+            
+            reference_adc_data, _ = load_mha_file(reference_adc_path)
+            reference_label_data, _ = load_mha_file(reference_label_path)
+            reference_healthy_data, _ = load_mha_file(reference_healthy_path)
+            
+            # Calculate lesion-specific offset value from reference patient's lesions
+            lesion_specific_offset = None
+            if np.any(reference_label_data > 0):
+                lesion_specific_offset = calculate_lesion_offset(reference_adc_data, reference_healthy_data, reference_label_data > 0)
+            else:
+                print(f"Warning: No lesions found in reference patient, using default offset")
             
             # Load synthetic lesion mask
             synthetic_lesion_data, _ = load_mha_file(lesion_file)
             
-            # Save the first synthetic lesion data for visualization
-            if i == 0 and not first_patient_processed:
-                first_synth_lesion_data = synthetic_lesion_data.copy()
+            # Create a fresh copy of the ADC data for each synthetic lesion
+            modified_adc = adc_data.copy()
             
-            # Add synthetic lesion to the ADC map
+            # Create a fresh copy of the label data for combining
+            combined_label = label_data.copy()
+            
+            # Add synthetic lesion to the ADC map (just one synthetic lesion at a time)
             modified_adc, combined_label = add_synthetic_lesion(
                 modified_adc, 
-                combined_label,  # Use the progressively updated label
+                combined_label,
                 synthetic_lesion_data,
                 None,  # We're not using the patient's own pseudo-healthy data anymore
-                global_offset  # Using the offset from random reference patient
+                lesion_specific_offset  # Using the lesion-specific offset from random reference patient
             )
-        
-        # Save modified ADC and combined label
-        modified_adc_path = os.path.join(inpainted_dir, f"{patient_id}-LESIONED_ADC.mha")
-        combined_label_path = os.path.join(combined_labels_dir, f"{patient_id}_combined_lesion.mha")
-        
-        save_mha_file(modified_adc, adc_img, modified_adc_path)
-        save_mha_file(combined_label, adc_img, combined_label_path)
-        
-        # Create visualization
-        if visualize:
-            # For the first patient, create comprehensive visualization
-            if not first_patient_processed and first_synth_lesion_data is not None:
-                visualize_comprehensive(
-                    adc_data,
+            
+            # Save modified ADC and combined label with unique names for each synthetic lesion
+            modified_adc_path = os.path.join(inpainted_dir, f"{patient_id}-{lesion_basename}-LESIONED_ADC.mha")
+            combined_label_path = os.path.join(combined_labels_dir, f"{patient_id}-{lesion_basename}_combined_lesion.mha")
+            
+            save_mha_file(modified_adc, adc_img, modified_adc_path)
+            save_mha_file(combined_label, adc_img, combined_label_path)
+            
+            # Create visualization for this specific lesion
+            if visualize:
+                # For the first lesion, create comprehensive visualization
+                if not first_lesion_processed:
+                    visualize_comprehensive(
+                        adc_data,
+                        modified_adc,
+                        label_data,
+                        combined_label,
+                        synthetic_lesion_data,
+                        f"{patient_id}-{lesion_basename}",
+                        visualization_dir,
+                        reference_id
+                    )
+                    first_lesion_processed = True
+                
+                # Standard visualization for all lesions
+                visualize_results(
+                    adc_data, 
                     modified_adc,
                     label_data,
                     combined_label,
-                    first_synth_lesion_data,
-                    patient_id,
-                    visualization_dir,
-                    reference_id
+                    f"{patient_id}-{lesion_basename}",
+                    visualization_dir
                 )
-                first_patient_processed = True
-            
-            # Standard visualization for all patients
-            visualize_results(
-                adc_data, 
-                modified_adc,
-                label_data,
-                combined_label,
-                patient_id,
-                visualization_dir
-            )
 
 
 def main():
