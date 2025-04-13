@@ -247,23 +247,23 @@ def calculate_lesion_offset(adc_data, pseudo_healthy_data, lesion_mask):
         print("Warning: No lesions found in the mask")
         return 0
     
-    # Get the minimum value in the original lesion area
+    # Get the average value in the original lesion area
     lesion_values = adc_data[lesion_mask]
-    min_lesion_value = np.min(lesion_values)
+    avg_lesion_value = np.mean(lesion_values)
     
     # Get the average value in the same area in the pseudo-healthy image
     healthy_values = pseudo_healthy_data[lesion_mask]
     avg_healthy_value = np.mean(healthy_values)
     
     # Calculate the offset (we want to decrease values, so it should be negative)
-    offset = min_lesion_value - avg_healthy_value
+    offset = avg_lesion_value - avg_healthy_value
     
     # Ensure the offset is negative (to decrease values)
     if offset >= 0:
         print(f"Warning: Calculated offset is non-negative ({offset:.2f}), using negative value")
         offset = -abs(offset)
     
-    print(f"Calculated offset: {offset:.2f} (Min lesion value: {min_lesion_value:.2f}, Avg healthy value: {avg_healthy_value:.2f})")
+    print(f"Calculated offset: {offset:.2f} (Avg lesion value: {avg_lesion_value:.2f}, Avg healthy value: {avg_healthy_value:.2f})")
     
     # Adjust offset to create stronger effect (make it more negative)
     adjusted_offset = offset * 1.2
