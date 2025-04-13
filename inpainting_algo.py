@@ -266,7 +266,7 @@ def calculate_lesion_offset(adc_data, pseudo_healthy_data, lesion_mask):
     print(f"Calculated offset: {offset:.2f} (Avg lesion value: {avg_lesion_value:.2f}, Avg healthy value: {avg_healthy_value:.2f})")
     
     # Adjust offset to create stronger effect (make it more negative)
-    adjusted_offset = offset * 1.8
+    adjusted_offset = offset * 1.50
     print(f"Adjusted offset (80% stronger): {adjusted_offset:.2f}")
     
     return adjusted_offset
