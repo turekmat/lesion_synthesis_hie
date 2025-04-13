@@ -543,11 +543,12 @@ def visualize_comprehensive(orig_adc_data, mod_adc_data, orig_label_data, comb_l
                            synth_lesion_data, patient_id, output_dir, random_reference_id=None):
     """
     Create a comprehensive visualization for the first processed image showing:
-    - Original ADC map with original lesion
-    - Modified ADC map with combined lesions
-    - Synthetic lesion mask only
-    - Combined lesion mask
+    - Original ADC map with original lesion outline
+    - Modified ADC map with combined lesion outline
     - Difference map
+    - Original ADC map without outlines
+    - Modified ADC map without outlines
+    - Combined lesion mask
     
     Args:
         orig_adc_data: Original ADC map data
@@ -621,22 +622,22 @@ def visualize_comprehensive(orig_adc_data, mod_adc_data, orig_label_data, comb_l
             else:
                 stats_text = f"No synthetic lesion in this slice ({z})"
             
-            # Row 1, Col 1: Original ADC
+            # Row 1, Col 1: Original ADC with outlines
             ax1 = fig.add_subplot(2, 3, 1)
             im1 = ax1.imshow(orig_adc_axial[:, :, z], cmap='gray', vmin=vmin, vmax=vmax, aspect='equal', origin='lower')
             if np.any(orig_lesion_mask[:, :, z]):
                 # Overlay original lesion outline in blue
                 contours = plt.contour(orig_lesion_mask[:, :, z], levels=[0.5], colors='blue', linewidths=1.5)
-            ax1.set_title(f'Original ADC with Original Lesion')
+            ax1.set_title(f'Original ADC with Original Lesion Outline')
             ax1.set_axis_off()
             
-            # Row 1, Col 2: Modified ADC
+            # Row 1, Col 2: Modified ADC with outlines
             ax2 = fig.add_subplot(2, 3, 2)
             im2 = ax2.imshow(mod_adc_axial[:, :, z], cmap='gray', vmin=vmin, vmax=vmax, aspect='equal', origin='lower')
             if np.any(comb_lesion_mask[:, :, z]):
                 # Overlay combined lesion outline in red
                 contours = plt.contour(comb_lesion_mask[:, :, z], levels=[0.5], colors='red', linewidths=1.5)
-            ax2.set_title(f'Modified ADC with Combined Lesion')
+            ax2.set_title(f'Modified ADC with Combined Lesion Outline')
             ax2.set_axis_off()
             
             # Row 1, Col 3: Difference map
@@ -650,16 +651,16 @@ def visualize_comprehensive(orig_adc_data, mod_adc_data, orig_label_data, comb_l
             ax3.set_title(f'Difference Map (Original - Modified)')
             ax3.set_axis_off()
             
-            # Row 2, Col 1: Original lesion mask
+            # Row 2, Col 1: Original ADC without outlines
             ax4 = fig.add_subplot(2, 3, 4)
-            im4 = ax4.imshow(orig_lesion_mask[:, :, z], cmap='Blues', aspect='equal', origin='lower')
-            ax4.set_title(f'Original Lesion Mask')
+            im4 = ax4.imshow(orig_adc_axial[:, :, z], cmap='gray', vmin=vmin, vmax=vmax, aspect='equal', origin='lower')
+            ax4.set_title(f'Original ADC (No Outlines)')
             ax4.set_axis_off()
             
-            # Row 2, Col 2: Synthetic lesion mask
+            # Row 2, Col 2: Modified ADC without outlines
             ax5 = fig.add_subplot(2, 3, 5)
-            im5 = ax5.imshow(synth_only_mask[:, :, z], cmap='Reds', aspect='equal', origin='lower')
-            ax5.set_title(f'Synthetic Lesion Mask')
+            im5 = ax5.imshow(mod_adc_axial[:, :, z], cmap='gray', vmin=vmin, vmax=vmax, aspect='equal', origin='lower')
+            ax5.set_title(f'Modified ADC (No Outlines)')
             ax5.set_axis_off()
             
             # Row 2, Col 3: Combined lesion mask
@@ -712,6 +713,14 @@ def process_dataset(adc_dir, label_dir, pseudo_healthy_dir, synthetic_lesions_di
         visualization_dir = os.path.join(output_dir, "visualization")
         os.makedirs(visualization_dir, exist_ok=True)
     
+    # Check for existing processed files to resume processing
+    existing_files = set()
+    if os.path.exists(inpainted_dir):
+        existing_files = set(os.listdir(inpainted_dir))
+        if existing_files:
+            print(f"Found {len(existing_files)} existing processed files in {inpainted_dir}")
+            print("Will skip already processed combinations of patients and synthetic lesions")
+    
     # List all ADC files
     adc_files = [f for f in os.listdir(adc_dir) if f.endswith('_ss.mha')]
     
@@ -757,6 +766,19 @@ def process_dataset(adc_dir, label_dir, pseudo_healthy_dir, synthetic_lesions_di
     
     # Flag for first lesion processed
     first_lesion_processed = False
+    
+    # Counters for statistics
+    total_lesions_to_process = 0
+    lesions_skipped = 0
+    lesions_processed = 0
+    
+    # Count total synthetic lesions to process
+    for adc_file in adc_files:
+        patient_id = adc_file.replace('-ADC_ss.mha', '')
+        synthetic_lesion_files = find_synthetic_lesions(patient_id, synthetic_lesions_dir)
+        total_lesions_to_process += len(synthetic_lesion_files)
+    
+    print(f"Total synthetic lesions to potentially process: {total_lesions_to_process}")
     
     # Process each ADC file
     for adc_file in tqdm(adc_files):
@@ -805,6 +827,21 @@ def process_dataset(adc_dir, label_dir, pseudo_healthy_dir, synthetic_lesions_di
         # Process each synthetic lesion INDIVIDUALLY
         for i, lesion_file in enumerate(synthetic_lesion_files):
             lesion_basename = os.path.basename(lesion_file).replace(".mha", "")
+            
+            # Check if this combination has already been processed
+            output_adc_filename = f"{patient_id}-{lesion_basename}-LESIONED_ADC.mha"
+            output_label_filename = f"{patient_id}-{lesion_basename}_combined_lesion.mha"
+            
+            # Paths to the expected output files
+            output_adc_path = os.path.join(inpainted_dir, output_adc_filename)
+            output_label_path = os.path.join(combined_labels_dir, output_label_filename)
+            
+            # Skip if both output files already exist
+            if os.path.exists(output_adc_path) and os.path.exists(output_label_path):
+                print(f"Skipping synthetic lesion: {lesion_basename} - already processed")
+                lesions_skipped += 1
+                continue
+            
             print(f"Processing synthetic lesion: {lesion_basename}")
             
             # *** Random reference selection for offset calculation (UNIQUE FOR EACH LESION) ***
@@ -861,11 +898,14 @@ def process_dataset(adc_dir, label_dir, pseudo_healthy_dir, synthetic_lesions_di
             modified_adc = masked_modified_adc
             
             # Save modified ADC and combined label with unique names for each synthetic lesion
-            modified_adc_path = os.path.join(inpainted_dir, f"{patient_id}-{lesion_basename}-LESIONED_ADC.mha")
-            combined_label_path = os.path.join(combined_labels_dir, f"{patient_id}-{lesion_basename}_combined_lesion.mha")
+            modified_adc_path = os.path.join(inpainted_dir, output_adc_filename)
+            combined_label_path = os.path.join(combined_labels_dir, output_label_filename)
             
             save_mha_file(modified_adc, adc_img, modified_adc_path)
             save_mha_file(combined_label, adc_img, combined_label_path)
+            
+            # Update counter
+            lesions_processed += 1
             
             # Create visualization for this specific lesion
             if visualize:
@@ -892,6 +932,14 @@ def process_dataset(adc_dir, label_dir, pseudo_healthy_dir, synthetic_lesions_di
                     f"{patient_id}-{lesion_basename}",
                     visualization_dir
                 )
+    
+    # Print summary statistics
+    print("\n--- Processing Summary ---")
+    print(f"Total synthetic lesions: {total_lesions_to_process}")
+    print(f"Lesions processed: {lesions_processed}")
+    print(f"Lesions skipped (already processed): {lesions_skipped}")
+    print(f"Remaining lesions: {total_lesions_to_process - lesions_processed - lesions_skipped}")
+    print("-----------------------")
 
 
 def main():
