@@ -266,8 +266,8 @@ def calculate_lesion_offset(adc_data, pseudo_healthy_data, lesion_mask):
     print(f"Calculated offset: {offset:.2f} (Avg lesion value: {avg_lesion_value:.2f}, Avg healthy value: {avg_healthy_value:.2f})")
     
     # Adjust offset to create stronger effect (make it more negative)
-    adjusted_offset = offset * 1.4
-    print(f"Adjusted offset (40% stronger): {adjusted_offset:.2f}")
+    adjusted_offset = offset * 1.8
+    print(f"Adjusted offset (80% stronger): {adjusted_offset:.2f}")
     
     return adjusted_offset
 
@@ -322,10 +322,10 @@ def add_synthetic_lesion(adc_data, original_label_data, synthetic_lesion_data, p
     labeled_synthetic_lesions, num_synthetic_lesions = ndimage.label(valid_synthetic_lesion_mask)
     
     # Parameters for lesion application
-    TARGET_RATIO = 0.8  # How much of the target value to apply
+    TARGET_RATIO = 0.95  # How much of the target value to apply (increased from 0.8)
     EDGE_THRESHOLD = 0.08  # Boundary between lesion interior and edge
-    EDGE_BLEND_FACTOR = 0.7  # Factor for edge blending
-    BOOST_FACTOR = 0.85  # Factor to adjust offset strength
+    EDGE_BLEND_FACTOR = 0.85  # Factor for edge blending (increased from 0.7)
+    BOOST_FACTOR = 1.1  # Factor to adjust offset strength (increased from 0.85)
     
     # Generate Perlin noise for the entire volume
     noise = generate_perlin_noise(adc_data.shape, scale=5.0, octaves=3)
@@ -686,7 +686,7 @@ def visualize_comprehensive(orig_adc_data, mod_adc_data, orig_label_data, comb_l
     print(f"Comprehensive visualization saved to {output_path}")
 
 
-def process_dataset(adc_dir, label_dir, pseudo_healthy_dir, synthetic_lesions_dir, output_dir, visualize=False):
+def process_dataset(adc_dir, label_dir, pseudo_healthy_dir, synthetic_lesions_dir, output_dir, visualize=False, reverse_order=False):
     """
     Process the dataset by adding synthetic lesions to ADC maps
     
@@ -697,6 +697,7 @@ def process_dataset(adc_dir, label_dir, pseudo_healthy_dir, synthetic_lesions_di
         synthetic_lesions_dir: Directory containing synthetic lesion masks
         output_dir: Directory to save results
         visualize: Whether to generate visualizations
+        reverse_order: Whether to process files in reverse order
     """
     # Create output directories
     inpainted_dir = os.path.join(output_dir, "lesioned_adc")
@@ -713,6 +714,13 @@ def process_dataset(adc_dir, label_dir, pseudo_healthy_dir, synthetic_lesions_di
     
     # List all ADC files
     adc_files = [f for f in os.listdir(adc_dir) if f.endswith('_ss.mha')]
+    
+    # Apply reverse order if requested
+    if reverse_order:
+        print("Processing files in REVERSE order")
+        adc_files = adc_files[::-1]
+    else:
+        print("Processing files in NORMAL order")
     
     # First, collect all valid patients with lesions for random selection
     valid_patients = []
@@ -779,6 +787,10 @@ def process_dataset(adc_dir, label_dir, pseudo_healthy_dir, synthetic_lesions_di
             print(f"Skipping {patient_id} - no synthetic lesions found")
             continue
         
+        # Apply reverse order to synthetic lesions if requested
+        if reverse_order:
+            synthetic_lesion_files = synthetic_lesion_files[::-1]
+        
         # Load ADC and label data for the current patient
         adc_path = os.path.join(adc_dir, adc_file)
         adc_data, adc_img = load_mha_file(adc_path)
@@ -836,6 +848,18 @@ def process_dataset(adc_dir, label_dir, pseudo_healthy_dir, synthetic_lesions_di
                 lesion_specific_offset  # Using the lesion-specific offset from random reference patient
             )
             
+            # *** NOVÝ KROK: Vymaskování výsledné ADC mapy podle původní ADC mapy ***
+            # Vytvoření masky nenulových hodnot z původní ADC mapy
+            original_mask = adc_data > 0
+            print("Applying original ADC mask to remove potential background artifacts...")
+            
+            # Aplikace masky na modifikovanou ADC mapu - zachováme pouze hodnoty v místech, kde byly nenulové hodnoty v původní mapě
+            masked_modified_adc = np.zeros_like(modified_adc)
+            masked_modified_adc[original_mask] = modified_adc[original_mask]
+            
+            # Použití vymaskované verze pro další zpracování a uložení
+            modified_adc = masked_modified_adc
+            
             # Save modified ADC and combined label with unique names for each synthetic lesion
             modified_adc_path = os.path.join(inpainted_dir, f"{patient_id}-{lesion_basename}-LESIONED_ADC.mha")
             combined_label_path = os.path.join(combined_labels_dir, f"{patient_id}-{lesion_basename}_combined_lesion.mha")
@@ -884,6 +908,8 @@ def main():
                         help='Directory to save results')
     parser.add_argument('--visualize', action='store_true',
                         help='Generate PDF visualizations')
+    parser.add_argument('--reverse', action='store_true',
+                        help='Process files in reverse order (useful for parallel processing)')
     
     args = parser.parse_args()
     
@@ -893,7 +919,8 @@ def main():
         args.pseudo_healthy_dir,
         args.synthetic_lesions_dir,
         args.output_dir,
-        args.visualize
+        args.visualize,
+        args.reverse
     )
 
 
