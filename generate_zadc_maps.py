@@ -195,7 +195,8 @@ def precompute_lesion_statistics(lesions_dir, norm_atlas_path, stdev_atlas_path)
     return lesion_stats
 
 
-def generate_modified_zadc(zadc_orig_data, adc_orig_data, adc_modified_data, sigma_scaling=0.01):
+def generate_modified_zadc(zadc_orig_data, adc_orig_data, adc_modified_data, 
+                          lesion_mean_norm, lesion_mean_stdev, sigma_scaling=1.0):
     """
     Generate modified ZADC map based on original ZADC, original ADC, and modified ADC
     
@@ -203,7 +204,9 @@ def generate_modified_zadc(zadc_orig_data, adc_orig_data, adc_modified_data, sig
         zadc_orig_data: Original ZADC map
         adc_orig_data: Original ADC map
         adc_modified_data: Modified ADC map with synthetic lesions
-        sigma_scaling: Scaling factor for normalization
+        lesion_mean_norm: Mean ADC value from normative atlas for this lesion
+        lesion_mean_stdev: Standard deviation from normative atlas for this lesion
+        sigma_scaling: Optional scaling factor for standard deviation (default: 1.0)
     
     Returns:
         Modified ZADC map and lesion mask
@@ -211,39 +214,37 @@ def generate_modified_zadc(zadc_orig_data, adc_orig_data, adc_modified_data, sig
     # Create a mask of where changes were made (where ADC values differ)
     lesion_mask = get_lesion_mask(adc_orig_data, adc_modified_data)
     
-    # Calculate the normalization factor sigma for the changed regions
-    sigma = np.zeros_like(adc_orig_data, dtype=np.float32)
-    
-    # Set sigma based on global statistics, scaled by the factor
-    adc_std = np.std(adc_orig_data[adc_orig_data > 0])
-    sigma[lesion_mask] = adc_std * sigma_scaling
-    
-    # Calculate ADC difference
-    adc_diff = adc_modified_data - adc_orig_data
-    
-    # Create modified ZADC by adding the normalized ADC difference to original ZADC
+    # Initialize the modified ZADC data as a copy of the original
     zadc_modified_data = zadc_orig_data.copy()
     
-    # Scale ZADC differences more strongly - this ensures that ZADC values drop more 
-    # significantly when ADC values are decreased (which is expected for synthetic lesions)
-    # The direction of change is preserved by the sign of adc_diff
-    zadc_modified_data[lesion_mask] = zadc_orig_data[lesion_mask] + (sigma[lesion_mask] * adc_diff[lesion_mask])
+    # Calculate Z-score for modified voxels: Z = (I - μ) / σ
+    # Where:
+    # - I is the modified ADC value
+    # - μ is the mean value from normative atlas
+    # - σ is the standard deviation from normative atlas
     
-    # Extra check to ensure ZADC values are lowered when ADC values are lowered
-    # This is particularly important for the synthetic lesions
-    lesion_lowered_adc = (adc_diff < 0) & lesion_mask
-    
-    # If we find areas where ADC decreased but ZADC didn't decrease enough,
-    # force a greater decrease in ZADC for those regions
-    if np.any(lesion_lowered_adc):
-        # Check if there are regions where ZADC didn't decrease enough
-        zadc_diff = zadc_modified_data - zadc_orig_data
-        problem_areas = (zadc_diff > 0) & lesion_lowered_adc
+    if np.any(lesion_mask):
+        # Get modified ADC values in lesion area
+        modified_adc_values = adc_modified_data[lesion_mask]
         
-        if np.any(problem_areas):
-            # For these areas, force a stronger decrease in ZADC values
-            # proportional to the ADC decrease
-            zadc_modified_data[problem_areas] = zadc_orig_data[problem_areas] + (1.5 * sigma[problem_areas] * adc_diff[problem_areas])
+        # Apply the Z-score formula
+        # Adjust standard deviation with scaling factor if needed
+        stdev_adjusted = lesion_mean_stdev * sigma_scaling
+        
+        # Calculate Z-scores for modified ADC values
+        z_scores = (modified_adc_values - lesion_mean_norm) / stdev_adjusted
+        
+        # Ensure Z-scores are within reasonable range (usually between -10 and 10)
+        z_scores = np.clip(z_scores, -10, 10)
+        
+        # Replace ZADC values in lesion area with new Z-scores
+        zadc_modified_data[lesion_mask] = z_scores
+        
+        # Print some statistics for debugging
+        print(f"Original ADC in lesion - Mean: {np.mean(adc_orig_data[lesion_mask]):.2f}")
+        print(f"Modified ADC in lesion - Mean: {np.mean(modified_adc_values):.2f}")
+        print(f"Normative atlas - Mean: {lesion_mean_norm:.2f}, StDev: {lesion_mean_stdev:.2f}")
+        print(f"Calculated Z-scores - Mean: {np.mean(z_scores):.4f}, Min: {np.min(z_scores):.4f}, Max: {np.max(z_scores):.4f}")
     
     return zadc_modified_data, lesion_mask
 
@@ -543,7 +544,7 @@ def create_enhanced_visualization(orig_zadc_data, modified_zadc_data, adc_orig_d
 
 
 def process_dataset(orig_zadc_dir, orig_adc_dir, modified_adc_dir, output_dir, 
-                  lesion_stats, default_sigma_scaling=0.01, visualize_all=False):
+                  lesion_stats, default_sigma_scaling=1.0, visualize_all=False):
     """
     Process the dataset by generating modified ZADC maps
     
@@ -553,7 +554,7 @@ def process_dataset(orig_zadc_dir, orig_adc_dir, modified_adc_dir, output_dir,
         modified_adc_dir: Directory containing modified ADC maps with synthetic lesions
         output_dir: Directory to save the modified ZADC maps
         lesion_stats: Dictionary with precomputed lesion statistics
-        default_sigma_scaling: Default scaling factor if lesion stats not found
+        default_sigma_scaling: Default scaling factor for standard deviation (default: 1.0)
         visualize_all: Whether to create visualizations for all processed files
     """
     # Create output directory
@@ -651,74 +652,56 @@ def process_dataset(orig_zadc_dir, orig_adc_dir, modified_adc_dir, output_dir,
                 error_count += 1
                 continue
             
-            # Check if this synthetic lesion decreases ADC values
-            lesion_mask = get_lesion_mask(orig_adc_data, modified_adc_data)
-            adc_diff = modified_adc_data - orig_adc_data
-            
-            # Get sigma scaling factor for this lesion
+            # Get lesion statistics from precomputed values
+            # These are needed for proper Z-score calculation
             if lesion_name and lesion_name in lesion_stats:
-                sigma_scaling = lesion_stats[lesion_name]['sigma_scaling']
+                lesion_mean_norm = lesion_stats[lesion_name]['mean_norm']
+                lesion_mean_stdev = lesion_stats[lesion_name]['mean_stdev']
+                sigma_scaling = default_sigma_scaling  # Use default scaling (1.0)
                 lesion_usage[lesion_name] += 1
+                
                 if processed_count < 5 or processed_count % 50 == 0:
-                    print(f"Using precomputed sigma_scaling={sigma_scaling:.4f} for lesion {lesion_name}")
+                    print(f"Using atlas statistics for lesion {lesion_name}:")
+                    print(f"  Mean norm: {lesion_mean_norm:.2f}")
+                    print(f"  Mean stdev: {lesion_mean_stdev:.2f}")
             else:
-                # If we don't have stats for this specific lesion, use a more aggressive default
-                # especially if it's a synthetic lesion that decreases ADC values
-                sigma_scaling = default_sigma_scaling * 2  # Use a stronger effect for synthetic lesions
-                if processed_count < 5 or processed_count % 50 == 0:
-                    print(f"Lesion {lesion_name} not found in precomputed stats, using enhanced sigma_scaling={sigma_scaling}")
-            
-            # If most of the lesion has decreased ADC values (more than 70%), 
-            # we need to ensure ZADC values decrease appropriately
-            if np.sum(adc_diff[lesion_mask] < 0) > 0.7 * np.sum(lesion_mask):
-                # Increase sigma_scaling to ensure ZADC decreases more significantly
-                sigma_scaling = max(sigma_scaling, 0.05)  # Ensure minimum of 0.05
-                if processed_count < 5 or processed_count % 50 == 0:
-                    print(f"This lesion primarily decreases ADC values. Using enhanced sigma_scaling={sigma_scaling}")
+                # If we don't have precomputed stats, use global estimate
+                # This is less accurate but allows processing to continue
+                print(f"No precomputed statistics for lesion {lesion_name}, using global estimates...")
+                
+                # Create a lesion mask to check values
+                lesion_mask = get_lesion_mask(orig_adc_data, modified_adc_data)
+                
+                # Use healthy tissue around the lesion as reference
+                # First create a dilated mask
+                from scipy import ndimage
+                dilated_mask = ndimage.binary_dilation(lesion_mask, iterations=2)
+                healthy_mask = dilated_mask & ~lesion_mask
+                
+                # Calculate statistics from healthy tissue
+                healthy_adc = orig_adc_data[healthy_mask]
+                lesion_mean_norm = np.mean(healthy_adc)
+                lesion_mean_stdev = np.std(healthy_adc)
+                
+                print(f"  Estimated mean from healthy tissue: {lesion_mean_norm:.2f}")
+                print(f"  Estimated stdev from healthy tissue: {lesion_mean_stdev:.2f}")
             
             # Generate modified ZADC map
             if processed_count < 5 or processed_count % 50 == 0:
                 print(f"Generating modified ZADC for {patient_id} with lesion {lesion_info}")
+            
             modified_zadc_data, lesion_mask = generate_modified_zadc(
                 orig_zadc_data, 
                 orig_adc_data, 
                 modified_adc_data,
+                lesion_mean_norm,
+                lesion_mean_stdev,
                 sigma_scaling
             )
             
             # Save the modified ZADC map
             save_mha_file(modified_zadc_data, orig_zadc_img, output_path)
             processed_count += 1
-            
-            # Verify that ZADC values have decreased in lesion areas where ADC decreased
-            decreased_adc_mask = (adc_diff < 0) & lesion_mask
-            if np.any(decreased_adc_mask):
-                zadc_diff = modified_zadc_data - orig_zadc_data
-                percent_decreased = np.sum(zadc_diff[decreased_adc_mask] < 0) / np.sum(decreased_adc_mask) * 100
-                if processed_count < 5 or processed_count % 50 == 0:
-                    print(f"ZADC decreased in {percent_decreased:.1f}% of voxels where ADC decreased")
-                
-                # If ZADC is not decreasing in at least 80% of lowered ADC areas, retry with stronger sigma
-                if percent_decreased < 80 and processed_count <= 5:
-                    print(f"Warning: ZADC not decreasing sufficiently in lesion area. Retrying with stronger sigma...")
-                    # Increase sigma_scaling by 50%
-                    stronger_sigma = sigma_scaling * 1.5
-                    modified_zadc_data, lesion_mask = generate_modified_zadc(
-                        orig_zadc_data, 
-                        orig_adc_data, 
-                        modified_adc_data,
-                        stronger_sigma
-                    )
-                    
-                    # Re-check
-                    zadc_diff = modified_zadc_data - orig_zadc_data
-                    new_percent_decreased = np.sum(zadc_diff[decreased_adc_mask] < 0) / np.sum(decreased_adc_mask) * 100
-                    print(f"After adjustment: ZADC decreased in {new_percent_decreased:.1f}% of voxels where ADC decreased")
-                    
-                    # Save the improved version if better
-                    if new_percent_decreased > percent_decreased:
-                        print(f"Saving improved version with stronger sigma={stronger_sigma:.4f}")
-                        save_mha_file(modified_zadc_data, orig_zadc_img, output_path)
             
             # Create visualizations
             if processed_count <= 5 or visualize_all:
@@ -775,8 +758,8 @@ def main():
                         help='Path to normative atlas (.nii file) (required for precomputing statistics)')
     parser.add_argument('--stdev_atlas', type=str, default=None,
                         help='Path to standard deviation atlas (.nii file) (required for precomputing statistics)')
-    parser.add_argument('--sigma_scaling', type=float, default=0.02,
-                        help='Default scaling factor for normalization (default: 0.02, increased from 0.01)')
+    parser.add_argument('--sigma_scaling', type=float, default=1.0,
+                        help='Scaling factor for standard deviation (default: 1.0)')
     parser.add_argument('--visualize_all', action='store_true',
                         help='Create visualizations for all processed files (default: only first 5)')
     
@@ -792,7 +775,7 @@ def main():
         )
     else:
         print("Warning: Missing parameters for precomputing lesion statistics")
-        print("Will use default sigma_scaling for all lesions")
+        print("Will use estimated statistics for each lesion")
         lesion_stats = {}
     
     process_dataset(
