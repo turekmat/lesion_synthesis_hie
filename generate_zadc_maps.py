@@ -350,10 +350,6 @@ def create_enhanced_visualization(orig_zadc_data, modified_zadc_data, adc_orig_d
 
     # Calculate difference maps
     zadc_diff = modified_zadc_data - orig_zadc_data
-    adc_diff = adc_modified_data - adc_orig_data
-    
-    # Create binary difference map (regions where ADC values differ)
-    adc_diff_binary = np.abs(adc_diff) > 1.0  # Threshold for significant difference
     
     # Calculate detailed statistics in lesion area
     zadc_stats = {}
@@ -443,13 +439,13 @@ def create_enhanced_visualization(orig_zadc_data, modified_zadc_data, adc_orig_d
         plt.title(f'Modified ADC (Axial Slice {slice_idx})')
         plt.colorbar()
         
-        # ADC Difference
+        # ZADC Difference map
         plt.subplot(233)
-        plt.imshow(adc_diff[slice_idx, :, :], cmap='hot', origin='lower')
-        plt.title('ADC Difference')
+        plt.imshow(zadc_diff[slice_idx, :, :], cmap='hot', vmin=-2, vmax=2, origin='lower')
+        plt.title('ZADC Difference')
         plt.colorbar()
         
-        # Row 2: ZADC maps and binary diff
+        # Row 2: ZADC maps and lesion mask
         # Original ZADC
         plt.subplot(234)
         plt.imshow(orig_zadc_data[slice_idx, :, :], cmap='gray', origin='lower')
@@ -462,10 +458,12 @@ def create_enhanced_visualization(orig_zadc_data, modified_zadc_data, adc_orig_d
         plt.title('Modified ZADC')
         plt.colorbar()
         
-        # Binary ADC difference map
+        # Lesion Mask
         plt.subplot(236)
-        plt.imshow(adc_diff_binary[slice_idx, :, :], cmap='Reds', origin='lower')
-        plt.title('Binary ADC Difference Map')
+        # Show a background anatomical image and overlay the lesion mask
+        plt.imshow(adc_orig_data[slice_idx, :, :], cmap='gray', origin='lower')
+        plt.imshow(lesion_mask[slice_idx, :, :], cmap='Reds', alpha=0.7, origin='lower')
+        plt.title('Lesion Mask')
         
         # Add title to the entire figure
         plt.suptitle(f"{patient_id} with lesion {lesion_info} - Axial Slice {slice_idx}", fontsize=16)
@@ -524,17 +522,17 @@ def create_enhanced_visualization(orig_zadc_data, modified_zadc_data, adc_orig_d
                     plt.title(f'ZADC Diff (Axial Slice {slice_i})')
                     plt.colorbar()
                     
-                    # ADC difference
+                    # Modified ZADC
                     plt.subplot(len(selected_slices), 3, 3*i + 2)
-                    plt.imshow(adc_diff[slice_i, :, :], cmap='hot', origin='lower')
-                    plt.title(f'ADC Diff (Axial Slice {slice_i})')
+                    plt.imshow(modified_zadc_data[slice_i, :, :], cmap='gray', origin='lower')
+                    plt.title(f'Modified ZADC (Axial Slice {slice_i})')
                     plt.colorbar()
                     
-                    # Binary ADC difference map
+                    # Lesion mask
                     plt.subplot(len(selected_slices), 3, 3*i + 3)
                     plt.imshow(adc_orig_data[slice_i, :, :], cmap='gray', origin='lower')
-                    plt.imshow(adc_diff_binary[slice_i, :, :], cmap='Reds', alpha=0.5, origin='lower')
-                    plt.title(f'Binary ADC Diff (Axial Slice {slice_i})')
+                    plt.imshow(lesion_mask[slice_i, :, :], cmap='Reds', alpha=0.7, origin='lower')
+                    plt.title(f'Lesion Mask (Axial Slice {slice_i})')
                 
                 plt.suptitle(f"Multiple slices for {patient_id} with lesion {lesion_info}", fontsize=16)
                 plt.tight_layout(rect=[0, 0, 1, 0.96])  # Adjust layout to make room for suptitle
@@ -559,13 +557,13 @@ def create_enhanced_visualization(orig_zadc_data, modified_zadc_data, adc_orig_d
     plt.title(f'Modified ADC (Axial Slice {slice_idx})')
     plt.colorbar()
     
-    # ADC Difference
+    # ZADC Difference map
     plt.subplot(233)
-    plt.imshow(adc_diff[slice_idx, :, :], cmap='hot', origin='lower')
-    plt.title('ADC Difference')
+    plt.imshow(zadc_diff[slice_idx, :, :], cmap='hot', vmin=-2, vmax=2, origin='lower')
+    plt.title('ZADC Difference')
     plt.colorbar()
     
-    # Row 2: ZADC maps and binary map
+    # Row 2: ZADC maps and lesion mask
     # Original ZADC
     plt.subplot(234)
     plt.imshow(orig_zadc_data[slice_idx, :, :], cmap='gray', origin='lower')
@@ -578,10 +576,12 @@ def create_enhanced_visualization(orig_zadc_data, modified_zadc_data, adc_orig_d
     plt.title('Modified ZADC')
     plt.colorbar()
     
-    # Binary ADC difference map
+    # Lesion Mask
     plt.subplot(236)
-    plt.imshow(adc_diff_binary[slice_idx, :, :], cmap='Reds', origin='lower')
-    plt.title('Binary ADC Difference Map')
+    # Show a background anatomical image and overlay the lesion mask
+    plt.imshow(adc_orig_data[slice_idx, :, :], cmap='gray', origin='lower')
+    plt.imshow(lesion_mask[slice_idx, :, :], cmap='Reds', alpha=0.7, origin='lower')
+    plt.title('Lesion Mask')
     
     # Add title to the entire figure
     plt.suptitle(f"{patient_id} with lesion {lesion_info} - Axial Slice {slice_idx}", fontsize=16)
@@ -634,9 +634,9 @@ def process_dataset(orig_zadc_dir, orig_adc_dir, modified_adc_dir, output_dir,
         modified_adc_dir: Directory containing modified ADC maps with synthetic lesions
         output_dir: Directory to save the modified ZADC maps
         lesion_stats: Dictionary with precomputed lesion statistics
-        registered_lesions_dir: Directory containing registered lesion masks (organized by patient)
+        registered_lesions_dir: Directory containing registered lesion masks organized by patient
         default_sigma_scaling: Default scaling factor for standard deviation (default: 1.0)
-        visualize_all: Whether to create visualizations for all processed files
+        visualize_all: Whether to create visualizations for all processed files (default: only first 5)
     """
     # Create output directory
     os.makedirs(output_dir, exist_ok=True)
