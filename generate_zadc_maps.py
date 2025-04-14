@@ -380,7 +380,137 @@ def create_enhanced_visualization(orig_zadc_data, modified_zadc_data, adc_orig_d
         else:
             adc_stats['direction'] = "unchanged"
     
-    # Create a figure with 2x3 subplots for the images and a separate figure for statistics
+    # Create a multi-page PDF with both visualizations and statistics
+    from matplotlib.backends.backend_pdf import PdfPages
+    pdf_path = os.path.join(viz_dir, f"{patient_id}-{lesion_info}-ZADC_analysis.pdf")
+    
+    with PdfPages(pdf_path) as pdf:
+        # Page 1: Main visualizations
+        plt.figure(figsize=(18, 10))
+        
+        # Row 1: ADC maps
+        # Original ADC
+        plt.subplot(231)
+        plt.imshow(adc_orig_data[slice_idx, :, :], cmap='gray', origin='lower')
+        plt.title(f'Original ADC (Axial Slice {slice_idx})')
+        plt.colorbar()
+        
+        # Modified ADC
+        plt.subplot(232)
+        plt.imshow(adc_modified_data[slice_idx, :, :], cmap='gray', origin='lower')
+        plt.title(f'Modified ADC (Axial Slice {slice_idx})')
+        plt.colorbar()
+        
+        # ADC Difference
+        plt.subplot(233)
+        plt.imshow(adc_diff[slice_idx, :, :], cmap='hot', origin='lower')
+        plt.title('ADC Difference')
+        plt.colorbar()
+        
+        # Row 2: ZADC maps
+        # Original ZADC
+        plt.subplot(234)
+        plt.imshow(orig_zadc_data[slice_idx, :, :], cmap='gray', origin='lower')
+        plt.title('Original ZADC')
+        plt.colorbar()
+        
+        # Modified ZADC
+        plt.subplot(235)
+        plt.imshow(modified_zadc_data[slice_idx, :, :], cmap='gray', origin='lower')
+        plt.title('Modified ZADC')
+        plt.colorbar()
+        
+        # ZADC Difference with lesion contour
+        plt.subplot(236)
+        plt.imshow(zadc_diff[slice_idx, :, :], cmap='hot', origin='lower')
+        
+        # Add lesion contour
+        if np.any(lesion_mask[slice_idx, :, :]):
+            from skimage import measure
+            contours = measure.find_contours(lesion_mask[slice_idx, :, :].astype(float), 0.5)
+            for contour in contours:
+                plt.plot(contour[:, 1], contour[:, 0], 'g-', linewidth=2)
+        
+        plt.title('ZADC Difference with Lesion Contour')
+        plt.colorbar()
+        
+        # Add title to the entire figure
+        plt.suptitle(f"{patient_id} with lesion {lesion_info} - Axial Slice {slice_idx}", fontsize=16)
+        
+        # Save visualization to the PDF
+        plt.tight_layout(rect=[0, 0, 1, 0.96])  # Adjust layout to make room for suptitle
+        pdf.savefig()
+        plt.close()
+        
+        # Page 2: Statistics page
+        if np.any(lesion_mask):
+            # Create a figure for statistics display
+            plt.figure(figsize=(12, 8))
+            
+            # Format detailed statistics
+            stats_text = (
+                f"Statistics for {patient_id} with lesion {lesion_info}\n"
+                f"=====================================================\n\n"
+                f"Lesion area: {np.sum(lesion_mask)} voxels\n\n"
+                f"ADC values in lesion region:\n"
+                f"  Original: mean={adc_stats['orig_mean']:.2f}, min={adc_stats['orig_min']:.2f}, max={adc_stats['orig_max']:.2f}\n"
+                f"  Modified: mean={adc_stats['mod_mean']:.2f}, min={adc_stats['mod_min']:.2f}, max={adc_stats['mod_max']:.2f}\n"
+                f"  Change: mean={adc_stats['change_mean']:.2f} ({adc_stats['percent_change_mean']:.2f}%)\n"
+                f"  ADC has {adc_stats['direction']} in the lesion region\n\n"
+                f"ZADC values in lesion region:\n"
+                f"  Original: mean={zadc_stats['orig_mean']:.4f}, min={zadc_stats['orig_min']:.4f}, max={zadc_stats['orig_max']:.4f}\n"
+                f"  Modified: mean={zadc_stats['mod_mean']:.4f}, min={zadc_stats['mod_min']:.4f}, max={zadc_stats['mod_max']:.4f}\n"
+                f"  Change: mean={zadc_stats['change_mean']:.4f} ({zadc_stats['percent_change_mean']:.2f}%)\n"
+                f"  ZADC has {zadc_stats['direction']} in the lesion region"
+            )
+            
+            # Display statistics on the empty figure
+            plt.text(0.1, 0.5, stats_text, fontsize=14, family='monospace', va='center')
+            plt.axis('off')  # Turn off axes
+            plt.title(f"Statistics for {patient_id} with lesion {lesion_info}", fontsize=16)
+            
+            # Save statistics to the PDF
+            pdf.savefig()
+            plt.close()
+            
+            # Page 3: Multi-slice visualization if there are multiple slices with lesions
+            lesion_slice_indices = np.where(np.any(np.any(lesion_mask, axis=1), axis=1))[0]
+            
+            if len(lesion_slice_indices) > 1:  # Only add this page if there's more than one slice
+                # Take up to 4 slices through the lesion
+                sample_indices = np.linspace(0, len(lesion_slice_indices)-1, min(4, len(lesion_slice_indices)), dtype=int)
+                selected_slices = [lesion_slice_indices[i] for i in sample_indices]
+                
+                # Create multi-slice visualization
+                plt.figure(figsize=(15, 4 * len(selected_slices)))
+                
+                for i, slice_i in enumerate(selected_slices):
+                    # ZADC difference
+                    plt.subplot(len(selected_slices), 3, 3*i + 1)
+                    plt.imshow(zadc_diff[slice_i, :, :], cmap='hot', vmin=-2, vmax=2, origin='lower')
+                    plt.title(f'ZADC Diff (Axial Slice {slice_i})')
+                    plt.colorbar()
+                    
+                    # ADC difference
+                    plt.subplot(len(selected_slices), 3, 3*i + 2)
+                    plt.imshow(adc_diff[slice_i, :, :], cmap='hot', origin='lower')
+                    plt.title(f'ADC Diff (Axial Slice {slice_i})')
+                    plt.colorbar()
+                    
+                    # Lesion mask
+                    plt.subplot(len(selected_slices), 3, 3*i + 3)
+                    plt.imshow(adc_orig_data[slice_i, :, :], cmap='gray', origin='lower')
+                    plt.imshow(lesion_mask[slice_i, :, :], cmap='Reds', alpha=0.5, origin='lower')
+                    plt.title(f'Lesion Mask (Axial Slice {slice_i})')
+                
+                plt.suptitle(f"Multiple slices for {patient_id} with lesion {lesion_info}", fontsize=16)
+                plt.tight_layout(rect=[0, 0, 1, 0.96])  # Adjust layout to make room for suptitle
+                pdf.savefig()
+                plt.close()
+    
+    print(f"Complete analysis saved to {pdf_path}")
+    
+    # Also create PNG version of the main visualization for quick preview
     plt.figure(figsize=(18, 10))
     
     # Row 1: ADC maps
@@ -432,115 +562,41 @@ def create_enhanced_visualization(orig_zadc_data, modified_zadc_data, adc_orig_d
     # Add title to the entire figure
     plt.suptitle(f"{patient_id} with lesion {lesion_info} - Axial Slice {slice_idx}", fontsize=16)
     
-    # Save visualization without statistics
-    plt.tight_layout(rect=[0, 0, 1, 0.96])  # Adjust layout to make room for suptitle
-    
-    # Save main visualization
+    # Save visualization as PNG
     viz_path = os.path.join(viz_dir, f"{patient_id}-{lesion_info}-ZADC_detailed_viz.png")
+    plt.tight_layout(rect=[0, 0, 1, 0.96])  # Adjust layout to make room for suptitle
     plt.savefig(viz_path, dpi=150)
     plt.close()
     
-    # Create a separate figure for statistics if we have lesion data
+    print(f"Main visualization also saved to {viz_path}")
+    
+    # Save the statistics to a text file for reference
     if np.any(lesion_mask):
-        # Create a figure just for the statistics display
-        plt.figure(figsize=(12, 8))
-        
-        # Format detailed statistics
-        stats_text = (
-            f"Statistics for {patient_id} with lesion {lesion_info}\n"
-            f"=====================================================\n\n"
-            f"Lesion area: {np.sum(lesion_mask)} voxels\n\n"
-            f"ADC values in lesion region:\n"
-            f"  Original: mean={adc_stats['orig_mean']:.2f}, min={adc_stats['orig_min']:.2f}, max={adc_stats['orig_max']:.2f}\n"
-            f"  Modified: mean={adc_stats['mod_mean']:.2f}, min={adc_stats['mod_min']:.2f}, max={adc_stats['mod_max']:.2f}\n"
-            f"  Change: mean={adc_stats['change_mean']:.2f} ({adc_stats['percent_change_mean']:.2f}%)\n"
-            f"  ADC has {adc_stats['direction']} in the lesion region\n\n"
-            f"ZADC values in lesion region:\n"
-            f"  Original: mean={zadc_stats['orig_mean']:.4f}, min={zadc_stats['orig_min']:.4f}, max={zadc_stats['orig_max']:.4f}\n"
-            f"  Modified: mean={zadc_stats['mod_mean']:.4f}, min={zadc_stats['mod_min']:.4f}, max={zadc_stats['mod_max']:.4f}\n"
-            f"  Change: mean={zadc_stats['change_mean']:.4f} ({zadc_stats['percent_change_mean']:.2f}%)\n"
-            f"  ZADC has {zadc_stats['direction']} in the lesion region"
-        )
-        
-        # Display statistics on the empty figure
-        plt.text(0.1, 0.5, stats_text, fontsize=14, family='monospace', va='center')
-        plt.axis('off')  # Turn off axes
-        
-        # Save statistics visualization
-        stats_viz_path = os.path.join(viz_dir, f"{patient_id}-{lesion_info}-statistics.png")
-        plt.savefig(stats_viz_path, dpi=150)
-        plt.close()
-        
-        print(f"Statistics visualization saved to {stats_viz_path}")
-    
-    print(f"Main visualization saved to {viz_path}")
-    
-    # Create a 3D visualization of changes across multiple slices
-    # Find slices with lesion
-    lesion_slice_indices = np.where(np.any(np.any(lesion_mask, axis=1), axis=1))[0]
-    
-    if len(lesion_slice_indices) > 0:
-        # Take up to 4 slices through the lesion
-        sample_indices = np.linspace(0, len(lesion_slice_indices)-1, min(4, len(lesion_slice_indices)), dtype=int)
-        selected_slices = [lesion_slice_indices[i] for i in sample_indices]
-        
-        # Create multi-slice visualization
-        plt.figure(figsize=(15, 4 * len(selected_slices)))
-        
-        for i, slice_i in enumerate(selected_slices):
-            # ZADC difference
-            plt.subplot(len(selected_slices), 3, 3*i + 1)
-            plt.imshow(zadc_diff[slice_i, :, :], cmap='hot', vmin=-2, vmax=2, origin='lower')
-            plt.title(f'ZADC Diff (Axial Slice {slice_i})')
-            plt.colorbar()
+        stats_path = os.path.join(viz_dir, f"{patient_id}-{lesion_info}-statistics.txt")
+        with open(stats_path, 'w') as f:
+            f.write(f"Statistics for {patient_id} with lesion {lesion_info}\n")
+            f.write(f"=====================================================\n\n")
+            f.write(f"Lesion size: {np.sum(lesion_mask)} voxels\n\n")
             
-            # ADC difference
-            plt.subplot(len(selected_slices), 3, 3*i + 2)
-            plt.imshow(adc_diff[slice_i, :, :], cmap='hot', origin='lower')
-            plt.title(f'ADC Diff (Axial Slice {slice_i})')
-            plt.colorbar()
+            f.write(f"ADC values in lesion region:\n")
+            f.write(f"  Original: mean={adc_stats['orig_mean']:.2f}, min={adc_stats['orig_min']:.2f}, max={adc_stats['orig_max']:.2f}\n")
+            f.write(f"  Modified: mean={adc_stats['mod_mean']:.2f}, min={adc_stats['mod_min']:.2f}, max={adc_stats['mod_max']:.2f}\n\n")
+            f.write(f"ADC changes in lesion region:\n")
+            f.write(f"  Mean change: {adc_stats['change_mean']:.2f} ({adc_stats['percent_change_mean']:.2f}%)\n")
+            f.write(f"  Min change: {adc_stats['change_min']:.2f}\n")
+            f.write(f"  Max change: {adc_stats['change_max']:.2f}\n")
+            f.write(f"  Summary: ADC has {adc_stats['direction']} in the lesion region\n\n")
             
-            # Lesion mask
-            plt.subplot(len(selected_slices), 3, 3*i + 3)
-            plt.imshow(adc_orig_data[slice_i, :, :], cmap='gray', origin='lower')
-            plt.imshow(lesion_mask[slice_i, :, :], cmap='Reds', alpha=0.5, origin='lower')
-            plt.title(f'Lesion Mask (Axial Slice {slice_i})')
+            f.write(f"ZADC values in lesion region:\n")
+            f.write(f"  Original: mean={zadc_stats['orig_mean']:.4f}, min={zadc_stats['orig_min']:.4f}, max={zadc_stats['orig_max']:.4f}\n")
+            f.write(f"  Modified: mean={zadc_stats['mod_mean']:.4f}, min={zadc_stats['mod_min']:.4f}, max={zadc_stats['mod_max']:.4f}\n\n")
+            f.write(f"ZADC changes in lesion region:\n")
+            f.write(f"  Mean change: {zadc_stats['change_mean']:.4f} ({zadc_stats['percent_change_mean']:.2f}%)\n")
+            f.write(f"  Min change: {zadc_stats['change_min']:.4f}\n")
+            f.write(f"  Max change: {zadc_stats['change_max']:.4f}\n")
+            f.write(f"  Summary: ZADC has {zadc_stats['direction']} in the lesion region\n")
         
-        # Save multi-slice visualization
-        multi_viz_path = os.path.join(viz_dir, f"{patient_id}-{lesion_info}-ZADC_multi_slice_viz.png")
-        plt.tight_layout()
-        plt.savefig(multi_viz_path, dpi=150)
-        plt.close()
-        
-        print(f"Multi-slice visualization saved to {multi_viz_path}")
-        
-        # Also save the statistics to a text file for reference
-        if np.any(lesion_mask):
-            stats_path = os.path.join(viz_dir, f"{patient_id}-{lesion_info}-statistics.txt")
-            with open(stats_path, 'w') as f:
-                f.write(f"Statistics for {patient_id} with lesion {lesion_info}\n")
-                f.write(f"=====================================================\n\n")
-                f.write(f"Lesion size: {np.sum(lesion_mask)} voxels\n\n")
-                
-                f.write(f"ADC values in lesion region:\n")
-                f.write(f"  Original: mean={adc_stats['orig_mean']:.2f}, min={adc_stats['orig_min']:.2f}, max={adc_stats['orig_max']:.2f}\n")
-                f.write(f"  Modified: mean={adc_stats['mod_mean']:.2f}, min={adc_stats['mod_min']:.2f}, max={adc_stats['mod_max']:.2f}\n\n")
-                f.write(f"ADC changes in lesion region:\n")
-                f.write(f"  Mean change: {adc_stats['change_mean']:.2f} ({adc_stats['percent_change_mean']:.2f}%)\n")
-                f.write(f"  Min change: {adc_stats['change_min']:.2f}\n")
-                f.write(f"  Max change: {adc_stats['change_max']:.2f}\n")
-                f.write(f"  Summary: ADC has {adc_stats['direction']} in the lesion region\n\n")
-                
-                f.write(f"ZADC values in lesion region:\n")
-                f.write(f"  Original: mean={zadc_stats['orig_mean']:.4f}, min={zadc_stats['orig_min']:.4f}, max={zadc_stats['orig_max']:.4f}\n")
-                f.write(f"  Modified: mean={zadc_stats['mod_mean']:.4f}, min={zadc_stats['mod_min']:.4f}, max={zadc_stats['mod_max']:.4f}\n\n")
-                f.write(f"ZADC changes in lesion region:\n")
-                f.write(f"  Mean change: {zadc_stats['change_mean']:.4f} ({zadc_stats['percent_change_mean']:.2f}%)\n")
-                f.write(f"  Min change: {zadc_stats['change_min']:.4f}\n")
-                f.write(f"  Max change: {zadc_stats['change_max']:.4f}\n")
-                f.write(f"  Summary: ZADC has {zadc_stats['direction']} in the lesion region\n")
-            
-            print(f"Statistics saved to {stats_path}")
+        print(f"Statistics text also saved to {stats_path}")
 
 
 def process_dataset(orig_zadc_dir, orig_adc_dir, modified_adc_dir, output_dir, 
