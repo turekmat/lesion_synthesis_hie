@@ -161,7 +161,7 @@ def find_matching_zadc_file(patient_id, zadc_dir):
     Find the corresponding ZADC file for a patient ID
     
     Args:
-        patient_id: Patient ID to match
+        patient_id: Patient ID to match (e.g., MGHNICU_010-VISIT_01)
         zadc_dir: Directory containing ZADC files
         
     Returns:
@@ -170,20 +170,27 @@ def find_matching_zadc_file(patient_id, zadc_dir):
     # List all files in the ZADC directory
     zadc_files = [f for f in os.listdir(zadc_dir) if f.endswith('.mha')]
     
-    # Try to find a file with the patient ID in it
-    # Format example: Zmap_MGHNICU_010-VISIT_01-ADC_smooth2mm_clipped10.mha
+    # First, look for exact match with format: Zmap_MGHNICU_010-VISIT_01-ADC_...
+    expected_prefix = f"Zmap_{patient_id}"
     for zadc_file in zadc_files:
-        if patient_id in zadc_file and zadc_file.startswith('Zmap_'):
+        if zadc_file.startswith(expected_prefix):
             return os.path.join(zadc_dir, zadc_file)
     
-    # Try alternative approach with regex
-    # Extract patient ID parts (assuming format like MGHNICU_010)
-    patient_parts = patient_id.split('-')
-    if len(patient_parts) > 0:
-        base_id = patient_parts[0]  # e.g., MGHNICU_010
+    # If no exact match, try to extract core patient ID (assuming MGHNICU_010-VISIT_01 format)
+    # Extract just the patient+visit part for matching
+    parts = patient_id.split('-')
+    if len(parts) >= 2:
+        # Combine patient ID and visit ID
+        patient_visit = f"{parts[0]}-{parts[1]}"
         for zadc_file in zadc_files:
-            if base_id in zadc_file and zadc_file.startswith('Zmap_'):
+            if patient_visit in zadc_file and zadc_file.startswith('Zmap_'):
                 return os.path.join(zadc_dir, zadc_file)
+
+    # Try just with patient ID if nothing found
+    patient_only = parts[0]  # e.g., MGHNICU_010
+    for zadc_file in zadc_files:
+        if patient_only in zadc_file and zadc_file.startswith('Zmap_'):
+            return os.path.join(zadc_dir, zadc_file)
     
     # No matching file found
     return None
@@ -370,10 +377,32 @@ def process_dataset(orig_zadc_dir, orig_adc_dir, modified_adc_dir, output_dir,
     
     for modified_adc_file in tqdm(modified_adc_files):
         # Extract patient and lesion info from filename
-        # Expected format: PATIENT_ID-LESION_ID-LESIONED_ADC.mha
+        # Expected format: PATIENT_ID-VISIT_ID-LESION_ID-LESIONED_ADC.mha or PATIENT_ID-LESION_ID-LESIONED_ADC.mha
         parts = modified_adc_file.split('-')
-        patient_id = parts[0]
-        lesion_info = '-'.join(parts[1:-1])  # In case lesion ID contains hyphens
+        
+        # Identify the lesion part by finding "LESIONED_ADC.mha" at the end
+        lesion_end_idx = -1  # This is the index of "LESIONED_ADC.mha"
+        
+        # Reconstruct patient_id which might include visit information
+        # We need to determine where patient/visit info ends and lesion info begins
+        # Typically, for MGHNICU_010-VISIT_01-lesion-LESIONED_ADC.mha:
+        # - patient_id should be "MGHNICU_010-VISIT_01"
+        # - lesion_info should be "lesion"
+        
+        # Check how many parts we have
+        if len(parts) > 3:  # We have PATIENT-VISIT-LESION-LESIONED_ADC
+            # First two parts are patient_id (includes visit)
+            patient_id = f"{parts[0]}-{parts[1]}"
+            # Everything between patient_id and "LESIONED_ADC" is the lesion info
+            lesion_info = '-'.join(parts[2:lesion_end_idx])
+        else:  # We have PATIENT-LESION-LESIONED_ADC
+            patient_id = parts[0]
+            lesion_info = '-'.join(parts[1:lesion_end_idx])
+        
+        # Print for debugging
+        print(f"Parsed file: {modified_adc_file}")
+        print(f"  Patient ID: {patient_id}")
+        print(f"  Lesion Info: {lesion_info}")
         
         # Construct output filename
         output_filename = f"{patient_id}-{lesion_info}-LESIONED_ZADC.mha"
@@ -385,7 +414,7 @@ def process_dataset(orig_zadc_dir, orig_adc_dir, modified_adc_dir, output_dir,
             skipped_count += 1
             continue
         
-        # Construct original ADC filename
+        # Construct original ADC filename - should match the pattern MGHNICU_010-VISIT_01-ADC_ss.mha
         orig_adc_file = f"{patient_id}-ADC_ss.mha"
         orig_adc_path = os.path.join(orig_adc_dir, orig_adc_file)
         
