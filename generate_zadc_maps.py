@@ -217,34 +217,66 @@ def generate_modified_zadc(zadc_orig_data, adc_orig_data, adc_modified_data,
     # Initialize the modified ZADC data as a copy of the original
     zadc_modified_data = zadc_orig_data.copy()
     
-    # Calculate Z-score for modified voxels: Z = (I - μ) / σ
-    # Where:
-    # - I is the modified ADC value
-    # - μ is the mean value from normative atlas
-    # - σ is the standard deviation from normative atlas
-    
     if np.any(lesion_mask):
+        # Get original values
+        orig_adc_in_lesion = adc_orig_data[lesion_mask]
+        orig_zadc_in_lesion = zadc_orig_data[lesion_mask]
+        
         # Get modified ADC values in lesion area
         modified_adc_values = adc_modified_data[lesion_mask]
         
-        # Apply the Z-score formula
-        # Adjust standard deviation with scaling factor if needed
-        stdev_adjusted = lesion_mean_stdev * sigma_scaling
+        # Compute ADC difference
+        adc_diff = modified_adc_values - orig_adc_in_lesion
         
-        # Calculate Z-scores for modified ADC values
-        z_scores = (modified_adc_values - lesion_mean_norm) / stdev_adjusted
+        # Apply the Z-score formula to get the new ZADC values
+        stdev_adjusted = lesion_mean_stdev * sigma_scaling
+        modified_zadc_values = (modified_adc_values - lesion_mean_norm) / stdev_adjusted
         
         # Ensure Z-scores are within reasonable range (usually between -10 and 10)
-        z_scores = np.clip(z_scores, -10, 10)
+        modified_zadc_values = np.clip(modified_zadc_values, -10, 10)
+        
+        # Calculate the expected change in ZADC based on the change in ADC
+        expected_zadc_diff = adc_diff / stdev_adjusted
+        
+        # Compute flag for voxels where the ZADC change has the wrong sign
+        # If ADC decreases, ZADC should also change in the same direction
+        inconsistent_voxels = ((adc_diff < 0) & (modified_zadc_values > orig_zadc_in_lesion))
+        
+        # For inconsistent voxels, adjust the ZADC values to ensure they decrease
+        if np.any(inconsistent_voxels):
+            # Count inconsistent voxels
+            inconsistent_count = np.sum(inconsistent_voxels)
+            total_voxels = inconsistent_voxels.size
+            percent_inconsistent = (inconsistent_count / total_voxels) * 100
+            
+            print(f"Warning: {inconsistent_count}/{total_voxels} voxels ({percent_inconsistent:.2f}%) "
+                  f"have inconsistent ZADC changes. Adjusting these values.")
+            
+            # For these voxels, ensure ZADC decreases by at least the amount of the expected change
+            modified_zadc_values[inconsistent_voxels] = orig_zadc_in_lesion[inconsistent_voxels] + expected_zadc_diff[inconsistent_voxels]
         
         # Replace ZADC values in lesion area with new Z-scores
-        zadc_modified_data[lesion_mask] = z_scores
+        zadc_modified_data[lesion_mask] = modified_zadc_values
         
-        # Print some statistics for debugging
-        print(f"Original ADC in lesion - Mean: {np.mean(adc_orig_data[lesion_mask]):.2f}")
+        # Print statistics for debugging
+        print(f"Original ADC in lesion - Mean: {np.mean(orig_adc_in_lesion):.2f}")
         print(f"Modified ADC in lesion - Mean: {np.mean(modified_adc_values):.2f}")
+        print(f"ADC difference - Mean: {np.mean(adc_diff):.2f}")
+        print(f"Original ZADC in lesion - Mean: {np.mean(orig_zadc_in_lesion):.4f}")
+        print(f"Modified ZADC in lesion - Mean: {np.mean(modified_zadc_values):.4f}")
+        print(f"ZADC difference - Mean: {np.mean(modified_zadc_values - orig_zadc_in_lesion):.4f}")
         print(f"Normative atlas - Mean: {lesion_mean_norm:.2f}, StDev: {lesion_mean_stdev:.2f}")
-        print(f"Calculated Z-scores - Mean: {np.mean(z_scores):.4f}, Min: {np.min(z_scores):.4f}, Max: {np.max(z_scores):.4f}")
+        
+        # Calculate percentage of voxels where ADC decreased
+        adc_decreased = adc_diff < 0
+        percent_adc_decreased = (np.sum(adc_decreased) / adc_decreased.size) * 100
+        
+        # Calculate percentage of voxels where ZADC decreased
+        zadc_decreased = modified_zadc_values < orig_zadc_in_lesion
+        percent_zadc_decreased = (np.sum(zadc_decreased) / zadc_decreased.size) * 100
+        
+        print(f"ADC decreased in {percent_adc_decreased:.2f}% of lesion voxels")
+        print(f"ZADC decreased in {percent_zadc_decreased:.2f}% of lesion voxels")
     
     return zadc_modified_data, lesion_mask
 
