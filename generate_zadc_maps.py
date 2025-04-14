@@ -263,6 +263,73 @@ def create_enhanced_visualization(orig_zadc_data, modified_zadc_data, adc_orig_d
     # - x is the width of each slice
     # For axial view, we want to visualize the data as looking at the [y, x] plane
     
+    # Calculate detailed statistics in lesion area
+    zadc_stats = {}
+    adc_stats = {}
+    
+    if np.any(lesion_mask):
+        # Original ZADC values in lesion area
+        orig_zadc_in_lesion = orig_zadc_data[lesion_mask]
+        zadc_stats['orig_mean'] = np.mean(orig_zadc_in_lesion)
+        zadc_stats['orig_min'] = np.min(orig_zadc_in_lesion)
+        zadc_stats['orig_max'] = np.max(orig_zadc_in_lesion)
+        
+        # Modified ZADC values in lesion area
+        mod_zadc_in_lesion = modified_zadc_data[lesion_mask]
+        zadc_stats['mod_mean'] = np.mean(mod_zadc_in_lesion)
+        zadc_stats['mod_min'] = np.min(mod_zadc_in_lesion)
+        zadc_stats['mod_max'] = np.max(mod_zadc_in_lesion)
+        
+        # ZADC Differences
+        zadc_stats['change_mean'] = zadc_stats['mod_mean'] - zadc_stats['orig_mean']
+        zadc_stats['change_min'] = zadc_stats['mod_min'] - zadc_stats['orig_min']
+        zadc_stats['change_max'] = zadc_stats['mod_max'] - zadc_stats['orig_max']
+        
+        # ZADC Percentage changes (avoid division by zero)
+        if zadc_stats['orig_mean'] != 0:
+            zadc_stats['percent_change_mean'] = (zadc_stats['change_mean'] / np.abs(zadc_stats['orig_mean'])) * 100
+        else:
+            zadc_stats['percent_change_mean'] = float('nan')
+            
+        # ZADC Direction of change
+        if zadc_stats['change_mean'] > 0:
+            zadc_stats['direction'] = "increased"
+        elif zadc_stats['change_mean'] < 0:
+            zadc_stats['direction'] = "decreased"
+        else:
+            zadc_stats['direction'] = "unchanged"
+            
+        # Original ADC values in lesion area
+        orig_adc_in_lesion = adc_orig_data[lesion_mask]
+        adc_stats['orig_mean'] = np.mean(orig_adc_in_lesion)
+        adc_stats['orig_min'] = np.min(orig_adc_in_lesion)
+        adc_stats['orig_max'] = np.max(orig_adc_in_lesion)
+        
+        # Modified ADC values in lesion area
+        mod_adc_in_lesion = adc_modified_data[lesion_mask]
+        adc_stats['mod_mean'] = np.mean(mod_adc_in_lesion)
+        adc_stats['mod_min'] = np.min(mod_adc_in_lesion)
+        adc_stats['mod_max'] = np.max(mod_adc_in_lesion)
+        
+        # ADC Differences
+        adc_stats['change_mean'] = adc_stats['mod_mean'] - adc_stats['orig_mean']
+        adc_stats['change_min'] = adc_stats['mod_min'] - adc_stats['orig_min'] 
+        adc_stats['change_max'] = adc_stats['mod_max'] - adc_stats['orig_max']
+        
+        # ADC Percentage changes (avoid division by zero)
+        if adc_stats['orig_mean'] != 0:
+            adc_stats['percent_change_mean'] = (adc_stats['change_mean'] / np.abs(adc_stats['orig_mean'])) * 100
+        else:
+            adc_stats['percent_change_mean'] = float('nan')
+            
+        # ADC Direction of change
+        if adc_stats['change_mean'] > 0:
+            adc_stats['direction'] = "increased"
+        elif adc_stats['change_mean'] < 0:
+            adc_stats['direction'] = "decreased"
+        else:
+            adc_stats['direction'] = "unchanged"
+    
     # Create a more comprehensive figure with 3x2 subplots
     plt.figure(figsize=(18, 12))
     
@@ -312,15 +379,25 @@ def create_enhanced_visualization(orig_zadc_data, modified_zadc_data, adc_orig_d
     plt.title('ZADC Difference with Lesion Contour')
     plt.colorbar()
     
-    # Add some statistical information
+    # Add detailed statistical information
     if np.any(lesion_mask):
-        zadc_change_mean = np.mean(zadc_diff[lesion_mask])
-        zadc_change_max = np.max(np.abs(zadc_diff[lesion_mask]))
-        plt.figtext(0.5, 0.01, 
-                   f"Lesion area: {np.sum(lesion_mask)} voxels\n"
-                   f"Mean ZADC change: {zadc_change_mean:.4f}\n"
-                   f"Max ZADC change magnitude: {zadc_change_max:.4f}",
-                   ha="center", fontsize=12, bbox={"facecolor":"orange", "alpha":0.2, "pad":5})
+        # Format detailed statistics
+        stats_text = (
+            f"Lesion area: {np.sum(lesion_mask)} voxels\n\n"
+            f"ADC values in lesion region:\n"
+            f"  Original: mean={adc_stats['orig_mean']:.2f}, min={adc_stats['orig_min']:.2f}, max={adc_stats['orig_max']:.2f}\n"
+            f"  Modified: mean={adc_stats['mod_mean']:.2f}, min={adc_stats['mod_min']:.2f}, max={adc_stats['mod_max']:.2f}\n"
+            f"  Change: mean={adc_stats['change_mean']:.2f} ({adc_stats['percent_change_mean']:.2f}%)\n"
+            f"  ADC has {adc_stats['direction']} in the lesion region\n\n"
+            f"ZADC values in lesion region:\n"
+            f"  Original: mean={zadc_stats['orig_mean']:.4f}, min={zadc_stats['orig_min']:.4f}, max={zadc_stats['orig_max']:.4f}\n"
+            f"  Modified: mean={zadc_stats['mod_mean']:.4f}, min={zadc_stats['mod_min']:.4f}, max={zadc_stats['mod_max']:.4f}\n"
+            f"  Change: mean={zadc_stats['change_mean']:.4f} ({zadc_stats['percent_change_mean']:.2f}%)\n"
+            f"  ZADC has {zadc_stats['direction']} in the lesion region"
+        )
+        
+        plt.figtext(0.5, 0.01, stats_text,
+                   ha="center", fontsize=11, bbox={"facecolor":"orange", "alpha":0.2, "pad":5})
     
     # Save visualization
     viz_path = os.path.join(viz_dir, f"{patient_id}-{lesion_info}-ZADC_detailed_viz.png")
@@ -368,6 +445,34 @@ def create_enhanced_visualization(orig_zadc_data, modified_zadc_data, adc_orig_d
         plt.close()
         
         print(f"Multi-slice visualization saved to {multi_viz_path}")
+        
+        # Also save the statistics to a text file for reference
+        if np.any(lesion_mask):
+            stats_path = os.path.join(viz_dir, f"{patient_id}-{lesion_info}-ZADC_stats.txt")
+            with open(stats_path, 'w') as f:
+                f.write(f"Statistics for {patient_id} with lesion {lesion_info}\n")
+                f.write(f"=====================================================\n\n")
+                f.write(f"Lesion size: {np.sum(lesion_mask)} voxels\n\n")
+                
+                f.write(f"ADC values in lesion region:\n")
+                f.write(f"  Original: mean={adc_stats['orig_mean']:.2f}, min={adc_stats['orig_min']:.2f}, max={adc_stats['orig_max']:.2f}\n")
+                f.write(f"  Modified: mean={adc_stats['mod_mean']:.2f}, min={adc_stats['mod_min']:.2f}, max={adc_stats['mod_max']:.2f}\n\n")
+                f.write(f"ADC changes in lesion region:\n")
+                f.write(f"  Mean change: {adc_stats['change_mean']:.2f} ({adc_stats['percent_change_mean']:.2f}%)\n")
+                f.write(f"  Min change: {adc_stats['change_min']:.2f}\n")
+                f.write(f"  Max change: {adc_stats['change_max']:.2f}\n")
+                f.write(f"  Summary: ADC has {adc_stats['direction']} in the lesion region\n\n")
+                
+                f.write(f"ZADC values in lesion region:\n")
+                f.write(f"  Original: mean={zadc_stats['orig_mean']:.4f}, min={zadc_stats['orig_min']:.4f}, max={zadc_stats['orig_max']:.4f}\n")
+                f.write(f"  Modified: mean={zadc_stats['mod_mean']:.4f}, min={zadc_stats['mod_min']:.4f}, max={zadc_stats['mod_max']:.4f}\n\n")
+                f.write(f"ZADC changes in lesion region:\n")
+                f.write(f"  Mean change: {zadc_stats['change_mean']:.4f} ({zadc_stats['percent_change_mean']:.2f}%)\n")
+                f.write(f"  Min change: {zadc_stats['change_min']:.4f}\n")
+                f.write(f"  Max change: {zadc_stats['change_max']:.4f}\n")
+                f.write(f"  Summary: ZADC has {zadc_stats['direction']} in the lesion region\n")
+            
+            print(f"Statistics saved to {stats_path}")
 
 
 def process_dataset(orig_zadc_dir, orig_adc_dir, modified_adc_dir, output_dir, 
