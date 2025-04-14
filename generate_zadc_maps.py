@@ -196,7 +196,7 @@ def precompute_lesion_statistics(lesions_dir, norm_atlas_path, stdev_atlas_path)
 
 
 def generate_modified_zadc(zadc_orig_data, adc_orig_data, adc_modified_data, 
-                          lesion_mean_norm, lesion_mean_stdev, sigma_scaling=1.0):
+                          lesion_mean_norm, lesion_mean_stdev, sigma_scaling=1.0, provided_lesion_mask=None):
     """
     Generate modified ZADC map based on original ZADC, original ADC, and modified ADC
     
@@ -207,12 +207,19 @@ def generate_modified_zadc(zadc_orig_data, adc_orig_data, adc_modified_data,
         lesion_mean_norm: Mean ADC value from normative atlas for this lesion
         lesion_mean_stdev: Standard deviation from normative atlas for this lesion
         sigma_scaling: Optional scaling factor for standard deviation (default: 1.0)
+        provided_lesion_mask: Optional pre-computed lesion mask (default: None, will compute from difference)
     
     Returns:
         Modified ZADC map and lesion mask
     """
-    # Create a mask of where changes were made (where ADC values differ)
-    lesion_mask = get_lesion_mask(adc_orig_data, adc_modified_data)
+    # Use provided lesion mask or create one from the ADC difference
+    if provided_lesion_mask is not None:
+        lesion_mask = provided_lesion_mask
+        print(f"Using provided lesion mask with {np.sum(lesion_mask)} voxels")
+    else:
+        # Create a mask of where changes were made (where ADC values differ)
+        lesion_mask = get_lesion_mask(adc_orig_data, adc_modified_data)
+        print(f"Computed difference-based lesion mask with {np.sum(lesion_mask)} voxels")
     
     # Initialize the modified ZADC data as a copy of the original
     zadc_modified_data = zadc_orig_data.copy()
@@ -617,7 +624,7 @@ def create_enhanced_visualization(orig_zadc_data, modified_zadc_data, adc_orig_d
 
 
 def process_dataset(orig_zadc_dir, orig_adc_dir, modified_adc_dir, output_dir, 
-                  lesion_stats, default_sigma_scaling=1.0, visualize_all=False):
+                  lesion_stats, registered_lesions_dir=None, default_sigma_scaling=1.0, visualize_all=False):
     """
     Process the dataset by generating modified ZADC maps
     
@@ -627,6 +634,7 @@ def process_dataset(orig_zadc_dir, orig_adc_dir, modified_adc_dir, output_dir,
         modified_adc_dir: Directory containing modified ADC maps with synthetic lesions
         output_dir: Directory to save the modified ZADC maps
         lesion_stats: Dictionary with precomputed lesion statistics
+        registered_lesions_dir: Directory containing registered lesion masks (organized by patient)
         default_sigma_scaling: Default scaling factor for standard deviation (default: 1.0)
         visualize_all: Whether to create visualizations for all processed files
     """
@@ -725,6 +733,58 @@ def process_dataset(orig_zadc_dir, orig_adc_dir, modified_adc_dir, output_dir,
                 error_count += 1
                 continue
             
+            # Load the registered lesion mask instead of computing from the difference
+            lesion_mask = None
+            
+            if registered_lesions_dir:
+                # Construct path to registered lesion mask
+                patient_lesion_dir = os.path.join(registered_lesions_dir, patient_id)
+                
+                if os.path.exists(patient_lesion_dir):
+                    # We should find a file named "registered_lesion_sampleXXX.mha"
+                    if lesion_name:
+                        registered_lesion_file = f"registered_{lesion_name}.mha"
+                        registered_lesion_path = os.path.join(patient_lesion_dir, registered_lesion_file)
+                        
+                        if os.path.exists(registered_lesion_path):
+                            print(f"Using registered lesion mask: {registered_lesion_path}")
+                            registered_lesion_data, _ = load_mha_file(registered_lesion_path)
+                            
+                            # Create binary mask
+                            lesion_mask = registered_lesion_data > 0
+                            
+                            # Verify the mask has the same dimensions
+                            if lesion_mask.shape != orig_adc_data.shape:
+                                print(f"Warning: Registered lesion mask dimensions {lesion_mask.shape} "
+                                      f"don't match ADC dimensions {orig_adc_data.shape}")
+                                
+                                if lesion_mask.shape[0] == 1 and lesion_mask.shape[1:] == orig_adc_data.shape[1:]:
+                                    # Special case: if the mask is 2D but ADC is 3D with matching x,y dimensions
+                                    # Find the axial slice with the maximum difference to determine where to place the 2D mask
+                                    diff = np.abs(orig_adc_data - modified_adc_data)
+                                    best_slice = np.argmax(np.sum(np.sum(diff, axis=1), axis=1))
+                                    
+                                    print(f"Detected 2D mask, placing at axial slice {best_slice}")
+                                    
+                                    # Create 3D mask with the 2D mask at the best slice
+                                    full_mask = np.zeros_like(orig_adc_data, dtype=bool)
+                                    full_mask[best_slice, :, :] = lesion_mask[0, :, :]
+                                    lesion_mask = full_mask
+                                else:
+                                    print("Cannot use registered mask due to dimension mismatch, falling back to difference method")
+                                    lesion_mask = None
+                        else:
+                            print(f"Registered lesion mask not found: {registered_lesion_path}")
+                    else:
+                        print(f"Could not determine lesion name from filename: {modified_adc_file}")
+                else:
+                    print(f"Patient directory not found in registered lesions: {patient_lesion_dir}")
+            
+            # If no registered mask was loaded, fall back to calculating from difference
+            if lesion_mask is None:
+                print("Using difference-based lesion mask")
+                lesion_mask = get_lesion_mask(orig_adc_data, modified_adc_data)
+            
             # Get lesion statistics from precomputed values
             # These are needed for proper Z-score calculation
             if lesion_name and lesion_name in lesion_stats:
@@ -741,9 +801,6 @@ def process_dataset(orig_zadc_dir, orig_adc_dir, modified_adc_dir, output_dir,
                 # If we don't have precomputed stats, use global estimate
                 # This is less accurate but allows processing to continue
                 print(f"No precomputed statistics for lesion {lesion_name}, using global estimates...")
-                
-                # Create a lesion mask to check values
-                lesion_mask = get_lesion_mask(orig_adc_data, modified_adc_data)
                 
                 # Use healthy tissue around the lesion as reference
                 # First create a dilated mask
@@ -769,7 +826,8 @@ def process_dataset(orig_zadc_dir, orig_adc_dir, modified_adc_dir, output_dir,
                 modified_adc_data,
                 lesion_mean_norm,
                 lesion_mean_stdev,
-                sigma_scaling
+                sigma_scaling,
+                lesion_mask
             )
             
             # Save the modified ZADC map
@@ -778,11 +836,11 @@ def process_dataset(orig_zadc_dir, orig_adc_dir, modified_adc_dir, output_dir,
             
             # Create visualizations
             if processed_count <= 5 or visualize_all:
-                # Find a slice with changes
-                diff = np.abs(orig_adc_data - modified_adc_data)
-                if np.any(diff > 0):
-                    # Find the slice with maximum difference (now searching in correct dimension for axial view)
-                    slice_idx = np.argmax(np.sum(np.sum(diff, axis=1), axis=1))
+                # Find a slice with lesions
+                if np.any(lesion_mask):
+                    # Find the slice with the largest lesion area
+                    lesion_areas = np.sum(np.sum(lesion_mask, axis=2), axis=1)
+                    slice_idx = np.argmax(lesion_areas)
                     
                     # Create enhanced visualization
                     create_enhanced_visualization(
@@ -827,6 +885,8 @@ def main():
                         help='Directory to save the modified ZADC maps')
     parser.add_argument('--lesions_dir', type=str, default=None,
                         help='Directory containing standardized lesion files (required for precomputing statistics)')
+    parser.add_argument('--registered_lesions_dir', type=str, default=None,
+                        help='Directory containing registered lesion masks organized by patient')
     parser.add_argument('--norm_atlas', type=str, default=None,
                         help='Path to normative atlas (.nii file) (required for precomputing statistics)')
     parser.add_argument('--stdev_atlas', type=str, default=None,
@@ -857,6 +917,7 @@ def main():
         args.modified_adc_dir,
         args.output_dir,
         lesion_stats,
+        args.registered_lesions_dir,
         args.sigma_scaling,
         args.visualize_all
     )
