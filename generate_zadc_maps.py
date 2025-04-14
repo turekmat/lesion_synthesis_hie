@@ -256,49 +256,56 @@ def create_enhanced_visualization(orig_zadc_data, modified_zadc_data, adc_orig_d
     zadc_diff = modified_zadc_data - orig_zadc_data
     adc_diff = adc_modified_data - adc_orig_data
     
+    # Transpose data to get axial view
+    # SimpleITK/nibabel data is in format [z, y, x] where:
+    # - z is the number of slices (axial direction)
+    # - y is the height of each slice
+    # - x is the width of each slice
+    # For axial view, we want to visualize the data as looking at the [y, x] plane
+    
     # Create a more comprehensive figure with 3x2 subplots
     plt.figure(figsize=(18, 12))
     
     # Row 1: ADC maps
     # Original ADC
     plt.subplot(231)
-    plt.imshow(adc_orig_data[:, :, slice_idx], cmap='gray')
-    plt.title(f'Original ADC (Slice {slice_idx})')
+    plt.imshow(adc_orig_data[slice_idx, :, :], cmap='gray', origin='lower')
+    plt.title(f'Original ADC (Axial Slice {slice_idx})')
     plt.colorbar()
     
     # Modified ADC
     plt.subplot(232)
-    plt.imshow(adc_modified_data[:, :, slice_idx], cmap='gray')
-    plt.title(f'Modified ADC (Slice {slice_idx})')
+    plt.imshow(adc_modified_data[slice_idx, :, :], cmap='gray', origin='lower')
+    plt.title(f'Modified ADC (Axial Slice {slice_idx})')
     plt.colorbar()
     
     # ADC Difference
     plt.subplot(233)
-    plt.imshow(adc_diff[:, :, slice_idx], cmap='hot')
+    plt.imshow(adc_diff[slice_idx, :, :], cmap='hot', origin='lower')
     plt.title('ADC Difference')
     plt.colorbar()
     
     # Row 2: ZADC maps
     # Original ZADC
     plt.subplot(234)
-    plt.imshow(orig_zadc_data[:, :, slice_idx], cmap='gray')
+    plt.imshow(orig_zadc_data[slice_idx, :, :], cmap='gray', origin='lower')
     plt.title('Original ZADC')
     plt.colorbar()
     
     # Modified ZADC
     plt.subplot(235)
-    plt.imshow(modified_zadc_data[:, :, slice_idx], cmap='gray')
+    plt.imshow(modified_zadc_data[slice_idx, :, :], cmap='gray', origin='lower')
     plt.title('Modified ZADC')
     plt.colorbar()
     
     # ZADC Difference with lesion contour
     plt.subplot(236)
-    plt.imshow(zadc_diff[:, :, slice_idx], cmap='hot')
+    plt.imshow(zadc_diff[slice_idx, :, :], cmap='hot', origin='lower')
     
     # Add lesion contour
-    if np.any(lesion_mask[:, :, slice_idx]):
+    if np.any(lesion_mask[slice_idx, :, :]):
         from skimage import measure
-        contours = measure.find_contours(lesion_mask[:, :, slice_idx].astype(float), 0.5)
+        contours = measure.find_contours(lesion_mask[slice_idx, :, :].astype(float), 0.5)
         for contour in contours:
             plt.plot(contour[:, 1], contour[:, 0], 'g-', linewidth=2)
     
@@ -325,7 +332,7 @@ def create_enhanced_visualization(orig_zadc_data, modified_zadc_data, adc_orig_d
     
     # Create a 3D visualization of changes across multiple slices
     # Find slices with lesion
-    lesion_slice_indices = np.where(np.any(np.any(lesion_mask, axis=0), axis=0))[0]
+    lesion_slice_indices = np.where(np.any(np.any(lesion_mask, axis=1), axis=1))[0]
     
     if len(lesion_slice_indices) > 0:
         # Take up to 4 slices through the lesion
@@ -338,21 +345,21 @@ def create_enhanced_visualization(orig_zadc_data, modified_zadc_data, adc_orig_d
         for i, slice_i in enumerate(selected_slices):
             # ZADC difference
             plt.subplot(len(selected_slices), 3, 3*i + 1)
-            plt.imshow(zadc_diff[:, :, slice_i], cmap='hot', vmin=-2, vmax=2)
-            plt.title(f'ZADC Diff (Slice {slice_i})')
+            plt.imshow(zadc_diff[slice_i, :, :], cmap='hot', vmin=-2, vmax=2, origin='lower')
+            plt.title(f'ZADC Diff (Axial Slice {slice_i})')
             plt.colorbar()
             
             # ADC difference
             plt.subplot(len(selected_slices), 3, 3*i + 2)
-            plt.imshow(adc_diff[:, :, slice_i], cmap='hot')
-            plt.title(f'ADC Diff (Slice {slice_i})')
+            plt.imshow(adc_diff[slice_i, :, :], cmap='hot', origin='lower')
+            plt.title(f'ADC Diff (Axial Slice {slice_i})')
             plt.colorbar()
             
             # Lesion mask
             plt.subplot(len(selected_slices), 3, 3*i + 3)
-            plt.imshow(adc_orig_data[:, :, slice_i], cmap='gray')
-            plt.imshow(lesion_mask[:, :, slice_i], cmap='Reds', alpha=0.5)
-            plt.title(f'Lesion Mask (Slice {slice_i})')
+            plt.imshow(adc_orig_data[slice_i, :, :], cmap='gray', origin='lower')
+            plt.imshow(lesion_mask[slice_i, :, :], cmap='Reds', alpha=0.5, origin='lower')
+            plt.title(f'Lesion Mask (Axial Slice {slice_i})')
         
         # Save multi-slice visualization
         multi_viz_path = os.path.join(viz_dir, f"{patient_id}-{lesion_info}-ZADC_multi_slice_viz.png")
@@ -502,8 +509,8 @@ def process_dataset(orig_zadc_dir, orig_adc_dir, modified_adc_dir, output_dir,
                 # Find a slice with changes
                 diff = np.abs(orig_adc_data - modified_adc_data)
                 if np.any(diff > 0):
-                    # Find the slice with maximum difference
-                    slice_idx = np.argmax(np.sum(np.sum(diff, axis=0), axis=0))
+                    # Find the slice with maximum difference (now searching in correct dimension for axial view)
+                    slice_idx = np.argmax(np.sum(np.sum(diff, axis=1), axis=1))
                     
                     # Create enhanced visualization
                     create_enhanced_visualization(
