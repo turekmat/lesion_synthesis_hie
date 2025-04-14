@@ -214,12 +214,19 @@ def generate_modified_zadc(zadc_orig_data, adc_orig_data, adc_modified_data,
     """
     # Use provided lesion mask or create one from the ADC difference
     if provided_lesion_mask is not None:
-        lesion_mask = provided_lesion_mask
-        print(f"Using provided lesion mask with {np.sum(lesion_mask)} voxels")
+        original_lesion_mask = provided_lesion_mask.copy()
+        print(f"Using provided lesion mask with {np.sum(original_lesion_mask)} voxels")
     else:
         # Create a mask of where changes were made (where ADC values differ)
-        lesion_mask = get_lesion_mask(adc_orig_data, adc_modified_data)
-        print(f"Computed difference-based lesion mask with {np.sum(lesion_mask)} voxels")
+        original_lesion_mask = get_lesion_mask(adc_orig_data, adc_modified_data)
+        print(f"Computed difference-based lesion mask with {np.sum(original_lesion_mask)} voxels")
+    
+    # Simply dilate the mask by 2 voxels to expand the area
+    from scipy import ndimage
+    expanded_mask = ndimage.binary_dilation(original_lesion_mask, iterations=2)
+    
+    # Use the expanded mask for all operations
+    lesion_mask = expanded_mask
     
     # Initialize the modified ZADC data as a copy of the original
     zadc_modified_data = zadc_orig_data.copy()
@@ -262,15 +269,15 @@ def generate_modified_zadc(zadc_orig_data, adc_orig_data, adc_modified_data,
             # For these voxels, ensure ZADC decreases by at least the amount of the expected change
             modified_zadc_values[inconsistent_voxels] = orig_zadc_in_lesion[inconsistent_voxels] + expected_zadc_diff[inconsistent_voxels]
         
-        # Replace ZADC values in lesion area with new Z-scores
+        # Replace ZADC values in expanded lesion area with new Z-scores
         zadc_modified_data[lesion_mask] = modified_zadc_values
         
         # Print statistics for debugging
-        print(f"Original ADC in lesion - Mean: {np.mean(orig_adc_in_lesion):.2f}")
-        print(f"Modified ADC in lesion - Mean: {np.mean(modified_adc_values):.2f}")
+        print(f"Original ADC in expanded lesion - Mean: {np.mean(orig_adc_in_lesion):.2f}")
+        print(f"Modified ADC in expanded lesion - Mean: {np.mean(modified_adc_values):.2f}")
         print(f"ADC difference - Mean: {np.mean(adc_diff):.2f}")
-        print(f"Original ZADC in lesion - Mean: {np.mean(orig_zadc_in_lesion):.4f}")
-        print(f"Modified ZADC in lesion - Mean: {np.mean(modified_zadc_values):.4f}")
+        print(f"Original ZADC in expanded lesion - Mean: {np.mean(orig_zadc_in_lesion):.4f}")
+        print(f"Modified ZADC in expanded lesion - Mean: {np.mean(modified_zadc_values):.4f}")
         print(f"ZADC difference - Mean: {np.mean(modified_zadc_values - orig_zadc_in_lesion):.4f}")
         print(f"Normative atlas - Mean: {lesion_mean_norm:.2f}, StDev: {lesion_mean_stdev:.2f}")
         
@@ -282,8 +289,9 @@ def generate_modified_zadc(zadc_orig_data, adc_orig_data, adc_modified_data,
         zadc_decreased = modified_zadc_values < orig_zadc_in_lesion
         percent_zadc_decreased = (np.sum(zadc_decreased) / zadc_decreased.size) * 100
         
-        print(f"ADC decreased in {percent_adc_decreased:.2f}% of lesion voxels")
-        print(f"ZADC decreased in {percent_zadc_decreased:.2f}% of lesion voxels")
+        print(f"ADC decreased in {percent_adc_decreased:.2f}% of expanded lesion voxels")
+        print(f"ZADC decreased in {percent_zadc_decreased:.2f}% of expanded lesion voxels")
+        print(f"Expanded lesion mask from {np.sum(original_lesion_mask)} to {np.sum(lesion_mask)} voxels")
     
     return zadc_modified_data, lesion_mask
 
