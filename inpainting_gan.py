@@ -1870,6 +1870,7 @@ def train(args):
         val_lesion_ssim = 0.0
         val_lesion_dice = 0.0
         val_lesion_perceptual = 0.0
+        val_lesion_mae_output_ph = 0.0  # Add new metric for output vs pseudo-healthy
         val_examples = 0
         
         with torch.no_grad():
@@ -1946,6 +1947,7 @@ def train(args):
                     
                     # Collect metrics for this batch
                     batch_mae = 0.0
+                    batch_mae_output_ph = 0.0  # Add new metric
                     batch_ssim = 0.0
                     batch_dice = 0.0
                     batch_focal = 0.0
@@ -2004,8 +2006,18 @@ def train(args):
                                 # Apply scaling if original range is provided
                                 if adc_orig_range is not None:
                                     mae_patch = mae_patch * (adc_orig_range[1] - adc_orig_range[0])
+                                
+                                # Calculate MAE between output and pseudo-healthy in the lesion area
+                                masked_ph = ph_patch * binary_mask
+                                abs_diff_ph = torch.abs(masked_pred - masked_ph)
+                                mae_patch_output_ph = abs_diff_ph.sum() / lesion_voxels  # Average only over lesion voxels
+                                
+                                # Apply scaling if original range is provided
+                                if adc_orig_range is not None:
+                                    mae_patch_output_ph = mae_patch_output_ph * (adc_orig_range[1] - adc_orig_range[0])
                             else:
                                 mae_patch = torch.tensor(0.0, device=device)
+                                mae_patch_output_ph = torch.tensor(0.0, device=device)
                             
                             # Pro SSIM metriku - pouze pro zpětnou kompatibilitu
                             if binary_mask.sum() > 0:
@@ -2101,6 +2113,7 @@ def train(args):
                             # Add metrics to batch totals
                             # Always add MAE regardless of loss type for validation (for comparison)
                             batch_mae += mae_patch.item()
+                            batch_mae_output_ph += mae_patch_output_ph.item()  # Add new metric
                             batch_ssim += ssim_patch_val
                             batch_dice += dice_patch.item()
                             if loss_type in ['focal', 'combined']:
@@ -2125,6 +2138,7 @@ def train(args):
                     if num_valid_patches > 0:
                         # Always calculate average MAE for validation
                         batch_mae /= num_valid_patches
+                        batch_mae_output_ph /= num_valid_patches  # Add new metric
                         batch_ssim /= num_valid_patches
                         batch_dice /= num_valid_patches
                         if loss_type in ['focal', 'combined']:
@@ -2139,6 +2153,7 @@ def train(args):
                         # Add to validation totals
                         # Always add MAE to validation totals for comparison
                         val_lesion_mae += batch_mae 
+                        val_lesion_mae_output_ph += batch_mae_output_ph  # Add new metric
                         val_lesion_ssim += batch_ssim
                         val_lesion_dice += batch_dice
                         if loss_type in ['focal', 'combined']:
