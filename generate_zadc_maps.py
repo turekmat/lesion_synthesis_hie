@@ -458,12 +458,10 @@ def create_enhanced_visualization(orig_zadc_data, modified_zadc_data, adc_orig_d
         plt.title('Modified ZADC')
         plt.colorbar()
         
-        # Lesion Mask
+        # Binary Lesion Mask - čistá binární maska léze
         plt.subplot(236)
-        # Show a background anatomical image and overlay the lesion mask
-        plt.imshow(adc_orig_data[slice_idx, :, :], cmap='gray', origin='lower')
-        plt.imshow(lesion_mask[slice_idx, :, :], cmap='Reds', alpha=0.7, origin='lower')
-        plt.title('Lesion Mask')
+        plt.imshow(lesion_mask[slice_idx, :, :], cmap='binary', origin='lower')
+        plt.title('Binary Lesion Mask')
         
         # Add title to the entire figure
         plt.suptitle(f"{patient_id} with lesion {lesion_info} - Axial Slice {slice_idx}", fontsize=16)
@@ -528,11 +526,10 @@ def create_enhanced_visualization(orig_zadc_data, modified_zadc_data, adc_orig_d
                     plt.title(f'Modified ZADC (Axial Slice {slice_i})')
                     plt.colorbar()
                     
-                    # Lesion mask
+                    # Binary lesion mask
                     plt.subplot(len(selected_slices), 3, 3*i + 3)
-                    plt.imshow(adc_orig_data[slice_i, :, :], cmap='gray', origin='lower')
-                    plt.imshow(lesion_mask[slice_i, :, :], cmap='Reds', alpha=0.7, origin='lower')
-                    plt.title(f'Lesion Mask (Axial Slice {slice_i})')
+                    plt.imshow(lesion_mask[slice_i, :, :], cmap='binary', origin='lower')
+                    plt.title(f'Binary Lesion Mask (Axial Slice {slice_i})')
                 
                 plt.suptitle(f"Multiple slices for {patient_id} with lesion {lesion_info}", fontsize=16)
                 plt.tight_layout(rect=[0, 0, 1, 0.96])  # Adjust layout to make room for suptitle
@@ -576,12 +573,10 @@ def create_enhanced_visualization(orig_zadc_data, modified_zadc_data, adc_orig_d
     plt.title('Modified ZADC')
     plt.colorbar()
     
-    # Lesion Mask
+    # Binary Lesion Mask - čistá binární maska léze
     plt.subplot(236)
-    # Show a background anatomical image and overlay the lesion mask
-    plt.imshow(adc_orig_data[slice_idx, :, :], cmap='gray', origin='lower')
-    plt.imshow(lesion_mask[slice_idx, :, :], cmap='Reds', alpha=0.7, origin='lower')
-    plt.title('Lesion Mask')
+    plt.imshow(lesion_mask[slice_idx, :, :], cmap='binary', origin='lower')
+    plt.title('Binary Lesion Mask')
     
     # Add title to the entire figure
     plt.suptitle(f"{patient_id} with lesion {lesion_info} - Axial Slice {slice_idx}", fontsize=16)
