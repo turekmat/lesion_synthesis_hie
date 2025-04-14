@@ -6,6 +6,7 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 import nibabel as nib
 import re
+from collections import defaultdict
 
 
 def load_mha_file(file_path):
@@ -61,56 +62,104 @@ def get_lesion_mask(adc_orig_data, adc_modified_data, threshold=1.0):
     return lesion_mask
 
 
-def calculate_atlas_based_sigma(lesion_mask, norm_atlas_data, stdev_atlas_data, lesion_info):
+def extract_lesion_name_from_file(filename):
     """
-    Calculate sigma scaling factor based on atlas data for a specific lesion
+    Extract lesion name from modified ADC filename
     
     Args:
-        lesion_mask: Binary mask of the synthetic lesion
-        norm_atlas_data: Normative atlas data
-        stdev_atlas_data: Standard deviation atlas data
-        lesion_info: Information about the lesion for caching
+        filename: Modified ADC filename (e.g., MGHNICU_015-VISIT_01-registered_lesion_sample115-LESIONED_ADC.mha)
         
     Returns:
-        Sigma scaling factor for this lesion
+        Lesion name (e.g., lesion_sample115)
     """
-    # Cache for already computed sigma factors
-    if not hasattr(calculate_atlas_based_sigma, "cache"):
-        calculate_atlas_based_sigma.cache = {}
-    
-    # Check if we already computed sigma for this lesion
-    if lesion_info in calculate_atlas_based_sigma.cache:
-        return calculate_atlas_based_sigma.cache[lesion_info]
-    
-    # Extract atlas values in the lesion area
-    if np.any(lesion_mask):
-        # Get mean normative value in lesion area
-        norm_values = norm_atlas_data[lesion_mask]
-        mean_norm = np.mean(norm_values)
+    # Search for pattern "registered_<lesion_name>"
+    match = re.search(r"registered_(lesion_sample\d+)", filename)
+    if match:
+        return match.group(1)
+    else:
+        # Try to find any pattern with "lesion_sample"
+        match = re.search(r"(lesion_sample\d+)", filename)
+        if match:
+            return match.group(1)
         
-        # Get mean standard deviation in lesion area
+    # If no match, return None
+    return None
+
+
+def precompute_lesion_statistics(lesions_dir, norm_atlas_path, stdev_atlas_path):
+    """
+    Precompute statistics for all lesions using normative and standard deviation atlases
+    
+    Args:
+        lesions_dir: Directory containing lesion files
+        norm_atlas_path: Path to normative atlas
+        stdev_atlas_path: Path to standard deviation atlas
+        
+    Returns:
+        Dictionary with lesion statistics
+    """
+    print("Precomputing lesion statistics...")
+    
+    # Load atlases
+    norm_atlas_data, _ = load_nii_file(norm_atlas_path)
+    stdev_atlas_data, _ = load_nii_file(stdev_atlas_path)
+    
+    print(f"Atlas dimensions: Norm={norm_atlas_data.shape}, StDev={stdev_atlas_data.shape}")
+    
+    # Dictionary to store statistics for each lesion
+    lesion_stats = {}
+    
+    # List all lesion files
+    lesion_files = [f for f in os.listdir(lesions_dir) if f.endswith('.mha') and 'lesion_sample' in f]
+    print(f"Found {len(lesion_files)} lesion files")
+    
+    for lesion_file in lesion_files:
+        lesion_name = lesion_file.replace(".mha", "")
+        lesion_path = os.path.join(lesions_dir, lesion_file)
+        
+        # Load lesion mask
+        lesion_data, _ = load_mha_file(lesion_path)
+        
+        # Create binary mask
+        lesion_mask = lesion_data > 0
+        
+        # Skip if lesion mask is empty
+        if not np.any(lesion_mask):
+            print(f"Warning: Empty lesion mask for {lesion_name}, skipping")
+            continue
+        
+        # Check if dimensions match atlas
+        if lesion_mask.shape != norm_atlas_data.shape:
+            print(f"Warning: Lesion {lesion_name} dimensions {lesion_mask.shape} don't match atlas dimensions {norm_atlas_data.shape}, skipping")
+            continue
+        
+        # Extract values from atlases
+        norm_values = norm_atlas_data[lesion_mask]
         stdev_values = stdev_atlas_data[lesion_mask]
+        
+        # Calculate statistics
+        mean_norm = np.mean(norm_values)
         mean_stdev = np.mean(stdev_values)
         
-        # Calculate reasonable sigma scaling
-        # For ADC to ZADC scaling, we need a small factor
-        # Using mean_stdev as a base and applying a scaling
-        # The 0.05 factor can be adjusted based on desired effect
+        # Calculate sigma scaling factor
         sigma_scaling = (mean_stdev / mean_norm) * 0.05
         
-        print(f"Lesion {lesion_info}: Mean norm={mean_norm:.2f}, Mean stdev={mean_stdev:.2f}, Sigma scaling={sigma_scaling:.4f}")
-    else:
-        # Default value if no lesion mask
-        sigma_scaling = 0.01
-        print(f"Warning: No lesion mask for {lesion_info}, using default sigma_scaling={sigma_scaling}")
+        # Store statistics
+        lesion_stats[lesion_name] = {
+            'mean_norm': mean_norm,
+            'mean_stdev': mean_stdev,
+            'sigma_scaling': sigma_scaling,
+            'voxel_count': np.sum(lesion_mask)
+        }
+        
+        print(f"Lesion {lesion_name}: Mean norm={mean_norm:.2f}, Mean stdev={mean_stdev:.2f}, "
+              f"Sigma scaling={sigma_scaling:.4f}, Voxels={lesion_stats[lesion_name]['voxel_count']}")
     
-    # Cache the result
-    calculate_atlas_based_sigma.cache[lesion_info] = sigma_scaling
-    
-    return sigma_scaling
+    print(f"Processed {len(lesion_stats)} lesions with valid statistics")
+    return lesion_stats
 
 
-def generate_modified_zadc(zadc_orig_data, adc_orig_data, adc_modified_data, norm_atlas_data=None, stdev_atlas_data=None, lesion_info=None, sigma_scaling=0.01):
+def generate_modified_zadc(zadc_orig_data, adc_orig_data, adc_modified_data, sigma_scaling=0.01):
     """
     Generate modified ZADC map based on original ZADC, original ADC, and modified ADC
     
@@ -118,26 +167,13 @@ def generate_modified_zadc(zadc_orig_data, adc_orig_data, adc_modified_data, nor
         zadc_orig_data: Original ZADC map
         adc_orig_data: Original ADC map
         adc_modified_data: Modified ADC map with synthetic lesions
-        norm_atlas_data: Normative atlas data (optional)
-        stdev_atlas_data: Standard deviation atlas data (optional)
-        lesion_info: Information about the lesion for caching
-        sigma_scaling: Scaling factor for normalization (used only if atlases are not provided)
+        sigma_scaling: Scaling factor for normalization
     
     Returns:
         Modified ZADC map and lesion mask
     """
     # Create a mask of where changes were made (where ADC values differ)
     lesion_mask = get_lesion_mask(adc_orig_data, adc_modified_data)
-    
-    # Calculate the sigma scaling factor
-    if norm_atlas_data is not None and stdev_atlas_data is not None and lesion_info is not None:
-        # Calculate sigma scaling from atlases
-        sigma_scaling = calculate_atlas_based_sigma(
-            lesion_mask,
-            norm_atlas_data,
-            stdev_atlas_data,
-            lesion_info
-        )
     
     # Calculate the normalization factor sigma for the changed regions
     sigma = np.zeros_like(adc_orig_data, dtype=np.float32)
@@ -328,8 +364,7 @@ def create_enhanced_visualization(orig_zadc_data, modified_zadc_data, adc_orig_d
 
 
 def process_dataset(orig_zadc_dir, orig_adc_dir, modified_adc_dir, output_dir, 
-                  norm_atlas_path=None, stdev_atlas_path=None, sigma_scaling=0.01,
-                  visualize_all=False):
+                  lesion_stats, default_sigma_scaling=0.01, visualize_all=False):
     """
     Process the dataset by generating modified ZADC maps
     
@@ -338,27 +373,12 @@ def process_dataset(orig_zadc_dir, orig_adc_dir, modified_adc_dir, output_dir,
         orig_adc_dir: Directory containing original ADC maps
         modified_adc_dir: Directory containing modified ADC maps with synthetic lesions
         output_dir: Directory to save the modified ZADC maps
-        norm_atlas_path: Path to normative atlas (optional)
-        stdev_atlas_path: Path to standard deviation atlas (optional)
-        sigma_scaling: Scaling factor for normalization (used only if atlases are not provided)
-        visualize_all: Whether to create visualizations for all processed files (default: False)
+        lesion_stats: Dictionary with precomputed lesion statistics
+        default_sigma_scaling: Default scaling factor if lesion stats not found
+        visualize_all: Whether to create visualizations for all processed files
     """
     # Create output directory
     os.makedirs(output_dir, exist_ok=True)
-    
-    # Load atlases if provided
-    norm_atlas_data = None
-    stdev_atlas_data = None
-    
-    if norm_atlas_path and stdev_atlas_path:
-        try:
-            norm_atlas_data, _ = load_nii_file(norm_atlas_path)
-            stdev_atlas_data, _ = load_nii_file(stdev_atlas_path)
-            print(f"Successfully loaded atlases: {norm_atlas_path} and {stdev_atlas_path}")
-            print(f"Atlas dimensions: Norm={norm_atlas_data.shape}, StDev={stdev_atlas_data.shape}")
-        except Exception as e:
-            print(f"Error loading atlases: {e}")
-            print("Will proceed with default sigma scaling")
     
     # List all modified ADC files
     modified_adc_files = [f for f in os.listdir(modified_adc_dir) if f.endswith('-LESIONED_ADC.mha')]
@@ -371,122 +391,148 @@ def process_dataset(orig_zadc_dir, orig_adc_dir, modified_adc_dir, output_dir,
             print(f"Found {len(existing_files)} existing processed files in {output_dir}")
             print("Will skip already processed files")
     
+    # Count lesions used
+    lesion_usage = defaultdict(int)
+    
     # Process each modified ADC file
     processed_count = 0
     skipped_count = 0
+    error_count = 0
     
     for modified_adc_file in tqdm(modified_adc_files):
-        # Extract patient and lesion info from filename
-        # Expected format: PATIENT_ID-VISIT_ID-LESION_ID-LESIONED_ADC.mha or PATIENT_ID-LESION_ID-LESIONED_ADC.mha
-        parts = modified_adc_file.split('-')
-        
-        # Identify the lesion part by finding "LESIONED_ADC.mha" at the end
-        lesion_end_idx = -1  # This is the index of "LESIONED_ADC.mha"
-        
-        # Reconstruct patient_id which might include visit information
-        # We need to determine where patient/visit info ends and lesion info begins
-        # Typically, for MGHNICU_010-VISIT_01-lesion-LESIONED_ADC.mha:
-        # - patient_id should be "MGHNICU_010-VISIT_01"
-        # - lesion_info should be "lesion"
-        
-        # Check how many parts we have
-        if len(parts) > 3:  # We have PATIENT-VISIT-LESION-LESIONED_ADC
-            # First two parts are patient_id (includes visit)
-            patient_id = f"{parts[0]}-{parts[1]}"
-            # Everything between patient_id and "LESIONED_ADC" is the lesion info
-            lesion_info = '-'.join(parts[2:lesion_end_idx])
-        else:  # We have PATIENT-LESION-LESIONED_ADC
-            patient_id = parts[0]
-            lesion_info = '-'.join(parts[1:lesion_end_idx])
-        
-        # Print for debugging
-        print(f"Parsed file: {modified_adc_file}")
-        print(f"  Patient ID: {patient_id}")
-        print(f"  Lesion Info: {lesion_info}")
-        
-        # Construct output filename
-        output_filename = f"{patient_id}-{lesion_info}-LESIONED_ZADC.mha"
-        output_path = os.path.join(output_dir, output_filename)
-        
-        # Skip if output file already exists
-        if output_filename in existing_files:
-            print(f"Skipping {output_filename} - already processed")
-            skipped_count += 1
+        try:
+            # Extract patient and lesion info from filename
+            parts = modified_adc_file.split('-')
+            
+            # Identify the lesion part by finding "LESIONED_ADC.mha" at the end
+            lesion_end_idx = -1  # This is the index of "LESIONED_ADC.mha"
+            
+            # Check how many parts we have
+            if len(parts) > 3:  # We have PATIENT-VISIT-LESION-LESIONED_ADC
+                # First two parts are patient_id (includes visit)
+                patient_id = f"{parts[0]}-{parts[1]}"
+                # Everything between patient_id and "LESIONED_ADC" is the lesion info
+                lesion_info = '-'.join(parts[2:lesion_end_idx])
+            else:  # We have PATIENT-LESION-LESIONED_ADC
+                patient_id = parts[0]
+                lesion_info = '-'.join(parts[1:lesion_end_idx])
+            
+            # Extract lesion name from filename
+            lesion_name = extract_lesion_name_from_file(modified_adc_file)
+            
+            # Print for debugging (reduce verbosity for large datasets)
+            if processed_count < 5 or processed_count % 50 == 0:
+                print(f"Parsed file: {modified_adc_file}")
+                print(f"  Patient ID: {patient_id}")
+                print(f"  Lesion Info: {lesion_info}")
+                print(f"  Extracted Lesion Name: {lesion_name}")
+            
+            # Construct output filename
+            output_filename = f"{patient_id}-{lesion_info}-LESIONED_ZADC.mha"
+            output_path = os.path.join(output_dir, output_filename)
+            
+            # Skip if output file already exists
+            if output_filename in existing_files:
+                if processed_count < 5 or processed_count % 50 == 0:
+                    print(f"Skipping {output_filename} - already processed")
+                skipped_count += 1
+                continue
+            
+            # Construct original ADC filename - should match the pattern MGHNICU_010-VISIT_01-ADC_ss.mha
+            orig_adc_file = f"{patient_id}-ADC_ss.mha"
+            orig_adc_path = os.path.join(orig_adc_dir, orig_adc_file)
+            
+            # Find matching ZADC file (they have different naming convention)
+            orig_zadc_path = find_matching_zadc_file(patient_id, orig_zadc_dir)
+            
+            modified_adc_path = os.path.join(modified_adc_dir, modified_adc_file)
+            
+            # Check if all required files exist
+            if not os.path.exists(orig_adc_path):
+                print(f"Warning: Original ADC file not found: {orig_adc_path}")
+                error_count += 1
+                continue
+            
+            if not orig_zadc_path or not os.path.exists(orig_zadc_path):
+                print(f"Warning: Original ZADC file not found for patient {patient_id}")
+                error_count += 1
+                continue
+            
+            # Load data
+            orig_adc_data, orig_adc_img = load_mha_file(orig_adc_path)
+            orig_zadc_data, orig_zadc_img = load_mha_file(orig_zadc_path)
+            modified_adc_data, _ = load_mha_file(modified_adc_path)
+            
+            # Check dimensions
+            if orig_adc_data.shape != orig_zadc_data.shape or orig_adc_data.shape != modified_adc_data.shape:
+                print(f"Warning: Dimension mismatch for {patient_id}. Skipping.")
+                print(f"  Original ADC shape: {orig_adc_data.shape}")
+                print(f"  Original ZADC shape: {orig_zadc_data.shape}")
+                print(f"  Modified ADC shape: {modified_adc_data.shape}")
+                error_count += 1
+                continue
+            
+            # Get sigma scaling factor for this lesion
+            if lesion_name and lesion_name in lesion_stats:
+                sigma_scaling = lesion_stats[lesion_name]['sigma_scaling']
+                lesion_usage[lesion_name] += 1
+                if processed_count < 5 or processed_count % 50 == 0:
+                    print(f"Using precomputed sigma_scaling={sigma_scaling:.4f} for lesion {lesion_name}")
+            else:
+                sigma_scaling = default_sigma_scaling
+                if processed_count < 5 or processed_count % 50 == 0:
+                    print(f"Lesion {lesion_name} not found in precomputed stats, using default sigma_scaling={sigma_scaling}")
+            
+            # Generate modified ZADC map
+            if processed_count < 5 or processed_count % 50 == 0:
+                print(f"Generating modified ZADC for {patient_id} with lesion {lesion_info}")
+            modified_zadc_data, lesion_mask = generate_modified_zadc(
+                orig_zadc_data, 
+                orig_adc_data, 
+                modified_adc_data,
+                sigma_scaling
+            )
+            
+            # Save the modified ZADC map
+            save_mha_file(modified_zadc_data, orig_zadc_img, output_path)
+            processed_count += 1
+            
+            # Create visualizations
+            if processed_count <= 5 or visualize_all:
+                # Find a slice with changes
+                diff = np.abs(orig_adc_data - modified_adc_data)
+                if np.any(diff > 0):
+                    # Find the slice with maximum difference
+                    slice_idx = np.argmax(np.sum(np.sum(diff, axis=0), axis=0))
+                    
+                    # Create enhanced visualization
+                    create_enhanced_visualization(
+                        orig_zadc_data, 
+                        modified_zadc_data,
+                        orig_adc_data,
+                        modified_adc_data,
+                        lesion_mask,
+                        slice_idx,
+                        patient_id,
+                        lesion_info,
+                        output_dir
+                    )
+        except Exception as e:
+            print(f"Error processing {modified_adc_file}: {e}")
+            error_count += 1
             continue
-        
-        # Construct original ADC filename - should match the pattern MGHNICU_010-VISIT_01-ADC_ss.mha
-        orig_adc_file = f"{patient_id}-ADC_ss.mha"
-        orig_adc_path = os.path.join(orig_adc_dir, orig_adc_file)
-        
-        # Find matching ZADC file (they have different naming convention)
-        orig_zadc_path = find_matching_zadc_file(patient_id, orig_zadc_dir)
-        
-        modified_adc_path = os.path.join(modified_adc_dir, modified_adc_file)
-        
-        # Check if all required files exist
-        if not os.path.exists(orig_adc_path):
-            print(f"Warning: Original ADC file not found: {orig_adc_path}")
-            continue
-        
-        if not orig_zadc_path or not os.path.exists(orig_zadc_path):
-            print(f"Warning: Original ZADC file not found for patient {patient_id}")
-            continue
-        
-        # Load data
-        orig_adc_data, orig_adc_img = load_mha_file(orig_adc_path)
-        orig_zadc_data, orig_zadc_img = load_mha_file(orig_zadc_path)
-        modified_adc_data, _ = load_mha_file(modified_adc_path)
-        
-        # Check dimensions
-        if orig_adc_data.shape != orig_zadc_data.shape or orig_adc_data.shape != modified_adc_data.shape:
-            print(f"Warning: Dimension mismatch for {patient_id}. Skipping.")
-            print(f"  Original ADC shape: {orig_adc_data.shape}")
-            print(f"  Original ZADC shape: {orig_zadc_data.shape}")
-            print(f"  Modified ADC shape: {modified_adc_data.shape}")
-            continue
-        
-        # Generate modified ZADC map
-        print(f"Generating modified ZADC for {patient_id} with lesion {lesion_info}")
-        modified_zadc_data, lesion_mask = generate_modified_zadc(
-            orig_zadc_data, 
-            orig_adc_data, 
-            modified_adc_data,
-            norm_atlas_data,
-            stdev_atlas_data,
-            lesion_info,
-            sigma_scaling
-        )
-        
-        # Save the modified ZADC map
-        save_mha_file(modified_zadc_data, orig_zadc_img, output_path)
-        processed_count += 1
-        
-        # Create visualizations
-        if processed_count <= 5 or visualize_all:
-            # Find a slice with changes
-            diff = np.abs(orig_adc_data - modified_adc_data)
-            if np.any(diff > 0):
-                # Find the slice with maximum difference
-                slice_idx = np.argmax(np.sum(np.sum(diff, axis=0), axis=0))
-                
-                # Create enhanced visualization
-                create_enhanced_visualization(
-                    orig_zadc_data, 
-                    modified_zadc_data,
-                    orig_adc_data,
-                    modified_adc_data,
-                    lesion_mask,
-                    slice_idx,
-                    patient_id,
-                    lesion_info,
-                    output_dir
-                )
     
     # Print summary
     print("\n--- Processing Summary ---")
     print(f"Total files: {len(modified_adc_files)}")
     print(f"Processed: {processed_count}")
     print(f"Skipped (already processed): {skipped_count}")
+    print(f"Errors: {error_count}")
+    
+    # Print lesion usage statistics
+    print("\n--- Lesion Usage Statistics ---")
+    for lesion_name, count in sorted(lesion_usage.items(), key=lambda x: x[1], reverse=True):
+        print(f"{lesion_name}: {count} files")
     print("-----------------------")
 
 
@@ -500,24 +546,38 @@ def main():
                         help='Directory containing modified ADC maps with synthetic lesions')
     parser.add_argument('--output_dir', type=str, required=True,
                         help='Directory to save the modified ZADC maps')
+    parser.add_argument('--lesions_dir', type=str, default=None,
+                        help='Directory containing standardized lesion files (required for precomputing statistics)')
     parser.add_argument('--norm_atlas', type=str, default=None,
-                        help='Path to normative atlas (.nii file)')
+                        help='Path to normative atlas (.nii file) (required for precomputing statistics)')
     parser.add_argument('--stdev_atlas', type=str, default=None,
-                        help='Path to standard deviation atlas (.nii file)')
+                        help='Path to standard deviation atlas (.nii file) (required for precomputing statistics)')
     parser.add_argument('--sigma_scaling', type=float, default=0.01,
-                        help='Scaling factor for normalization (default: 0.01, used only if atlases are not provided)')
+                        help='Default scaling factor for normalization (default: 0.01, used if lesion stats not found)')
     parser.add_argument('--visualize_all', action='store_true',
                         help='Create visualizations for all processed files (default: only first 5)')
     
     args = parser.parse_args()
+    
+    # Check if we have all required parameters for precomputing statistics
+    if args.lesions_dir and args.norm_atlas and args.stdev_atlas:
+        # Precompute statistics for all lesions
+        lesion_stats = precompute_lesion_statistics(
+            args.lesions_dir,
+            args.norm_atlas,
+            args.stdev_atlas
+        )
+    else:
+        print("Warning: Missing parameters for precomputing lesion statistics")
+        print("Will use default sigma_scaling for all lesions")
+        lesion_stats = {}
     
     process_dataset(
         args.orig_zadc_dir,
         args.orig_adc_dir,
         args.modified_adc_dir,
         args.output_dir,
-        args.norm_atlas,
-        args.stdev_atlas,
+        lesion_stats,
         args.sigma_scaling,
         args.visualize_all
     )
