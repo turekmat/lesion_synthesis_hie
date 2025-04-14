@@ -651,6 +651,10 @@ def process_dataset(orig_zadc_dir, orig_adc_dir, modified_adc_dir, output_dir,
                 error_count += 1
                 continue
             
+            # Check if this synthetic lesion decreases ADC values
+            lesion_mask = get_lesion_mask(orig_adc_data, modified_adc_data)
+            adc_diff = modified_adc_data - orig_adc_data
+            
             # Get sigma scaling factor for this lesion
             if lesion_name and lesion_name in lesion_stats:
                 sigma_scaling = lesion_stats[lesion_name]['sigma_scaling']
@@ -663,10 +667,6 @@ def process_dataset(orig_zadc_dir, orig_adc_dir, modified_adc_dir, output_dir,
                 sigma_scaling = default_sigma_scaling * 2  # Use a stronger effect for synthetic lesions
                 if processed_count < 5 or processed_count % 50 == 0:
                     print(f"Lesion {lesion_name} not found in precomputed stats, using enhanced sigma_scaling={sigma_scaling}")
-            
-            # Check if this synthetic lesion decreases ADC values
-            lesion_mask = get_lesion_mask(adc_orig_data, adc_modified_data)
-            adc_diff = modified_adc_data - adc_orig_data
             
             # If most of the lesion has decreased ADC values (more than 70%), 
             # we need to ensure ZADC values decrease appropriately
