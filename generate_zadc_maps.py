@@ -345,6 +345,9 @@ def create_enhanced_visualization(orig_zadc_data, modified_zadc_data, adc_orig_d
     zadc_diff = modified_zadc_data - orig_zadc_data
     adc_diff = adc_modified_data - adc_orig_data
     
+    # Create binary difference map (regions where ADC values differ)
+    adc_diff_binary = np.abs(adc_diff) > 1.0  # Threshold for significant difference
+    
     # Calculate detailed statistics in lesion area
     zadc_stats = {}
     adc_stats = {}
@@ -439,7 +442,7 @@ def create_enhanced_visualization(orig_zadc_data, modified_zadc_data, adc_orig_d
         plt.title('ADC Difference')
         plt.colorbar()
         
-        # Row 2: ZADC maps
+        # Row 2: ZADC maps and binary diff
         # Original ZADC
         plt.subplot(234)
         plt.imshow(orig_zadc_data[slice_idx, :, :], cmap='gray', origin='lower')
@@ -452,19 +455,10 @@ def create_enhanced_visualization(orig_zadc_data, modified_zadc_data, adc_orig_d
         plt.title('Modified ZADC')
         plt.colorbar()
         
-        # ZADC Difference with lesion contour
+        # Binary ADC difference map
         plt.subplot(236)
-        plt.imshow(zadc_diff[slice_idx, :, :], cmap='hot', origin='lower')
-        
-        # Add lesion contour
-        if np.any(lesion_mask[slice_idx, :, :]):
-            from skimage import measure
-            contours = measure.find_contours(lesion_mask[slice_idx, :, :].astype(float), 0.5)
-            for contour in contours:
-                plt.plot(contour[:, 1], contour[:, 0], 'g-', linewidth=2)
-        
-        plt.title('ZADC Difference with Lesion Contour')
-        plt.colorbar()
+        plt.imshow(adc_diff_binary[slice_idx, :, :], cmap='Reds', origin='lower')
+        plt.title('Binary ADC Difference Map')
         
         # Add title to the entire figure
         plt.suptitle(f"{patient_id} with lesion {lesion_info} - Axial Slice {slice_idx}", fontsize=16)
@@ -529,11 +523,11 @@ def create_enhanced_visualization(orig_zadc_data, modified_zadc_data, adc_orig_d
                     plt.title(f'ADC Diff (Axial Slice {slice_i})')
                     plt.colorbar()
                     
-                    # Lesion mask
+                    # Binary ADC difference map
                     plt.subplot(len(selected_slices), 3, 3*i + 3)
                     plt.imshow(adc_orig_data[slice_i, :, :], cmap='gray', origin='lower')
-                    plt.imshow(lesion_mask[slice_i, :, :], cmap='Reds', alpha=0.5, origin='lower')
-                    plt.title(f'Lesion Mask (Axial Slice {slice_i})')
+                    plt.imshow(adc_diff_binary[slice_i, :, :], cmap='Reds', alpha=0.5, origin='lower')
+                    plt.title(f'Binary ADC Diff (Axial Slice {slice_i})')
                 
                 plt.suptitle(f"Multiple slices for {patient_id} with lesion {lesion_info}", fontsize=16)
                 plt.tight_layout(rect=[0, 0, 1, 0.96])  # Adjust layout to make room for suptitle
@@ -564,7 +558,7 @@ def create_enhanced_visualization(orig_zadc_data, modified_zadc_data, adc_orig_d
     plt.title('ADC Difference')
     plt.colorbar()
     
-    # Row 2: ZADC maps
+    # Row 2: ZADC maps and binary map
     # Original ZADC
     plt.subplot(234)
     plt.imshow(orig_zadc_data[slice_idx, :, :], cmap='gray', origin='lower')
@@ -577,19 +571,10 @@ def create_enhanced_visualization(orig_zadc_data, modified_zadc_data, adc_orig_d
     plt.title('Modified ZADC')
     plt.colorbar()
     
-    # ZADC Difference with lesion contour
+    # Binary ADC difference map
     plt.subplot(236)
-    plt.imshow(zadc_diff[slice_idx, :, :], cmap='hot', origin='lower')
-    
-    # Add lesion contour
-    if np.any(lesion_mask[slice_idx, :, :]):
-        from skimage import measure
-        contours = measure.find_contours(lesion_mask[slice_idx, :, :].astype(float), 0.5)
-        for contour in contours:
-            plt.plot(contour[:, 1], contour[:, 0], 'g-', linewidth=2)
-    
-    plt.title('ZADC Difference with Lesion Contour')
-    plt.colorbar()
+    plt.imshow(adc_diff_binary[slice_idx, :, :], cmap='Reds', origin='lower')
+    plt.title('Binary ADC Difference Map')
     
     # Add title to the entire figure
     plt.suptitle(f"{patient_id} with lesion {lesion_info} - Axial Slice {slice_idx}", fontsize=16)
